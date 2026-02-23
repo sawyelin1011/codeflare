@@ -93,11 +93,11 @@ export async function deleteSession(id: string): Promise<void> {
 
 /**
  * Get status for all sessions in a single batch call
- * Returns a map of sessionId -> { status, ptyActive, startupStage? }
+ * Returns statuses map and maxSessions limit
  */
-export async function getBatchSessionStatus(): Promise<Record<string, { status: 'running' | 'stopped' | 'stopping'; ptyActive: boolean; startupStage?: string; lastStartedAt?: string | null; lastActiveAt?: string | null; metrics?: { cpu?: string; mem?: string; hdd?: string; syncStatus?: string; updatedAt?: string } }>> {
+export async function getBatchSessionStatus(): Promise<{ statuses: Record<string, { status: 'running' | 'stopped' | 'stopping'; ptyActive: boolean; startupStage?: string; lastStartedAt?: string | null; lastActiveAt?: string | null; metrics?: { cpu?: string; mem?: string; hdd?: string; syncStatus?: string; updatedAt?: string } }>; maxSessions: number }> {
   const response = await fetchApi('/sessions/batch-status', {}, BatchSessionStatusResponseSchema);
-  return response.statuses;
+  return { statuses: response.statuses, maxSessions: response.maxSessions };
 }
 
 // Get container startup status (polling endpoint)
@@ -142,15 +142,14 @@ export function startSession(
       // The backend uses ctx.waitUntil() — container may have started despite client error.
       // For transient errors, proceed to polling; polling will timeout naturally if container didn't start.
       const isDefinitiveFailure = err instanceof ApiError
-        && err.status >= 400 && err.status < 500
-        && err.status !== 429; // 429 is transient (rate limit)
+        && err.status >= 400 && err.status < 500;
 
       if (isDefinitiveFailure) {
         logger.error('Container start failed (definitive):', (err as ApiError).status, err.message);
         onError(`Container start failed: ${err.message}`);
         return;
       }
-      // Transient error (network failure, timeout, 5xx, 429) — proceed to polling
+      // Transient error (network failure, timeout, 5xx) — proceed to polling
       logger.debug('Container start request (transient, proceeding to poll):', err);
     }
 
@@ -307,14 +306,6 @@ export async function getOnboardingConfig(): Promise<OnboardingConfigResponse> {
     basePath: '/public',
     schema: OnboardingConfigResponseSchema,
   });
-}
-
-// Admin API
-export async function adminDestroyContainer(doId: string): Promise<{ success: boolean; message: string }> {
-  return fetchApi('/admin/destroy-by-id', {
-    method: 'POST',
-    body: JSON.stringify({ doId }),
-  }) as Promise<{ success: boolean; message: string }>;
 }
 
 // Session ID format: 8-24 lowercase alphanumeric characters (matches backend SESSION_ID_PATTERN)
