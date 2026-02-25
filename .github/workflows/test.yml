@@ -1,11 +1,13 @@
 name: PR Checks
 on:
+  push:
+    branches: [develop]
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: test-${{ github.head_ref }}
+  group: test-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -52,6 +54,13 @@ jobs:
         run: npm run lint
         working-directory: web-ui
 
+      - name: Dead code check (backend)
+        run: npm run knip
+
+      - name: Dead code check (frontend)
+        run: npm run knip
+        working-directory: web-ui
+
       - name: Build frontend
         run: npm run build
         working-directory: web-ui
@@ -81,5 +90,5 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/dependency-review-action@4901385134134e04cec5fbe5ddfe3b2c5bd5d976 # v4
