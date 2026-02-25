@@ -89,6 +89,10 @@ In your fork: `Settings` > `Secrets and variables` > `Actions` > `New repository
 
 Add each as a separate secret. Name goes in the **Name** field, value in **Secret**. Click **Add secret** after each one.
 
+**Secrets** (optional — for E2E testing):
+- `CF_ACCESS_CLIENT_ID` - CF Access service token client ID
+- `CF_ACCESS_CLIENT_SECRET` - CF Access service token client secret
+
 ### 3. Deploy
 
 Go to your fork: `Actions` > `Deploy` > `Run workflow` > Branch: `main` > **Run workflow**. GitHub Actions builds, tests, and deploys to Cloudflare Workers. Takes about 2 minutes - go grab a coffee.
@@ -149,6 +153,7 @@ All optional. The defaults work out of the box. I respect your time.
 | `CLAUDE_UNLEASHED_CACHE_BUSTER` | `inactive` | Set to `active` to force-reinstall the AI agent layer on every deploy |
 | `MAX_SESSIONS_USER` | `3` | Max concurrent running sessions per regular user |
 | `MAX_SESSIONS_ADMIN` | `10` | Max concurrent running sessions per admin user |
+| `E2E_BASE_URL` | unset | Custom domain URL for E2E tests (e.g., `https://codeflare.example.com`) |
 
 </details>
 
@@ -158,6 +163,53 @@ All optional. The defaults work out of the box. I respect your time.
 - AI agents run with full terminal access *inside* the container - and can't get out. I gave them root and a sandbox. They got root in a sandbox.
 - Cloudflare Access gates all authenticated surfaces (`/app`, `/api`, `/setup`).
 - API tokens never enter the container. Secrets stay in GitHub and Cloudflare. The agent doesn't know your passwords, and frankly, it doesn't want to.
+- For vulnerability reporting, see [SECURITY.md](SECURITY.md).
+
+## Testing
+
+~2,200+ tests across four layers:
+
+| Layer | Tests | Framework |
+|-------|-------|-----------|
+| Backend | ~758 (63 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
+| Frontend | ~1,280 (64 files) | Vitest v4 + jsdom 28 + SolidJS Testing Library |
+| E2E API | ~47 (10 files) | Vitest + plain fetch |
+| E2E UI | ~73 (10 files, run as desktop + mobile) | Vitest + Puppeteer |
+
+```bash
+npm test                           # Backend tests
+cd web-ui && npm test              # Frontend tests
+npm run test:e2e:api               # E2E API (requires deployed worker)
+npm run test:e2e:ui                # E2E UI desktop (requires deployed worker)
+E2E_MOBILE=1 npm run test:e2e:ui   # E2E UI mobile
+```
+
+E2E tests require a deployed worker and CF Access service tokens. See `TECHNICAL.md` Section 16 for setup details.
+
+## CI/CD
+
+Six GitHub Actions workflows:
+
+| Workflow | Trigger | Purpose |
+|----------|---------|---------|
+| `deploy.yml` | Push to `main` / manual | Tests + Docker build + Trivy scan + deploy |
+| `test.yml` | Pull requests | Lint, tests, typecheck, security audit, dependency review |
+| `e2e.yml` | Manual | E2E matrix: API, UI desktop, UI mobile |
+| `codeql.yml` | Push, PRs, weekly | CodeQL static analysis |
+| `scorecard.yml` | Push to `main`, weekly | OSSF Scorecard |
+
+See `TECHNICAL.md` Section 15 for full CI/CD documentation.
+
+## Security
+
+- Container isolation: one per session, no cross-session access
+- Cloudflare Access: gates `/app`, `/api`, `/setup` with JWT verification
+- Security headers: HSTS, CSP, X-Frame-Options, Referrer-Policy on every response
+- Rate limiting: KV-backed, per-user
+- Input validation: Zod schemas, 64 KiB body limit
+- Supply chain: CodeQL (with Copilot Autofix), OSSF Scorecard, `npm audit`, dependency review, Dependabot, Trivy container scanning
+- GitHub security: secret scanning, push protection, private vulnerability reporting, dependency graph
+- See [SECURITY.md](SECURITY.md) for full security architecture
 
 ## Docs
 

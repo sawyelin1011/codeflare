@@ -50,7 +50,6 @@ function getCookieValue(cookieHeader: string | null, key: string): string | null
  *    When CF Access validates a service token, it sets cf-access-client-id header.
  *    Service tokens are mapped to SERVICE_TOKEN_EMAIL env var or default email.
  *
- * In DEV_MODE, returns a test user when no Access headers are present.
  */
 export async function getUserFromRequest(request: Request, env?: Env): Promise<AccessUser> {
   // Check for JWT assertion header first (primary auth method)
@@ -98,6 +97,40 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     : (cachedAccessAud ? [cachedAccessAud] : []);
   const authConfigured = !!(cachedAuthDomain && accessAudList.length > 0);
 
+  // Direct service auth validation — checked FIRST because CF Access may
+  // inject a JWT for service tokens whose audience doesn't match our app's
+  // access_aud, AND CF Access strips CF-Access-Client-Secret from forwarded
+  // requests. Uses custom X-Service-Auth header to bypass both issues.
+  // Only active when SERVICE_AUTH_SECRET is set as a worker secret.
+  if (env?.SERVICE_AUTH_SECRET) {
+    const serviceAuth = request.headers.get('X-Service-Auth');
+    if (serviceAuth) {
+      // Constant-time comparison to prevent timing attacks
+      const expected = new TextEncoder().encode(env.SERVICE_AUTH_SECRET);
+      const actual = new TextEncoder().encode(serviceAuth);
+      if (expected.byteLength !== actual.byteLength) {
+        // Length mismatch — fall through to normal rejection
+        return { email: '', authenticated: false};
+      }
+      const match = await crypto.subtle.timingSafeEqual(expected, actual);
+      if (match) {
+        // Use SERVICE_TOKEN_EMAIL or fixed e2e identity.
+        // CF Access may strip CF-Access-Client-Id, so we don't rely on it here.
+        // Role is set to 'admin' — the caller proved they have the worker secret,
+        // so they're trusted without a KV allowlist lookup.
+        const serviceEmail = env.SERVICE_TOKEN_EMAIL || 'e2e-service@codeflare.local';
+        return { email: normalizeEmail(serviceEmail), authenticated: true, role: 'admin'};
+      }
+      // timingSafeEqual failed
+      return { email: '', authenticated: false};
+    } else {
+      // SERVICE_AUTH_SECRET is set but header not sent — note this but continue to other auth methods
+      // (caller might be using JWT auth instead)
+    }
+  } else {
+    // SERVICE_AUTH_SECRET not in env — note for diagnostics but continue to other auth methods
+  }
+
   // JWT verification: if token present and auth is configured, verify it
   if (jwtToken && authConfigured && cachedAuthDomain) {
     for (const expectedAud of accessAudList) {
@@ -108,15 +141,12 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     }
 
     // JWT verification failed
-    // In DEV_MODE, fall through to header-based trust
-    if (env?.DEV_MODE !== 'true') {
-      return { email: '', authenticated: false };
-    }
+    return { email: '', authenticated: false };
   }
 
   // Post-setup (auth configured) but NO JWT: reject even if header is present (FIX-1).
   // This prevents header spoofing when Cloudflare Access is configured.
-  if (authConfigured && !jwtToken && env?.DEV_MODE !== 'true') {
+  if (authConfigured && !jwtToken) {
     return { email: '', authenticated: false };
   }
 
@@ -136,12 +166,6 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     // Use SERVICE_TOKEN_EMAIL env var or fall back to a default based on client ID
     const serviceEmail = env?.SERVICE_TOKEN_EMAIL || `service-${serviceTokenClientId.split('.')[0]}@codeflare.local`;
     return { email: normalizeEmail(serviceEmail), authenticated: true };
-  }
-
-  // DEV_MODE bypass: return user from SERVICE_TOKEN_EMAIL when no Access headers
-  if (env?.DEV_MODE === 'true') {
-    const devEmail = env?.SERVICE_TOKEN_EMAIL || 'test@example.com';
-    return { email: normalizeEmail(devEmail), authenticated: true };
   }
 
   return { email: '', authenticated: false };
@@ -225,16 +249,16 @@ export async function authenticateRequest(
   if (!normalizedEmail) {
     throw new AuthError('Not authenticated');
   }
-  let role: UserRole;
-  if (env.DEV_MODE !== 'true') {
-    const kvEntry = await resolveUserFromKV(env.KV, normalizedEmail);
-    if (!kvEntry) {
-      throw new ForbiddenError('User not in allowlist');
-    }
-    role = kvEntry.role;
-  } else {
-    role = 'admin';
+  // Service auth users already have a role — skip KV allowlist lookup
+  if (rawUser.role) {
+    const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
+    return { user: { ...rawUser, email: normalizedEmail }, bucketName };
   }
+  const kvEntry = await resolveUserFromKV(env.KV, normalizedEmail);
+  if (!kvEntry) {
+    throw new ForbiddenError('User not in allowlist');
+  }
+  const role = kvEntry.role;
   const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
   return { user: { ...rawUser, email: normalizedEmail, role }, bucketName };
 }

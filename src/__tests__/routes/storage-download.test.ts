@@ -7,7 +7,7 @@ import { ValidationError } from '../../lib/error-types';
 import { createMockKV } from '../helpers/mock-kv';
 
 // Track mock state for assertions - vi.hoisted() ensures these are available when vi.mock() factory runs
-const { mockSign, mockCreateR2Client, mockGetR2Url, mockFetch } = vi.hoisted(() => {
+const { mockSign, mockCreateR2Client, mockGetR2Url, mockFetch: _mockFetch } = vi.hoisted(() => {
   const mockSign = vi.fn();
   const mockFetch = vi.fn();
   return {
@@ -56,7 +56,7 @@ describe('Storage Download Routes', () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal('fetch', async (input: RequestInfo) => {
       const url = typeof input === 'string' ? input : input instanceof Request ? input.url : '';
-      if (url.includes('test.r2.cloudflarestorage.com')) {
+      if (new URL(url).hostname === 'test.r2.cloudflarestorage.com') {
         return new Response('file-content', {
           status: 200,
           headers: {
