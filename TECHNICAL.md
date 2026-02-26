@@ -18,6 +18,7 @@ Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2
 8. [API Reference](#8-api-reference)
 9. [Container Image](#9-container-image)
 10. [Container Startup](#10-container-startup)
+    - [Fast Start](#fast-start)
 11. [Claude-Unleashed Integration](#11-claude-unleashed-integration)
 12. [File Structure](#12-file-structure)
 13. [Environment Variables](#13-environment-variables)
@@ -86,12 +87,12 @@ With SPA fallback (`not_found_handling = "single-page-application"`), control-pl
 **SDK-Managed Hibernation:** `sleepAfter` lets the SDK handle container process lifecycle via its own alarm loop. `onStart()` updates KV with `lastStartedAt` timestamp, clears stale `collectMetrics` schedules, and arms a fresh 5-second `collectMetrics` schedule. `onStop()` sets KV status to `'stopped'` and updates `lastActiveAt` timestamp, ensuring other devices see correct status for hibernated containers.
 
 **`collectMetrics()` Heartbeat (every 5s):**
-1. Checks `this.ctx.container?.running` — returns early (no re-arm) if container is dead
-2. Fetches `/activity` via `getTcpPort()` — if active WS clients, calls `renewActivityTimeout()` (keepalive). If `/activity` fails, renews as safety net (don't kill container on transient errors). Activity/keepalive logs are at `debug` level to reduce noise (was `info` — downgraded once keepalive was confirmed stable).
-3. Fetches `/health` via `getTcpPort()` — reads cpu/mem/hdd/syncStatus
+1. Checks `this.ctx.container?.running` - returns early (no re-arm) if container is dead
+2. Fetches `/activity` via `getTcpPort()` - if active WS clients, calls `renewActivityTimeout()` (keepalive). If `/activity` fails, renews as safety net (don't kill container on transient errors). Activity/keepalive logs are at `debug` level to reduce noise (was `info` - downgraded once keepalive was confirmed stable).
+3. Fetches `/health` via `getTcpPort()` - reads cpu/mem/hdd/syncStatus
 4. Writes metrics to KV session record (`session.metrics`)
 5. Re-arms schedule if container still running
-6. **Zombie DO detection**: When identifiers are missing (post-`destroy()`), returns early WITHOUT re-arming — kills both metrics push and schedule re-arm via if/else pattern
+6. **Zombie DO detection**: When identifiers are missing (post-`destroy()`), returns early WITHOUT re-arming - kills both metrics push and schedule re-arm via if/else pattern
 
 **Zombie DO Detection:** When `collectMetrics` reaches the health-fetch stage but `sessionId` or `bucketName` are missing from DO storage (happens after `destroy()` clears them), it logs `"missing identifiers, not re-arming (zombie DO)"` and returns without scheduling the next cycle. This is the kill switch for orphaned DOs.
 
@@ -150,7 +151,7 @@ sequenceDiagram
 
 **File:** `host/server.js` - Node.js server inside the container. Single port 8080 for WebSocket + REST + health/metrics.
 
-Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads sync status from `/tmp/sync-status.json` and exposes via `/health`. Activity tracking (`lastUserInputMs`, `lastAgentFileActivityMs`) for hibernation decisions via `GET /activity`.
+Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads sync status from `/tmp/sync-status.json` and exposes via `/health`. Activity tracking (WebSocket connection state: `hasActiveConnections`, `connectedClients`, `activeSessions`, `disconnectedForMs`) for hibernation decisions via `GET /activity`.
 
 **Auth-Exempt Paths:** The terminal server validates `Authorization: Bearer <token>` on all HTTP requests. Paths called via `getTcpPort().fetch()` (which bypasses the DO's `fetch()` override that injects the auth header) must be in the `authExemptPaths` Set at `host/server.js`: `['/health', '/activity']`. The `/activity` endpoint is also exempted from auth in the DO-level `fetch()` override so internal health checks don't require token injection.
 
@@ -227,6 +228,10 @@ function connect() {
 
 **Terminal Tab Configuration:** `web-ui/src/lib/terminal-config.ts` -- Generic "Terminal 1-6" defaults with live process detection via `PROCESS_ICON_MAP` (maps process names like claude, cu, claude-code, codex, gemini, opencode, htop, yazi, lazygit, bash, sh, zsh to MDI icons).
 
+#### Frontend Constants
+
+**File:** `web-ui/src/lib/constants.ts` -- 20 constants for polling intervals, timeouts, retry limits, WebSocket close codes, max terminals, display lengths, URL detection patterns, view transitions, context expiry, dashboard WS disconnect delay.
+
 ---
 
 ## 3. Backend Libraries
@@ -245,7 +250,7 @@ function connect() {
 | `src/lib/cache-reset.ts` | Centralized invalidation of CORS + auth config + JWKS caches. Called by setup wizard after configuration changes. |
 | `src/lib/cf-api.ts` | Cloudflare API client. `parseCfResponse` checks `Content-Type` header before JSON parsing. When content-type is not `application/json`, attempts `JSON.parse` on the text body as a lenient fallback (Cloudflare sometimes omits content-type on valid JSON). Only throws a structured `AppError` with the first 200 chars of the response body if the parse actually fails -- this gives clear diagnostics for HTML error pages or plain text from expired tokens, instead of opaque JSON parse errors. |
 
-**DEV_MODE Gating:** `/api/container/debug/*` restricted to `DEV_MODE = "true"`. Note: DEV_MODE only gates debug endpoints and enables localhost CORS — it does NOT bypass CF Access authentication.
+**DEV_MODE Gating:** `/api/container/debug/*` restricted to `DEV_MODE = "true"`. Note: DEV_MODE only gates debug endpoints and enables localhost CORS - it does NOT bypass CF Access authentication.
 
 ### Setup Wizard Resilience
 
@@ -280,10 +285,6 @@ flowchart TD
 **Session Stop Flow (user-initiated):** Sets KV status to `'stopped'`, calls `container.destroy()` (sends SIGINT per Dockerfile STOPSIGNAL, then SIGKILL), entrypoint.sh shutdown handler runs final `rclone bisync`. `destroy()` override clears `SESSION_ID_KEY`/`bucketName` from DO storage before `super.destroy()` -- prevents `onStop()` from resurrecting the deleted session. Both `batch-status` and `GET /:id/status` trust the `'stopped'` KV status to avoid waking the DO (exception: stale >5 minutes triggers probe).
 
 **Session Stop Flow (idle):** `onActivityExpired()` detects no active WS clients -> `this.stop('SIGTERM')` -> `onStop()` fires with identifiers intact -> writes `status: 'stopped'` to KV.
-
-### Frontend Constants
-
-**File:** `web-ui/src/lib/constants.ts` -- 20 constants for polling intervals, timeouts, retry limits, WebSocket close codes, max terminals, display lengths, URL detection patterns, view transitions, context expiry, dashboard WS disconnect delay.
 
 ---
 
@@ -691,6 +692,8 @@ GET `/api/presets`, POST `/api/presets`, PATCH `/api/presets/:id` (rename), DELE
 
 GET `/api/preferences`, PATCH `/api/preferences`
 
+`UserPreferences` fields: `samsungAddressBarTop` (boolean), `clipboardAccess` (boolean), `fastStartEnabled` (boolean, default: `true`). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
+
 ### Public (Onboarding)
 
 GET `/public/onboarding-config`, POST `/public/waitlist` (rate limited)
@@ -703,25 +706,34 @@ GET `/health`, GET `/api/health`
 
 ## 9. Container Image
 
-**File:** `Dockerfile` - Base: `node:22.13-alpine3.21`, multi-stage build (builder compiles native addons, runtime has no build tools).
+**File:** `Dockerfile` - Base: `node:24-bookworm-slim`, multi-stage build (builder compiles native addons, runtime has no build tools).
 
 ### Installed Tools
 
 | Category | Packages |
 |----------|----------|
 | Sync | rclone |
-| Version Control | git, github-cli (gh), lazygit |
+| Version Control | git, github-cli (gh), lazygit (v0.59.0) |
 | Editors | vim (symlinked to neovim), neovim, nano |
 | Network | curl, openssh-client |
-| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi, fzf, zoxide, bat |
+| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.1.22), fzf, zoxide, bat |
 
 ### Global NPM Packages
 
-`claude-unleashed` (wraps `@anthropic-ai/claude-code`), `@anthropic-ai/claude-code` (symlinked from claude-unleashed), `@openai/codex`, `@google/gemini-cli`, `@github/copilot-cli`, `opencode-ai`
+Versions are pinned in the Dockerfile and updated periodically (`.cache-bust` layer invalidation triggers fresh installs on each deploy). The Dockerfile is the source of truth for version pins - versions listed below are approximate and may drift between documentation updates.
+
+| Package | Version | Provides |
+|---------|---------|----------|
+| `claude-unleashed` | Git commit pin | `cu` / `claude-unleashed` commands (wraps `@anthropic-ai/claude-code`) |
+| `@anthropic-ai/claude-code` | _(symlinked from claude-unleashed)_ | `claude` command |
+| `@openai/codex` | 0.105.0 | `codex` command |
+| `@google/gemini-cli` | 0.30.0 | `gemini` command |
+| `opencode-ai` | 1.2.15 | `opencode` command |
+| `@github/copilot` | 0.0.418 | `copilot` command |
 
 ### V8 Compile Cache Warm-Up
 
-Node.js CLIs (claude, codex, gemini) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need this optimization.
+Node.js CLIs (claude, codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need this optimization.
 
 ### OpenCode Database Pre-Initialization
 
@@ -752,7 +764,29 @@ flowchart TD
     D --> E["Start terminal server (:8080)"]
 ```
 
-Auto-start uses `cu --silent --no-consent` for fast boot. Updates are enabled - pre-patched at build time, so the update check is fast (~2s). Users can also update manually via `cu` in any tab.
+Auto-start uses `cu --silent --no-consent` for fast boot. Auto-updates are disabled by default via `FAST_CLI_START=true` (see [Fast Start](#fast-start) below). Users can enable auto-updates via Settings, or update manually via `cu` in any tab.
+
+### Fast Start
+
+**User preference:** `fastStartEnabled` (default: `true`) in `UserPreferences`.
+**Container env var:** `FAST_CLI_START` (default: `'true'`).
+
+When enabled, `entrypoint.sh` disables auto-update checks for all 6 AI tools, eliminating 5-30s of startup delay per tool. Each tool has a different disable mechanism:
+
+| Tool | Disable Mechanism | Type |
+|------|------------------|------|
+| Claude Code | `DISABLE_AUTOUPDATER=1` | Env var |
+| Claude Unleashed | `CLAUDE_UNLEASHED_NO_UPDATE=1` | Env var |
+| OpenCode | `OPENCODE_DISABLE_AUTOUPDATE=1` | Env var |
+| Copilot | `COPILOT_AUTO_UPDATE=false` | Env var |
+| Gemini | `~/.gemini/settings.json` -> `general.enableAutoUpdate: false` | Config file (jq merge) |
+| Codex | `~/.codex/version.json` -> `dismissed_version: "999.0.0"` | Config file (overwrite) |
+
+**Gemini settings.json merge pattern:** Uses `jq '. * {"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}'` to deep-merge into existing settings. This preserves user customizations since the file is synced via rclone from R2. If the file doesn't exist, creates it with only the auto-update keys.
+
+**Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
+
+When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`DISABLE_AUTOUPDATER`, `CLAUDE_UNLEASHED_NO_UPDATE`, `OPENCODE_DISABLE_AUTOUPDATE`, `DISABLE_INSTALLATION_CHECKS`) and skips writing config files, allowing all tools to check for updates normally.
 
 ---
 
@@ -766,9 +800,9 @@ Auto-start uses `cu --silent --no-consent` for fast boot. Updates are enabled - 
 
 ### Environment Variables
 
-**Global (Dockerfile ENV):** `CLAUDE_UNLEASHED_SKIP_CONSENT=1`, `CLAUDE_UNLEASHED_NO_UPDATE=1`, `IS_SANDBOX=1`, `DISABLE_INSTALLATION_CHECKS=1`
+**Global (Dockerfile ENV):** `NPM_CONFIG_UPDATE_NOTIFIER=false`, `CLAUDE_UNLEASHED_SKIP_CONSENT=1`, `CLAUDE_UNLEASHED_CHANNEL=stable`, `CLAUDE_UNLEASHED_NO_UPDATE=1`, `IS_SANDBOX=1`, `DISABLE_INSTALLATION_CHECKS=1`, `NODE_COMPILE_CACHE=/root/.cache/node-compile-cache`, `BROWSER=/usr/local/bin/open-url`
 
-**Prewarm readiness:** `cu`/`claude-unleashed` are classified as TUI agents (not shell commands) in `host/prewarm-config.js`. They use 500ms quiescence (vs 2000ms for shells) and a `readyPattern` of `/╭/` — the first character of Claude Code's ink TUI welcome box. This fires instantly on render, avoiding premature readiness from update silence periods.
+**Prewarm readiness:** All TUI agents are classified in `host/prewarm-config.js` with agent-specific ready patterns. When a `readyPattern` is configured, quiescence-based detection is disabled - only the pattern match or the 20s hard timeout declares readiness. This prevents startup silence (e.g. Node.js V8 compile time) from prematurely firing "ready". Patterns: `cu`/`claude-unleashed` match `/╭/` (Ink TUI welcome box border), `opencode` matches `/>/' (Bubble Tea TUI prompt), `gemini` matches `/Type your message/` (Ink InputPrompt placeholder), `copilot` matches `/Describe a task|Copilot uses/` (Ink welcome box text), `codex` matches `/Codex can make mistakes/` (Rust TUI footer). The `claude` command (vanilla CLI) also gets 500ms quiescence but has no readyPattern. Shell commands (bash, sh, zsh) use 2000ms quiescence with no pattern.
 
 **Auto-start flags (.bashrc):** `--silent`, `--no-consent`
 
@@ -828,12 +862,13 @@ codeflare/
 │   │                         # session-helpers, tutorial-seed.generated, type-guards,
 │   │                         # xml-utils
 │   ├── container/index.ts    # Container DO class
-│   └── __tests__/            # Backend unit tests (63 files)
-├── e2e/                      # E2E tests: 11 API files (~47 tests) + 10 UI files (~73 tests, Puppeteer)
+│   └── __tests__/            # Backend unit tests (64 files)
+├── e2e/                      # E2E tests: 11 API files (~49 tests) + 10 UI files (~74 tests, Puppeteer)
 ├── host/
 │   ├── server.js             # Terminal server (node-pty + WebSocket)
 │   ├── activity-tracker.js   # WebSocket disconnect tracking for idle detection
 │   ├── prewarm-config.js     # Agent-aware PTY pre-warm configuration
+│   ├── __tests__/            # Host unit tests (4 files, ~33 tests)
 │   └── package.json
 ├── web-ui/
 │   └── src/
@@ -905,6 +940,9 @@ codeflare/
 | `TERMINAL_ID` | Unique ID for this terminal instance | Worker -> DO |
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls | Worker -> DO |
 | `MANUAL_TAB` | Set to `1` for user-created tabs to skip autostart | Worker -> DO |
+| `FAST_CLI_START` | Disables auto-update for all 6 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
+| `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
+| `BROWSER` | Points to `open-url` shim that exits 1, forcing CLIs to print OAuth URLs as text | Dockerfile ENV (`/usr/local/bin/open-url`) |
 
 ---
 
@@ -930,7 +968,7 @@ Dynamic: setup wizard adds custom domain + `.workers.dev` to KV. `ALLOWED_ORIGIN
 | default | 1 vCPU, 3 GiB, 4 GB | 10 | Baseline for node-pty + agent CLIs |
 | `high` | 2 vCPU, 6 GiB, 8 GB | 10 | Higher parallelism |
 
-Base image: Node.js 22 Alpine.
+Base image: Node.js 24 Debian (bookworm-slim).
 
 ### API Token Permissions
 
@@ -959,15 +997,16 @@ Base image: Node.js 22 Alpine.
 
 ## 15. CI/CD (GitHub Actions)
 
-Five workflows covering deploy, testing, and supply chain security. Additionally, GitHub's built-in **secret scanning** (with push protection) and **Dependabot security updates** are enabled at the repository level.
+Six workflows covering deploy, testing, fuzzing, and supply chain security. Additionally, GitHub's built-in **secret scanning** (with push protection) and **Dependabot security updates** are enabled at the repository level.
 
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
 | `deploy.yml` | Push to `main` + `workflow_dispatch` (production/integration) | Full pipeline: tests, typecheck, Docker build, Trivy vulnerability scan, wrangler deploy, worker secrets |
-| `test.yml` | Pull requests to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
-| `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker — matrix strategy: `api`, `ui-desktop`, `ui-mobile` on `ubuntu-latest` |
-| `codeql.yml` | Push to `main`/`develop`, PRs to `main`/`develop`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
-| `scorecard.yml` | Push to `main`, weekly (Monday 06:00 UTC) | OSSF Scorecard security posture assessment, publishes results and uploads SARIF |
+| `test.yml` | Push to `develop` + PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
+| `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - matrix strategy: `api`, `ui-desktop`, `ui-mobile` on `ubuntu-latest` |
+| `codeql.yml` | Push to `main`, PRs to `main`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
+| `fuzz.yml` | Weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
+| `scorecard.yml` | Push to `main`, weekly (Monday 06:00 UTC) + `workflow_dispatch` | OSSF Scorecard security posture assessment, publishes results and uploads SARIF |
 
 ### GitHub Environments
 
@@ -994,7 +1033,7 @@ Five workflows covering deploy, testing, and supply chain security. Additionally
 |----------|---------|---------|
 | `CLOUDFLARE_WORKER_NAME` | `codeflare` | `deploy.yml`, `e2e.yml` |
 | `RUNNER` | `ubuntu-latest` | All workflows |
-| `E2E_BASE_URL` | — | `e2e.yml` |
+| `E2E_BASE_URL` | - | `e2e.yml` |
 | `ONBOARDING_LANDING_PAGE` | `inactive` | `deploy.yml` |
 | `RESSOURCE_TIER` | unset (1 vCPU, 3 GiB) | `deploy.yml` |
 | `CLAUDE_UNLEASHED_CACHE_BUSTER` | `inactive` | `deploy.yml` |
@@ -1017,7 +1056,7 @@ Five workflows covering deploy, testing, and supply chain security. Additionally
 
 Two parallel jobs:
 - **test**: Lint (oxlint), build frontend, run backend + frontend tests, typecheck both, `npm audit --audit-level=high` for backend and frontend
-- **dependency-review**: Runs `actions/dependency-review-action` on PRs — blocks merging if new dependencies introduce known vulnerabilities
+- **dependency-review**: Runs `actions/dependency-review-action` on PRs - blocks merging if new dependencies introduce known vulnerabilities
 
 ### E2E Workflow Detail
 
@@ -1031,8 +1070,8 @@ Two-phase execution:
 
 ### 16.1 Backend Tests
 
-**Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` — tests run in real Workers runtime (not Node.js).
-**Count:** 63 test files, ~758 tests.
+**Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` - tests run in real Workers runtime (not Node.js).
+**Count:** 64 test files, ~775 tests.
 **Run:** `npm test`
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
@@ -1040,40 +1079,47 @@ Two-phase execution:
 ### 16.2 Frontend Tests
 
 **Config:** `web-ui/vitest.config.ts` with jsdom + `@solidjs/testing-library`.
-**Count:** 64 test files, ~1,280 tests.
+**Count:** 64 test files, ~1,288 tests.
 **Run:** `cd web-ui && npm test`
 **Key patterns:** SolidJS stores use getter-based exports. Test by re-importing module after `vi.resetModules()`. Use `render()` from `@solidjs/testing-library` for component tests.
 
-### 16.3 Vitest Version Split
+### 16.3 Host Tests
 
-Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/` uses Vitest v4.x (SolidJS testing library compatibility). Each has independent `node_modules` and separate configs. Do not attempt to unify — the version constraint is real.
+**Config:** `host/package.json` with Node.js built-in test runner (`node --test`).
+**Count:** 4 test files, ~33 tests.
+**Run:** `cd host && npm test`
+**Scope:** PTY pre-warm readiness patterns, activity tracker disconnect tracking, WebSocket input classification, server prewarm integration.
 
-### 16.4 E2E API Tests
+### 16.4 Vitest Version Split
 
-**Dir:** `e2e/api/` — 11 test files, ~47 tests.
+Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/` uses Vitest v4.x (SolidJS testing library compatibility). Each has independent `node_modules` and separate configs. Do not attempt to unify - the version constraint is real.
+
+### 16.5 E2E API Tests
+
+**Dir:** `e2e/api/` - 11 test files, ~49 tests.
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:api`
 **Pattern:** Plain `fetch` via `apiRequest()` helper from `e2e/setup.ts`. No Puppeteer. Authenticates via `X-Service-Auth` header matching `SERVICE_AUTH_SECRET` worker secret.
 
 Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, `presets`, `setup-status`, `health`, `container`, `error-responses`, `rate-limiting`.
 
-### 16.5 E2E UI Tests
+### 16.6 E2E UI Tests
 
-**Dir:** `e2e/ui/` — 8 test files, ~66 desktop tests (expanding to ~76 desktop + ~81 mobile).
+**Dir:** `e2e/ui/` - 10 test files, ~74 tests (run as desktop + mobile).
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:ui`
 **Mobile:** `E2E_MOBILE=1 E2E_BASE_URL=... npm run test:e2e:ui`
 **Pattern:** Puppeteer + Vitest. Each suite creates a fresh page. Desktop viewport: 1366x768. Mobile viewport: 375x812 (iPhone-like).
 
-Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-panel`, `storage`, `terminal-tabs`, `tiling`, `bookmarks`.
+Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-panel`, `storage`, `terminal-tabs`, `tiling`, `bookmarks`, `error-states`, `mobile-specific`.
 
-### 16.6 E2E Infrastructure
+### 16.7 E2E Infrastructure
 
-- **CF Access auth:** E2E API tests use `X-Service-Auth` header. UI tests use `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers via `setExtraHTTPHeaders`. CF Access intercepts browser navigation with login page — UI tests work around this by intercepting requests.
+- **CF Access auth:** E2E API tests use `X-Service-Auth` header. UI tests use `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers via `setExtraHTTPHeaders`. CF Access intercepts browser navigation with login page - UI tests work around this by intercepting requests.
 - **KV eventual consistency:** New KV entries take ~60s to propagate. E2E setup job includes retry loops with 15s waits. Test helpers use `waitForFunction` with generous timeouts.
 - **CSS disable:** UI tests inject `document.querySelectorAll('style, link[rel=stylesheet]').forEach(el => el.remove())` to disable CSS for reliable element positioning in headless Chrome.
 - **Screenshot artifacts:** Failed UI tests capture screenshots to `/tmp/e2e-*.png`. CI uploads these as artifacts with 5-day retention.
 - **Suite prefix isolation:** Each E2E suite prefixes its test sessions/presets with a unique identifier (e.g., `e2e-api-`, `e2e-ui-`) to avoid cross-suite interference when running in parallel.
 
-### 16.7 E2E Service Token Setup
+### 16.8 E2E Service Token Setup
 
 Step-by-step for running E2E tests against a deployed worker:
 
@@ -1094,7 +1140,7 @@ npm run test:e2e:ui     # UI desktop tests only
 E2E_MOBILE=1 npm run test:e2e:ui  # UI mobile tests only
 ```
 
-### 16.8 E2E Test Maintenance
+### 16.9 E2E Test Maintenance
 
 **Rule:** When modifying UI components or API routes, review and update corresponding E2E tests.
 
@@ -1132,7 +1178,7 @@ cd web-ui && npm run build # Frontend production build
 | `default` | 1 vCPU, 3 GiB, 4 GB | ~$56 (reference) |
 | `high` | 2 vCPU, 6 GiB, 8 GB | Higher; check CF pricing |
 
-Cost scales per ACTIVE SESSION (each tab = container). Idle containers hibernate after `sleepAfter` (30m) of no SDK-proxied requests. Hibernated containers = zero cost.
+Cost scales per ACTIVE SESSION (each session = one container; a session has up to 6 terminal tabs sharing a single container). Idle containers hibernate after `sleepAfter` (30m) of no SDK-proxied requests. Hibernated containers = zero cost.
 
 **R2:** First 10GB free, $0.015/GB/month after. User config typically <100MB.
 
@@ -1194,7 +1240,7 @@ sudo apt-get install -yqq --no-install-recommends \
   fonts-liberation
 ```
 
-**Note:** Package names differ between Ubuntu versions — 22.04 uses `libatk1.0-0`, 24.04 uses `libatk1.0-0t64`.
+**Note:** Package names differ between Ubuntu versions - 22.04 uses `libatk1.0-0`, 24.04 uses `libatk1.0-0t64`.
 
 ### Common Failure Modes
 

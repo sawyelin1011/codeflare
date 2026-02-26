@@ -33,12 +33,12 @@ Every response from the worker includes the following security headers:
 
 | Header | Value | Purpose |
 |--------|-------|---------|
-| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Enforces HTTPS |
-| `Content-Security-Policy` | Restrictive policy | Prevents XSS and injection |
+| `Strict-Transport-Security` | `max-age=63072000; includeSubDomains; preload` | Enforces HTTPS (2-year max-age with preload) |
+| `Content-Security-Policy` | `default-src 'none'` (API responses); `default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' wss:; img-src 'self' data: https://www.gravatar.com; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'` (HTML responses) | Prevents XSS and injection |
 | `X-Frame-Options` | `DENY` | Prevents clickjacking |
 | `X-Content-Type-Options` | `nosniff` | Prevents MIME sniffing |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Limits referrer leakage |
-| `Permissions-Policy` | Restrictive | Disables unnecessary browser APIs |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), interest-cohort=()` | Disables unnecessary browser APIs |
 
 ### Rate Limiting
 
@@ -50,7 +50,7 @@ Every response from the worker includes the following security headers:
 
 - **Zod schemas** validate all API request bodies and parameters (backend: `src/lib/schemas.ts`, frontend: `web-ui/src/lib/schemas.ts`).
 - **Body size limit:** 64 KiB on all `/api/*` routes. Storage upload routes are exempt for file uploads.
-- **Session ID validation:** `SESSION_ID_PATTERN = /^[a-z0-9]{8,24}$/` — strict alphanumeric, length-bounded.
+- **Session ID validation:** `SESSION_ID_PATTERN = /^[a-z0-9]{8,24}$/` - strict alphanumeric, length-bounded.
 - **CORS enforcement:** `matchesPattern()` enforces domain boundaries with dot-prefix matching. `.workers.dev` matches `x.workers.dev` but NOT `evil-workers.dev`.
 
 ### Container Isolation

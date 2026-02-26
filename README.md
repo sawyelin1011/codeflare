@@ -1,6 +1,8 @@
-# Codeflare
+# <img src="docs/images/logo-icon.svg" width="28" align="absmiddle" alt="Codeflare logo"> Codeflare
 
-I set out to prove that fully autonomous AI development actually works when done properly. Gave coding agents a detailed specification, made them follow TDD principles, and let them run unchecked. Somewhere along the way I accidentally built my favorite development environment.
+You're not sure which AI coding agent is the best. Neither is anyone else. So Codeflare gives you all of them - at the same time. Six agents, six tabs, one browser. No guardrails, no permission prompts, no risk. Every session runs in an isolated container that deletes itself when you're done. Your files persist. Your bad decisions don't.
+
+It runs wherever you happen to find yourself - on the Cloudflare edge that spans the planet, accessible from anything with a browser. Your phone, your tablet, your partner's laptop while they're not looking. Because the best commits in history were made from places without desks.
 
 ![Codeflare on a foldable tablet](docs/images/mobile-foldable.jpg)
 *Keyboard dismissed: free scrolling through terminal output. Keyboard open: terminal locks in place with full gesture support.*
@@ -13,7 +15,7 @@ Every session comes pre-loaded with your choice of AI coding agent:
 | [Claude Unleashed](https://github.com/nikolanovoselec/claude-unleashed) | Claude Code without the guardrails |
 | [Codex](https://github.com/openai/codex) | OpenAI's coding agent |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Google's terminal agent |
-| [GitHub Copilot](https://github.com/github/copilot-cli) | GitHub's AI coding agent |
+| [GitHub Copilot](https://docs.github.com/en/copilot) | GitHub's AI coding agent |
 | [OpenCode](https://github.com/opencode-ai/opencode) | Open-source coding agent |
 | Bash | For the purists |
 
@@ -35,17 +37,18 @@ It's strongly optimized for mobile - because the best ideas hit while rewatching
 **Try it:** [codeflare.graymatter.ch](https://codeflare.graymatter.ch) (gated behind a waitlist - I'm not an animal)
 
 ![Onboarding](docs/images/onboarding.png)
-*Join the waitlist, get approved, log in. No account creation, no password — Cloudflare Access handles it.*
+*Join the waitlist, get approved, log in. No account creation, no password - Cloudflare Access handles it.*
 
 ## What you get
 
 ![Dashboard](docs/images/dashboard.png)
-*Manage sessions, browse persistent storage, and monitor live resource usage — all from one view.*
+*Manage sessions, browse persistent storage, and monitor live resource usage - all from one view.*
 
 - Browser-native terminal with 6 tabs per session and tiling mode - view 2-4 terminals side by side. Once you tile, you don't go back.
 - One isolated container per session - agents can't escape their sandbox (I checked)
 - Persistent R2 storage with bisync every 60s - even if a session dies before you `git push`, R2 has got your back. Sync conflicts? Cleaned up automatically next cycle.
 - Pre-warmed terminals - the agent is already loaded when you open the tab, not staring at a blank screen wondering if something broke
+- Fast Start - auto-updates disabled by default across all 6 tools for instant agent startup. Toggle it in Settings if you prefer bleeding edge over fast boot.
 - Set your API key once. It syncs across sessions forever. (It's rclone, but magic sounds better.)
 - Dashboard for managing sessions, browsing files, and inviting users (or revoking them when they get too creative). Live CPU/memory/disk metrics per session. Three-color status: green (active), yellow (idle but alive), gray (stopped).
 - Scales to zero when idle. You pay for what you use. Nothing when you don't.
@@ -53,7 +56,7 @@ It's strongly optimized for mobile - because the best ideas hit while rewatching
 ## Architecture
 
 ![Codeflare IDE](docs/images/hero-ide-fullscreen.png)
-*Six terminal tabs, split tiling, and your favorite dev tools — running in a disposable container you didn't have to configure.*
+*Six terminal tabs, split tiling, and your favorite dev tools - running in a disposable container you didn't have to configure.*
 
 ```mermaid
 flowchart LR
@@ -90,7 +93,7 @@ In your fork: `Settings` > `Secrets and variables` > `Actions` > `New repository
 
 Add each as a separate secret. Name goes in the **Name** field, value in **Secret**. Click **Add secret** after each one.
 
-**Secrets** (optional — for E2E testing):
+**Secrets** (optional - for E2E testing):
 - `CF_ACCESS_CLIENT_ID` - CF Access service token client ID
 - `CF_ACCESS_CLIENT_SECRET` - CF Access service token client secret
 
@@ -148,7 +151,7 @@ All optional. The defaults work out of the box. I respect your time.
 | Variable | Default | What it does |
 |---|---|---|
 | `CLOUDFLARE_WORKER_NAME` | `codeflare` | Worker name and Access group prefix |
-| `RESSOURCE_TIER` | unset (1 vCPU, 3 GB RAM) | Container size: `low` (0.25 vCPU, 1 GB) or `high` (2 vCPU, 6 GB) |
+| `RESSOURCE_TIER` | unset (1 vCPU, 3 GiB RAM) | Container size: `low` (0.25 vCPU, 1 GiB) or `high` (2 vCPU, 6 GiB). Spelling is intentional - matches the Cloudflare API naming. |
 | `ONBOARDING_LANDING_PAGE` | `inactive` | Set to `active` for a public waitlist at `/` (requires Turnstile + `RESEND_API_KEY` secret) |
 | `RUNNER` | `ubuntu-latest` | GitHub Actions runner |
 | `CLAUDE_UNLEASHED_CACHE_BUSTER` | `inactive` | Set to `active` to force-reinstall the AI agent layer on every deploy |
@@ -162,27 +165,35 @@ All optional. The defaults work out of the box. I respect your time.
 
 - Every session runs in its own container. No shared shells, no cross-session access. Your agent can `rm -rf /` and the only victim is itself.
 - AI agents run with full terminal access *inside* the container - and can't get out. I gave them root and a sandbox. They got root in a sandbox.
-- Cloudflare Access gates all authenticated surfaces (`/app`, `/api`, `/setup`).
+- Cloudflare Access gates all authenticated surfaces (`/app`, `/api`, `/setup`) with JWT verification.
 - API tokens never enter the container. Secrets stay in GitHub and Cloudflare. The agent doesn't know your passwords, and frankly, it doesn't want to.
+- Security headers: HSTS, CSP, X-Frame-Options, Referrer-Policy on every response.
+- Rate limiting: KV-backed, per-user.
+- Input validation: Zod schemas, 64 KiB body limit.
+- Supply chain: CodeQL (with Copilot Autofix), OSSF Scorecard, `npm audit`, dependency review, Dependabot, Trivy container scanning.
+- GitHub security: secret scanning, push protection, private vulnerability reporting, dependency graph.
 - For vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
 ## Testing
 
-~2,200+ tests across four layers:
+~2,200+ tests across five layers:
 
 | Layer | Tests | Framework |
 |-------|-------|-----------|
-| Backend | ~758 (63 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
-| Frontend | ~1,280 (64 files) | Vitest v4 + jsdom 28 + SolidJS Testing Library |
-| E2E API | ~47 (10 files) | Vitest + plain fetch |
-| E2E UI | ~73 (10 files, run as desktop + mobile) | Vitest + Puppeteer |
+| Backend | ~775 (64 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
+| Frontend | ~1,288 (64 files) | Vitest v4 + jsdom 28 + SolidJS Testing Library |
+| Host | ~33 (4 files) | Node.js test runner |
+| E2E API | ~49 (11 files) | Vitest + plain fetch |
+| E2E UI | ~74 (10 files, desktop + mobile) | Vitest + Puppeteer |
 
 ```bash
 npm test                           # Backend tests
 cd web-ui && npm test              # Frontend tests
+cd host && npm test                # Host tests (prewarm, activity tracker)
 npm run test:e2e:api               # E2E API (requires deployed worker)
 npm run test:e2e:ui                # E2E UI desktop (requires deployed worker)
-E2E_MOBILE=1 npm run test:e2e:ui   # E2E UI mobile
+npm run test:e2e:ui-desktop        # E2E UI desktop (alias)
+npm run test:e2e:ui-mobile         # E2E UI mobile
 ```
 
 E2E tests require a deployed worker and CF Access service tokens. See `TECHNICAL.md` Section 16 for setup details.
@@ -197,20 +208,10 @@ Six GitHub Actions workflows:
 | `test.yml` | Pull requests | Lint, tests, typecheck, security audit, dependency review |
 | `e2e.yml` | Manual | E2E matrix: API, UI desktop, UI mobile |
 | `codeql.yml` | Push, PRs, weekly | CodeQL static analysis |
-| `scorecard.yml` | Push to `main`, weekly | OSSF Scorecard |
+| `scorecard.yml` | Push to `main`, weekly, manual | OSSF Scorecard |
+| `fuzz.yml` | Weekly / manual | Property-based fuzzing (fast-check) |
 
 See `TECHNICAL.md` Section 15 for full CI/CD documentation.
-
-## Security
-
-- Container isolation: one per session, no cross-session access
-- Cloudflare Access: gates `/app`, `/api`, `/setup` with JWT verification
-- Security headers: HSTS, CSP, X-Frame-Options, Referrer-Policy on every response
-- Rate limiting: KV-backed, per-user
-- Input validation: Zod schemas, 64 KiB body limit
-- Supply chain: CodeQL (with Copilot Autofix), OSSF Scorecard, `npm audit`, dependency review, Dependabot, Trivy container scanning
-- GitHub security: secret scanning, push protection, private vulnerability reporting, dependency graph
-- See [SECURITY.md](SECURITY.md) for full security architecture
 
 ## Docs
 
