@@ -8,7 +8,7 @@ RUN apk add --no-cache make gcc g++ python3
 
 COPY host/package.json /app/host/
 WORKDIR /app/host
-RUN npm install --production --ignore-scripts
+RUN npm install --production
 
 # ---- Stage 2: Runtime ----
 FROM node:22.13-alpine3.21@sha256:e2b39f7b64281324929257d0f8004fb6cb4bf0fdfb9aa8cedb235a766aec31da
@@ -105,7 +105,7 @@ RUN ln -s /usr/local/lib/node_modules/claude-unleashed/node_modules/@anthropic-a
 # OpenCode ships 11 platform binaries as optionalDependencies — delete unused ones (~446MB saved).
 # Alpine uses musl libc, so only opencode-linux-x64-musl is needed.
 # Pin updated periodically — .cache-bust invalidates this layer
-RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1.2.14 && \
+RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1.2.14 @github/copilot@0.0.418 && \
     cd /usr/local/lib/node_modules/opencode-ai/node_modules && \
     find . -maxdepth 1 -name 'opencode-*' ! -name 'opencode-linux-x64-musl' -type d -exec rm -rf {} + && \
     npm cache clean --force && \
@@ -118,7 +118,8 @@ RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1
 # Note: Go binaries (like opencode) don't need this — they're already natively compiled.
 RUN claude --version 2>&1 || true && \
     codex --version 2>&1 || true && \
-    gemini --version 2>&1 || true
+    gemini --version 2>&1 || true && \
+    copilot --version 2>&1 || true
 
 # Pre-initialize OpenCode's SQLite database to skip Goose migrations on first launch.
 # OpenCode stores its DB at ~/.local/share/opencode/opencode.db (XDG data dir) and runs

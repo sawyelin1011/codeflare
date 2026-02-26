@@ -87,7 +87,7 @@ describe('CreateSessionDialog', () => {
   });
 
   describe('Agent type selection', () => {
-    it('renders all 6 agent options', () => {
+    it('renders all 6 visible agent options (copilot hidden pending Node 24)', () => {
       render(() => (
         <CreateSessionDialog
           isOpen={true}
@@ -100,6 +100,7 @@ describe('CreateSessionDialog', () => {
       expect(screen.getByTestId('csd-agent-claude-unleashed')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-codex')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-gemini')).toBeInTheDocument();
+      expect(screen.queryByTestId('csd-agent-copilot')).not.toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-opencode')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-bash')).toBeInTheDocument();
     });

@@ -20,7 +20,17 @@ permissions:
   contents: read
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block production deploys from non-main branches
+        if: github.ref != 'refs/heads/main' && inputs.environment == 'production'
+        run: |
+          echo "::error::Production deploys are only allowed from main. Got branch: ${{ github.ref }}"
+          exit 1
+
   deploy:
+    needs: guard
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     environment: ${{ github.ref == 'refs/heads/main' && (inputs.environment || 'production') || 'integration' }}
     timeout-minutes: 20
@@ -39,6 +49,7 @@ jobs:
         with:
           path: node_modules
           key: root-${{ hashFiles('package-lock.json') }}
+          restore-keys: root-
 
       - name: Cache web-ui node_modules
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -46,6 +57,7 @@ jobs:
         with:
           path: web-ui/node_modules
           key: webui-${{ hashFiles('web-ui/package-lock.json') }}
+          restore-keys: webui-
 
       - name: Install root dependencies
         if: steps.cache-root.outputs.cache-hit != 'true'

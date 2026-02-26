@@ -6,6 +6,7 @@ import {
   mdiConsole,
   mdiFire,
   mdiRobotIndustrial,
+  // mdiGithub,  // Re-enable with copilot option
 } from '@mdi/js';
 import Icon from './Icon';
 import type { AgentType, TabConfig } from '../types';
@@ -32,6 +33,8 @@ const AGENT_OPTIONS: AgentOption[] = [
   { type: 'claude-unleashed', label: 'Claude Unleashed', icon: mdiFire, description: 'Full Claude Code experience' },
   { type: 'codex', label: 'Codex', icon: mdiCodeBraces, description: 'OpenAI Codex agent' },
   { type: 'gemini', label: 'Gemini', icon: mdiDiamond, description: 'Google Gemini CLI' },
+  // TODO: Re-enable when Node 24+ or gcompat fix lands (copilot requires Node >= 24 on Alpine)
+  // { type: 'copilot', label: 'GitHub Copilot', icon: mdiGithub, description: "GitHub's AI coding agent" },
   { type: 'opencode', label: 'OpenCode', icon: mdiRobotIndustrial, description: 'Multi-model agent', badge: 'beta' },
   { type: 'bash', label: 'Bash', icon: mdiConsole, description: 'Plain terminal session' },
 ];
@@ -44,7 +47,7 @@ const CreateSessionDialog: Component<CreateSessionDialogProps> = (props) => {
 
   // Compute fixed position from anchor button rect — dialog opens BELOW the button.
   // If there isn't enough room below, flip it above the button instead.
-  const DIALOG_ESTIMATED_HEIGHT = 380; // Approximate height of 6 agent options + header
+  const DIALOG_ESTIMATED_HEIGHT = 380; // Approximate height of 6 visible agent options + header
   const GAP = 8;
 
   const updatePosition = () => {
