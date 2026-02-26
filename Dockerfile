@@ -108,6 +108,7 @@ RUN ln -s /usr/local/lib/node_modules/claude-unleashed/node_modules/@anthropic-a
 RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1.2.14 @github/copilot@0.0.418 && \
     cd /usr/local/lib/node_modules/opencode-ai/node_modules && \
     find . -maxdepth 1 -name 'opencode-*' ! -name 'opencode-linux-x64-musl' -type d -exec rm -rf {} + && \
+    cp -f opencode-linux-x64-musl/bin/opencode ../bin/.opencode && \
     npm cache clean --force && \
     rm -rf /tmp/* /root/.npm
 
@@ -117,7 +118,7 @@ RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1
 # bypassing both the binary path and the Node version check.
 RUN rm -rf /usr/local/lib/node_modules/@github/copilot/node_modules/@github/copilot-linux-x64 && \
     mv /usr/local/bin/copilot /usr/local/bin/copilot-original && \
-    printf '#!/bin/sh\nexec node /usr/local/lib/node_modules/@github/copilot/index.js "$@"\n' > /usr/local/bin/copilot && \
+    printf '#!/bin/sh\nexec node --no-warnings /usr/local/lib/node_modules/@github/copilot/index.js "$@"\n' > /usr/local/bin/copilot && \
     chmod +x /usr/local/bin/copilot
 
 # V8 compile cache warm-up: Pre-populate Node.js V8 compile cache at Docker build time.
