@@ -55,7 +55,7 @@ const app = new Hono<{ Bindings: Env; Variables: AuthVariables }>();
 /**
  * GET /api/sessions/batch-status
  * Get status for all sessions in a single call (eliminates N+1 on page load)
- * Returns a map of sessionId -> { status, ptyActive }
+ * Returns a map of sessionId -> { status, ptyActive } plus storageStats from KV cache
  *
  * KV-ONLY: This endpoint never contacts Durable Objects or containers.
  * KV is authoritative for session status:
@@ -91,7 +91,11 @@ app.get('/batch-status', async (c) => {
   const user = c.get('user');
   const maxSessions = getMaxSessions(user.role, c.env);
 
-  return c.json({ statuses, maxSessions });
+  // Include cached storage stats (already in KV from /api/storage/stats, 60s TTL)
+  const storageStatsCached = await c.env.KV.get(`storage-stats:${bucketName}`, 'json') as { totalFiles: number; totalFolders: number; totalSizeBytes: number } | null;
+  const storageStats = storageStatsCached || undefined;
+
+  return c.json({ statuses, maxSessions, storageStats });
 });
 
 /**

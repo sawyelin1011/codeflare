@@ -171,6 +171,13 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
   return { email: '', authenticated: false };
 }
 
+/** Strip trailing hyphens without regex (avoids CodeQL ReDoS false positive on /-+$/). */
+function trimTrailingHyphens(s: string): string {
+  let end = s.length;
+  while (end > 0 && s[end - 1] === '-') end--;
+  return end === s.length ? s : s.substring(0, end);
+}
+
 /**
  * Generate a bucket name from email.
  * Format: {workerName}-{sanitized-email}
@@ -193,7 +200,11 @@ export function getBucketName(email: string, workerName?: string): string {
   const maxLength = 63;
   const maxSanitizedLength = maxLength - prefix.length;
 
-  return `${prefix}${sanitized.substring(0, maxSanitizedLength)}`;
+  // Strip trailing hyphens AFTER truncation — substring can reintroduce them.
+  // Also strip from the final result — long workerName can make prefix end with "-" and truncated be empty.
+  // Uses iterative trim instead of regex to satisfy CodeQL ReDoS analysis.
+  const truncated = trimTrailingHyphens(sanitized.substring(0, Math.max(0, maxSanitizedLength)));
+  return trimTrailingHyphens(`${prefix}${truncated}`);
 }
 
 /**

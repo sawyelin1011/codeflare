@@ -113,6 +113,11 @@ export const BatchSessionStatusResponseSchema = z.object({
     }).optional(),
   })),
   maxSessions: z.number(),
+  storageStats: z.object({
+    totalFiles: z.number(),
+    totalFolders: z.number(),
+    totalSizeBytes: z.number(),
+  }).optional(),
 });
 
 // Setup API schemas — moved from client.ts (strict versions)
@@ -145,11 +150,6 @@ export const UserEntrySchema = z.object({
 
 export const GetUsersResponseSchema = z.object({
   users: z.array(UserEntrySchema),
-});
-
-export const UserMutationResponseSchema = z.object({
-  success: z.boolean(),
-  email: z.string(),
 });
 
 // Storage API schemas

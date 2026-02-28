@@ -13,7 +13,6 @@ import {
   SetupPrefillResponseSchema,
   UserEntrySchema,
   GetUsersResponseSchema,
-  UserMutationResponseSchema,
   PresetsResponseSchema,
   CreatePresetResponseSchema,
   DeletePresetResponseSchema,
@@ -94,9 +93,9 @@ export async function deleteSession(id: string): Promise<void> {
  * Get status for all sessions in a single batch call
  * Returns statuses map and maxSessions limit
  */
-export async function getBatchSessionStatus(): Promise<{ statuses: Record<string, { status: 'running' | 'stopped' | 'stopping'; ptyActive: boolean; startupStage?: string; lastStartedAt?: string | null; lastActiveAt?: string | null; metrics?: { cpu?: string; mem?: string; hdd?: string; syncStatus?: string; updatedAt?: string } }>; maxSessions: number }> {
+export async function getBatchSessionStatus(): Promise<{ statuses: Record<string, { status: 'running' | 'stopped' | 'stopping'; ptyActive: boolean; startupStage?: string; lastStartedAt?: string | null; lastActiveAt?: string | null; metrics?: { cpu?: string; mem?: string; hdd?: string; syncStatus?: string; updatedAt?: string } }>; maxSessions: number; storageStats?: { totalFiles: number; totalFolders: number; totalSizeBytes: number } }> {
   const response = await fetchApi('/sessions/batch-status', {}, BatchSessionStatusResponseSchema);
-  return { statuses: response.statuses, maxSessions: response.maxSessions };
+  return { statuses: response.statuses, maxSessions: response.maxSessions, storageStats: response.storageStats };
 }
 
 // Get container startup status (polling endpoint)
@@ -217,11 +216,6 @@ export async function getUsers(): Promise<UserEntry[]> {
   return data.users;
 }
 
-export async function removeUser(email: string): Promise<void> {
-  await fetchApi(`/users/${encodeURIComponent(email)}`, {
-    method: 'DELETE',
-  }, UserMutationResponseSchema);
-}
 
 // Setup API
 export type SetupStatusResponse = z.infer<typeof SetupStatusResponseSchema>;

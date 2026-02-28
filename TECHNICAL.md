@@ -165,7 +165,7 @@ Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads syn
 
 Key files: `App.tsx` (root), `Terminal.tsx` (xterm.js), `TerminalTabs.tsx`, `Layout.tsx` (orchestrates dashboard/terminal views, manages WS disconnect/reconnect lifecycle), `SessionStatCard.tsx` (dashboard card with three-color status dot and metrics), `StorageBrowser.tsx` (R2 browser with toolbar), `StoragePanel.tsx` (slide-in drawer), `SettingsPanel.tsx`, `Dashboard.tsx`, `OnboardingLanding.tsx`, `KittScanner.tsx`.
 
-Stores: `terminal.ts` (WebSocket state, compound key `sessionId:terminalId`, scheduled disconnect/reconnect), `session.ts` (CRUD, `terminalsPerSession`, `stopSession()` sets `'stopping'` and polls, `refreshSessionStatuses()` for lightweight dashboard polling), `storage.ts` (R2 operations), `setup.ts`.
+Stores: `terminal.ts` (WebSocket state, compound key `sessionId:terminalId`, scheduled disconnect/reconnect), `session.ts` (CRUD, `terminalsPerSession`, `stopSession()` sets `'stopping'` and polls, `refreshSessionStatuses()` for lightweight dashboard polling — also updates storage stats from batch-status via `updateStatsFromBatch()`), `storage.ts` (R2 operations), `setup.ts`.
 
 #### Dashboard WS Disconnect Flow
 
@@ -224,7 +224,7 @@ function connect() {
 
 **Frontend Zod Validation:** `web-ui/src/lib/schemas.ts` -- Zod schemas validate API responses at runtime. Types derived from schemas via `z.infer`.
 
-**Terminal Tab Configuration:** `web-ui/src/lib/terminal-config.ts` -- Generic "Terminal 1-6" defaults with live process detection via `PROCESS_ICON_MAP` (maps running process names like cu, codex, gemini, opencode, copilot, htop, yazi, lazygit, bash, sh, zsh to MDI icons). Separate `AGENT_ICON_MAP` maps the 6 agent types (claude-code, codex, gemini, opencode, copilot, bash) to session card icons.
+**Terminal Tab Configuration:** `web-ui/src/lib/terminal-config.ts` -- Generic "Terminal 1-6" defaults with live process detection via `PROCESS_ICON_MAP` (maps running process names like cu, codex, gemini, opencode, copilot, htop, yazi, lazygit, bash, sh, zsh to MDI icons). `PROCESS_DISPLAY_NAME` maps binary names to display names (e.g. `cu` → `claude`) so tabs show the product name instead of the binary name. Separate `AGENT_ICON_MAP` maps the 6 agent types (claude-code, codex, gemini, opencode, copilot, bash) to session card icons.
 
 #### Frontend Constants
 
@@ -413,7 +413,7 @@ flowchart TD
 
     subgraph Worker["Worker"]
         B1["GET batch-status<br/>(pure KV read, stateless,<br/>NO DO touch)"]
-        B2["Returns: status, metrics,<br/>lastStartedAt, lastActiveAt"]
+        B2["Returns: status, metrics,<br/>lastStartedAt, lastActiveAt,<br/>storageStats (from KV cache)"]
         B3["KV eventual consistency<br/>~60s for new sessions"]
         B1 --> B2
         B1 -.-> B3
@@ -442,9 +442,9 @@ rclone bisync: all file ops on local disk (<1ms), background daemon every 60s, f
 
 ### Initial Sync on Startup
 
-1. One-way `rclone sync` from R2 to local (restore data)
+1. One-way `rclone sync` from R2 to local (restore data) — blocking, container waits for completion (120s timeout)
 2. All file modifications run (`.claude.json`, `.gemini/settings.json`, `.codex/version.json`, tab autostart) — these complete before bisync starts to avoid hash mismatches
-3. `rclone bisync --resync --ignore-checksum --max-delete 100` to establish baseline (background), then start 60-second daemon
+3. `rclone bisync --resync --ignore-checksum --max-delete 100` to establish baseline (non-blocking — runs in background), then start 60-second daemon
 
 All bisync commands use `--ignore-checksum` to skip post-transfer MD5 verification. rclone v1.73+ treats hash mismatches as fatal ("corrupted on transfer"), which aborts bisync when files change during transfer (e.g., coding agents modifying workspace files). Change detection still uses modtime + size; files that change mid-transfer are caught in the next 60s cycle.
 
@@ -655,7 +655,7 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 | POST | `/api/sessions/:id/touch` | Update lastAccessedAt |
 | POST | `/api/sessions/:id/stop` | Stop session (KV 'stopped' + container.destroy()) |
 | GET | `/api/sessions/:id/status` | Get session and container status |
-| GET | `/api/sessions/batch-status` | Batch status for all sessions (status, ptyActive, lastActiveAt, lastStartedAt, metrics, maxSessions) |
+| GET | `/api/sessions/batch-status` | Batch status for all sessions (status, ptyActive, lastActiveAt, lastStartedAt, metrics, maxSessions, storageStats from KV cache) |
 
 ### Container Lifecycle
 
@@ -788,11 +788,9 @@ Uses polling with safety timeouts: poll until success OR background process exit
 
 ```mermaid
 flowchart TD
-    A[Container Start] --> B["initial_sync_from_r2() &"]
-    A --> C[Wait for R2 sync]
-    B -.->|Background| C
-    C -->|Data restored| D["configure_tab_autostart()"]
-    D --> E["Start terminal server (:8080)"]
+    A[Container Start] --> B["initial_sync_from_r2()"]
+    B -->|"Blocking — waits for sync to complete"| C["configure_tab_autostart()"]
+    C --> D["Start terminal server (:8080)"]
 ```
 
 Auto-start uses `cu --silent --no-consent` for fast boot. Auto-updates are disabled by default via `FAST_CLI_START=true` (see [Fast Start](#fast-start) below). Users can enable auto-updates via Settings, or update manually via `cu` in any tab.
@@ -890,11 +888,17 @@ codeflare/
 │   │                         # r2-admin, r2-client, r2-config, r2-seed, schemas,
 │   │                         # session-helpers, tutorial-seed.generated, type-guards,
 │   │                         # xml-utils
+│   │                         #   escapeXml() — sanitizes user input for XML/HTML interpolation
+│   │                         #   decodeXmlEntities() — decodes &amp; &lt; etc. from R2 S3 API responses
+│   │                         #   FIX-39 audit trail in file header tracks all interpolation sites
 │   ├── container/index.ts    # Container DO class
 │   └── __tests__/            # Backend unit tests (65 files)
 ├── e2e/                      # E2E tests: 11 API files (~49 tests) + 10 UI files (~74 tests, Puppeteer)
 ├── host/
-│   ├── server.js             # Terminal server (node-pty + WebSocket)
+│   ├── server.js             # HTTP/WS server, auth, routing, prewarm, signal handlers (~496 lines)
+│   ├── session.js            # Session class — PTY management, tab lifecycle (~312 lines)
+│   ├── session-manager.js    # SessionManager class, PREWARM_SESSION_ID constant (~177 lines)
+│   ├── metrics.js            # System metrics collection (disk usage, sync status) (~74 lines)
 │   ├── activity-tracker.js   # WebSocket disconnect tracking for idle detection
 │   ├── prewarm-config.js     # PTY pre-warm configuration (first-output readiness)
 │   ├── __tests__/            # Host unit tests (5 files)
@@ -917,6 +921,10 @@ codeflare/
 ├── vitest.config.ts          # Backend test config
 └── vitest.e2e.config.ts      # E2E test config
 ```
+
+### Intentional Schema Duplication (Bundle Boundary)
+
+`src/lib/schemas.ts` (backend) and `web-ui/src/lib/schemas.ts` (frontend) contain similar Zod schemas for API response validation. This is intentional, not a DRY violation. The frontend (`web-ui/`) has its own Vite build pipeline and produces a separate bundle — it cannot import from the backend Workers module. Both schemas validate the same API contract but live in independent build targets.
 
 ### Critical Paths Inside Container
 
@@ -1034,7 +1042,7 @@ Six workflows covering deploy, testing, fuzzing, and supply chain security. Addi
 | `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
 | `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop` -> `e2e-ui-mobile` |
 | `codeql.yml` | Push to `main`, PRs to `main`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
-| `fuzz.yml` | Weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
+| `fuzz.yml` | PRs to `main`, weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
 | `scorecard.yml` | Push to `main`, weekly (Monday 06:00 UTC) + `workflow_dispatch` | OSSF Scorecard security posture assessment, publishes results and uploads SARIF |
 
 ### GitHub Environments
@@ -1124,11 +1132,30 @@ Sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop`
 **Run:** `cd host && npm test`
 **Scope:** PTY pre-warm readiness (first-output detection), activity tracker disconnect tracking, WebSocket input classification, server prewarm integration, entrypoint sync filter validation.
 
-### 16.4 Vitest Version Split
+### 16.4 Property-Based Fuzz Tests
+
+**Library:** [fast-check](https://github.com/dubzzz/fast-check). **CI:** `fuzz.yml` runs 50,000 iterations on PRs to main, weekly, and manual dispatch.
+**Local:** Default 1,000 iterations. Override with `FAST_CHECK_NUM_RUNS=50000`.
+
+| Suite | File | Tests | What it covers |
+|-------|------|-------|----------------|
+| Backend | `src/__tests__/fuzz/input-validation.fuzz.test.ts` | 120 | XML injection/parsing, getBucketName, validateKey (path traversal, null bytes, encoding tricks), KV namespacing, ReDoS, circuit breaker state machine, error types, logger, content-type helpers |
+| Frontend | `web-ui/src/__tests__/fuzz/frontend-fuzz.test.ts` | 13 | md5 (custom impl), isActionableUrl (ReDoS resistance), cleanupMapByPrefix (Map iteration+deletion) |
+| Host | `host/__tests__/fuzz-host.test.js` | 9 | getPrewarmConfig (untrusted tab config), createActivityTracker (idle shutdown state machine) |
+
+**Test selection criteria:** Every test must exercise real production code (no replicas) on an untrusted input boundary (user input, API responses, WebSocket data, env vars). Tests that verify framework guarantees (Zod safeParse), language features (class inheritance), or trivial formatters are excluded.
+
+**Bugs found by fuzzing:**
+- `getBucketName` trailing hyphen for long worker names (`src/lib/access.ts`)
+- Null byte bypass in `validateKey` (`src/routes/storage/validation.ts`)
+- `prewarm-config.js` crash on non-string tab command (`host/prewarm-config.js`)
+- `toError`/`toErrorMessage` crash on objects with throwing `toString()` (`src/lib/error-types.ts`)
+
+### 16.5 Vitest Version Split
 
 Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/` uses Vitest v4.x (SolidJS testing library compatibility). Each has independent `node_modules` and separate configs. Do not attempt to unify - the version constraint is real.
 
-### 16.5 E2E API Tests
+### 16.6 E2E API Tests
 
 **Dir:** `e2e/api/` - 11 test files, ~49 tests.
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:api`
@@ -1136,7 +1163,7 @@ Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/`
 
 Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, `presets`, `setup-status`, `health`, `container`, `error-responses`, `rate-limiting`.
 
-### 16.6 E2E UI Tests
+### 16.7 E2E UI Tests
 
 **Dir:** `e2e/ui/` - 10 test files, ~74 tests (run as desktop + mobile).
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:ui`
@@ -1145,7 +1172,7 @@ Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, 
 
 Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-panel`, `storage`, `terminal-tabs`, `tiling`, `bookmarks`, `error-states`, `mobile-specific`.
 
-### 16.7 E2E Infrastructure
+### 16.8 E2E Infrastructure
 
 - **CF Access auth:** E2E API tests use `X-Service-Auth` header. UI tests use `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers via `setExtraHTTPHeaders`. CF Access intercepts browser navigation with login page - UI tests work around this by intercepting requests.
 - **KV eventual consistency:** New KV entries take ~60s to propagate. E2E setup job includes retry loops with 15s waits. Test helpers use `waitForFunction` with generous timeouts.
@@ -1153,7 +1180,7 @@ Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-pan
 - **Screenshot artifacts:** Failed UI tests capture screenshots to `/tmp/e2e-*.png`. CI uploads these as artifacts with 5-day retention.
 - **Suite prefix isolation:** Each E2E suite prefixes its test sessions/presets with a unique identifier (e.g., `e2e-api-`, `e2e-ui-`) to avoid cross-suite interference when running in parallel.
 
-### 16.8 E2E Service Token Setup
+### 16.9 E2E Service Token Setup
 
 Step-by-step for running E2E tests against a deployed worker:
 
@@ -1174,7 +1201,7 @@ npm run test:e2e:ui     # UI desktop tests only
 E2E_MOBILE=1 npm run test:e2e:ui  # UI mobile tests only
 ```
 
-### 16.9 E2E Test Maintenance
+### 16.10 E2E Test Maintenance
 
 **Rule:** When modifying UI components or API routes, review and update corresponding E2E tests.
 
@@ -1299,6 +1326,7 @@ sudo apt-get install -yqq --no-install-recommends \
 | Container dies during active use | Auth issue on internal paths | Verify `/activity` in `authExemptPaths` in `host/server.js` |
 | Phantom container on session switch | Reconnect scope issue | Ensure `activeSessionId` filter passed to `reconnectDisconnectedTerminals()` |
 | Character doubling in terminal | Handler not disposed on reconnect | Dispose `inputDisposable` before creating new handler in `connect()` |
+| Container returns 503 on all authenticated endpoints | `CONTAINER_AUTH_TOKEN` not set | Security default-deny. Token is set automatically by the DO via `crypto.randomUUID()` on lifecycle start. If missing, verify DO `updateEnvVars()` runs before `startAndWaitForPorts()` |
 
 ---
 
@@ -1329,81 +1357,22 @@ wrangler tail --service codeflare --level error
 
 ## 21. Architecture Decisions
 
-| ID | Decision | Rationale |
-|----|----------|-----------|
-| AD1 | One container per SESSION | CPU isolation - each tab gets full 1 vCPU instead of sharing |
-| AD2 | Container ID format | `{bucketName}-{sessionId}` (e.g., `codeflare-user-example-com-abc12345`) |
-| AD3 | Per-user R2 buckets | Bucket name derived from email, auto-created on first login |
-| AD4 | Periodic rclone bisync | Background daemon runs bisync every 60 seconds, plus final sync on shutdown (SIGINT/SIGTERM). Local disk for all file operations. |
-| AD5 | Login shell | `.bashrc` auto-starts the configured agent in workspace |
-| AD6 | KV read-modify-write races | Last-writer-wins is acceptable - session PATCH/stop overlap is rare, rate limit off-by-one is minor, lastAccessedAt is best-effort |
-| AD7 | Pre-setup public endpoints | Setup runs once during initial deploy; short exposure window is acceptable risk. Pre-setup auth trusts spoofable email header - bootstrap problem, mitigated by rate limiting and short exposure window. |
-| AD8 | Container runs as root with no internal auth | Network isolation via DO proxy is sufficient; root needed for rclone mount; wildcard CORS is internal-only |
-| AD9 | RESSOURCE_TIER spelling | French/German "ressource" is intentional - consistent across all config, changing would be a breaking API change |
-
-#### AD10: Open setup endpoint before first configure
-
-The `/api/setup/configure` endpoint is intentionally public before `setup:complete` is written to KV. This allows the deployer to configure their instance without pre-existing auth infrastructure (Cloudflare Access isn't set up yet -- that's what setup configures).
-
-**Trade-off**: A narrow window exists between deploy and first configure where any actor could claim the deployment. This is accepted because:
-- The window is typically seconds to minutes (deploy -> owner configures)
-- Adding a bootstrap secret would require an extra deploy-time step, increasing setup friction
-- The target audience is self-hosted single-user/small-team deployments where the deployer is watching the process
-
-**Mitigation**: `setup:complete` KV flag prevents re-configuration after initial setup. Rate limiting applies to setup routes.
-
-**Future consideration**: A one-time bootstrap secret injected at deploy time would close this window entirely with minimal friction. Tracked as a potential hardening improvement.
-
-#### AD11: Suffix-pattern CORS with credentialed requests
-
-CORS origin matching uses `matchesPattern()` with domain-boundary enforcement (not naive substring). The default `ALLOWED_ORIGINS` includes `.workers.dev` as a suffix pattern, and `Access-Control-Allow-Credentials: true` is set on matching responses.
-
-**Trade-off**: Any `*.workers.dev` subdomain could pass the CORS check for credentialed requests. This is accepted because:
-- `matchesPattern()` enforces domain boundaries (e.g., `evil-workers.dev` does NOT match `.workers.dev`, only `x.workers.dev` does)
-- Custom domain deployments replace the workers.dev origin with the exact production domain
-- `ALLOWED_ORIGINS` is configurable per deployment -- operators can restrict to exact origins
-- Cloudflare Access JWT validation is the primary auth gate, not CORS
-
-**Mitigation**: Setup adds `.workers.dev` suffix and `.{customDomain}` suffix to `setup:allowed_origins` in KV. Any `*.workers.dev` subdomain passes the CORS check. Operators deploying to custom domains should set `ALLOWED_ORIGINS` to their exact domain.
-
-**Future consideration**: Restricting credentialed CORS to exact known hosts (rather than suffix patterns) would tighten the trust surface. This is a low-risk hardening improvement.
-
-#### AD12: KV-based setup lock (non-atomic)
-
-The setup completion lock uses a KV read-then-write pattern: read `setup:complete`, check if false, perform setup, write `setup:complete = true`. This is not atomic -- two simultaneous `/api/setup/configure` requests could both read `false` and proceed.
-
-**Trade-off**: This is accepted because:
-- Setup is a one-time operation performed by a single admin
-- The probability of concurrent configure requests is near zero in practice
-- KV is the existing state store -- no additional infrastructure needed
-- `withSetupRetry` handles transient failures in individual setup steps, and each step is idempotent (creating Access apps, DNS records, etc. checks for existing resources first)
-
-**Mitigation**: Each setup sub-step (CF API calls) is individually idempotent -- duplicate execution produces the same result. The worst case of a race is redundant CF API calls, not corrupted state.
-
-**Future consideration**: Moving the setup lock to a Durable Object would provide strict serialization. The blast radius of changing setup plumbing is non-trivial, so this is deferred until there's evidence of the race occurring in practice.
-
-#### AD13: Per-user scoped R2 tokens
-
-Each container gets an R2 API token scoped to its user's bucket only, replacing the previous shared credential model. Token lifecycle:
-
-1. **Creation**: On first container start, `getOrCreateScopedR2Token()` calls `POST /accounts/{accountId}/tokens` with an Object Read + Write policy restricted to the user's bucket name
-2. **Caching**: Token data (ID, access key, secret key) cached in KV as `r2token:{email}` — survives container restarts without re-creating
-3. **Delivery**: Passed to container via `setBucketName` body → container env vars → rclone config
-4. **Revocation**: `deleteScopedR2Token()` calls `DELETE /accounts/{accountId}/tokens/{tokenId}` on user deletion
-
-**Trade-off**: Requires `API Tokens: Edit` permission on the deploy token, which is a broader permission than ideal. Accepted because the alternative (manual R2 credential management per user) is operationally impractical.
-
-#### AD14: Never auto-`--resync` on bisync failure
-
-`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses any pending deletions — if side A deleted a file and bisync fails before propagating, `--resync` resurrects the file from side B.
-
-**Instead**: Use `--resilient` + `--recover` for self-healing:
-- `--resilient` allows bisync to continue past non-critical errors (e.g., listing mismatches)
-- `--recover` automatically reconstructs corrupted listing files without losing deletion state
-- `--max-delete 100` allows bulk workspace deletions to propagate (the rclone default of 50% aborts bisync when more than half the files are deleted in one cycle)
-- The sync daemon retries in 60s on any failure
-
-**Manual `--resync`** is still available via `establish_bisync_baseline()` on container startup, where it is safe because the one-way restore (`rclone sync`) runs first to populate the local filesystem.
+| ID | Decision | Details |
+|----|----------|---------|
+| AD1 | One container per session | <details><summary>CPU isolation - each tab gets full 1 vCPU instead of sharing</summary><br>Alternative was one container per user with multiplexed PTYs. Per-session containers avoid noisy-neighbor CPU contention between tabs running different agents, and simplify cleanup (destroy container = clean slate).</details> |
+| AD2 | Container ID format | <details><summary><code>{bucketName}-{sessionId}</code></summary><br>Example: `codeflare-user-example-com-abc12345`. Deterministic from user email + session ID. Enables DO lookup without KV round-trip. `getContainerId()` must NEVER fallback on invalid sessionId - that was root cause of orphaned containers.</details> |
+| AD3 | Per-user R2 buckets | <details><summary>Bucket name derived from email, auto-created on first login</summary><br>Isolation boundary: each user's files live in their own bucket. Simplifies deletion (empty + delete bucket). Bucket name sanitized from email (max 63 chars, S3-compatible). Per-user scoped R2 tokens (AD13) further restrict access.</details> |
+| AD4 | Periodic rclone bisync | <details><summary>Background daemon every 60s + final sync on shutdown</summary><br>Local disk for all file operations (fast I/O). Bisync daemon runs in background, syncing changes bidirectionally. SIGINT/SIGTERM trap runs final bisync before exit. Alternative (s3fs FUSE) was fragile and slow - see Lessons Learned #1.</details> |
+| AD5 | Login shell autostart | <details><summary><code>.bashrc</code> auto-starts the configured agent in workspace</summary><br>PTY spawns `bash -l` (login shell). `.bashrc` reads `TAB_CONFIG` env var and launches the configured agent. `MANUAL_TAB=1` env var skips autostart for user-created tabs.</details> |
+| AD6 | KV read-modify-write races | <details><summary>Last-writer-wins is acceptable</summary><br>Session PATCH/stop overlap is rare, rate limit off-by-one is minor, `lastAccessedAt` is best-effort. KV doesn't support atomic read-modify-write. Durable Objects would add latency for negligible consistency gain in this use case.</details> |
+| AD7 | Pre-setup public endpoints | <details><summary>Short exposure window is acceptable risk</summary><br>Setup runs once during initial deploy. Pre-setup auth trusts spoofable email header - bootstrap problem (can't require CF Access auth when CF Access isn't configured yet). Mitigated by rate limiting and short exposure window. See AD10 for full trade-off analysis.</details> |
+| AD8 | Root container, no internal auth | <details><summary>Network isolation via DO proxy is sufficient</summary><br>Root needed for rclone mount. Container auth token (random UUID per DO lifecycle) validates all proxied requests. Network boundary: only the DO can reach the container's port 8080. Wildcard CORS inside container is safe - it's internal-only.</details> |
+| AD9 | RESSOURCE_TIER spelling | <details><summary>French/German "ressource" is intentional</summary><br>Consistent across all config (wrangler.toml, GitHub variables, TypeScript types). Changing would be a breaking API change affecting deployed instances. The spelling is a deliberate nod to the developer's language background.</details> |
+| AD10 | Open setup endpoint before first configure | <details><summary>Bootstrap problem - no auth before auth is configured</summary><br>`/api/setup/configure` is public before `setup:complete` is written to KV. This allows the deployer to configure their instance without pre-existing auth infrastructure (Cloudflare Access isn't set up yet - that's what setup configures).<br><br>**Trade-off**: A narrow window (seconds to minutes) exists where any actor could claim the deployment. Accepted because the target audience is self-hosted single-user/small-team deployments where the deployer is watching the process.<br><br>**Mitigation**: `setup:complete` KV flag prevents re-configuration. Rate limiting applies to setup routes.<br><br>**Future**: A one-time bootstrap secret injected at deploy time would close this window entirely.</details> |
+| AD11 | Suffix-pattern CORS with credentials | <details><summary><code>matchesPattern()</code> with domain-boundary enforcement</summary><br>Default `ALLOWED_ORIGINS` includes `.workers.dev` as a suffix pattern, with `Access-Control-Allow-Credentials: true` on matching responses.<br><br>**Trade-off**: Any `*.workers.dev` subdomain passes the CORS check. Accepted because: `matchesPattern()` enforces domain boundaries (`evil-workers.dev` does NOT match), custom domains replace the wildcard, `ALLOWED_ORIGINS` is configurable, and CF Access JWT is the primary auth gate.<br><br>**Mitigation**: Setup adds `.workers.dev` suffix and `.{customDomain}` suffix to `setup:allowed_origins` in KV.<br><br>**Future**: Restricting credentialed CORS to exact known hosts would tighten the trust surface.</details> |
+| AD12 | KV-based setup lock (non-atomic) | <details><summary>Read-then-write pattern, acceptable for one-time setup</summary><br>Read `setup:complete`, check if false, perform setup, write true. Not atomic - two simultaneous requests could both proceed.<br><br>**Trade-off**: Accepted because setup is a one-time operation by a single admin. Each sub-step (CF API calls) is individually idempotent - duplicate execution produces the same result. Worst case is redundant API calls, not corrupted state.<br><br>**Future**: Moving to a Durable Object would provide strict serialization, deferred until there's evidence of the race occurring.</details> |
+| AD13 | Per-user scoped R2 tokens | <details><summary>Each container gets an R2 token scoped to its user's bucket only</summary><br>Replaces previous shared credential model. Token lifecycle:<br>1. **Creation**: `getOrCreateScopedR2Token()` creates token with Object Read+Write policy restricted to user's bucket<br>2. **Caching**: Token data cached in KV as `r2token:{email}` - survives container restarts<br>3. **Delivery**: Passed via `setBucketName` body -> container env vars -> rclone config<br>4. **Revocation**: `deleteScopedR2Token()` on user deletion<br><br>**Trade-off**: Requires `API Tokens: Edit` permission on deploy token (broader than ideal). Accepted because manual R2 credential management per user is operationally impractical.</details> |
+| AD14 | Never auto-resync on bisync failure | <details><summary><code>--resilient</code> + <code>--recover</code> for self-healing instead</summary><br>`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses pending deletions - if side A deleted a file and bisync fails before propagating, `--resync` resurrects it from side B.<br><br>**Instead**: `--resilient` (continue past non-critical errors) + `--recover` (reconstruct corrupted listings) + `--max-delete 100` (allow bulk deletions). Daemon retries in 60s on any failure.<br><br>**Manual `--resync`** is safe in `establish_bisync_baseline()` on container startup because one-way restore runs first.</details> |
 
 ---
 

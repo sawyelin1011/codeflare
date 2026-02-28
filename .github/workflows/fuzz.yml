@@ -1,6 +1,8 @@
 name: Fuzz
 
 on:
+  pull_request:
+    branches: [main]
   schedule:
     - cron: '0 4 * * 0' # Weekly, Sunday 4am UTC
   workflow_dispatch:
@@ -27,7 +29,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run fuzz tests (extended iterations)
+      - name: Create assets directory (wrangler.toml requires web-ui/dist)
+        run: mkdir -p web-ui/dist
+
+      - name: Run backend fuzz tests (extended iterations)
         env:
           FAST_CHECK_NUM_RUNS: '50000'
         run: npx vitest run src/__tests__/fuzz/ --reporter=verbose
+
+      - name: Install frontend dependencies
+        run: cd web-ui && npm ci
+
+      - name: Run frontend fuzz tests
+        env:
+          FAST_CHECK_NUM_RUNS: '50000'
+        run: cd web-ui && npx vitest run src/__tests__/fuzz/ --reporter=verbose
+
+      - name: Install host dependencies
+        run: cd host && npm ci
+
+      - name: Run host fuzz tests
+        env:
+          FAST_CHECK_NUM_RUNS: '50000'
+        run: cd host && node --test __tests__/fuzz-host.test.js
