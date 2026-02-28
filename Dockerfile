@@ -40,6 +40,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Network tools
     curl \
     openssh-client \
+    # Process utilities
+    procps \
     # Utilities
     jq \
     ripgrep \
@@ -62,8 +64,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Symlink vim → neovim so both `vim` and `nvim` commands work
     && ln -s "$(which nvim)" /usr/local/bin/vim
 
-# Install rclone from official script (Debian repo version is often outdated)
-RUN curl -fsSL https://rclone.org/install.sh | bash
+# Install rclone (pinned version — unpinned install.sh broke bisync, see TECHNICAL.md §22.13)
+RUN curl -fsSL https://downloads.rclone.org/v1.73.1/rclone-v1.73.1-linux-amd64.deb -o /tmp/rclone.deb \
+    && dpkg -i /tmp/rclone.deb \
+    && rm /tmp/rclone.deb
 
 # Install GitHub CLI from official apt repo (not in Debian default repos)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -110,12 +114,6 @@ ENV NODE_COMPILE_CACHE=/root/.cache/node-compile-cache
 RUN mkdir -p $NODE_COMPILE_CACHE && \
     claude-unleashed --silent --no-consent --help > /dev/null 2>&1 || true
 
-# Symlink `claude` binary to the claude-code bundled inside claude-unleashed.
-# claude-unleashed already installs @anthropic-ai/claude-code as a dependency —
-# a separate `npm install -g @anthropic-ai/claude-code` would duplicate ~350MB.
-RUN ln -s /usr/local/lib/node_modules/claude-unleashed/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude && \
-    chmod +x /usr/local/bin/claude
-
 # Install Codex + Gemini + OpenCode CLIs for multi-agent support (single RUN for npm dedup).
 # OpenCode (opencode-ai) is an open-source multi-model AI coding CLI supporting 75+ providers.
 # Consolidated install allows npm to deduplicate shared dependencies across packages.
@@ -130,11 +128,10 @@ RUN npm install -g @openai/codex@0.105.0 @google/gemini-cli@0.30.0 opencode-ai@1
 
 # V8 compile cache warm-up: Pre-populate Node.js V8 compile cache at Docker build time.
 # Running --version triggers V8 to compile and cache bytecode for each CLI's JavaScript.
-# This speeds up first-launch of Node.js CLIs (claude, codex, gemini) inside containers
+# This speeds up first-launch of Node.js CLIs (codex, gemini) inside containers
 # by avoiding the compilation overhead on every container start.
 # Note: Go binaries (like opencode) don't need this — they're already natively compiled.
-RUN claude --version 2>&1 || true && \
-    codex --version 2>&1 || true && \
+RUN codex --version 2>&1 || true && \
     gemini --version 2>&1 || true && \
     copilot --version 2>&1
 
@@ -147,9 +144,9 @@ RUN claude --version 2>&1 || true && \
 RUN ANTHROPIC_API_KEY="" OPENAI_API_KEY="" GEMINI_API_KEY="" GITHUB_TOKEN="" \
     timeout 30 opencode run "hello" 2>&1 || true
 
-# Verify critical tools are installed (including vim→nvim symlink and claude→claude-code symlink)
+# Verify critical tools are installed (including vim→nvim symlink)
 RUN git --version && gh --version && rclone --version && node --version && \
-    claude --version && vim --version && \
+    vim --version && \
     which yazi && which lazygit
 
 # Browser shims: force CLI tools to fall back to displaying auth URLs as text.

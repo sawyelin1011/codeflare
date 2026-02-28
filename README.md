@@ -1,6 +1,6 @@
 # <img src="docs/images/logo-icon.svg" width="28" align="absmiddle" alt="Codeflare logo"> Codeflare
 
-You're not sure which AI coding agent is the best. Neither is anyone else. So Codeflare gives you all of them - at the same time. Six agents, six tabs, one browser. No guardrails, no permission prompts, no risk. Every session runs in an isolated container that deletes itself when you're done. Your files persist. Your bad decisions don't.
+You're not sure which AI coding agent is the best. Neither is anyone else. So Codeflare gives you all of them - at the same time. Five agents, six tabs, one browser. No guardrails, no permission prompts, no risk. Every session runs in an isolated container that deletes itself when you're done. Your files persist. Your bad decisions don't.
 
 It runs wherever you happen to find yourself - on the Cloudflare edge that spans the planet, accessible from anything with a browser. Your phone, your tablet, your partner's laptop while they're not looking. Because the best commits in history were made from places without desks.
 
@@ -11,8 +11,7 @@ Every session comes pre-loaded with your choice of AI coding agent:
 
 | Agent | Description |
 |---|---|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Anthropic's agentic CLI |
-| [Claude Unleashed](https://github.com/nikolanovoselec/claude-unleashed) | Claude Code without the guardrails |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Anthropic's agentic CLI (uses [claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) behind the scenes for root permission bypass and controlled updates) |
 | [Codex](https://github.com/openai/codex) | OpenAI's coding agent |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Google's terminal agent |
 | [GitHub Copilot](https://docs.github.com/en/copilot) | GitHub's AI coding agent |
@@ -20,10 +19,10 @@ Every session comes pre-loaded with your choice of AI coding agent:
 | Bash | For the purists |
 
 <details>
-<summary><strong>Why Claude Unleashed?</strong></summary>
+<summary><strong>Why Claude Unleashed under the hood?</strong></summary>
 <a id="why-claude-unleashed"></a>
 
-Cloudflare Containers run as root. Claude Code refuses to run with `--dangerously-skip-permissions` as root - even inside an ephemeral container where the root check is protecting a filesystem that won't exist in 30 seconds. Heroic. [Claude Unleashed](https://github.com/nikolanovoselec/claude-unleashed) is a wrapper that politely disagrees with this decision, patching around the restriction at source level. Handles root detection, auto-updates, and mode switching. Pre-installed in every Codeflare container because arguing with your tools is not a productive use of compute.
+Cloudflare Containers run as root. Claude Code refuses to run with `--dangerously-skip-permissions` as root - even inside an ephemeral container where the root check is protecting a filesystem that won't exist in 30 seconds. Heroic. [Claude Unleashed](https://github.com/nikolanovoselec/claude-unleashed) is a wrapper that politely disagrees with this decision, patching around the restriction at source level. Handles root detection, auto-updates, and mode switching. Pre-installed in every Codeflare container because arguing with your tools is not a productive use of compute. In the UI, it shows up as "Claude Code" - because that's what it is, just without the unnecessary guardrails.
 
 </details>
 
@@ -48,7 +47,7 @@ It's strongly optimized for mobile - because the best ideas hit while rewatching
 - One isolated container per session - agents can't escape their sandbox (I checked)
 - Persistent R2 storage with bisync every 60s - even if a session dies before you `git push`, R2 has got your back. Sync conflicts? Cleaned up automatically next cycle.
 - Pre-warmed terminals - the agent is already loaded when you open the tab, not staring at a blank screen wondering if something broke
-- Fast Start - auto-updates disabled by default across all 6 tools for instant agent startup. Toggle it in Settings if you prefer bleeding edge over fast boot.
+- Fast Start - auto-updates disabled by default across all 5 tools for instant agent startup. Toggle it in Settings if you prefer bleeding edge over fast boot.
 - Set your API key once. It syncs across sessions forever. (It's rclone, but magic sounds better.)
 - Dashboard for managing sessions, browsing files, and inviting users (or revoking them when they get too creative). Live CPU/memory/disk metrics per session. Three-color status: green (active), yellow (idle but alive), gray (stopped).
 - Scales to zero when idle. You pay for what you use. Nothing when you don't.
@@ -134,6 +133,7 @@ The minimum permissions for Codeflare to deploy and run. Every scope earns its k
 | Zone | Zone | Read | Discovers your domain for custom domain setup |
 | Zone | DNS | Edit | Adds DNS records for the custom domain |
 | Zone | Workers Routes | Edit | Routes your domain to the Worker |
+| Account | API Tokens | Edit | Creates per-user scoped R2 tokens for bucket access |
 
 ### Optional
 
@@ -180,9 +180,9 @@ All optional. The defaults work out of the box. I respect your time.
 
 | Layer | Tests | Framework |
 |-------|-------|-----------|
-| Backend | ~775 (64 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
+| Backend | ~775 (65 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
 | Frontend | ~1,288 (64 files) | Vitest v4 + jsdom 28 + SolidJS Testing Library |
-| Host | ~33 (4 files) | Node.js test runner |
+| Host | ~33 (5 files) | Node.js test runner |
 | E2E API | ~49 (11 files) | Vitest + plain fetch |
 | E2E UI | ~74 (10 files, desktop + mobile) | Vitest + Puppeteer |
 

@@ -5,11 +5,14 @@
  * One container serves multiple sessions (terminal tabs).
  *
  * Endpoints:
- * - WS /terminal?session=<id> - Connect to terminal session
- * - GET /health - Health check
- * - GET /sessions - List active sessions
- * - POST /sessions - Create new session
- * - DELETE /sessions/:id - Delete session
+ * - WS  /terminal?session=<id> - Connect to terminal session
+ * - GET  /health              - Health check with system metrics
+ * - GET  /activity            - WebSocket connection activity (for idle detection)
+ * - GET  /sessions            - List active sessions
+ * - POST /sessions            - Create new session
+ * - DELETE /sessions/:id      - Delete session
+ * - GET  /ws-events           - Recent WebSocket event log (debugging)
+ * - GET  /sync-log            - rclone sync log
  */
 
 import http from 'http';
@@ -19,7 +22,7 @@ import { parse as parseUrl } from 'url';
 import { parse as parseQuery } from 'querystring';
 import fs from 'fs';
 import { createActivityTracker } from './activity-tracker.js';
-import { getPrewarmConfig, shouldUseQuiescence } from './prewarm-config.js';
+import { getPrewarmConfig } from './prewarm-config.js';
 
 const PROCESS_NAME_POLL_MS = 2000;
 const WS_KEEPALIVE_PING_MS = 30000;
@@ -105,8 +108,8 @@ async function getSystemMetrics() {
 }
 
 const PORT = process.env.TERMINAL_PORT || 8080;
-// Spawn a login shell so .bashrc runs and auto-starts Claude
-// The .bashrc has claude auto-start logic that only works in interactive login shells
+// Spawn a login shell so .bashrc runs and auto-starts the configured agent
+// The .bashrc has agent auto-start logic that only works in interactive login shells
 const TERMINAL_COMMAND = process.env.TERMINAL_COMMAND || '/bin/bash';
 const TERMINAL_ARGS = process.env.TERMINAL_ARGS || '-l';  // Login shell flag
 const WORKSPACE_DEFAULT = process.env.WORKSPACE || '/home/user/workspace';
@@ -190,7 +193,6 @@ class Session {
     this.keepAliveTimeout = null; // Timer for PTY cleanup after disconnect
     this.lastProcessName = null; // Track PTY foreground process name
     this.processNameInterval = null; // Interval for polling process name changes
-    this.lastDataTime = 0; // Timestamp of last PTY data output (for pre-warm quiescence detection)
     this.orphanTimeout = null; // Timer for killing pre-warmed sessions not adopted by a client
   }
 
@@ -268,8 +270,6 @@ class Session {
     });
 
     this.ptyProcess.onData((data) => {
-      this.lastDataTime = Date.now();
-
       // Feed data into headless terminal for state tracking
       this.headlessTerminal.write(data);
 
@@ -552,11 +552,9 @@ class SessionManager {
             prewarmed.orphanTimeout = null;
           }
           this.sessions.set(id, prewarmed);
-          // NOTE: Do NOT set prewarmReady here. The quiescence check interval
+          // NOTE: Do NOT set prewarmReady here. The first-output listener
           // manages prewarmReady independently — adoption just moves the session
-          // from 'prewarm-1' to the real ID. The PTY output tracker (lastDataTime)
-          // continues working on the same Session object, so the quiescence check
-          // correctly waits until the agent CLI goes quiet before declaring ready.
+          // from 'prewarm-1' to the real ID.
           log('info', 'Adopted pre-warmed session', { session: id });
           return prewarmed;
         }
@@ -890,14 +888,10 @@ wss.on('connection', (ws, req) => {
 let prewarmReady = false;
 let prewarmStartTime = 0;
 
-// Agent-aware quiescence: TUI agents (OpenCode, Gemini, Codex) get 500ms instead of 2000ms
-// because their busy startup spinners keep resetting the default 2s quiescence timer.
 const parsedTabConfig = (() => {
   try { return JSON.parse(process.env.TAB_CONFIG || '[]'); } catch { return []; }
 })();
 const prewarmConfig = getPrewarmConfig(parsedTabConfig);
-const PREWARM_QUIESCENCE_MS = prewarmConfig.quiescenceMs;
-const PREWARM_READY_PATTERN = prewarmConfig.readyPattern;
 const PREWARM_TIMEOUT_MS = 20000;     // Hard cap: consider ready after 20s regardless
 const PREWARM_ORPHAN_MS = 120000;     // Kill pre-warmed session if not adopted within 2min
 
@@ -914,43 +908,42 @@ server.listen(PORT, '0.0.0.0', () => {
   sessionManager.sessions.set('prewarm-1', prewarmSession);
   prewarmSession.start();
   prewarmStartTime = Date.now();
-  log('info', 'Pre-warming tab 1 PTY', { quiescenceMs: PREWARM_QUIESCENCE_MS, hasReadyPattern: !!PREWARM_READY_PATTERN });
+  log('info', 'Pre-warming tab 1 PTY', { command: prewarmConfig.command });
 
-  // If a ready-pattern is configured, listen for it on PTY output
+  // Readiness = first PTY output + 1.5s settle delay.
+  // The delay lets the agent render its initial UI before the user can click "Open".
+  const PREWARM_SETTLE_MS = 1500;
   let prewarmDataListener = null;
-  if (PREWARM_READY_PATTERN && prewarmSession.ptyProcess) {
-    prewarmDataListener = prewarmSession.ptyProcess.onData((data) => {
-      if (!prewarmReady && PREWARM_READY_PATTERN.test(data)) {
-        prewarmReady = true;
+  if (prewarmSession.ptyProcess) {
+    prewarmDataListener = prewarmSession.ptyProcess.onData(() => {
+      if (!prewarmReady) {
         const elapsed = Date.now() - prewarmStartTime;
-        log('info', 'Pre-warm ready (pattern match)', { elapsedSec: (elapsed / 1000).toFixed(1) });
+        log('info', 'Pre-warm first output detected, settling', { elapsedSec: (elapsed / 1000).toFixed(1), command: prewarmConfig.command });
+        if (prewarmDataListener) {
+          prewarmDataListener.dispose();
+          prewarmDataListener = null;
+        }
+        setTimeout(() => {
+          if (!prewarmReady) {
+            prewarmReady = true;
+            log('info', 'Pre-warm ready (settled)', { elapsedSec: ((Date.now() - prewarmStartTime) / 1000).toFixed(1) });
+          }
+        }, PREWARM_SETTLE_MS);
       }
     });
   }
 
-  const readinessCheck = setInterval(() => {
-    if (prewarmReady) {
-      clearInterval(readinessCheck);
-      if (prewarmDataListener) prewarmDataListener.dispose();
-      return;
-    }
-    const elapsed = Date.now() - prewarmStartTime;
-    const lastData = prewarmSession.lastDataTime || prewarmStartTime; // Fallback to start time if no output yet
-    const silent = Date.now() - lastData;
-    if (shouldUseQuiescence(PREWARM_READY_PATTERN) && elapsed >= PREWARM_QUIESCENCE_MS && silent >= PREWARM_QUIESCENCE_MS) {
+  // Hard timeout safety net (20s) — in case PTY produces no output at all
+  const timeoutId = setTimeout(() => {
+    if (!prewarmReady) {
       prewarmReady = true;
-      log('info', 'Pre-warm ready (quiescent)', { elapsedSec: (elapsed / 1000).toFixed(1) });
-      clearInterval(readinessCheck);
-      if (prewarmDataListener) prewarmDataListener.dispose();
-      return;
+      log('info', 'Pre-warm ready (timeout)', { elapsedSec: (PREWARM_TIMEOUT_MS / 1000).toFixed(1), command: prewarmConfig.command });
+      if (prewarmDataListener) {
+        prewarmDataListener.dispose();
+        prewarmDataListener = null;
+      }
     }
-    if (elapsed >= PREWARM_TIMEOUT_MS) {
-      prewarmReady = true;
-      log('info', 'Pre-warm ready (timeout)', { elapsedSec: (elapsed / 1000).toFixed(1) });
-      clearInterval(readinessCheck);
-      if (prewarmDataListener) prewarmDataListener.dispose();
-    }
-  }, 500);
+  }, PREWARM_TIMEOUT_MS);
 
   prewarmSession.orphanTimeout = setTimeout(() => {
     if (sessionManager.sessions.has('prewarm-1')) {

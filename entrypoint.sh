@@ -36,10 +36,9 @@ export TERM
 # === Fast Start: control auto-update behavior ===
 if [ "${FAST_CLI_START:-true}" = "false" ]; then
     # Unset Dockerfile-level vars so tools CAN auto-update
-    unset DISABLE_AUTOUPDATER CLAUDE_UNLEASHED_NO_UPDATE CLAUDE_UNLEASHED_CHANNEL OPENCODE_DISABLE_AUTOUPDATE DISABLE_INSTALLATION_CHECKS
+    unset CLAUDE_UNLEASHED_NO_UPDATE CLAUDE_UNLEASHED_CHANNEL OPENCODE_DISABLE_AUTOUPDATE DISABLE_INSTALLATION_CHECKS
 else
     # Ensure all disable vars are set
-    export DISABLE_AUTOUPDATER=1
     export CLAUDE_UNLEASHED_NO_UPDATE=1
     export OPENCODE_DISABLE_AUTOUPDATE=1
     export COPILOT_AUTO_UPDATE=false
@@ -205,7 +204,21 @@ RCLONE_FILTERS_COMMON=(
     # Node modules — restored via npm install, often 100s of MB
     --filter "- **/node_modules/**"
 
+    # Claude Code native installer artifacts (removed from build, but exclude leftover data)
+    --filter "- .local/share/claude/**"      # native installer version binaries (228MB)
+
+    # Copilot — auto-update binary, session logs, and ephemeral state
+    --filter "- .copilot/logs/**"            # session logs
+    --filter "- .copilot/pkg/**"             # auto-update binary download (~35MB)
+    --filter "- .copilot/session-state/**"   # per-session checkpoints
+
+    # Codex — session recordings and SQLite temp files
+    --filter "- .codex/sessions/**"          # TUI session recordings
+    --filter "- .codex/state*.sqlite-shm"    # SQLite shared memory (ephemeral, corrupt on restore)
+    --filter "- .codex/state*.sqlite-wal"    # SQLite WAL (ephemeral, corrupt on restore)
+
     # Claude Code — session-specific ephemeral data, regenerated per session
+    --filter "- .claude/plugins/marketplaces/**/.git/**"  # marketplace git clones (~2MB each, reinstalled from remote)
     --filter "- .claude/cache/**"            # changelog cache
     --filter "- .claude/debug/**"            # debug logs
     --filter "- .claude/file-history/**"     # per-session file edit history, grows unbounded
@@ -297,6 +310,7 @@ establish_bisync_baseline() {
     local BISYNC_TIMEOUT=180  # 3 minutes max for baseline
     echo "[entrypoint] Step 2: Establishing bisync baseline (max ${BISYNC_TIMEOUT}s)..." | tee -a /tmp/sync.log
 
+    BASELINE_OUTPUT=$(mktemp)
     if timeout $BISYNC_TIMEOUT rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
         --config "$RCLONE_CONFIG" \
         "${RCLONE_FILTERS[@]}" \
@@ -305,13 +319,18 @@ establish_bisync_baseline() {
         --conflict-resolve newer \
         --resilient \
         --recover \
+        --ignore-checksum \
+        --max-delete 100 \
         --contimeout 10s \
         --timeout 30s \
-        --transfers 32 --checkers 32 -v 2>&1 | tee -a /tmp/sync.log; then
+        --transfers 32 --checkers 32 -v 2>&1 > "$BASELINE_OUTPUT"; then
         SYNC_RESULT=0
     else
         SYNC_RESULT=$?
     fi
+    cat "$BASELINE_OUTPUT" >> /tmp/sync.log
+    cat "$BASELINE_OUTPUT"
+    rm -f "$BASELINE_OUTPUT"
     if [ $SYNC_RESULT -eq 0 ]; then
         echo "[entrypoint] Step 2 complete: Bisync baseline established"
         touch /tmp/.bisync-initialized
@@ -319,6 +338,7 @@ establish_bisync_baseline() {
         return 0
     elif [ $SYNC_RESULT -eq 124 ]; then
         echo "[entrypoint] WARNING: Bisync baseline timed out after ${BISYNC_TIMEOUT}s"
+        touch /tmp/.bisync-initialized
         SYNC_STATUS="timeout"
         return 0  # Don't fail, just skip daemon
     else
@@ -338,14 +358,8 @@ bisync_with_r2() {
     # Clear stale bisync lock if no bisync is running
     local LOCK_FILE="/home/user/.cache/rclone/bisync/home_user..r2_${R2_BUCKET_NAME}.lck"
     local BISYNC_RUNNING=0
-    if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "rclone bisync" >/dev/null 2>&1; then
-            BISYNC_RUNNING=1
-        fi
-    else
-        if ps -ef | grep -v grep | grep -q "rclone bisync"; then
-            BISYNC_RUNNING=1
-        fi
+    if pgrep -f "rclone bisync" >/dev/null 2>&1; then
+        BISYNC_RUNNING=1
     fi
     if [ -f "$LOCK_FILE" ] && [ "$BISYNC_RUNNING" -eq 0 ]; then
         echo "[sync] Removing stale bisync lock: $LOCK_FILE" | tee -a /tmp/sync.log
@@ -355,7 +369,7 @@ bisync_with_r2() {
     # Write output to temp file so we can capture exit code AND log it
     SYNC_OUTPUT=$(mktemp)
 
-    # First try normal bisync (capture exit code without triggering set -e)
+    # Run bisync (capture exit code without triggering set -e)
     if rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
         --config "$RCLONE_CONFIG" \
         "${RCLONE_FILTERS[@]}" \
@@ -363,6 +377,8 @@ bisync_with_r2() {
         --conflict-resolve newer \
         --resilient \
         --recover \
+        --ignore-checksum \
+        --max-delete 100 \
         --transfers 32 --checkers 32 $VERBOSE 2>&1 > "$SYNC_OUTPUT"; then
         RESULT=0
     else
@@ -370,25 +386,6 @@ bisync_with_r2() {
     fi
     cat "$SYNC_OUTPUT" >> /tmp/sync.log
     cat "$SYNC_OUTPUT"
-
-    # If bisync failed (especially due to empty listing), try with --resync
-    if [ $RESULT -ne 0 ]; then
-        echo "[sync] Normal bisync failed (exit $RESULT), attempting --resync..." | tee -a /tmp/sync.log
-        if rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
-            --config "$RCLONE_CONFIG" \
-            "${RCLONE_FILTERS[@]}" \
-            --conflict-resolve newer \
-            --resync \
-            --resilient \
-            --recover \
-            --transfers 32 --checkers 32 $VERBOSE 2>&1 > "$SYNC_OUTPUT"; then
-            RESULT=0
-        else
-            RESULT=$?
-        fi
-        cat "$SYNC_OUTPUT" >> /tmp/sync.log
-        cat "$SYNC_OUTPUT"
-    fi
 
     rm -f "$SYNC_OUTPUT"
 
@@ -443,11 +440,8 @@ start_sync_daemon() {
 shutdown_handler() {
     echo "[entrypoint] Received shutdown signal, performing final bisync..."
 
-    # Kill sync daemon (try PID file first, then variable fallback)
+    # Kill sync daemon via PID file
     kill "$(cat /tmp/sync-daemon.pid 2>/dev/null)" 2>/dev/null || true
-    if [ -n "$SYNC_DAEMON_PID" ]; then
-        kill "$SYNC_DAEMON_PID" 2>/dev/null || true
-    fi
 
     # Perform final bisync to R2 (only if baseline was established)
     echo "[entrypoint] Final bisync to R2..."
@@ -526,7 +520,7 @@ PROFILE_EOF
 
 # terminal-autostart
 # Start different apps based on terminal tab ID:
-# Tab 1: Claude Code (unleashed mode)
+# Tab 1: Claude Code (cu)
 # Tab 2: htop (system monitor)
 # Tab 3: yazi (file manager)
 # Tab 4-6: Plain bash terminal in workspace
@@ -544,7 +538,7 @@ if [ -t 1 ] && [ -z "$TERMINAL_APP_STARTED" ]; then
         1)
             # Tab 1: Claude Code (via claude-unleashed)
             # Auto-start: silent + no-consent for non-interactive boot
-            # Updates enabled — pre-patched at build time, so update check is fast (~2s)
+            # Updates enabled (Fast Start is OFF -- tools will check for updates on launch)
             # Manual re-run: just `cu` or `claude-unleashed`
             cu --silent --no-consent
             # If claude exits, drop to bash (don't use exec so PTY survives)
@@ -627,7 +621,7 @@ CASE_EOF
             ;;
 CASE_EOF
                     ;;
-                codex|claude|opencode|copilot*)
+                codex|opencode|copilot*)
                     cat >> "$BASHRC_FILE" << CASE_EOF
         ${key})
             # ${cmd} (bash stays as session leader for TTY stability)
@@ -712,19 +706,6 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ]; then
         # Ensure workspace directory exists after sync
         mkdir -p "$USER_WORKSPACE"
         update_sync_status "success" "null"
-
-        # Step 2: Establish bisync baseline IN BACKGROUND (don't block startup)
-        (
-            echo "[entrypoint] Establishing bisync baseline in background..."
-            if establish_bisync_baseline; then
-                echo "[entrypoint] Bisync baseline established, starting daemon..."
-                start_sync_daemon
-            else
-                echo "[entrypoint] Bisync baseline failed, daemon not started"
-            fi
-        ) &
-        BISYNC_INIT_PID=$!
-        echo "[entrypoint] Bisync init running in background (PID $BISYNC_INIT_PID)"
     else
         update_sync_status "failed" "$SYNC_ERROR"
         # Continue anyway - servers should still start
@@ -768,6 +749,23 @@ fi
 
 # Configure tab auto-start
 configure_tab_autostart
+
+# Step 2: Establish bisync baseline IN BACKGROUND (don't block startup)
+# Runs AFTER all file modifications (.claude.json, .gemini/settings.json, .codex/version.json,
+# .bashrc tab autostart) to avoid hash mismatches from files changing during --resync.
+if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
+    (
+        echo "[entrypoint] Establishing bisync baseline in background..."
+        if establish_bisync_baseline; then
+            echo "[entrypoint] Bisync baseline established, starting daemon..."
+            start_sync_daemon
+        else
+            echo "[entrypoint] Bisync baseline failed, daemon not started"
+        fi
+    ) &
+    BISYNC_INIT_PID=$!
+    echo "[entrypoint] Bisync init running in background (PID $BISYNC_INIT_PID)"
+fi
 
 # ============================================================================
 # Start servers AFTER initial sync completes

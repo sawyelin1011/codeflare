@@ -19,7 +19,7 @@ Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2
 9. [Container Image](#9-container-image)
 10. [Container Startup](#10-container-startup)
     - [Fast Start](#fast-start)
-11. [Claude-Unleashed Integration](#11-claude-unleashed-integration)
+11. [Claude Code Integration](#11-claude-code-integration)
 12. [File Structure](#12-file-structure)
 13. [Environment Variables](#13-environment-variables)
 14. [Configuration](#14-configuration)
@@ -109,15 +109,13 @@ flowchart TD
     Renew --> FetchHealth["Fetch /health<br/>from container"]
     NoRenew --> FetchHealth
     FetchHealth --> WriteKV["Write metrics to KV"]
-    WriteKV --> FetchFailed{"Fetch failed?"}
-    FetchFailed -->|Yes| ReArm1["Still re-arm<br/>(safety net)"]
-    FetchFailed -->|No| ReArm2["Re-arm setTimeout<br/>(collectMetrics, 5000)"]
+    WriteKV --> ReArm["Re-arm setTimeout<br/>(collectMetrics, 5000)<br/>(unconditional if container.running)"]
 
 ```
 
 **`onActivityExpired()` Override:** Checks `/activity` for active WS clients. If clients connected -> `renewActivityTimeout()`. If no clients -> `this.stop('SIGTERM')`. Safety net: renews timeout on any error (network failures, non-OK responses) rather than killing the container.
 
-**`destroy()` Override:** Clears `SESSION_ID_KEY`, `bucketName`, `workspaceSyncEnabled`, `tabConfig` from DO storage and nulls `_bucketName` in memory BEFORE calling `super.destroy()`. This prevents `onStop()` (triggered asynchronously by `super.destroy()` killing the container) from resurrecting deleted sessions in KV.
+**`destroy()` Override:** Clears `SESSION_ID_KEY`, `bucketName`, `workspaceSyncEnabled`, `tabConfig`, `fastStartEnabled` from DO storage and nulls `_bucketName` in memory BEFORE calling `super.destroy()`. This prevents `onStop()` (triggered asynchronously by `super.destroy()` killing the container) from resurrecting deleted sessions in KV.
 
 **Environment Variables Injection:** R2 credentials flow via two paths: (1) `_internal/setBucketName` request body (primary, from Worker), (2) `this.env` fallback (DO restart). Fallback chain: Worker-provided > `this.env` > empty string.
 
@@ -141,11 +139,11 @@ sequenceDiagram
 
 **Critical: `envVars` must be set as a property assignment**, not as a getter. Cloudflare Containers reads `this.envVars` as a plain property at `start()` time.
 
-**`setBucketName` Idempotency (409 Path):** Once `_bucketName` is set, subsequent `setBucketName` calls return 409. BUT the 409 handler still stores `sessionId`, `workspaceSyncEnabled`, and `tabConfig` in DO storage -- this ensures `collectMetrics`/`onStop` can find the KV entry even on session restarts (where the DO already has a bucket set but needs the sessionId for the new lifecycle), and that user preference changes take effect without container recreation.
+**`setBucketName` Idempotency (409 Path):** Once `_bucketName` is set, subsequent `setBucketName` calls return 409. BUT the 409 handler still stores `sessionId`, `workspaceSyncEnabled`, `tabConfig`, and `fastStartEnabled` in DO storage -- this ensures `collectMetrics`/`onStop` can find the KV entry even on session restarts (where the DO already has a bucket set but needs the sessionId for the new lifecycle), and that user preference changes take effect without container recreation.
 
 **Lifecycle Route Re-calls `setBucketName` After `destroy()`:** In the `needsBucketUpdate` path (restart with different bucket), `destroy()` wipes DO storage. The lifecycle route must call `setBucketName` again after `destroy()` to re-populate sessionId, bucketName, and R2 credentials. See `src/routes/container/lifecycle.ts`.
 
-**Internal Endpoints:** `/_internal/setBucketName`, `/_internal/setSessionId`, `/_internal/getBucketName`, `/_internal/debugEnvVars`
+**Internal Endpoints:** `/_internal/setBucketName`, `/_internal/setSessionId`, `/_internal/getBucketName`
 
 ### 2.3 Terminal Server (node-pty)
 
@@ -226,7 +224,7 @@ function connect() {
 
 **Frontend Zod Validation:** `web-ui/src/lib/schemas.ts` -- Zod schemas validate API responses at runtime. Types derived from schemas via `z.infer`.
 
-**Terminal Tab Configuration:** `web-ui/src/lib/terminal-config.ts` -- Generic "Terminal 1-6" defaults with live process detection via `PROCESS_ICON_MAP` (maps process names like claude, cu, claude-code, codex, gemini, opencode, htop, yazi, lazygit, bash, sh, zsh to MDI icons).
+**Terminal Tab Configuration:** `web-ui/src/lib/terminal-config.ts` -- Generic "Terminal 1-6" defaults with live process detection via `PROCESS_ICON_MAP` (maps running process names like cu, codex, gemini, opencode, copilot, htop, yazi, lazygit, bash, sh, zsh to MDI icons). Separate `AGENT_ICON_MAP` maps the 6 agent types (claude-code, codex, gemini, opencode, copilot, bash) to session card icons.
 
 #### Frontend Constants
 
@@ -249,8 +247,6 @@ function connect() {
 | `src/lib/jwt.ts` | RS256 verification against CF Access JWKS (`https://{authDomain}/cdn-cgi/access/certs`). Per-isolate JWKS cache with `resetJWKSCache()`. |
 | `src/lib/cache-reset.ts` | Centralized invalidation of CORS + auth config + JWKS caches. Called by setup wizard after configuration changes. |
 | `src/lib/cf-api.ts` | Cloudflare API client. `parseCfResponse` checks `Content-Type` header before JSON parsing. When content-type is not `application/json`, attempts `JSON.parse` on the text body as a lenient fallback (Cloudflare sometimes omits content-type on valid JSON). Only throws a structured `AppError` with the first 200 chars of the response body if the parse actually fails -- this gives clear diagnostics for HTML error pages or plain text from expired tokens, instead of opaque JSON parse errors. |
-
-**DEV_MODE Gating:** `/api/container/debug/*` restricted to `DEV_MODE = "true"`. Note: DEV_MODE only gates debug endpoints and enables localhost CORS - it does NOT bypass CF Access authentication.
 
 ### Setup Wizard Resilience
 
@@ -277,6 +273,8 @@ flowchart TD
 ```
 
 **Error propagation:** `listAccessApps()` and `listAccessGroups()` propagate errors through `withSetupRetry` rather than silently returning `[]`. Errors surface as `SetupError` with step details. The frontend `ApiError` carries a `steps` array from `SetupError` JSON responses.
+
+**Stale user removal during reconfiguration:** When `POST /configure` is re-run with a new `allowedUsers` list, users no longer in the list are removed via `cleanupUserData()` (`src/lib/user-cleanup.ts`), wrapped in `runStep('cleanup_stale_users')` for progress visibility. This performs full cleanup identical to `DELETE /api/users/:email`: destroys all active sessions/containers, deletes bucket-keyed KV entries (`storage-stats:`, `presets:`, `user-prefs:`), deletes the R2 scoped token, empties the R2 bucket (paginated `ListObjectsV2` + `DeleteObjects` via `emptyR2Bucket`), and deletes the bucket via CF API with retry logic (up to 3 attempts with exponential backoff for R2 eventual consistency).
 
 ### Session Route Architecture
 
@@ -382,7 +380,7 @@ flowchart TD
 
 ```
 
-**Restart (same bucket):** `setBucketName` -> 409 (bucket already set, but stores `sessionId`, `workspaceSyncEnabled`, and `tabConfig` in DO storage for KV reconciliation and preference updates) -> `startAndWaitForPorts()` -> `onStart()` re-arms metrics
+**Restart (same bucket):** `setBucketName` -> 409 (bucket already set, but stores `sessionId`, `workspaceSyncEnabled`, `tabConfig`, and `fastStartEnabled` in DO storage for KV reconciliation and preference updates) -> `startAndWaitForPorts()` -> `onStart()` re-arms metrics
 
 **Restart (different bucket):** `setBucketName` succeeds -> `destroy()` (wipes DO storage) -> lifecycle route re-calls `setBucketName` (re-populates sessionId + bucketName + R2 creds) -> `startAndWaitForPorts()`
 
@@ -390,7 +388,7 @@ flowchart TD
 flowchart TD
     Start["setBucketName(newBucket)"] --> SameBucket{"Same bucket<br/>already set?"}
 
-    SameBucket -->|"Yes (409 path)"| Store409["Store sessionId +<br/>workspaceSyncEnabled +<br/>tabConfig in DO storage"]
+    SameBucket -->|"Yes (409 path)"| Store409["Store sessionId +<br/>workspaceSyncEnabled +<br/>tabConfig + fastStartEnabled<br/>in DO storage"]
     Store409 --> Start409["startAndWaitForPorts()"]
     Start409 --> OnStart409["onStart() re-arms metrics"]
 
@@ -445,7 +443,12 @@ rclone bisync: all file ops on local disk (<1ms), background daemon every 60s, f
 ### Initial Sync on Startup
 
 1. One-way `rclone sync` from R2 to local (restore data)
-2. `rclone bisync --resync` to establish baseline, then start 60-second daemon
+2. All file modifications run (`.claude.json`, `.gemini/settings.json`, `.codex/version.json`, tab autostart) — these complete before bisync starts to avoid hash mismatches
+3. `rclone bisync --resync --ignore-checksum --max-delete 100` to establish baseline (background), then start 60-second daemon
+
+All bisync commands use `--ignore-checksum` to skip post-transfer MD5 verification. rclone v1.73+ treats hash mismatches as fatal ("corrupted on transfer"), which aborts bisync when files change during transfer (e.g., coding agents modifying workspace files). Change detection still uses modtime + size; files that change mid-transfer are caught in the next 60s cycle.
+
+`--max-delete 100` allows bisync to propagate bulk deletions (e.g., deleting entire workspace folders). The rclone default of 50% aborts bisync when more than half the files are deleted in one cycle — in a config-heavy sync with few files, even a single folder deletion can exceed this threshold.
 
 ### What's Synced vs Excluded
 
@@ -455,7 +458,13 @@ rclone bisync: all file ops on local disk (<1ms), background daemon every 60s, f
 | `~/.config/` | Yes | App configs (gh CLI, etc.) |
 | `~/.gitconfig` | Yes | Git configuration |
 | `~/workspace/` | Depends on `SYNC_MODE` | Excluded by default (`none`). Synced when `full` or partially with `metadata`. |
-| `~/.npm/`, `~/.bun/`, `.config/rclone/**`, `.cache/rclone/**`, `.claude/debug/**`, `.claude/plugins/cache/**` | **NO** | Cache/debug, regenerated |
+| `~/.npm/`, `~/.bun/`, `~/.cache/**`, `~/.config/rclone/**` | **NO** | Package manager and rclone caches, regenerated |
+| `~/.local/share/claude/**` | **NO** | Native installer version binaries (leftover data, removed from build) |
+| `~/.copilot/logs/**`, `~/.copilot/pkg/**` | **NO** | Copilot session logs and auto-update binary |
+| `~/.codex/sessions/**`, `~/.codex/log/**`, `~/.codex/tmp/**`, etc. | **NO** | Codex ephemeral session data and caches |
+| `~/.claude/cache/**`, `~/.claude/debug/**`, `~/.claude/file-history/**`, etc. | **NO** | Claude Code session-specific ephemeral data |
+| `~/.gemini/tmp/**` | **NO** | Gemini CLI temp files (ripgrep binary, chat logs) |
+| `~/.local/share/opencode/log/**`, `opencode.db-shm`, `opencode.db-wal` | **NO** | OpenCode session logs and SQLite temp files |
 
 ### rclone Sync Modes
 
@@ -465,13 +474,17 @@ rclone bisync: all file ops on local disk (<1ms), background daemon every 60s, f
 | `full` | Entire `workspace/` (minus `node_modules/`) | Persistent storage across stop/resume |
 | `metadata` | Only agent config files (`.claude/`) per repo | Lightweight project context sync |
 
-All modes always exclude: `.bashrc`, `.bash_profile`, `.config/rclone/`, `.cache/rclone/`, `.npm/`, `.bun/`, `.claude/debug/`, `.claude/plugins/cache/`, `**/node_modules/`. All rclone commands use `--filter` flags (NOT `--include`/`--exclude`).
+All modes always exclude: `.bashrc`, `.bash_profile`, `.npm/**`, `.bun/**`, `.cache/**`, `.config/rclone/**`, `**/node_modules/**`, `.local/share/claude/**`, `.copilot/logs/**`, `.copilot/pkg/**`, `.codex/sessions/**`, `.claude/cache/**`, `.claude/debug/**`, `.claude/file-history/**`, `.claude/plugins/cache/**`, `.claude/session-env/**`, `.claude/shell-snapshots/**`, `.claude/stats-cache.json`, `.claude.json.backup.*`, `.codex/log/**`, `.codex/models_cache.json`, `.codex/.personality_migration`, `.codex/shell_snapshots/**`, `.codex/tmp/**`, `.codex/version.json`, `.gemini/tmp/**`, `.local/share/opencode/log/**`, `.local/share/opencode/opencode.db-shm`, `.local/share/opencode/opencode.db-wal`. All rclone commands use `--filter` flags (NOT `--include`/`--exclude`).
 
 **Note:** The `metadata` mode is defined in `entrypoint.sh` but the Container DO currently only maps `workspaceSyncEnabled` to `full` or `none`. The `metadata` mode can be used by setting `SYNC_MODE` directly in the container environment.
 
 ### Conflict Resolution
 
-Newest file wins (`--conflict-resolve newer`). Auto `--resync` on bisync failure. Shutdown handler runs final bisync.
+Newest file wins (`--conflict-resolve newer`). `--resilient` + `--recover` handle transient bisync failures (e.g., interrupted transfers, listing mismatches) without losing deletion tracking. The sync daemon retries in 60s on failure. `--max-delete 100` on ALL bisync commands (`establish_bisync_baseline` and `bisync_with_r2`) allows bulk workspace deletions to propagate. Shutdown handler runs final bisync. All bisync commands use `--ignore-checksum` to prevent false hash-mismatch aborts — rclone v1.73 introduced stricter post-transfer MD5 verification that fails when files change during sync.
+
+**Bisync exit code handling:** `bisync_with_r2()` uses a temp file approach instead of `| tee` to capture both output and exit code. Piping through `tee` swallows the rclone exit code (the pipe's exit code is `tee`'s, not rclone's), masking bisync failures and breaking error detection in the daemon loop.
+
+**Bisync-initialized flag on timeout:** The bisync-initialized flag (`/tmp/bisync-initialized`) is now touched on the sync timeout path as well. Previously, if initial sync timed out, the flag was never set, causing the shutdown trap to skip the final bisync — losing any files created during the session.
 
 ---
 
@@ -491,7 +504,7 @@ One Access application with five destinations: `/app`, `/app/*`, `/api/*`, `/set
 
 ### Access Group Model
 
-Per-worker groups: `<worker-name>-admins`, `<worker-name>-users`. Setup upserts both, stores IDs in KV. `/api/users` syncs group membership via `syncAccessPolicy()`. `GET /api/setup/prefill` reads existing membership for redeploy prefill.
+Per-worker groups: `<worker-name>-admins`, `<worker-name>-users`. Setup upserts both, stores IDs in KV. `/api/users` syncs group membership via `syncAccessPolicy()`. `GET /api/setup/prefill` reads existing membership for redeploy prefill. Admin-only deployments (0 regular users) are supported: the users group is skipped entirely and the Access policy references only the admin group.
 
 ### Root Redirect
 
@@ -528,19 +541,41 @@ flowchart TD
 
 ### CF Access Gate
 
-Cloudflare Access protects all authenticated surfaces. One Access application with five destinations: `/app`, `/app/*`, `/api/*`, `/setup`, `/setup/*`. Including exact + wildcard variants removes ambiguity. Uses all 5 allowed entries.
+Cloudflare Access protects all authenticated surfaces (see Section 6 for Access application destination strategy).
 
 ### API Token Containment
 
 The `CLOUDFLARE_API_TOKEN` never enters the container. It stays in the Worker/DO environment (GitHub Secrets -> Worker secrets). Containers only receive R2 credentials (scoped key pair), never the master API token.
 
+**Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `lifecycle.ts`, which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
+
 ### Container Auth Token
 
 A random UUID is generated per DO lifecycle and passed to the container as `CONTAINER_AUTH_TOKEN` env var. All proxied HTTP requests from the DO to the container include this token in the `Authorization: Bearer` header. The terminal server (`host/server.js`) validates this token on all non-exempt paths. `getTcpPort().fetch()` bypasses the DO's `fetch()` override (which injects the header), so internal paths (`/health`, `/activity`) must be in `authExemptPaths`.
 
+### Dual R2 Credential Architecture
+
+Two types of R2 credentials serve different purposes:
+
+**Worker-level R2 credentials** (setup wizard):
+- Created during `POST /configure` step 2 (`handleDeriveR2Credentials`)
+- `R2_ACCESS_KEY_ID` = API token ID (from `/user/tokens/verify`)
+- `R2_SECRET_ACCESS_KEY` = SHA-256(API token value)
+- Stored as worker secrets — used for bucket admin operations (create, empty, delete)
+- If API token rotated, must re-run setup to regenerate
+
+**Per-user scoped R2 tokens** (first login):
+- Created via `getOrCreateScopedR2Token()` in `src/routes/container/lifecycle.ts`
+- Calls `POST /accounts/{accountId}/tokens` with bucket-specific Object Read + Write policy
+- Token ID = S3 Access Key ID, SHA-256(token value) = S3 Secret Access Key
+- Cached in KV as `r2token:{email}` — survives container restarts
+- Passed to container via `setBucketName` → container env vars → rclone config
+- Revoked via `deleteScopedR2Token()` on user deletion
+- Requires `API Tokens: Edit` permission on the deploy token
+
 ### Graceful Shutdown
 
-`STOPSIGNAL SIGINT` in the Dockerfile. The `entrypoint.sh` trap handler catches SIGINT/SIGTERM, kills the sync daemon, runs a final `rclone bisync` to R2, and kills the terminal server. This ensures no data loss on container stop.
+`STOPSIGNAL SIGINT` in the Dockerfile. The `entrypoint.sh` trap handler catches SIGINT/SIGTERM, kills the sync daemon via PID file at `/tmp/sync-daemon.pid` (PID file is the sole mechanism — no in-memory PID variable fallback), runs a final `rclone bisync` (with `--ignore-checksum --max-delete 100`) to R2, and kills the terminal server. The bisync-initialized flag is touched on the timeout path as well (was previously missing, which caused shutdown to skip final bisync when initial sync timed out). This ensures no data loss on container stop.
 
 ### Security Headers
 
@@ -584,7 +619,7 @@ Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (i
 
 ### Protected R2 Paths
 
-The following paths are excluded from R2 sync and cannot be uploaded/deleted/moved via the storage API: `.claude/`, `.anthropic/`, `.ssh/`, `.config/`, `.claude.json`. Defined in `PROTECTED_PATHS` in `src/lib/constants.ts`.
+Cannot be accessed via the web storage API (browse, upload, delete, move). These paths ARE synced to R2 via rclone for session persistence (credentials, config, plugins). Defined in `PROTECTED_PATHS` in `src/lib/constants.ts`: `.claude/`, `.anthropic/`, `.ssh/`, `.config/`, `.claude.json`.
 
 ---
 
@@ -630,10 +665,6 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 | POST | `/api/container/destroy` | Destroy container (SIGKILL) |
 | GET | `/api/container/startup-status` | Poll startup progress |
 | GET | `/api/container/health` | Health check |
-| GET | `/api/container/state` | Container state (DEV_MODE) |
-| GET | `/api/container/debug` | Debug info (DEV_MODE) |
-| GET | `/api/container/sync-log` | Sync log (DEV_MODE) |
-| GET | `/api/container/mount-test` | Mount verification (DEV_MODE) |
 
 ### Terminal
 
@@ -665,7 +696,7 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 - Always returns HTTP 200 -- errors are conveyed within the stream. Validation errors (missing fields) still return HTTP 400 before streaming begins.
 - Frontend reads via `response.body.getReader()` with buffer-based line parsing, updating `configureSteps` progressively so the UI shows real-time step status.
 
-Public before setup; admin-only after. All `adminUsers` must also be in `allowedUsers`.
+Public before setup; admin-only after. All `adminUsers` must also be in `allowedUsers`. Regular users (`allowedUsers` beyond admins) are optional -- admin-only deployments with 0 regular users are fully supported.
 
 ### Storage (R2 File Browser)
 
@@ -716,6 +747,7 @@ GET `/health`, GET `/api/health`
 | Version Control | git, github-cli (gh), lazygit (v0.59.0) |
 | Editors | vim (symlinked to neovim), neovim, nano |
 | Network | curl, openssh-client |
+| Process | procps (ps, pgrep) |
 | Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.1.22), fzf, zoxide, bat |
 
 ### Global NPM Packages
@@ -724,8 +756,7 @@ Versions are pinned in the Dockerfile and updated periodically (`.cache-bust` la
 
 | Package | Version | Provides |
 |---------|---------|----------|
-| `claude-unleashed` | Git commit pin | `cu` / `claude-unleashed` commands (wraps `@anthropic-ai/claude-code`) |
-| `@anthropic-ai/claude-code` | _(symlinked from claude-unleashed)_ | `claude` command |
+| `claude-unleashed` | Git commit pin | `cu` / `claude-unleashed` commands (wraps `@anthropic-ai/claude-code`). Used as the "Claude Code" agent in the UI -- provides root permission bypass and controlled update mechanism. |
 | `@openai/codex` | 0.105.0 | `codex` command |
 | `@google/gemini-cli` | 0.30.0 | `gemini` command |
 | `opencode-ai` | 1.2.15 | `opencode` command |
@@ -733,7 +764,7 @@ Versions are pinned in the Dockerfile and updated periodically (`.cache-bust` la
 
 ### V8 Compile Cache Warm-Up
 
-Node.js CLIs (claude, codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need this optimization.
+Node.js CLIs (codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need V8 cache warm-up. Claude Code is pre-updated and pre-patched at build time via `claude-unleashed --silent --no-consent --help`, which seeds the V8 compile cache.
 
 ### OpenCode Database Pre-Initialization
 
@@ -766,17 +797,18 @@ flowchart TD
 
 Auto-start uses `cu --silent --no-consent` for fast boot. Auto-updates are disabled by default via `FAST_CLI_START=true` (see [Fast Start](#fast-start) below). Users can enable auto-updates via Settings, or update manually via `cu` in any tab.
 
+**PTY PATH:** The `.bashrc` tab autostart block sets `PATH="/usr/local/bin:/usr/bin:/bin:$PATH"` so that PTY sessions can find globally installed CLI tools.
+
 ### Fast Start
 
 **User preference:** `fastStartEnabled` (default: `true`) in `UserPreferences`.
 **Container env var:** `FAST_CLI_START` (default: `'true'`).
 
-When enabled, `entrypoint.sh` disables auto-update checks for all 6 AI tools, eliminating 5-30s of startup delay per tool. Each tool has a different disable mechanism:
+When enabled, `entrypoint.sh` disables auto-update checks for all 5 AI tools, eliminating 5-30s of startup delay per tool. Each tool has a different disable mechanism:
 
 | Tool | Disable Mechanism | Type |
 |------|------------------|------|
-| Claude Code | `DISABLE_AUTOUPDATER=1` | Env var |
-| Claude Unleashed | `CLAUDE_UNLEASHED_NO_UPDATE=1` | Env var |
+| Claude Code (claude-unleashed) | `CLAUDE_UNLEASHED_NO_UPDATE=1`, `CLAUDE_UNLEASHED_CHANNEL=stable` | Env var |
 | OpenCode | `OPENCODE_DISABLE_AUTOUPDATE=1` | Env var |
 | Copilot | `COPILOT_AUTO_UPDATE=false` | Env var |
 | Gemini | `~/.gemini/settings.json` -> `general.enableAutoUpdate: false` | Config file (jq merge) |
@@ -786,23 +818,21 @@ When enabled, `entrypoint.sh` disables auto-update checks for all 6 AI tools, el
 
 **Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
 
-When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`DISABLE_AUTOUPDATER`, `CLAUDE_UNLEASHED_NO_UPDATE`, `OPENCODE_DISABLE_AUTOUPDATE`, `DISABLE_INSTALLATION_CHECKS`) and skips writing config files, allowing all tools to check for updates normally.
+When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the env vars it conditionally sets (`CLAUDE_UNLEASHED_NO_UPDATE`, `CLAUDE_UNLEASHED_CHANNEL`, `OPENCODE_DISABLE_AUTOUPDATE`, `DISABLE_INSTALLATION_CHECKS`) and skips writing config files, allowing all tools to check for updates normally.
 
 ---
 
-## 11. Claude-Unleashed Integration
+## 11. Claude Code Integration
 
-[claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) enables `--dangerously-skip-permissions` when running as root inside containers (standard CLI prevents this via `process.getuid() === 0` check).
+The "Claude Code" agent in Codeflare uses [claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) (`cu` command) behind the scenes. claude-unleashed enables `--dangerously-skip-permissions` when running as root inside containers (standard CLI prevents this via `process.getuid() === 0` check), and provides a controlled update mechanism.
 
-**Two separate updaters:** (1) claude-unleashed's updater checks npm for latest `@anthropic-ai/claude-code` - disabled at runtime via `CLAUDE_UNLEASHED_NO_UPDATE=1` to avoid ~25-30s startup delay from `npm view` + `npm install` on every container start. Updates happen at Docker build time instead (via `.cache-bust` layer invalidation). (2) Upstream CLI's internal auto-updater - disabled via `DISABLE_INSTALLATION_CHECKS=1`.
-
-`claude` = vanilla CLI, `cu` = claude-unleashed.
+**Updater:** claude-unleashed's updater checks npm for latest `@anthropic-ai/claude-code` - disabled at runtime via `CLAUDE_UNLEASHED_NO_UPDATE=1` to avoid ~25-30s startup delay from `npm view` + `npm install` on every container start. Updates happen at Docker build time instead (via `.cache-bust` layer invalidation). Upstream CLI's internal auto-updater is disabled via `DISABLE_INSTALLATION_CHECKS=1`.
 
 ### Environment Variables
 
 **Global (Dockerfile ENV):** `NPM_CONFIG_UPDATE_NOTIFIER=false`, `CLAUDE_UNLEASHED_SKIP_CONSENT=1`, `CLAUDE_UNLEASHED_CHANNEL=stable`, `CLAUDE_UNLEASHED_NO_UPDATE=1`, `IS_SANDBOX=1`, `DISABLE_INSTALLATION_CHECKS=1`, `NODE_COMPILE_CACHE=/root/.cache/node-compile-cache`, `BROWSER=/usr/local/bin/open-url`
 
-**Prewarm readiness:** All TUI agents are classified in `host/prewarm-config.js` with agent-specific ready patterns. When a `readyPattern` is configured, quiescence-based detection is disabled - only the pattern match or the 20s hard timeout declares readiness. This prevents startup silence (e.g. Node.js V8 compile time) from prematurely firing "ready". Patterns: `cu`/`claude-unleashed` match `/╭/` (Ink TUI welcome box border), `opencode` matches `/>/' (Bubble Tea TUI prompt), `gemini` matches `/Type your message/` (Ink InputPrompt placeholder), `copilot` matches `/Describe a task|Copilot uses/` (Ink welcome box text), `codex` matches `/Codex can make mistakes/` (Rust TUI footer). The `claude` command (vanilla CLI) also gets 500ms quiescence but has no readyPattern. Shell commands (bash, sh, zsh) use 2000ms quiescence with no pattern.
+**Prewarm readiness:** Detected by first PTY output — as soon as the agent produces any terminal output, pre-warm is considered ready. This replaced the previous approach of agent-specific regex patterns and quiescence-based detection, which failed when agents weren't logged in (startup output was completely different, patterns didn't match, causing 20s timeout delays). The 20s hard timeout in `server.js` remains as a safety net for the rare case where a PTY produces no output at all. `host/prewarm-config.js` now only extracts the command name from `tabConfig` for logging.
 
 **Auto-start flags (.bashrc):** `--silent`, `--no-consent`
 
@@ -820,7 +850,6 @@ codeflare/
 │   │   │   ├── index.ts      # Route aggregator
 │   │   │   ├── lifecycle.ts  # Start/destroy
 │   │   │   ├── status.ts     # Health, startup-status
-│   │   │   ├── debug.ts      # Debug endpoints (DEV_MODE)
 │   │   │   └── shared.ts     # Shared helpers
 │   │   ├── session/          # Session API
 │   │   │   ├── index.ts      # Route aggregator
@@ -862,13 +891,13 @@ codeflare/
 │   │                         # session-helpers, tutorial-seed.generated, type-guards,
 │   │                         # xml-utils
 │   ├── container/index.ts    # Container DO class
-│   └── __tests__/            # Backend unit tests (64 files)
+│   └── __tests__/            # Backend unit tests (65 files)
 ├── e2e/                      # E2E tests: 11 API files (~49 tests) + 10 UI files (~74 tests, Puppeteer)
 ├── host/
 │   ├── server.js             # Terminal server (node-pty + WebSocket)
 │   ├── activity-tracker.js   # WebSocket disconnect tracking for idle detection
-│   ├── prewarm-config.js     # Agent-aware PTY pre-warm configuration
-│   ├── __tests__/            # Host unit tests (4 files, ~33 tests)
+│   ├── prewarm-config.js     # PTY pre-warm configuration (first-output readiness)
+│   ├── __tests__/            # Host unit tests (5 files)
 │   └── package.json
 ├── web-ui/
 │   └── src/
@@ -908,7 +937,6 @@ codeflare/
 
 | Variable | Purpose | Source |
 |----------|---------|--------|
-| `DEV_MODE` | Enables localhost CORS and debug endpoints (does NOT bypass auth) | wrangler.toml |
 | `SERVICE_TOKEN_EMAIL` | Email for service token auth | Optional |
 | `CLOUDFLARE_API_TOKEN` | R2 bucket creation | Wrangler secret |
 | `R2_ACCESS_KEY_ID` | R2 auth for containers | Wrangler secret |
@@ -940,7 +968,7 @@ codeflare/
 | `TERMINAL_ID` | Unique ID for this terminal instance | Worker -> DO |
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls | Worker -> DO |
 | `MANUAL_TAB` | Set to `1` for user-created tabs to skip autostart | Worker -> DO |
-| `FAST_CLI_START` | Disables auto-update for all 6 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
+| `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
 | `BROWSER` | Points to `open-url` shim that exits 1, forcing CLIs to print OAuth URLs as text | Dockerfile ENV (`/usr/local/bin/open-url`) |
 
@@ -952,7 +980,7 @@ codeflare/
 
 Repository: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `RESEND_API_KEY`
 
-Worker secrets lifecycle: deploy sets `CLOUDFLARE_API_TOKEN`, setup writes `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`, Turnstile keys stored in KV. **R2 credentials are derived from the API token** -- if the token is rotated, setup must be re-run to regenerate R2 credentials.
+Worker secrets lifecycle: deploy sets `CLOUDFLARE_API_TOKEN`, setup writes `R2_ACCESS_KEY_ID`/`R2_SECRET_ACCESS_KEY`, Turnstile keys stored in KV. **Worker-level R2 credentials are derived from the API token** (used for bucket admin operations like create/empty/delete). Per-user scoped R2 tokens are separate — created on first login, independent of the master token but revoked when the API token changes. If the token is rotated, setup must be re-run.
 
 ### CORS
 
@@ -965,7 +993,7 @@ Dynamic: setup wizard adds custom domain + `.workers.dev` to KV. `ALLOWED_ORIGIN
 | Tier | Config | Max Instances | Notes |
 |------|--------|---------------|-------|
 | `low` | `basic` (0.25 vCPU, 1 GiB, 4 GB) | 10 | Sub-1-vCPU workloads |
-| default | 1 vCPU, 3 GiB, 4 GB | 10 | Baseline for node-pty + agent CLIs |
+| default | 1 vCPU, 3 GiB, 6 GB | 10 | Baseline for node-pty + agent CLIs |
 | `high` | 2 vCPU, 6 GiB, 8 GB | 10 | Higher parallelism |
 
 Base image: Node.js 24 Debian (bookworm-slim).
@@ -984,6 +1012,7 @@ Base image: Node.js 24 Debian (bookworm-slim).
 | Access: Apps and Policies | Edit | Yes | Managed Access app |
 | Access: Organizations, Identity Providers, and Groups | Edit | Yes | Access groups + auth_domain |
 | Turnstile | Edit | Only if onboarding active | Turnstile widget |
+| API Tokens | Edit | Yes | Create/revoke per-user scoped R2 tokens |
 
 #### Zone Permissions
 
@@ -1002,8 +1031,8 @@ Six workflows covering deploy, testing, fuzzing, and supply chain security. Addi
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
 | `deploy.yml` | Push to `main` + `workflow_dispatch` (production/integration) | Full pipeline: tests, typecheck, Docker build, Trivy vulnerability scan, wrangler deploy, worker secrets |
-| `test.yml` | Push to `develop` + PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
-| `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - matrix strategy: `api`, `ui-desktop`, `ui-mobile` on `ubuntu-latest` |
+| `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
+| `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop` -> `e2e-ui-mobile` |
 | `codeql.yml` | Push to `main`, PRs to `main`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
 | `fuzz.yml` | Weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
 | `scorecard.yml` | Push to `main`, weekly (Monday 06:00 UTC) + `workflow_dispatch` | OSSF Scorecard security posture assessment, publishes results and uploads SARIF |
@@ -1019,38 +1048,41 @@ Six workflows covering deploy, testing, fuzzing, and supply chain security. Addi
 
 **Secrets (repository-level):**
 
-| Secret | Required | Used by |
-|--------|----------|---------|
-| `CLOUDFLARE_API_TOKEN` | Yes | `deploy.yml`, `e2e.yml` |
-| `CLOUDFLARE_ACCOUNT_ID` | Yes | `deploy.yml`, `e2e.yml` |
-| `RESEND_API_KEY` | Only if `ONBOARDING_LANDING_PAGE=active` | `deploy.yml` |
-| `CF_ACCESS_CLIENT_ID` | For E2E | `deploy.yml`, `e2e.yml` |
-| `CF_ACCESS_CLIENT_SECRET` | For E2E | `deploy.yml`, `e2e.yml` |
+| Secret | Required | Used by | Purpose |
+|--------|----------|---------|---------|
+| `CLOUDFLARE_API_TOKEN` | Yes | `deploy.yml`, `e2e.yml` | Wrangler CLI auth, KV operations, container push, worker deploy, secret management |
+| `CLOUDFLARE_ACCOUNT_ID` | Yes | `deploy.yml`, `e2e.yml` | Identifies the Cloudflare account for all API operations |
+| `RESEND_API_KEY` | Only if `ONBOARDING_LANDING_PAGE=active` | `deploy.yml` | Waitlist notification emails via Resend |
+| `CF_ACCESS_CLIENT_ID` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token ID for E2E auth |
+| `CF_ACCESS_CLIENT_SECRET` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token secret; also used as `SERVICE_AUTH_SECRET` worker secret and KV seeding |
 
 **Variables:**
 
-| Variable | Default | Used by |
-|----------|---------|---------|
-| `CLOUDFLARE_WORKER_NAME` | `codeflare` | `deploy.yml`, `e2e.yml` |
-| `RUNNER` | `ubuntu-latest` | All workflows |
-| `E2E_BASE_URL` | - | `e2e.yml` |
-| `ONBOARDING_LANDING_PAGE` | `inactive` | `deploy.yml` |
-| `RESSOURCE_TIER` | unset (1 vCPU, 3 GiB) | `deploy.yml` |
-| `CLAUDE_UNLEASHED_CACHE_BUSTER` | `inactive` | `deploy.yml` |
-| `MAX_SESSIONS_USER` | `3` | `deploy.yml` |
-| `MAX_SESSIONS_ADMIN` | `10` | `deploy.yml` |
+| Variable | Default | Used by | Purpose | Default source |
+|----------|---------|---------|---------|----------------|
+| `CLOUDFLARE_WORKER_NAME` | `codeflare` | `deploy.yml`, `e2e.yml` | Worker name for deploy and E2E target resolution | Hardcoded fallback in workflow |
+| `RUNNER` | `ubuntu-latest` | All workflows | GitHub Actions runner label (self-hosted support) | Hardcoded fallback in workflow |
+| `E2E_BASE_URL` | - | `e2e.yml` | Base URL of deployed worker for E2E tests | Set per environment |
+| `ONBOARDING_LANDING_PAGE` | `inactive` | `deploy.yml` | Enables public waitlist landing page via `--var` | Hardcoded fallback in workflow |
+| `RESSOURCE_TIER` | unset (1 vCPU, 3 GiB, 6 GB) | `deploy.yml` | Container resource tier (low/default/high) | Defaults to `default` in deploy step |
+| `CLAUDE_UNLEASHED_CACHE_BUSTER` | `inactive` | `deploy.yml` | When `active`, writes `.cache-bust` to invalidate CU Docker layer | Not set by default |
+| `MAX_SESSIONS_USER` | `3` | `deploy.yml` | Per-user session cap passed via `--var` | Omitted if unset (backend default applies) |
+| `MAX_SESSIONS_ADMIN` | `10` | `deploy.yml` | Per-admin session cap passed via `--var` | Omitted if unset (backend default applies) |
 
 ### Deploy Workflow Detail
 
 1. Install dependencies (cached via `actions/cache`)
 2. Build frontend, run backend + frontend tests, typecheck both
 3. Resolve/create KV namespace, patch `wrangler.toml` with KV ID
-4. Apply worker name and container tier from `RESSOURCE_TIER` (low=basic 0.25vCPU, default=1vCPU/3GiB, high=2vCPU/6GiB)
+4. Apply worker name and container tier from `RESSOURCE_TIER` (low=basic 0.25vCPU/1GiB/4GB, default=1vCPU/3GiB/6GB, high=2vCPU/6GiB/8GB)
 5. Optionally generate `.cache-bust` for Claude Unleashed layer
-6. Build Docker image, scan with Trivy (HIGH/CRITICAL severity, `.trivyignore` for exceptions)
-7. Deploy with `npx wrangler deploy` passing `--var` for runtime config
-8. Set worker secrets: `CLOUDFLARE_API_TOKEN`, optional `SERVICE_AUTH_SECRET` (E2E), optional `RESEND_API_KEY` (onboarding)
-9. Seed E2E service user in KV allowlist when `CF_ACCESS_CLIENT_SECRET` is present
+6. Build Docker image locally
+7. Scan with Trivy (HIGH/CRITICAL severity, `.trivyignore` for exceptions)
+8. Push image to Cloudflare registry via `wrangler containers push`, extract registry URI
+9. Patch `wrangler.toml` `image` field to registry URI (skips Docker rebuild on deploy)
+10. Deploy with `npx wrangler deploy` passing `--var` for runtime config
+11. Set worker secrets: `CLOUDFLARE_API_TOKEN`, optional `SERVICE_AUTH_SECRET` (E2E), optional `RESEND_API_KEY`
+12. Seed E2E service user in KV allowlist when `CF_ACCESS_CLIENT_SECRET` is present
 
 ### Test Workflow Detail
 
@@ -1060,9 +1092,11 @@ Two parallel jobs:
 
 ### E2E Workflow Detail
 
-Two-phase execution:
+Sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop` -> `e2e-ui-mobile`:
 1. **setup** job: Sets `SERVICE_AUTH_SECRET` on target worker, seeds E2E service user in KV, smoke-tests auth with retry loop (handles KV eventual consistency ~60s)
-2. **e2e** job (matrix): Runs `api`, `ui-desktop`, `ui-mobile` suites in parallel on `ubuntu-latest`. UI suites install Chrome via `npx puppeteer browsers install chrome` + system shared libraries. Failed runs upload screenshots/HTML as artifacts (5-day retention)
+2. **e2e-api** job (depends on `setup`): Runs API test suite
+3. **e2e-ui-desktop** job (depends on `setup` + `e2e-api`): Runs UI desktop tests. Installs Chrome via `npx puppeteer browsers install chrome` + system shared libraries
+4. **e2e-ui-mobile** job (depends on `setup` + `e2e-ui-desktop`): Runs UI mobile tests with `E2E_MOBILE=1`. Failed runs upload screenshots/HTML as artifacts (5-day retention)
 
 ---
 
@@ -1071,7 +1105,7 @@ Two-phase execution:
 ### 16.1 Backend Tests
 
 **Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` - tests run in real Workers runtime (not Node.js).
-**Count:** 64 test files, ~775 tests.
+**Count:** 65 test files, ~775 tests.
 **Run:** `npm test`
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
@@ -1086,9 +1120,9 @@ Two-phase execution:
 ### 16.3 Host Tests
 
 **Config:** `host/package.json` with Node.js built-in test runner (`node --test`).
-**Count:** 4 test files, ~33 tests.
+**Count:** 5 test files.
 **Run:** `cd host && npm test`
-**Scope:** PTY pre-warm readiness patterns, activity tracker disconnect tracking, WebSocket input classification, server prewarm integration.
+**Scope:** PTY pre-warm readiness (first-output detection), activity tracker disconnect tracking, WebSocket input classification, server prewarm integration, entrypoint sync filter validation.
 
 ### 16.4 Vitest Version Split
 
@@ -1172,15 +1206,23 @@ cd web-ui && npm run build # Frontend production build
 
 ### Per-Container Pricing
 
-| Tier | Specs | Monthly Cost (active) |
-|------|-------|-----------------------|
-| `low` | 0.25 vCPU, 1 GiB, 4 GB | Lower; check CF pricing |
-| `default` | 1 vCPU, 3 GiB, 4 GB | ~$56 (reference) |
-| `high` | 2 vCPU, 6 GiB, 8 GB | Higher; check CF pricing |
+Parameters: 8h/day, 20 days/month = 160h = 576,000s active. Default tier (1 vCPU, 3 GiB, 6 GB). CPU usage: 20% average.
+
+| Resource | Calculation | Free Tier | Billable | Rate | Cost |
+|----------|-------------|-----------|----------|------|------|
+| CPU (active usage) | 0.2 vCPU x 576,000s = 115,200 vCPU-s | 22,500 vCPU-s | 92,700 vCPU-s | $0.000020/vCPU-s | $1.85 |
+| Memory (provisioned) | 3 GiB x 576,000s = 1,728,000 GiB-s | 90,000 GiB-s | 1,638,000 GiB-s | $0.0000025/GiB-s | $4.10 |
+| Disk (provisioned) | 6 GB x 576,000s = 3,456,000 GB-s | 720,000 GB-s | 2,736,000 GB-s | $0.00000007/GB-s | $0.19 |
+| Workers Paid plan | | | | | $5.00 |
+| **Total** | | | | | **~$11.14/user/month** |
+
+Notes:
+- CPU billed on active usage only. Memory + disk billed on provisioned resources.
+- Hibernated containers (after 30m idle) = zero cost
+- R2: First 10 GB free, $0.015/GB/month after
+- Pricing: [Cloudflare Containers Pricing](https://developers.cloudflare.com/containers/pricing/)
 
 Cost scales per ACTIVE SESSION (each session = one container; a session has up to 6 terminal tabs sharing a single container). Idle containers hibernate after `sleepAfter` (30m) of no SDK-proxied requests. Hibernated containers = zero cost.
-
-**R2:** First 10GB free, $0.015/GB/month after. User config typically <100MB.
 
 ---
 
@@ -1204,18 +1246,18 @@ Browser retained stale Access session. Test in incognito. Clear CF Access cookie
 
 ### Container Stuck at "Waiting for Services"
 
-Terminal server not starting (sync blocking). Check: `GET /api/container/sync-log?sessionId=xxx`. Common causes: missing R2 credentials, bucket doesn't exist, network timeout.
+Terminal server not starting (sync blocking). Check: `GET /api/container/startup-status?sessionId=xxx` (inspect `details.syncError` field). Common causes: missing R2 credentials, bucket doesn't exist, network timeout.
 
 ### R2 Sync Issues
 
-- **Bisync empty listing**: On-demand sync uses `--resync` by default, handles this case.
+- **Bisync empty listing**: Initial `establish_bisync_baseline()` uses `--resync` to create the baseline, handles this case. The periodic daemon never uses `--resync` (see AD14).
 - **Transfers 0 files**: Filter order indeterminacy from mixed `--include`/`--exclude`. Use `--filter` flags instead.
 - **Slow sync**: Switch to `SYNC_MODE=metadata` or manually clean large repos from R2.
 - **Missing secrets**: Check `startup-status` response `details.syncError` for the missing variable.
 
 ### Zombie Container
 
-DO alarm loops from `collectMetrics` can persist after `destroy()` since `destroy()` doesn't cancel alarms. However, zombie DOs self-terminate via two mechanisms: (1) `collectMetrics` checks `container.running` and returns early if false, (2) the missing-identifiers guard returns early without re-arming. Zombie DOs are harmless (no container process) but may briefly log debug-level warnings.
+DO alarm loops from `collectMetrics` can persist after `destroy()` since `destroy()` doesn't cancel alarms. However, zombie DOs self-terminate via three mechanisms: (1) `collectMetrics` checks `container.running` and returns early if false, (2) the missing-identifiers guard returns early without re-arming, (3) the re-arm guard checks `container.running` before scheduling the next alarm. Zombie DOs are harmless (no container process) but may briefly log INFO-level log messages.
 
 ### Secrets Lost After Worker Deletion
 
@@ -1223,7 +1265,9 @@ DO alarm loops from `collectMetrics` can persist after `destroy()` since `destro
 
 ### R2 Bucket Cleanup on User Deletion
 
-Non-empty buckets fail to delete silently. Manual R2 cleanup may be needed.
+`DELETE /api/users/:email` and `POST /configure` (stale user removal during reconfiguration) both call `cleanupUserData()` in `src/lib/user-cleanup.ts`, which: destroys all active containers, deletes the user KV entry and bucket-keyed KV entries (`storage-stats:`, `presets:`, `user-prefs:`), deletes the scoped R2 token, empties the R2 bucket via S3 `ListObjectsV2` + `DeleteObjects` loop (using worker-level R2 credentials via `createR2Client` + `emptyR2Bucket`), and deletes the empty bucket via Cloudflare API with retry logic (up to 3 attempts with exponential backoff for R2 eventual consistency when objects were deleted).
+
+If worker-level R2 credentials are not configured (e.g., setup was interrupted), the emptying step is skipped and bucket deletion may fail with `BucketNotEmpty`. This logs `logger.warn` server-side but does not block the overall cleanup. During reconfiguration, stale user cleanup is wrapped in a `runStep('cleanup_stale_users')` call for NDJSON progress visibility in the setup wizard frontend.
 
 ### Chrome in CI (Ubuntu 22.04)
 
@@ -1264,7 +1308,7 @@ sudo apt-get install -yqq --no-install-recommends \
 
 ```bash
 curl -H "CF-Access-Client-Id: <id>" -H "CF-Access-Client-Secret: <secret>" \
-  https://codeflare.example.com/api/container/state?sessionId=abc12345
+  https://codeflare.example.com/api/container/startup-status?sessionId=abc12345
 ```
 
 ### Verify Secrets
@@ -1279,12 +1323,6 @@ wrangler secret list
 ```bash
 wrangler tail --service codeflare
 wrangler tail --service codeflare --level error
-```
-
-### Debug Environment Variables (DEV_MODE)
-
-```bash
-curl .../api/container/debug?sessionId=abc12345  # Returns masked env vars
 ```
 
 ---
@@ -1326,7 +1364,7 @@ CORS origin matching uses `matchesPattern()` with domain-boundary enforcement (n
 - `ALLOWED_ORIGINS` is configurable per deployment -- operators can restrict to exact origins
 - Cloudflare Access JWT validation is the primary auth gate, not CORS
 
-**Mitigation**: Setup adds the specific worker subdomain to KV-based dynamic origins. Operators deploying to custom domains should set `ALLOWED_ORIGINS` to their exact domain.
+**Mitigation**: Setup adds `.workers.dev` suffix and `.{customDomain}` suffix to `setup:allowed_origins` in KV. Any `*.workers.dev` subdomain passes the CORS check. Operators deploying to custom domains should set `ALLOWED_ORIGINS` to their exact domain.
 
 **Future consideration**: Restricting credentialed CORS to exact known hosts (rather than suffix patterns) would tighten the trust surface. This is a low-risk hardening improvement.
 
@@ -1344,6 +1382,29 @@ The setup completion lock uses a KV read-then-write pattern: read `setup:complet
 
 **Future consideration**: Moving the setup lock to a Durable Object would provide strict serialization. The blast radius of changing setup plumbing is non-trivial, so this is deferred until there's evidence of the race occurring in practice.
 
+#### AD13: Per-user scoped R2 tokens
+
+Each container gets an R2 API token scoped to its user's bucket only, replacing the previous shared credential model. Token lifecycle:
+
+1. **Creation**: On first container start, `getOrCreateScopedR2Token()` calls `POST /accounts/{accountId}/tokens` with an Object Read + Write policy restricted to the user's bucket name
+2. **Caching**: Token data (ID, access key, secret key) cached in KV as `r2token:{email}` — survives container restarts without re-creating
+3. **Delivery**: Passed to container via `setBucketName` body → container env vars → rclone config
+4. **Revocation**: `deleteScopedR2Token()` calls `DELETE /accounts/{accountId}/tokens/{tokenId}` on user deletion
+
+**Trade-off**: Requires `API Tokens: Edit` permission on the deploy token, which is a broader permission than ideal. Accepted because the alternative (manual R2 credential management per user) is operationally impractical.
+
+#### AD14: Never auto-`--resync` on bisync failure
+
+`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses any pending deletions — if side A deleted a file and bisync fails before propagating, `--resync` resurrects the file from side B.
+
+**Instead**: Use `--resilient` + `--recover` for self-healing:
+- `--resilient` allows bisync to continue past non-critical errors (e.g., listing mismatches)
+- `--recover` automatically reconstructs corrupted listing files without losing deletion state
+- `--max-delete 100` allows bulk workspace deletions to propagate (the rclone default of 50% aborts bisync when more than half the files are deleted in one cycle)
+- The sync daemon retries in 60s on any failure
+
+**Manual `--resync`** is still available via `establish_bisync_baseline()` on container startup, where it is safe because the one-way restore (`rclone sync`) runs first to populate the local filesystem.
+
 ---
 
 ## 22. Lessons Learned
@@ -1352,7 +1413,7 @@ Architectural principles and design rationale.
 
 1. **rclone bisync > s3fs FUSE** - FUSE mounts are fragile and slow. Periodic bisync with local disk is faster and more reliable.
 2. **Newest file wins** - Simple conflict resolution for single-user scenarios.
-3. **Auto-resync on failure** - Automatic `--resync` recovery handles most bisync failures.
+3. **Resilient bisync over auto-resync** - `--resilient` + `--recover` handle transient failures without losing deletion tracking. `--resync` is only used for initial baseline establishment (see AD14).
 4. **SDK-managed lifecycle with heartbeat** - `sleepAfter` with `collectMetrics` heartbeat keeps containers alive during active WS use. The heartbeat compensates for WS frames bypassing `renewActivityTimeout()`.
 5. **`onStop()` must set KV status** - SDK hibernation fires `onStop()` which must write `status: 'stopped'` to KV, otherwise other devices see stale 'running' status.
 6. **`destroy()` must clear identifiers before `super.destroy()`** - `onStop()` fires asynchronously after `super.destroy()`. Without clearing identifiers first, `onStop()` resuscitates deleted sessions in KV via read-modify-write.
@@ -1362,6 +1423,9 @@ Architectural principles and design rationale.
 10. **Downgrade verbose heartbeat logs to debug** - Per-cycle keepalive logs at `info` level generate enormous log volume (every 5s per container). Once keepalive is confirmed stable, downgrade to `debug`.
 11. **Stateless dashboard polling preserves hibernation** - Dashboard status endpoints must be pure KV reads with zero DO contact. Touching DOs resets `sleepAfter` on every poll, preventing containers from ever hibernating.
 12. **Polling interval should match push cadence** - Frontend poll frequency should equal the backend push cycle. Polling faster wastes requests since data doesn't change between pushes.
+13. **rclone version upgrades can break bisync** - The Alpine → Debian migration changed rclone v1.68 → v1.73, introducing stricter MD5 post-transfer verification that aborts on files modified during sync ("corrupted on transfer"). Fix: `--ignore-checksum` on all bisync commands. Pin rclone version in Dockerfile to prevent future surprise breakage. Additionally, `--max-delete 100` is required on all bisync commands — the default 50% threshold aborts syncs when bulk deletions (e.g., deleting a workspace folder) remove more than half the tracked files. **Warning**: `--resync` should never be used as an automatic recovery mechanism — it destroys bisync's deletion tracking (see AD14).
+14. **Never auto-`--resync` on bisync failure** - `--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses any pending deletions — if side A deleted a file and bisync fails before propagating, `--resync` resurrects the file from side B. Use `--resilient` + `--recover` for self-healing: `--resilient` allows bisync to continue past non-critical errors, and `--recover` automatically reconstructs corrupted listing files without losing state. Manual `--resync` is still available via `establish_bisync_baseline()` on container startup (one-way restore runs first, so no data loss).
+15. **Never `docker system prune` in CI deploy workflows** - `docker system prune -af` in the deploy workflow nukes the Docker layer cache on self-hosted runners, causing every subsequent build to pull all layers from scratch. This triggers Docker Hub 429 rate limit errors when base images need re-downloading. Let Docker manage its own cache; only prune manually if disk space is critical.
 
 ---
 

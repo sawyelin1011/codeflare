@@ -52,15 +52,19 @@ vi.mock('../../components/SessionLimitPopup', () => ({
 vi.mock('../../stores/session', () => {
   let _isAtLimit = false;
   let _maxSessions = 3;
+  let _r2Ready = true;
   return {
     sessionStore: {
       get sessions() { return []; },
       get maxSessions() { return _maxSessions; },
+      get r2Ready() { return _r2Ready; },
       isAtSessionLimit: () => _isAtLimit,
+      startR2Polling: vi.fn(),
       _setTestLimit: (atLimit: boolean, max?: number) => {
         _isAtLimit = atLimit;
         if (max !== undefined) _maxSessions = max;
       },
+      _setR2Ready: (ready: boolean) => { _r2Ready = ready; },
     },
   };
 });
@@ -356,4 +360,46 @@ describe('Dashboard', () => {
     // Reset
     (sessionStore as any)._setTestLimit(false);
   });
+
+  // === R2 Readiness Tests ===
+
+  it('should disable New Session button when r2Ready is false', () => {
+    (sessionStore as any)._setR2Ready(false);
+    render(() => <Dashboard {...defaultProps} />);
+
+    const btn = screen.getByTestId('dashboard-new-session');
+    expect(btn).toBeDisabled();
+
+    // Reset
+    (sessionStore as any)._setR2Ready(true);
+  });
+
+  it('should enable New Session button when r2Ready is true', () => {
+    (sessionStore as any)._setR2Ready(true);
+    (sessionStore as any)._setTestLimit(false);
+    render(() => <Dashboard {...defaultProps} />);
+
+    const btn = screen.getByTestId('dashboard-new-session');
+    expect(btn).not.toBeDisabled();
+  });
+
+  it('should show storage skeleton when r2Ready is false', () => {
+    (sessionStore as any)._setR2Ready(false);
+    render(() => <Dashboard {...defaultProps} />);
+
+    expect(screen.getByTestId('storage-skeleton')).toBeInTheDocument();
+    expect(screen.queryByTestId('storage-browser')).not.toBeInTheDocument();
+
+    // Reset
+    (sessionStore as any)._setR2Ready(true);
+  });
+
+  it('should show StorageBrowser when r2Ready is true', () => {
+    (sessionStore as any)._setR2Ready(true);
+    render(() => <Dashboard {...defaultProps} />);
+
+    expect(screen.getByTestId('storage-browser')).toBeInTheDocument();
+    expect(screen.queryByTestId('storage-skeleton')).not.toBeInTheDocument();
+  });
+
 });

@@ -23,10 +23,18 @@ describe('Container Lifecycle API', () => {
     }
   }, TIMEOUTS.CONTAINER_STARTUP);
 
-  it('POST /api/container/start returns success', async () => {
+  // Container start implicitly tests scoped R2 credentials flow:
+  // The start endpoint now calls getOrCreateScopedR2Token() which provisions
+  // per-user bucket-scoped R2 API tokens before passing them to setBucketName.
+  // If scoped token creation fails, container start will return 500.
+  it('POST /api/container/start returns success (implicitly tests scoped R2 creds)', async () => {
     const res = await apiRequest(`/api/container/start?sessionId=${sessionId}`, {
       method: 'POST',
     });
+    if (!res.ok) {
+      const errorBody = await res.text();
+      console.error(`Container start failed: HTTP ${res.status} ${errorBody.slice(0, 500)}`);
+    }
     expect(res.ok).toBe(true);
     const data = await res.json();
     expect(data.success).toBe(true);
@@ -77,6 +85,10 @@ describe('Container Lifecycle API', () => {
     const res = await apiRequest(`/api/container/start?sessionId=${sessionId}`, {
       method: 'POST',
     });
+    if (!res.ok) {
+      const errorBody = await res.text();
+      console.error(`Container start (idempotent) failed: HTTP ${res.status} ${errorBody.slice(0, 500)}`);
+    }
     expect(res.ok).toBe(true);
     const data = await res.json();
     expect(data.success).toBe(true);
