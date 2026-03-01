@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context, type Next } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../../types';
 import { ValidationError, toError } from '../../lib/error-types';
@@ -21,7 +21,7 @@ const ConfigureBodySchema = z.object({
   customDomain: z
     .string()
     .min(1, 'customDomain is required')
-    .regex(/^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/, 'customDomain must be a valid domain (e.g. claude.example.com)'),
+    .regex(/^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/, 'customDomain must be a valid domain (e.g. claude.example.com)'),
   allowedUsers: z
     .array(z.string().email('Each allowedUsers entry must be a valid email'))
     .min(1, 'allowedUsers must not be empty'),
@@ -40,52 +40,36 @@ const ConfigureBodySchema = z.object({
 const app = new Hono<{ Bindings: Env; Variables: AuthVariables }>();
 
 /**
- * Conditional auth middleware for /detect-token:
+ * Conditional auth middleware factory for setup routes (FIX-11).
  * - First-time setup (setup:complete not set): public access (bootstrap)
  * - After setup complete: require admin auth via CF Access
  */
-app.use('/detect-token', async (c, next) => {
-  const isComplete = await c.env.KV.get('setup:complete');
-  if (isComplete === 'true') {
-    return authMiddleware(c, async () => requireAdmin(c, next));
-  }
-  return next();
-});
+function createConditionalSetupAuth() {
+  return async (c: Context<{ Bindings: Env; Variables: AuthVariables }>, next: Next) => {
+    const isComplete = await c.env.KV.get('setup:complete');
+    if (isComplete === 'true') {
+      return authMiddleware(c, async () => requireAdmin(c, next));
+    }
+    return next();
+  };
+}
 
-/**
- * Conditional auth middleware for /prefill:
- * - First-time setup (setup:complete not set): public access (bootstrap)
- * - After setup complete: require admin auth via CF Access
- */
-app.use('/prefill', async (c, next) => {
-  const isComplete = await c.env.KV.get('setup:complete');
-  if (isComplete === 'true') {
-    return authMiddleware(c, async () => requireAdmin(c, next));
-  }
-  return next();
-});
+// Apply conditional auth and rate limiting to setup routes
+app.use('/detect-token', createConditionalSetupAuth());
+app.use('/detect-token', setupRateLimiter);
+app.use('/prefill', createConditionalSetupAuth());
+app.use('/prefill', setupRateLimiter);
 
 // Register simple endpoint handlers (status, detect-token, prefill)
 app.route('/', handlers);
 
-/**
- * Conditional auth middleware for /configure:
- * - First-time setup (setup:complete not set): public access (bootstrap)
- * - After setup complete: require admin auth via CF Access
- */
-app.use('/configure', async (c, next) => {
-  const isComplete = await c.env.KV.get('setup:complete');
-  if (isComplete === 'true') {
-    return authMiddleware(c, async () => requireAdmin(c, next));
-  }
-  return next();
-});
+app.use('/configure', createConditionalSetupAuth());
 
 /**
  * POST /api/setup/configure
  * Main setup endpoint - configures everything using extracted step handlers
  *
- * Body: { customDomain: string, allowedUsers: string[], allowedOrigins?: string[] }
+ * Body: { customDomain: string, allowedUsers: string[], adminUsers: string[], allowedOrigins?: string[] }
  * Token is read from env (CLOUDFLARE_API_TOKEN), not from request body.
  */
 app.use('/configure', setupRateLimiter);

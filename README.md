@@ -176,15 +176,7 @@ All optional. The defaults work out of the box. I respect your time.
 
 ## Testing
 
-~2,200+ tests across five layers:
-
-| Layer | Tests | Framework |
-|-------|-------|-----------|
-| Backend | ~775 (65 files) | Vitest v3 + `@cloudflare/vitest-pool-workers` |
-| Frontend | ~1,288 (64 files) | Vitest v4 + jsdom 28 + SolidJS Testing Library |
-| Host | ~33 (5 files) | Node.js test runner |
-| E2E API | ~49 (11 files) | Vitest + plain fetch |
-| E2E UI | ~74 (10 files, desktop + mobile) | Vitest + Puppeteer |
+See `TECHNICAL.md` Section 16 for test suite details, counts, and configuration.
 
 ```bash
 npm test                           # Backend tests
@@ -209,14 +201,14 @@ Six GitHub Actions workflows:
 | `e2e.yml` | Manual | E2E matrix: API, UI desktop, UI mobile |
 | `codeql.yml` | Push, PRs, weekly | CodeQL static analysis |
 | `scorecard.yml` | Push to `main`, weekly, manual | OSSF Scorecard |
-| `fuzz.yml` | Weekly / manual | Property-based fuzzing (fast-check) |
+| `fuzz.yml` | PRs, weekly, manual | Property-based fuzzing (fast-check) |
 
 See `TECHNICAL.md` Section 15 for full CI/CD documentation.
 
 ## Docs
 
 - `TECHNICAL.md` - deep dive into architecture, container lifecycle, and sync model
-- `tutorials/Getting Started.md` - what you can do and why you should want to. Tabs, tiling, API keys, file persistence, and three paths forward depending on how much hand-holding you need.
+- `tutorials/Getting Started.md` - what you can do and why you should want to. Tabs, tiling, file persistence, and three paths forward depending on how much hand-holding you need.
 - `tutorials/Examples/` - spec-driven project examples from Hello World to full blog platform. Hand one to your agent and go do something more interesting.
 
 <details>

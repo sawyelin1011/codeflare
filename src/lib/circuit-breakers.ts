@@ -1,31 +1,95 @@
 import { CircuitBreaker } from './circuit-breaker';
 
-/**
- * Circuit breaker for container health checks (singleton).
- */
-export const containerHealthCB = new CircuitBreaker('container-health', {
-  failureThreshold: 5,
-  resetTimeoutMs: 30000,
-  halfOpenMaxAttempts: 2,
-});
+/** TTL for per-container breaker entries: 5 minutes of inactivity. */
+export const CONTAINER_BREAKER_TTL_MS = 5 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Per-container circuit breaker maps (FIX-2)
+// Each container gets its own breaker instance, lazily created on first access.
+// ---------------------------------------------------------------------------
+interface BreakerEntry {
+  breaker: CircuitBreaker;
+  lastAccessedAt: number;
+}
+
+const containerHealthMap = new Map<string, BreakerEntry>();
+const containerInternalMap = new Map<string, BreakerEntry>();
+const containerSessionsMap = new Map<string, BreakerEntry>();
+
+function getOrCreateBreaker(
+  map: Map<string, BreakerEntry>,
+  containerId: string,
+  namePrefix: string,
+  options: { failureThreshold: number; resetTimeoutMs: number; halfOpenMaxAttempts?: number },
+): CircuitBreaker {
+  const existing = map.get(containerId);
+  if (existing) {
+    existing.lastAccessedAt = Date.now();
+    return existing.breaker;
+  }
+  const breaker = new CircuitBreaker(`${namePrefix}:${containerId}`, options);
+  map.set(containerId, { breaker, lastAccessedAt: Date.now() });
+  return breaker;
+}
 
 /**
- * Circuit breaker for internal container operations
- * Used for setBucketName, getBucketName, and other internal endpoints
+ * Get a per-container circuit breaker for health checks.
  */
-export const containerInternalCB = new CircuitBreaker('container-internal', {
-  failureThreshold: 3,
-  resetTimeoutMs: 15000,
-});
+export function getContainerHealthCB(containerId: string): CircuitBreaker {
+  return getOrCreateBreaker(containerHealthMap, containerId, 'container-health', {
+    failureThreshold: 5,
+    resetTimeoutMs: 30000,
+    halfOpenMaxAttempts: 2,
+  });
+}
 
 /**
- * Circuit breaker for container session operations
- * Used for /sessions endpoint and session-related operations
+ * Get a per-container circuit breaker for internal container operations.
  */
-export const containerSessionsCB = new CircuitBreaker('container-sessions', {
-  failureThreshold: 5,
-  resetTimeoutMs: 30000,
-});
+export function getContainerInternalCB(containerId: string): CircuitBreaker {
+  return getOrCreateBreaker(containerInternalMap, containerId, 'container-internal', {
+    failureThreshold: 3,
+    resetTimeoutMs: 15000,
+  });
+}
+
+/**
+ * Get a per-container circuit breaker for session operations.
+ */
+export function getContainerSessionsCB(containerId: string): CircuitBreaker {
+  return getOrCreateBreaker(containerSessionsMap, containerId, 'container-sessions', {
+    failureThreshold: 5,
+    resetTimeoutMs: 30000,
+  });
+}
+
+/**
+ * Evict breaker entries that haven't been accessed within the TTL.
+ */
+export function cleanupStaleBreakers(): void {
+  const now = Date.now();
+  for (const map of [containerHealthMap, containerInternalMap, containerSessionsMap]) {
+    for (const [id, entry] of map) {
+      if (now - entry.lastAccessedAt > CONTAINER_BREAKER_TTL_MS) {
+        map.delete(id);
+      }
+    }
+  }
+}
+
+/**
+ * Clear all per-container breaker maps. Used in tests.
+ */
+export function resetContainerBreakers(): void {
+  containerHealthMap.clear();
+  containerInternalMap.clear();
+  containerSessionsMap.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Module-level singleton circuit breakers (non-container-scoped)
+// These are for R2 admin and CF API calls, which are not per-container.
+// ---------------------------------------------------------------------------
 
 /**
  * Circuit breaker for R2 admin API calls

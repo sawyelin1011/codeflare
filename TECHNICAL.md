@@ -74,7 +74,7 @@ if (wsRouteResult.isWebSocketRoute) {
 
 **CORS:** Checks static patterns from `env.ALLOWED_ORIGINS` + dynamic origins from KV (cached in memory). Uses `matchesPattern()` with domain-boundary enforcement (dot-prefixed = suffix match, bare domains = exact or subdomain with dot boundary).
 
-**Route Registration:** `/api/user`, `/api/users`, `/api/container`, `/api/sessions`, `/api/terminal`, `/api/setup`, `/api/storage`, `/api/presets`, `/api/preferences`, `/public`
+**Route Registration:** `/health`, `/api/user`, `/api/users`, `/api/container`, `/api/sessions`, `/api/terminal`, `/api/setup`, `/api/storage`, `/api/presets`, `/api/preferences`, `/public`
 
 **Workers Assets Routing Guardrails (`wrangler.toml`):**
 
@@ -104,12 +104,12 @@ flowchart TD
     IDs -->|No| Exit2["Early return, no re-arm<br/>(zombie DO detected)"]
     IDs -->|Yes| FetchAct["Fetch /activity<br/>from container"]
     FetchAct --> WSClients{"Active WS clients?"}
-    WSClients -->|Yes| Renew["renewTimeout(sleepAfter)<br/>(keepalive)"]
+    WSClients -->|Yes| Renew["renewActivityTimeout()<br/>(keepalive)"]
     WSClients -->|No| NoRenew["Don't renew<br/>(let container idle to sleepAfter)"]
     Renew --> FetchHealth["Fetch /health<br/>from container"]
     NoRenew --> FetchHealth
     FetchHealth --> WriteKV["Write metrics to KV"]
-    WriteKV --> ReArm["Re-arm setTimeout<br/>(collectMetrics, 5000)<br/>(unconditional if container.running)"]
+    WriteKV --> ReArm["schedule(5, 'collectMetrics')<br/>(unconditional if container.running)"]
 
 ```
 
@@ -165,7 +165,7 @@ Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads syn
 
 Key files: `App.tsx` (root), `Terminal.tsx` (xterm.js), `TerminalTabs.tsx`, `Layout.tsx` (orchestrates dashboard/terminal views, manages WS disconnect/reconnect lifecycle), `SessionStatCard.tsx` (dashboard card with three-color status dot and metrics), `StorageBrowser.tsx` (R2 browser with toolbar), `StoragePanel.tsx` (slide-in drawer), `SettingsPanel.tsx`, `Dashboard.tsx`, `OnboardingLanding.tsx`, `KittScanner.tsx`.
 
-Stores: `terminal.ts` (WebSocket state, compound key `sessionId:terminalId`, scheduled disconnect/reconnect), `session.ts` (CRUD, `terminalsPerSession`, `stopSession()` sets `'stopping'` and polls, `refreshSessionStatuses()` for lightweight dashboard polling — also updates storage stats from batch-status via `updateStatsFromBatch()`), `storage.ts` (R2 operations), `setup.ts`.
+Stores: `terminal.ts` (WebSocket state, compound key `sessionId:terminalId`, scheduled disconnect/reconnect), `terminal-url-detection.ts` (URL detection signals for floating buttons), `terminal-layout.ts` (terminal layout state), `session.ts` (CRUD, `terminalsPerSession`, `stopSession()` sets `'stopping'` and polls, `refreshSessionStatuses()` for lightweight dashboard polling — also updates storage stats from batch-status via `updateStatsFromBatch()`), `storage.ts` (R2 operations), `setup.ts`, `tiling.ts` (tiled terminal layout), `session-presets.ts` (preset/bookmark management), `session-tabs.ts` (tab configuration).
 
 #### Dashboard WS Disconnect Flow
 
@@ -472,9 +472,9 @@ All bisync commands use `--ignore-checksum` to skip post-transfer MD5 verificati
 |------|---------------|----------|
 | `none` | Excluded entirely | Default. Settings and config only. |
 | `full` | Entire `workspace/` (minus `node_modules/`) | Persistent storage across stop/resume |
-| `metadata` | Only agent config files (`.claude/`) per repo | Lightweight project context sync |
+| `metadata` | Only agent config files (`.claude/` and `CLAUDE.md`) per repo | Lightweight project context sync |
 
-All modes always exclude: `.bashrc`, `.bash_profile`, `.npm/**`, `.bun/**`, `.cache/**`, `.config/rclone/**`, `**/node_modules/**`, `.local/share/claude/**`, `.copilot/logs/**`, `.copilot/pkg/**`, `.codex/sessions/**`, `.claude/cache/**`, `.claude/debug/**`, `.claude/file-history/**`, `.claude/plugins/cache/**`, `.claude/session-env/**`, `.claude/shell-snapshots/**`, `.claude/stats-cache.json`, `.claude.json.backup.*`, `.codex/log/**`, `.codex/models_cache.json`, `.codex/.personality_migration`, `.codex/shell_snapshots/**`, `.codex/tmp/**`, `.codex/version.json`, `.gemini/tmp/**`, `.local/share/opencode/log/**`, `.local/share/opencode/opencode.db-shm`, `.local/share/opencode/opencode.db-wal`. All rclone commands use `--filter` flags (NOT `--include`/`--exclude`).
+All modes always exclude: `.bashrc`, `.bash_profile`, `.npm/**`, `.bun/**`, `.cache/**`, `.config/rclone/**`, `**/node_modules/**`, `.local/share/claude/**`, `.copilot/logs/**`, `.copilot/pkg/**`, `.copilot/session-state/**`, `.codex/sessions/**`, `.codex/state*.sqlite-shm`, `.codex/state*.sqlite-wal`, `.claude/cache/**`, `.claude/debug/**`, `.claude/file-history/**`, `.claude/plugins/cache/**`, `.claude/plugins/marketplaces/**/.git/**`, `.claude/session-env/**`, `.claude/shell-snapshots/**`, `.claude/stats-cache.json`, `.claude.json.backup.*`, `.codex/log/**`, `.codex/models_cache.json`, `.codex/.personality_migration`, `.codex/shell_snapshots/**`, `.codex/tmp/**`, `.codex/version.json`, `.gemini/tmp/**`, `.local/share/opencode/log/**`, `.local/share/opencode/opencode.db-shm`, `.local/share/opencode/opencode.db-wal`. All rclone commands use `--filter` flags (NOT `--include`/`--exclude`).
 
 **Note:** The `metadata` mode is defined in `entrypoint.sh` but the Container DO currently only maps `workspaceSyncEnabled` to `full` or `none`. The `metadata` mode can be used by setting `SYNC_MODE` directly in the container environment.
 
@@ -484,7 +484,7 @@ Newest file wins (`--conflict-resolve newer`). `--resilient` + `--recover` handl
 
 **Bisync exit code handling:** `bisync_with_r2()` uses a temp file approach instead of `| tee` to capture both output and exit code. Piping through `tee` swallows the rclone exit code (the pipe's exit code is `tee`'s, not rclone's), masking bisync failures and breaking error detection in the daemon loop.
 
-**Bisync-initialized flag on timeout:** The bisync-initialized flag (`/tmp/bisync-initialized`) is now touched on the sync timeout path as well. Previously, if initial sync timed out, the flag was never set, causing the shutdown trap to skip the final bisync — losing any files created during the session.
+**Bisync-initialized flag on timeout:** The bisync-initialized flag (`/tmp/.bisync-initialized`) is now touched on the sync timeout path as well. Previously, if initial sync timed out, the flag was never set, causing the shutdown trap to skip the final bisync — losing any files created during the session.
 
 ---
 
@@ -547,7 +547,7 @@ Cloudflare Access protects all authenticated surfaces (see Section 6 for Access 
 
 The `CLOUDFLARE_API_TOKEN` never enters the container. It stays in the Worker/DO environment (GitHub Secrets -> Worker secrets). Containers only receive R2 credentials (scoped key pair), never the master API token.
 
-**Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `lifecycle.ts`, which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
+**Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `r2-admin.ts` (called from `lifecycle.ts`), which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
 
 ### Container Auth Token
 
@@ -587,13 +587,27 @@ Applied to every response in `src/index.ts`:
 - `Referrer-Policy: strict-origin-when-cross-origin`
 - `Permissions-Policy`
 
+HSTS is also applied to all redirect responses via `secureRedirect()` helper, including root redirect and CORS preflight redirects, ensuring browsers upgrade to HTTPS even on redirect hops.
+
+### Session ID Validation
+
+`SESSION_ID_PATTERN` (`/^[a-z0-9]{8,24}$/`) is enforced on terminal WebSocket upgrade and container lifecycle endpoints (`terminal.ts`, `container/lifecycle.ts`). Invalid session IDs are rejected with 400 before any DO interaction, preventing malformed IDs from creating orphaned Durable Objects.
+
 ### Body Limit
 
 64 KiB on all `/api/*` routes (storage routes exempt for file uploads).
 
 ### Rate Limiting
 
-Per-user rate limiting via KV (`src/middleware/rate-limit.ts`). Uses `bucketName` from auth as the rate limit key, with IP fallback for unauthenticated requests. Configurable window and max per route. Adds `X-RateLimit-Limit`, `X-RateLimit-Remaining` response headers.
+Per-user rate limiting via KV (`src/middleware/rate-limit.ts`). Uses `bucketName` from auth as the rate limit key, with IP fallback for unauthenticated requests. Configurable window and max per route. Adds `X-RateLimit-Limit`, `X-RateLimit-Remaining` response headers. All setup routes (`/detect-token`, `/prefill`, `/configure`) are rate-limited.
+
+### Content-Disposition Hardening
+
+File download responses use `Content-Disposition: attachment` with sanitized filenames. Special characters are stripped and filenames are truncated to prevent header injection.
+
+### Input Validation (atob)
+
+Base64-encoded inputs are validated with try/catch around `atob()`. Invalid base64 returns 400 immediately rather than propagating decode errors.
 
 ### WebSocket Rate Limit
 
@@ -670,7 +684,7 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| WS | `/api/terminal/:sessionId-:terminalId/ws` | Terminal WebSocket |
+| WS | `/api/terminal/:compoundId/ws` | Terminal WebSocket (compoundId format: `sessionId-terminalId`) |
 | GET | `/api/terminal/:sessionId/status` | Connection status |
 
 ### User Management
@@ -723,7 +737,7 @@ GET `/api/presets`, POST `/api/presets`, PATCH `/api/presets/:id` (rename), DELE
 
 GET `/api/preferences`, PATCH `/api/preferences`
 
-`UserPreferences` fields: `samsungAddressBarTop` (boolean), `clipboardAccess` (boolean), `fastStartEnabled` (boolean, default: `true`). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
+`UserPreferences` fields: `lastAgentType` (AgentType, optional — last selected agent), `lastPresetId` (string, optional — last used preset), `workspaceSyncEnabled` (boolean, optional — workspace sync toggle), `fastStartEnabled` (boolean, default: `true` — fast CLI start toggle). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
 
 ### Public (Onboarding)
 
@@ -816,7 +830,7 @@ When enabled, `entrypoint.sh` disables auto-update checks for all 5 AI tools, el
 
 **Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
 
-When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the env vars it conditionally sets (`CLAUDE_UNLEASHED_NO_UPDATE`, `CLAUDE_UNLEASHED_CHANNEL`, `OPENCODE_DISABLE_AUTOUPDATE`, `DISABLE_INSTALLATION_CHECKS`) and skips writing config files, allowing all tools to check for updates normally.
+When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`CLAUDE_UNLEASHED_NO_UPDATE`, `CLAUDE_UNLEASHED_CHANNEL`, `DISABLE_INSTALLATION_CHECKS`) and the entrypoint-level `OPENCODE_DISABLE_AUTOUPDATE`, and skips writing config files and setting `COPILOT_AUTO_UPDATE`, allowing all tools to check for updates normally.
 
 ---
 
@@ -883,17 +897,19 @@ codeflare/
 │   │   └── users.ts          # User management
 │   ├── middleware/            # auth.ts, rate-limit.ts
 │   ├── lib/                  # access, access-policy, agent-config, cache-reset, cf-api,
-│   │                         # circuit-breaker, circuit-breakers, constants, container-helpers,
+│   │                         # circuit-breaker, circuit-breakers (per-container CB via
+│   │                         #   getContainerXxxCB(containerId) — no more global singletons),
+│   │                         # constants, container-helpers,
 │   │                         # cors-cache, error-types, jwt, kv-keys, logger, onboarding,
 │   │                         # r2-admin, r2-client, r2-config, r2-seed, schemas,
 │   │                         # session-helpers, tutorial-seed.generated, type-guards,
-│   │                         # xml-utils
+│   │                         # user-cleanup, xml-utils
 │   │                         #   escapeXml() — sanitizes user input for XML/HTML interpolation
 │   │                         #   decodeXmlEntities() — decodes &amp; &lt; etc. from R2 S3 API responses
 │   │                         #   FIX-39 audit trail in file header tracks all interpolation sites
 │   ├── container/index.ts    # Container DO class
-│   └── __tests__/            # Backend unit tests (65 files)
-├── e2e/                      # E2E tests: 11 API files (~49 tests) + 10 UI files (~74 tests, Puppeteer)
+│   └── __tests__/            # Backend unit tests (68 files, ~996 tests)
+├── e2e/                      # E2E tests: 12 API files (~55 tests) + 10 UI files (~75 tests, Puppeteer)
 ├── host/
 │   ├── server.js             # HTTP/WS server, auth, routing, prewarm, signal handlers (~496 lines)
 │   ├── session.js            # Session class — PTY management, tab lifecycle (~312 lines)
@@ -901,17 +917,18 @@ codeflare/
 │   ├── metrics.js            # System metrics collection (disk usage, sync status) (~74 lines)
 │   ├── activity-tracker.js   # WebSocket disconnect tracking for idle detection
 │   ├── prewarm-config.js     # PTY pre-warm configuration (first-output readiness)
-│   ├── __tests__/            # Host unit tests (5 files)
+│   ├── __tests__/            # Host unit tests (8 files: prewarm, activity tracker, WS input, server prewarm integration, entrypoint sync filter, server security, host fixes, fuzz)
+│   ├── knip.json             # Dead code detection config for host package
 │   └── package.json
 ├── web-ui/
 │   └── src/
 │       ├── components/       # SolidJS components (Terminal, Layout, SessionCard, StorageBrowser, etc.)
-│       ├── stores/           # terminal.ts, session.ts, storage.ts, setup.ts, tiling.ts, session-presets.ts, session-tabs.ts
+│       ├── stores/           # terminal.ts, terminal-layout.ts, terminal-url-detection.ts, session.ts, storage.ts, setup.ts, tiling.ts, session-presets.ts, session-tabs.ts, preferences.ts, r2-readiness.ts
 │       ├── api/              # client.ts, fetch-helper.ts, storage.ts
 │       ├── hooks/            # useTerminal.ts, useStageTimings.ts
-│       ├── lib/              # constants, schemas, terminal-config, terminal-link-provider, settings, format, mobile, + others
+│       ├── lib/              # constants, schemas, terminal-config, terminal-link-provider, xterm-internals, settings, format, mobile, + others
 │       ├── styles/           # CSS (design tokens, animations, component styles)
-│       └── __tests__/        # Frontend unit tests (64 files)
+│       └── __tests__/        # Frontend unit tests (68 files)
 ├── .oxlintrc.json            # oxlint configuration (root + web-ui)
 ├── scripts/                  # generate-tutorial-seed.mjs, fix-broken-sourcemaps.js
 ├── tutorials/                # Tutorial content (Getting Started, Examples, etc.)
@@ -957,9 +974,10 @@ codeflare/
 | `TURNSTILE_SECRET_KEY` | Optional direct Turnstile secret override | Optional |
 | `RESEND_API_KEY` | Waitlist notification emails | Optional |
 | `WAITLIST_FROM_EMAIL` | Sender identity for waitlist | Optional |
-| `CLOUDFLARE_WORKER_NAME` | Worker name override for forks | GitHub Actions variable |
+| `CLOUDFLARE_WORKER_NAME` | Worker name override for forks (set at deploy time via `--var`, also used at runtime by worker code) | GitHub Actions variable / Worker runtime env |
 | `MAX_SESSIONS_USER` | Per-user session cap (default: 3) | wrangler.toml |
 | `MAX_SESSIONS_ADMIN` | Per-admin session cap (default: 10) | wrangler.toml |
+| `SERVICE_AUTH_SECRET` | Worker secret for E2E/CLI service auth (`X-Service-Auth` header) | Worker secret (optional) |
 
 ### Container Environment
 
@@ -970,10 +988,10 @@ codeflare/
 | `R2_ACCOUNT_ID` / `R2_ENDPOINT` | rclone endpoint | Worker -> DO or `getR2Config()` fallback |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 compatibility | Mirrors R2 keys |
 | `TERMINAL_PORT` | Always 8080 | Hardcoded |
-| `SYNC_MODE` | Sync strategy (`none` or `full`) -- see Section 5 | Worker -> DO |
+| `SYNC_MODE` | Sync strategy (`none`, `full`, or `metadata`) -- see Section 5 | Worker -> DO |
 | `WORKSPACE_SYNC_ENABLED` | Whether workspace sync is enabled (`'true'`/`'false'`). Drives `SYNC_MODE` value. | Worker via `setBucketName` |
 | `TAB_CONFIG` | JSON array of terminal tab configurations | Worker -> DO |
-| `TERMINAL_ID` | Unique ID for this terminal instance | Worker -> DO |
+| `TERMINAL_ID` | Unique ID for this terminal instance | Host terminal server (`session.js`) |
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls | Worker -> DO |
 | `MANUAL_TAB` | Set to `1` for user-created tabs to skip autostart | Worker -> DO |
 | `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
@@ -1039,7 +1057,7 @@ Six workflows covering deploy, testing, fuzzing, and supply chain security. Addi
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
 | `deploy.yml` | Push to `main` + `workflow_dispatch` (production/integration) | Full pipeline: tests, typecheck, Docker build, Trivy vulnerability scan, wrangler deploy, worker secrets |
-| `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, `npm audit`, dependency review |
+| `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, dead code check (knip), `npm audit`, dependency review |
 | `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop` -> `e2e-ui-mobile` |
 | `codeql.yml` | Push to `main`, PRs to `main`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
 | `fuzz.yml` | PRs to `main`, weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
@@ -1095,7 +1113,7 @@ Six workflows covering deploy, testing, fuzzing, and supply chain security. Addi
 ### Test Workflow Detail
 
 Two parallel jobs:
-- **test**: Lint (oxlint), build frontend, run backend + frontend tests, typecheck both, `npm audit --audit-level=high` for backend and frontend
+- **test**: Lint (oxlint), build frontend, run backend + frontend tests, typecheck both, dead code check (knip), `npm audit --audit-level=high` for backend and frontend
 - **dependency-review**: Runs `actions/dependency-review-action` on PRs - blocks merging if new dependencies introduce known vulnerabilities
 
 ### E2E Workflow Detail
@@ -1113,7 +1131,7 @@ Sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop`
 ### 16.1 Backend Tests
 
 **Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` - tests run in real Workers runtime (not Node.js).
-**Count:** 65 test files, ~775 tests.
+**Count:** 68 test files, ~996 tests.
 **Run:** `npm test`
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
@@ -1121,16 +1139,16 @@ Sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop`
 ### 16.2 Frontend Tests
 
 **Config:** `web-ui/vitest.config.ts` with jsdom + `@solidjs/testing-library`.
-**Count:** 64 test files, ~1,288 tests.
+**Count:** 68 test files, ~1,324 tests.
 **Run:** `cd web-ui && npm test`
 **Key patterns:** SolidJS stores use getter-based exports. Test by re-importing module after `vi.resetModules()`. Use `render()` from `@solidjs/testing-library` for component tests.
 
 ### 16.3 Host Tests
 
 **Config:** `host/package.json` with Node.js built-in test runner (`node --test`).
-**Count:** 5 test files.
+**Count:** 8 test files, ~71 tests.
 **Run:** `cd host && npm test`
-**Scope:** PTY pre-warm readiness (first-output detection), activity tracker disconnect tracking, WebSocket input classification, server prewarm integration, entrypoint sync filter validation.
+**Scope:** PTY pre-warm readiness (first-output detection), activity tracker disconnect tracking, WebSocket input classification, server prewarm integration, entrypoint sync filter validation, server security, host module extraction, host fuzz tests.
 
 ### 16.4 Property-Based Fuzz Tests
 
@@ -1157,7 +1175,7 @@ Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/`
 
 ### 16.6 E2E API Tests
 
-**Dir:** `e2e/api/` - 11 test files, ~49 tests.
+**Dir:** `e2e/api/` - 12 test files, ~55 tests.
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:api`
 **Pattern:** Plain `fetch` via `apiRequest()` helper from `e2e/setup.ts`. No Puppeteer. Authenticates via `X-Service-Auth` header matching `SERVICE_AUTH_SECRET` worker secret.
 
@@ -1165,10 +1183,10 @@ Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, 
 
 ### 16.7 E2E UI Tests
 
-**Dir:** `e2e/ui/` - 10 test files, ~74 tests (run as desktop + mobile).
+**Dir:** `e2e/ui/` - 10 test files, ~75 tests (run as desktop + mobile).
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:ui`
 **Mobile:** `E2E_MOBILE=1 E2E_BASE_URL=... npm run test:e2e:ui`
-**Pattern:** Puppeteer + Vitest. Each suite creates a fresh page. Desktop viewport: 1366x768. Mobile viewport: 375x812 (iPhone-like).
+**Pattern:** Puppeteer + Vitest. Each suite creates a fresh page. Desktop viewport: 1280x720. Mobile viewport: 390x844 (iPhone-like).
 
 Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-panel`, `storage`, `terminal-tabs`, `tiling`, `bookmarks`, `error-states`, `mobile-specific`.
 
@@ -1176,9 +1194,9 @@ Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-pan
 
 - **CF Access auth:** E2E API tests use `X-Service-Auth` header. UI tests use `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers via `setExtraHTTPHeaders`. CF Access intercepts browser navigation with login page - UI tests work around this by intercepting requests.
 - **KV eventual consistency:** New KV entries take ~60s to propagate. E2E setup job includes retry loops with 15s waits. Test helpers use `waitForFunction` with generous timeouts.
-- **CSS disable:** UI tests inject `document.querySelectorAll('style, link[rel=stylesheet]').forEach(el => el.remove())` to disable CSS for reliable element positioning in headless Chrome.
-- **Screenshot artifacts:** Failed UI tests capture screenshots to `/tmp/e2e-*.png`. CI uploads these as artifacts with 5-day retention.
-- **Suite prefix isolation:** Each E2E suite prefixes its test sessions/presets with a unique identifier (e.g., `e2e-api-`, `e2e-ui-`) to avoid cross-suite interference when running in parallel.
+- **CSS disable:** UI tests inject a `<style>` element via `evaluateOnNewDocument` that sets `transition: none !important; animation: none !important; scroll-behavior: auto !important` on all elements (`*, *::before, *::after`), disabling CSS transitions and animations for reliable element positioning in headless Chrome.
+- **Screenshot artifacts:** Failed UI tests capture screenshots and HTML dumps to `e2e-artifacts/`. CI uploads these as artifacts with 5-day retention.
+- **Suite prefix isolation:** Each E2E suite prefixes its test sessions/presets with a unique identifier driven by the `E2E_SUITE` env var (default: `'default'`) to avoid cross-suite interference when running in parallel.
 
 ### 16.9 E2E Service Token Setup
 
@@ -1205,7 +1223,7 @@ E2E_MOBILE=1 npm run test:e2e:ui  # UI mobile tests only
 
 **Rule:** When modifying UI components or API routes, review and update corresponding E2E tests.
 
-- **Source -> test mapping:** See the mapping table in CLAUDE.md for which source files correspond to which E2E test files.
+- **Source -> test mapping:** Each source module has a corresponding E2E test file. Key mappings: `src/routes/session/` -> `e2e/api/sessions.test.ts`, `src/routes/storage/` -> `e2e/api/storage.test.ts`, `src/routes/setup/` -> `e2e/api/setup-status.test.ts`, `web-ui/.../Dashboard.tsx` -> `e2e/ui/dashboard.test.ts`. Run `grep -r 'data-testid' e2e/` to find all referenced test IDs.
 - **`data-testid` verification:** Every `data-testid` referenced in E2E tests must exist in the web-ui source. Grep to verify before committing.
 - **Cleanup:** `afterAll` hooks handle test cleanup. If tests fail mid-run, manually restore: `npx wrangler kv key put "setup:complete" "true" --namespace-id <id> --remote`
 
@@ -1349,8 +1367,8 @@ wrangler secret list
 ### Monitor Logs
 
 ```bash
-wrangler tail --service codeflare
-wrangler tail --service codeflare --level error
+wrangler tail codeflare
+wrangler tail codeflare --status error
 ```
 
 ---
@@ -1364,7 +1382,7 @@ wrangler tail --service codeflare --level error
 | AD3 | Per-user R2 buckets | <details><summary>Bucket name derived from email, auto-created on first login</summary><br>Isolation boundary: each user's files live in their own bucket. Simplifies deletion (empty + delete bucket). Bucket name sanitized from email (max 63 chars, S3-compatible). Per-user scoped R2 tokens (AD13) further restrict access.</details> |
 | AD4 | Periodic rclone bisync | <details><summary>Background daemon every 60s + final sync on shutdown</summary><br>Local disk for all file operations (fast I/O). Bisync daemon runs in background, syncing changes bidirectionally. SIGINT/SIGTERM trap runs final bisync before exit. Alternative (s3fs FUSE) was fragile and slow - see Lessons Learned #1.</details> |
 | AD5 | Login shell autostart | <details><summary><code>.bashrc</code> auto-starts the configured agent in workspace</summary><br>PTY spawns `bash -l` (login shell). `.bashrc` reads `TAB_CONFIG` env var and launches the configured agent. `MANUAL_TAB=1` env var skips autostart for user-created tabs.</details> |
-| AD6 | KV read-modify-write races | <details><summary>Last-writer-wins is acceptable</summary><br>Session PATCH/stop overlap is rare, rate limit off-by-one is minor, `lastAccessedAt` is best-effort. KV doesn't support atomic read-modify-write. Durable Objects would add latency for negligible consistency gain in this use case.</details> |
+| AD6 | KV read-modify-write races | <details><summary>Last-writer-wins is acceptable; collectMetrics race mitigated</summary><br>Session PATCH/stop overlap is rare, rate limit off-by-one is minor, `lastAccessedAt` is best-effort. KV doesn't support atomic read-modify-write. Durable Objects would add latency for negligible consistency gain in this use case.<br><br>`collectMetrics` KV read-modify-write can revert session status. Mitigated: session status changes are only observed from the Dashboard, not during active terminal use. Sessions are never interrupted while in Terminal view.</details> |
 | AD7 | Pre-setup public endpoints | <details><summary>Short exposure window is acceptable risk</summary><br>Setup runs once during initial deploy. Pre-setup auth trusts spoofable email header - bootstrap problem (can't require CF Access auth when CF Access isn't configured yet). Mitigated by rate limiting and short exposure window. See AD10 for full trade-off analysis.</details> |
 | AD8 | Root container, no internal auth | <details><summary>Network isolation via DO proxy is sufficient</summary><br>Root needed for rclone mount. Container auth token (random UUID per DO lifecycle) validates all proxied requests. Network boundary: only the DO can reach the container's port 8080. Wildcard CORS inside container is safe - it's internal-only.</details> |
 | AD9 | RESSOURCE_TIER spelling | <details><summary>French/German "ressource" is intentional</summary><br>Consistent across all config (wrangler.toml, GitHub variables, TypeScript types). Changing would be a breaking API change affecting deployed instances. The spelling is a deliberate nod to the developer's language background.</details> |
@@ -1373,6 +1391,17 @@ wrangler tail --service codeflare --level error
 | AD12 | KV-based setup lock (non-atomic) | <details><summary>Read-then-write pattern, acceptable for one-time setup</summary><br>Read `setup:complete`, check if false, perform setup, write true. Not atomic - two simultaneous requests could both proceed.<br><br>**Trade-off**: Accepted because setup is a one-time operation by a single admin. Each sub-step (CF API calls) is individually idempotent - duplicate execution produces the same result. Worst case is redundant API calls, not corrupted state.<br><br>**Future**: Moving to a Durable Object would provide strict serialization, deferred until there's evidence of the race occurring.</details> |
 | AD13 | Per-user scoped R2 tokens | <details><summary>Each container gets an R2 token scoped to its user's bucket only</summary><br>Replaces previous shared credential model. Token lifecycle:<br>1. **Creation**: `getOrCreateScopedR2Token()` creates token with Object Read+Write policy restricted to user's bucket<br>2. **Caching**: Token data cached in KV as `r2token:{email}` - survives container restarts<br>3. **Delivery**: Passed via `setBucketName` body -> container env vars -> rclone config<br>4. **Revocation**: `deleteScopedR2Token()` on user deletion<br><br>**Trade-off**: Requires `API Tokens: Edit` permission on deploy token (broader than ideal). Accepted because manual R2 credential management per user is operationally impractical.</details> |
 | AD14 | Never auto-resync on bisync failure | <details><summary><code>--resilient</code> + <code>--recover</code> for self-healing instead</summary><br>`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses pending deletions - if side A deleted a file and bisync fails before propagating, `--resync` resurrects it from side B.<br><br>**Instead**: `--resilient` (continue past non-critical errors) + `--recover` (reconstruct corrupted listings) + `--max-delete 100` (allow bulk deletions). Daemon retries in 60s on any failure.<br><br>**Manual `--resync`** is safe in `establish_bisync_baseline()` on container startup because one-way restore runs first.</details> |
+| AD15 | TabConfigSchema allows arbitrary command strings | <details><summary><code>z.string().max(200)</code> — no additional security risk</summary><br>Users already have full root shell access inside their own ephemeral container. Restricting tab commands provides no additional security benefit since the container is their sandbox.</details> |
+| AD16 | entrypoint.sh ~680 lines complexity | <details><summary>Battle-tested, rewrite risk > benefit</summary><br>Handles Alpine→Debian migration, PTY pre-warm, rclone sync orchestration, tab autostart, and graceful shutdown. Accumulated complexity reflects real-world edge cases discovered over months of production use. A rewrite risks reintroducing solved bugs for marginal readability gains.</details> |
+| AD17 | collectMetrics density | <details><summary>Extends AD6 scope — alarm() context needs atomicity</summary><br>`collectMetrics` performs activity checking, health probing, and KV status updates in a single alarm callback. Splitting into separate alarms would require coordination logic more complex than the current monolithic approach. The alarm() context provides natural atomicity across these tightly coupled operations.</details> |
+| AD18 | WebGL `any` types in webgl-utils.ts | <details><summary>No standard TS definitions for WebGL extensions</summary><br>Extensions like `OES_texture_half_float`, `WEBGL_lose_context`, etc. have no official TypeScript definitions. The `any` casts are isolated to this single utility file and the WebGL API surface is stable. Adding custom type definitions would be maintenance burden with no runtime benefit.</details> |
+| AD19 | splash-cursor-logic.ts `as any` casts | <details><summary>Creative-coding adapted code with no upstream TS types</summary><br>Pointer tracking objects and WebGL shader uniforms in this creative-coding module have no typed definitions upstream. The code is adapted from a visual effect library. Type assertions are confined to this isolated module.</details> |
+| AD20 | TOCTOU in container/lifecycle.ts | <details><summary>Durable Objects are single-threaded per ID — false positive</summary><br>Static analysis flags time-of-check-time-of-use patterns between KV reads and subsequent writes. However, Durable Objects guarantee that `alarm()` and `fetch()` handlers are serialized by the runtime — no concurrent execution within a single DO instance. The TOCTOU pattern is architecturally impossible here.</details> |
+| AD21 | Inconsistent function signatures | <details><summary>Old helpers use positional args, new ones use options objects</summary><br>Legacy helper functions accept positional parameters while newer ones use destructured options objects. Normalizing all signatures risks caller regressions across the codebase. The inconsistency is cosmetic — both styles are well-typed and documented.</details> |
+| AD22 | JWKS 30s cache staleness | <details><summary>Industry-standard tradeoff for key rotation</summary><br>The 30-second JWKS cache in `jwt.ts` means a rotated key might not be recognized for up to 30s. This is an industry-standard tradeoff — Cloudflare Access uses key overlap periods during rotation, and shorter cache durations add latency to every JWT verification without meaningful security improvement.</details> |
+| AD23 | CORS origin pattern validation | <details><summary>Admin is trusted — has full worker access</summary><br>Admin-configured CORS origin patterns stored in KV are not re-validated on every request read. The admin already has full worker access (can deploy code, modify secrets). Validating every KV-sourced pattern adds request overhead for zero additional security.</details> |
+| AD24 | Predictable session IDs ([a-z0-9]{8,24}) | <details><summary>Session IDs are namespace keys, not secrets</summary><br>Session IDs are user-provided identifiers for KV namespacing, not authentication tokens. Security is JWT-based — knowing a session ID without a valid JWT grants zero access. The `SESSION_ID_PATTERN` validates format, not entropy. Randomizing IDs would break user-friendly naming.</details> |
+| AD25 | E2E service email hardcoded | <details><summary><code>e2e-service@codeflare.local</code> is a test identifier</summary><br>The `.local` TLD is RFC 6762 reserved and obviously non-production. The email is a test fixture seeded into KV for E2E authentication, not a secret. Extracting it to an environment variable adds configuration complexity for zero security benefit.</details> |
 
 ---
 

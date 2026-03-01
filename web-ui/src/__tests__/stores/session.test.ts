@@ -45,6 +45,8 @@ vi.mock('../../api/client', () => ({
   deletePreset: vi.fn(),
   getPreferences: vi.fn().mockResolvedValue({}),
   updatePreferences: vi.fn().mockResolvedValue({}),
+  getR2Status: vi.fn().mockResolvedValue({ ready: false }),
+  ensureR2Token: vi.fn().mockResolvedValue({ ready: false }),
 }));
 
 // Import after mocks
@@ -384,9 +386,9 @@ describe('Session Store', () => {
 
     it('should set status to stopping immediately then stopped after polling', async () => {
       mockStopSession.mockResolvedValue(undefined);
-      // First poll returns 'stopping', second returns 'stopped'
+      // First poll returns 'running' (still shutting down), second returns 'stopped'
       mockGetBatchSessionStatus
-        .mockResolvedValueOnce({ statuses: { 'session-1': { status: 'stopping' as any, ptyActive: false } }, maxSessions: 3 })
+        .mockResolvedValueOnce({ statuses: { 'session-1': { status: 'running', ptyActive: false } }, maxSessions: 3 })
         .mockResolvedValueOnce({ statuses: { 'session-1': { status: 'stopped', ptyActive: false } }, maxSessions: 3 });
 
       const stopPromise = sessionStore.stopSession('session-1');
@@ -1200,6 +1202,22 @@ describe('Session Store', () => {
 
       expect(sessionMetrics['session-1'].bucketName).toBe('my-bucket');
       expect(sessionMetrics['session-1'].cpu).toBe('50%');
+    });
+  });
+
+  describe('loadSessions batch status error handling', () => {
+    it('should log error and set error state when getBatchSessionStatus fails', async () => {
+      mockGetSessions.mockResolvedValue([
+        { id: 'session-1', name: 'Test', createdAt: new Date().toISOString(), lastAccessedAt: new Date().toISOString() },
+      ]);
+      mockGetBatchSessionStatus.mockRejectedValue(new Error('Batch status network error'));
+
+      await sessionStore.loadSessions();
+
+      // Sessions should still load (graceful degradation)
+      expect(sessionStore.sessions.length).toBe(1);
+      // Error state should be set
+      expect(sessionStore.error).toBe('Batch status network error');
     });
   });
 

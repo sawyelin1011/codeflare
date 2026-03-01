@@ -1,17 +1,18 @@
 /**
  * Session lifecycle routes
- * Handles start/stop/status endpoints for session containers
+ * Handles stop, status, and batch-status endpoints for session containers
  */
 import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
 import type { DurableObjectStub } from '@cloudflare/workers-types';
 import type { Env, Session } from '../../types';
 import { getSessionKey, getSessionPrefix, listAllKvKeys, getSessionOrThrow } from '../../lib/kv-keys';
-import { getMaxSessions } from '../../lib/constants';
+import { getMaxSessions, SESSION_ID_PATTERN } from '../../lib/constants';
 import { AuthVariables } from '../../middleware/auth';
 import { getContainerId, safeCheckContainerHealth } from '../../lib/container-helpers';
-import { containerSessionsCB } from '../../lib/circuit-breakers';
+import { getContainerSessionsCB } from '../../lib/circuit-breakers';
 import { toApiSession } from '../../lib/session-helpers';
+import { ValidationError } from '../../lib/error-types';
 
 /**
  * Check container health and PTY status for a session.
@@ -19,9 +20,10 @@ import { toApiSession } from '../../lib/session-helpers';
  */
 async function getContainerSessionStatus(
   container: DurableObjectStub,
-  sessionId: string
+  sessionId: string,
+  containerId: string
 ): Promise<{ status: string; ptyActive: boolean; terminalSessions: { id: string; [key: string]: unknown }[] }> {
-  const healthResult = await safeCheckContainerHealth(container);
+  const healthResult = await safeCheckContainerHealth(container, containerId);
 
   if (!healthResult.healthy) {
     return { status: 'stopped', ptyActive: false, terminalSessions: [] };
@@ -29,7 +31,7 @@ async function getContainerSessionStatus(
 
   let terminalSessions: { id: string; [key: string]: unknown }[] = [];
   try {
-    const sessionsRes = await containerSessionsCB.execute(() =>
+    const sessionsRes = await getContainerSessionsCB(containerId).execute(() =>
       container.fetch(
         new Request('http://container/sessions', { method: 'GET' })
       )
@@ -100,13 +102,15 @@ app.get('/batch-status', async (c) => {
 
 /**
  * POST /api/sessions/:id/stop
- * Stop a session (kills the PTY but keeps the container alive for restart)
- * Note: The container will naturally go to sleep after inactivity.
- * Use DELETE to fully destroy the container and remove the session.
+ * Stop a session and destroy its container.
+ * Use DELETE to fully remove the session from KV.
  */
 app.post('/:id/stop', async (c) => {
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
+  if (!SESSION_ID_PATTERN.test(sessionId)) {
+    throw new ValidationError('Invalid sessionId format');
+  }
   const key = getSessionKey(bucketName, sessionId);
 
   const session = await getSessionOrThrow(c.env.KV, key);
@@ -133,6 +137,9 @@ app.post('/:id/stop', async (c) => {
 app.get('/:id/status', async (c) => {
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
+  if (!SESSION_ID_PATTERN.test(sessionId)) {
+    throw new ValidationError('Invalid sessionId format');
+  }
   const key = getSessionKey(bucketName, sessionId);
 
   const session = await getSessionOrThrow(c.env.KV, key);
@@ -154,7 +161,7 @@ app.get('/:id/status', async (c) => {
   try {
     const containerId = getContainerId(bucketName, sessionId);
     const container = getContainer(c.env.CONTAINER, containerId);
-    result = await getContainerSessionStatus(container, sessionId);
+    result = await getContainerSessionStatus(container, sessionId, containerId);
   } catch {
     // Container check failed - defaults to stopped
   }

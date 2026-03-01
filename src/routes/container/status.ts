@@ -1,6 +1,6 @@
 /**
  * Container status routes
- * Handles GET /health, /state, /startup-status
+ * Handles GET /health, /startup-status
  */
 import { Hono } from 'hono';
 import type { Env } from '../../types';
@@ -9,10 +9,9 @@ import { AuthVariables } from '../../middleware/auth';
 import { ContainerError, toError, toErrorMessage } from '../../lib/error-types';
 import {
   containerLogger,
-  containerHealthCB,
-  containerSessionsCB,
   fetchWithTimeout,
 } from './shared';
+import { getContainerHealthCB, getContainerSessionsCB } from '../../lib/circuit-breakers';
 
 /** Copy cpu/mem/hdd metrics from health data into the response details object */
 function populateMetrics(
@@ -108,7 +107,7 @@ app.get('/health', async (c) => {
   try {
     const { containerId, container } = getContainerContext(c);
 
-    const healthResult = await safeCheckContainerHealth(container);
+    const healthResult = await safeCheckContainerHealth(container, containerId);
 
     if (!healthResult.healthy) {
       reqLogger.error('Container health check failed', new Error(healthResult.error || 'Unknown error'), { containerId });
@@ -137,7 +136,7 @@ app.get('/health', async (c) => {
  * Stage progression:
  * 1. stopped (0%) - Container not running
  * 2. starting (10-20%) - Container state is running/healthy but services not ready
- * 3. syncing (30-60%) - Health server responding, R2 sync in progress
+ * 3. syncing (30-45%) - Health server responding, R2 sync in progress
  * 4. verifying (80-85%) - Sync complete, terminal server starting
  * 5. mounting (90%) - Terminal server ready, PTY pre-warming in progress
  * 6. ready (100%) - All services ready
@@ -221,7 +220,7 @@ app.get('/startup-status', async (c) => {
     // Returns sync status from /tmp/sync-status.json and system metrics (cpu/mem/hdd)
     const healthRequest = new Request('http://container/health', { method: 'GET' });
     const healthRes = await fetchWithTimeout(() =>
-      containerHealthCB.execute(() => container.fetch(healthRequest))
+      getContainerHealthCB(containerId).execute(() => container.fetch(healthRequest))
     );
 
     // Parse health data if available (includes sync status and system metrics)
@@ -258,7 +257,7 @@ app.get('/startup-status', async (c) => {
     //   responding → container is fully ready, sync is just a background data operation
     const sessionsRequest = new Request('http://container/sessions', { method: 'GET' });
     const sessionsRes = await fetchWithTimeout(() =>
-      containerSessionsCB.execute(() => container.fetch(sessionsRequest))
+      getContainerSessionsCB(containerId).execute(() => container.fetch(sessionsRequest))
     );
     const terminalServerReady = sessionsRes != null && sessionsRes.ok;
 

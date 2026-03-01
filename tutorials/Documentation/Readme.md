@@ -18,7 +18,7 @@ Codeflare isn't tied to any single AI provider. Each session lets you choose whi
 
 | Agent | Description |
 |-------|-------------|
-| [Claude Code](https://github.com/nikolanovoselec/claude-unleashed) | Anthropic's Claude Code with root permission bypass (uses claude-unleashed under the hood) |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Anthropic's agentic coding tool running directly in the terminal |
 | Codex | OpenAI's Codex CLI agent |
 | Gemini | Google's Gemini CLI agent |
 | [GitHub Copilot](https://docs.github.com/en/copilot) | GitHub's AI coding agent |
@@ -32,7 +32,7 @@ All six are first-class citizens. Pick the one that fits your task, or use Bash 
 - **Browser-native terminal with 6 tabs per session.** Full Linux containers with root access, available in seconds from any browser. No local installation required.
 - **One isolated container per session.** No shared state between sessions. Agents can't escape their sandbox (I checked).
 - **Pre-warmed terminals.** The agent starts loading during container startup. By the time you click Open, it's ready - not staring at a blank screen wondering if something broke.
-- **Persistent R2 storage with bisync every 60s.** Files, shell config, and credentials survive container teardown. Set your API key once. It's there forever.
+- **Persistent R2 storage with bisync every 60s.** Files, shell config, and credentials survive container teardown.
 - **Terminal tiling.** View 2-4 terminals side by side. Once you tile, you don't go back.
 - **R2 file browser.** Browse, upload, download, and manage files directly from the dashboard - without starting a container.
 - **User management.** Email-based allowlists and role-based permissions (admin and user). Invite users or revoke them when they get too creative.
