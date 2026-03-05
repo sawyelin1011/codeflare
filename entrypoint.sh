@@ -109,6 +109,7 @@ secret_access_key = PLACEHOLDER_SECRET_KEY
 endpoint = PLACEHOLDER_ENDPOINT
 acl = private
 no_check_bucket = true
+disable_checksum = true
 RCLONE_EOF
     # Validate credentials before sed substitution (delimiter is |, so | in values would break it)
     if echo "$R2_ACCESS_KEY_ID" | grep -qE '[|]'; then
@@ -676,6 +677,71 @@ BASHRC_FOOTER
 }
 
 # ============================================================================
+# Memory file merge/cleanup for persistent memory across sessions
+# ============================================================================
+merge_memory_files() {
+    local MEMORY_DIR="$USER_HOME/.memory"
+    local SESSION_FILE="$MEMORY_DIR/session-${SESSION_ID}.jsonl"
+    mkdir -p "$MEMORY_DIR"
+
+    local FILES=()
+    while IFS= read -r -d '' f; do FILES+=("$f"); done \
+        < <(find "$MEMORY_DIR" -name "session-*.jsonl" -type f -print0 2>/dev/null)
+
+    if [ ${#FILES[@]} -eq 0 ]; then
+        echo "[entrypoint] No memory files to merge"; return 0
+    fi
+    if [ ${#FILES[@]} -eq 1 ] && [ "${FILES[0]}" = "$SESSION_FILE" ]; then
+        echo "[entrypoint] Single memory file already matches current session"; return 0
+    fi
+
+    echo "[entrypoint] Merging ${#FILES[@]} memory files into $SESSION_FILE"
+    cat "${FILES[@]}" | node -e "
+        const lines = require('fs').readFileSync('/dev/stdin','utf8').split('\n').filter(l=>l.trim());
+        const entities = new Map(); const relations = new Set();
+        for (const line of lines) {
+            try {
+                const item = JSON.parse(line);
+                if (item.type === 'entity') {
+                    const existing = entities.get(item.name);
+                    if (existing) {
+                        const obs = new Set([...existing.observations, ...item.observations]);
+                        existing.observations = [...obs];
+                    } else { entities.set(item.name, {...item}); }
+                } else if (item.type === 'relation') { relations.add(JSON.stringify(item)); }
+            } catch {}
+        }
+        const out = [...entities.values(), ...[...relations].map(r=>JSON.parse(r))];
+        console.log(out.map(o=>JSON.stringify(o)).join('\n'));
+    " > "$SESSION_FILE.tmp"
+    mv "$SESSION_FILE.tmp" "$SESSION_FILE"
+    # Old session files are NOT deleted here — cleanup_old_memory_files() runs
+    # after bisync baseline so deletions propagate correctly to R2.
+    # Direct R2 deletion is unsafe: concurrent sessions would lose their active file
+    # when bisync propagates the deletion to the other container.
+    echo "[entrypoint] Memory merge complete (old files kept for bisync baseline)"
+}
+
+cleanup_old_memory_files() {
+    local MEMORY_DIR="$USER_HOME/.memory"
+    local KEEP=10
+    local count=0
+
+    # Keep the 10 newest session files (by mtime), delete the rest.
+    # 10 >= MAX_SESSIONS_ADMIN, so no active session's file is ever deleted.
+    # Bisync propagates local deletions to R2 on the next cycle.
+    while IFS= read -r f; do
+        rm -f "$f"
+        count=$((count + 1))
+    done < <(find "$MEMORY_DIR" -name "session-*.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2-)
+
+    if [ $count -gt 0 ]; then
+        echo "[entrypoint] Cleaned up $count old memory files (kept $KEEP newest)"
+    fi
+}
+
+# ============================================================================
 # MAIN EXECUTION
 # ============================================================================
 
@@ -718,6 +784,12 @@ else
     update_sync_status "skipped" "$SYNC_ERROR"
 fi
 
+# Merge memory files from previous sessions (after R2 sync pulls them down)
+# Old files kept — cleanup happens after bisync baseline (Phase 2)
+if [ -n "${SESSION_ID:-}" ]; then
+    merge_memory_files
+fi
+
 # Pre-accept Claude Code's bypass permissions consent
 # Claude Code stores this in ~/.claude.json (bypassPermissionsModeAccepted field)
 # This prevents the interactive "WARNING: Claude Code running in Bypass Permissions mode" prompt
@@ -732,6 +804,28 @@ else
     echo '{"bypassPermissionsModeAccepted":true}' > "$USER_CLAUDE_JSON"
 fi
 echo "[entrypoint] Claude Code bypass permissions consent pre-accepted"
+
+# Configure memory MCP server for Claude Code
+# MCP servers are configured in ~/.claude.json (not ~/.claude/settings.json)
+# See: https://code.claude.com/docs/en/mcp — "User and local scope: ~/.claude.json"
+if [ -n "${SESSION_ID:-}" ]; then
+    MEMORY_MCP_CONFIG="{\"mcpServers\":{\"memory\":{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-memory\"],\"env\":{\"MEMORY_FILE_PATH\":\"${USER_HOME}/.memory/session-${SESSION_ID}.jsonl\"}}}}"
+    if [ -f "$USER_CLAUDE_JSON" ]; then
+        # Recursive merge — preserves ALL existing config (bypass consent, other MCP servers, etc.)
+        # jq `*` merges objects recursively: only mcpServers.memory is added/updated
+        TMP_JSON=$(mktemp)
+        if jq --argjson mcp "$MEMORY_MCP_CONFIG" '. * $mcp' "$USER_CLAUDE_JSON" > "$TMP_JSON" 2>/dev/null; then
+            mv "$TMP_JSON" "$USER_CLAUDE_JSON"
+        else
+            # jq failed (malformed JSON?) — do NOT overwrite, skip instead
+            echo "[entrypoint] WARNING: Could not merge memory MCP config (malformed .claude.json?)"
+            rm -f "$TMP_JSON"
+        fi
+    else
+        echo "$MEMORY_MCP_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
+    fi
+    echo "[entrypoint] Memory MCP server configured for Claude Code"
+fi
 
 # === Fast Start: tool-specific config files ===
 if [ "${FAST_CLI_START:-true}" != "false" ]; then
@@ -761,6 +855,10 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
     (
         echo "[entrypoint] Establishing bisync baseline in background..."
         if establish_bisync_baseline; then
+            # Cleanup old memory files AFTER baseline — bisync will propagate deletions to R2
+            if [ -n "${SESSION_ID:-}" ]; then
+                cleanup_old_memory_files
+            fi
             echo "[entrypoint] Bisync baseline established, starting daemon..."
             start_sync_daemon
         else
