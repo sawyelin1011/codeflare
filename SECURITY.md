@@ -45,6 +45,7 @@ Every response from the worker includes the following security headers:
 - **KV-backed per-user rate limiting** on API endpoints via `src/middleware/rate-limit.ts`.
 - **WebSocket connection rate limiting:** `WS_RATE_LIMIT_WINDOW_MS = 60,000` with `WS_RATE_LIMIT_MAX_CONNECTIONS = 30` per window.
 - **Session caps:** `MAX_SESSIONS_USER = 3` (default), `MAX_SESSIONS_ADMIN = 10` (default). Configurable via worker variables.
+- **Stress test bypass:** When `STRESS_TEST_MODE` is set to `"active"`, all rate limits (HTTP and WebSocket) are bypassed. This variable is **only set on the integration worker** for k6 load testing. Production workers must never have this variable set. The bypass requires the exact string `"active"` — no other value disables rate limiting.
 
 ### Input Validation
 
@@ -108,9 +109,31 @@ Enabled at the repository level (Settings > Code security and analysis):
 - **Static origins:** Configured via `ALLOWED_ORIGINS` worker variable (comma-separated patterns).
 - **Dynamic origins:** Additional origins loaded from KV (`cors-cache.ts`), refreshed on cache miss.
 - **Pattern matching:** Dot-prefixed patterns enable suffix matching (e.g., `.workers.dev`). Non-prefixed patterns require exact match.
+- **`.workers.dev` wildcard:** The app allows any `*.workers.dev` origin by design. This is required because the initial setup flow runs on a `*.workers.dev` URL before a custom domain is configured, and the setup wizard persists `.workers.dev` to KV as an allowed origin. `matchesPattern()` enforces domain boundaries so `evil-workers.dev` does not match. The CF Access JWT cookie defaults to `SameSite=Lax`, which blocks cross-origin credentialed `fetch()` requests. This is an accepted design tradeoff documented in Architecture Decisions (AD11).
 
 ### WebSocket Security
 
 - **Route validation:** WebSocket upgrade requests are validated against allowed routes before Hono routing (workerd bug workaround).
 - **Auth on connect:** WebSocket connections go through the same CF Access auth middleware as HTTP requests.
 - **Container-scoped tokens:** WebSocket traffic proxied to containers includes the DO-scoped `Authorization: Bearer` token.
+
+### Automated Penetration Testing
+
+A weekly CI workflow (`pentest.yml`) runs external black-box security tests against the production deployment. It validates that the security posture described above actually holds in production.
+
+**What it checks:**
+
+| Job | Tests |
+|-----|-------|
+| `security-headers` | Presence of HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy. Absence of `X-Powered-By`. |
+| `tls` | TLS 1.3 support, TLS 1.0/1.1 rejection, HSTS preload, certificate expiry (fails if <14 days remaining). |
+| `auth-gate` | All `/api/*` endpoints require CF Access authentication. Header spoofing (`cf-access-authenticated-user-email`) is blocked. |
+| `info-disclosure` | No secrets in `/.env`, `/.git/config`, `/api/debug` responses. No stack traces in error pages. |
+| `injection` | Host header injection blocked, `X-Forwarded-Host` has no effect, CL/TE request smuggling rejected, path traversal payloads blocked at auth layer. |
+| `http-methods` | TRACE disabled (405). WebSocket upgrade without auth blocked (302). |
+
+**Running it manually:** Go to `Actions` > `Pentest` > `Run workflow`. The workflow runs six parallel jobs using only `curl` and `openssl` -- no heavy scanning tools.
+
+**Configuration:** The workflow requires a `PENTEST_TARGET` variable (e.g., `https://codeflare.graymatter.ch`) set in the GitHub `production` environment (`Settings` > `Environments` > `production` > `Environment variables`).
+
+**Full report:** See [PENTEST.md](PENTEST.md) for the complete manual penetration test report covering all 13 test categories.
