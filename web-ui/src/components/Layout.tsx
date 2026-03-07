@@ -6,7 +6,8 @@ import StoragePanel from './StoragePanel';
 import SplashCursor from './SplashCursor';
 import '../styles/layout.css';
 import { sessionStore } from '../stores/session';
-import { terminalStore, reconnectDisconnectedTerminals, scheduleDisconnect, cancelScheduledDisconnect } from '../stores/terminal';
+import { terminalStore, reconnectDisconnectedTerminals, reconnectOnVisibilityReturn, scheduleDisconnect, cancelScheduledDisconnect } from '../stores/terminal';
+import { forceResetKeyboardState, enableVirtualKeyboardOverlay, isSamsungBrowser } from '../lib/mobile';
 import { logger } from '../lib/logger';
 import { loadSettings, applyAccentColor } from '../lib/settings';
 import type { TileLayout, AgentType, TabConfig } from '../types';
@@ -77,7 +78,32 @@ const Layout: Component<LayoutProps> = (props) => {
   {
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible' && viewState() !== 'dashboard') {
-        reconnectDisconnectedTerminals(untrack(() => sessionStore.activeSessionId) ?? undefined);
+        forceResetKeyboardState();
+
+        if (isSamsungBrowser) {
+          // Samsung: bounce through dashboard to fully reset keyboard state.
+          // Samsung's VirtualKeyboard API returns stale cached values on resume
+          // and no combination of signal resets fixes it reliably. The only path
+          // that always works is deactivate→reactivate, which triggers the full
+          // Terminal keyboard lifecycle cleanup and re-init.
+          const sessionId = untrack(() => sessionStore.activeSessionId);
+          if (sessionId) {
+            sessionStore.setActiveSession(null);
+            setViewState('dashboard');
+            setTimeout(() => {
+              sessionStore.setActiveSession(sessionId);
+              setViewState('terminal');
+              setTimeout(() => terminalStore.triggerLayoutResize(), 50);
+              reconnectOnVisibilityReturn(sessionId);
+            }, 50);
+            return;
+          }
+        }
+
+        setTimeout(() => {
+          if (viewState() !== 'dashboard') enableVirtualKeyboardOverlay();
+        }, 300);
+        reconnectOnVisibilityReturn(untrack(() => sessionStore.activeSessionId) ?? undefined);
       }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);

@@ -83,10 +83,20 @@ vi.mock('../../stores/session', () => ({
 vi.mock('../../stores/terminal', () => ({
   terminalStore: { reconnect: vi.fn(), triggerLayoutResize: vi.fn() },
   reconnectDisconnectedTerminals: vi.fn(),
+  reconnectOnVisibilityReturn: vi.fn(),
   scheduleDisconnect: vi.fn(),
   cancelScheduledDisconnect: vi.fn(),
 }));
 
+let mockIsSamsungBrowser = false;
+vi.mock('../../lib/mobile', () => ({
+  forceResetKeyboardState: vi.fn(),
+  enableVirtualKeyboardOverlay: vi.fn(),
+  get isSamsungBrowser() { return mockIsSamsungBrowser; },
+}));
+
+import { forceResetKeyboardState } from '../../lib/mobile';
+import { reconnectOnVisibilityReturn } from '../../stores/terminal';
 import Layout from '../../components/Layout';
 
 // Helper to create a mock session
@@ -106,6 +116,7 @@ describe('Layout Component', () => {
     vi.clearAllMocks();
     mockSessions = [];
     mockActiveSessionId = null;
+    mockIsSamsungBrowser = false;
     delete (window as any).__terminalAreaProps;
   });
 
@@ -423,6 +434,61 @@ describe('Layout Component', () => {
         value: originalLocation,
         writable: true,
       });
+    });
+  });
+
+  // =========================================================================
+  // Visibility Return: Keyboard State Reset
+  //
+  // When the browser tab regains focus, stale keyboard signals from
+  // backgrounding must be cleared before WS reconnection.
+  // =========================================================================
+
+  describe('Visibility Return Keyboard Reset', () => {
+    it('calls forceResetKeyboardState on visibility return in terminal view', () => {
+      mockSessions = [createMockSession({ status: 'running' })];
+      mockActiveSessionId = 'sess1';
+
+      render(() => <Layout />);
+
+      vi.mocked(forceResetKeyboardState).mockClear();
+      vi.mocked(reconnectOnVisibilityReturn).mockClear();
+
+      // Simulate returning from backgrounded browser
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      expect(forceResetKeyboardState).toHaveBeenCalled();
+      expect(reconnectOnVisibilityReturn).toHaveBeenCalled();
+    });
+
+    it('does NOT call forceResetKeyboardState when on dashboard', () => {
+      // No active session = dashboard view
+      render(() => <Layout />);
+
+      vi.mocked(forceResetKeyboardState).mockClear();
+
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      expect(forceResetKeyboardState).not.toHaveBeenCalled();
+    });
+
+    it('Samsung: bounces through dashboard on visibility return to reset keyboard state', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockIsSamsungBrowser = true;
+      mockSessions = [createMockSession({ status: 'running' })];
+      mockActiveSessionId = 'sess1';
+
+      render(() => <Layout />);
+
+      vi.mocked(sessionStore.setActiveSession).mockClear();
+
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      // Should deactivate session immediately (dashboard bounce)
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith(null);
     });
   });
 

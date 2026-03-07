@@ -1,5 +1,5 @@
 import type { Terminal as XTerm } from '@xterm/xterm';
-import { disableVirtualKeyboardOverlay } from './mobile';
+import { disableVirtualKeyboardOverlay, enableVirtualKeyboardOverlay, forceResetKeyboardState, isSamsungBrowser } from './mobile';
 import { logger } from './logger';
 import { getXtermCore, setIframeInput, setRemoveFocusGuard } from './xterm-internals';
 
@@ -74,6 +74,39 @@ export function setupMobileInput(
   const restoreFocusIfNeeded = () => {
     if (wasInputFocused && iframeInputRef && !iframeInputRef.readOnly && props.active) {
       wasInputFocused = false;
+      // Force-zero ALL keyboard signals unconditionally. resetKeyboardStateIfStale()
+      // trusts boundingRect.height which returns stale cached values on browser resume.
+      forceResetKeyboardState();
+
+      // Samsung: don't auto-focus (which opens the keyboard and triggers stale
+      // geometrychange events). BUT we MUST re-enable overlaysContent so it's
+      // already true when the user taps later. Without this, the tap triggers a
+      // false→true toggle which makes Samsung fire a stale cached geometrychange,
+      // and the 50ms ignore window (Fix 2) eats the REAL geometrychange that
+      // follows — leaving keyboardHeight at 0 with the keyboard visually open
+      // (the "gap" bug).
+      //
+      // The dashboard→re-enter path works because the keyboard lifecycle effect
+      // re-runs (props.active toggles false→true) and calls enableVirtualKeyboardOverlay()
+      // well before the user taps. We replicate that here with a delay:
+      // Samsung fires delayed stale geometrychange events up to ~200ms after
+      // overlaysContent toggle during resume. We wait 300ms so the toggle's
+      // stale events are caught by Fix 2's 50ms window, and any subsequent
+      // Samsung-specific delayed events arrive while overlaysContent is still
+      // false (ignored by handleGeometryChange's else branch). By 300ms the
+      // compositor has settled and the toggle to true triggers at most one
+      // stale event (caught by the new 50ms window from the delayed call).
+      if (isSamsungBrowser) {
+        setTimeout(() => {
+          // Re-check: don't enable if terminal was deactivated during the delay
+          if (props.active) enableVirtualKeyboardOverlay();
+        }, 300);
+        return;
+      }
+
+      // Chrome: re-enable overlaysContent before focus so geometrychange handler
+      // takes the correct branch when the keyboard opens.
+      enableVirtualKeyboardOverlay();
       setTimeout(() => {
         if (iframeInputRef) {
           iframeInputRef.focus({ preventScroll: true });

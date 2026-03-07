@@ -78,8 +78,8 @@ vi.mock('../../stores/terminal', () => ({
     unregisterFitAddon: vi.fn(),
     connect: vi.fn(() => vi.fn()),
     resize: vi.fn(),
-    getRetryMessage: vi.fn(() => null),
     getConnectionState: vi.fn(() => 'disconnected'),
+    getRetryMessage: vi.fn(() => null),
     triggerLayoutResize: vi.fn(),
     startUrlDetection: vi.fn(),
     stopUrlDetection: vi.fn(),
@@ -106,6 +106,7 @@ vi.mock('../../lib/mobile', () => ({
   disableVirtualKeyboardOverlay: vi.fn(),
   resetKeyboardStateIfStale: vi.fn(),
   forceResetKeyboardState: vi.fn(),
+  isSamsungBrowser: false,
 }));
 
 vi.mock('../../lib/touch-gestures', () => ({
@@ -127,7 +128,8 @@ vi.mock('../../lib/settings', () => ({
 import { useTerminal, type UseTerminalOptions, DECTCEM_CURSOR_PARAM, KEYBOARD_REFIT_DEBOUNCE_MS } from '../../hooks/useTerminal';
 import { terminalStore } from '../../stores/terminal';
 import { sessionStore } from '../../stores/session';
-import { isTouchDevice, getKeyboardHeight, isVirtualKeyboardOpen } from '../../lib/mobile';
+import { isTouchDevice, getKeyboardHeight, isVirtualKeyboardOpen, forceResetKeyboardState } from '../../lib/mobile';
+import * as mobileModule from '../../lib/mobile';
 import { loadSettings } from '../../lib/settings';
 
 describe('useTerminal hook', () => {
@@ -186,7 +188,6 @@ describe('useTerminal hook', () => {
       expect(result.containerRef).toBeTypeOf('function');
       expect(result.terminal).toBeTypeOf('function');
       expect(result.dimensions).toBeTypeOf('function');
-      expect(result.retryMessage).toBeTypeOf('function');
       expect(result.connectionState).toBeTypeOf('function');
       expect(result.isInitializing).toBeTypeOf('function');
       expect(result.initProgress).toBeTypeOf('function');
@@ -203,21 +204,6 @@ describe('useTerminal hook', () => {
       });
 
       expect(result.dimensions()).toEqual({ cols: 80, rows: 24 });
-
-      dispose();
-    });
-
-    it('should expose retryMessage from terminalStore', () => {
-      vi.mocked(terminalStore.getRetryMessage).mockReturnValue('Retrying...');
-
-      let result!: ReturnType<typeof useTerminal>;
-
-      const dispose = createRoot((dispose) => {
-        result = useTerminal(defaultProps);
-        return dispose;
-      });
-
-      expect(result.retryMessage()).toBe('Retrying...');
 
       dispose();
     });
@@ -513,6 +499,49 @@ describe('useTerminal hook', () => {
       dispose();
       vi.useRealTimers();
     });
+
+    it('should skip fitAddon.fit() in active-state effect when kbDebouncePending is true', async () => {
+      vi.useFakeTimers();
+
+      const isTouchDeviceMock = vi.mocked(isTouchDevice);
+      const getKeyboardHeightMock = vi.mocked(getKeyboardHeight);
+
+      // Mobile device
+      isTouchDeviceMock.mockReturnValue(true);
+
+      // Use a SolidJS signal to back the mock so createEffect re-tracks
+      const [kbHeight, setKbHeight] = createSignal(0);
+      getKeyboardHeightMock.mockImplementation(() => kbHeight());
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      // Clear mount-time fit calls
+      mockFit.mockClear();
+
+      // Trigger keyboard height change — sets kbDebouncePending = true
+      setKbHeight(300);
+
+      // At this point kbDebouncePending is true (debounce timer hasn't fired).
+      // No synchronous fit() calls should happen because:
+      //  - The keyboard refit effect only starts a debounce timer (no immediate fit)
+      //  - The active-state effect's fit() is guarded by kbDebouncePending
+      //  - The ResizeObserver's fit() is also guarded by kbDebouncePending
+      expect(mockFit).not.toHaveBeenCalled();
+
+      // Now advance past debounce — the debounced keyboard refit should call fit()
+      await vi.advanceTimersByTimeAsync(KEYBOARD_REFIT_DEBOUNCE_MS + 50);
+
+      // fit() should have been called at least once (by the debounced refit callback;
+      // other deferred effects like document.fonts.ready may also contribute)
+      expect(mockFit).toHaveBeenCalled();
+
+      dispose();
+      vi.useRealTimers();
+    });
   });
 
   describe('mobile viewport touch handler disable', () => {
@@ -615,6 +644,122 @@ describe('useTerminal hook', () => {
       expect(touchStartHandler()).toBeUndefined();
 
       dispose();
+    });
+  });
+
+  describe('Samsung focusout keyboard dismiss (Fix 1)', () => {
+    beforeEach(() => {
+      vi.mocked(isTouchDevice).mockReturnValue(true);
+    });
+
+    afterEach(() => {
+      vi.mocked(isTouchDevice).mockReturnValue(false);
+      // Reset isSamsungBrowser
+      (mobileModule as any).isSamsungBrowser = false;
+    });
+
+    it('should register focusout handler on Samsung to detect back-button keyboard dismiss', () => {
+      (mobileModule as any).isSamsungBrowser = true;
+
+      // Provide a textarea on the mock terminal for the handler to attach to
+      const mockTextarea = document.createElement('textarea');
+      const addEventSpy = vi.spyOn(mockTextarea, 'addEventListener');
+      mockTerminalInstance.textarea = mockTextarea as any;
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      // Should have attached a focusout handler
+      expect(addEventSpy).toHaveBeenCalledWith('focusout', expect.any(Function));
+
+      dispose();
+      mockTerminalInstance.textarea = null;
+    });
+
+    it('should call forceResetKeyboardState when focusout fires while keyboard is open on Samsung', () => {
+      (mobileModule as any).isSamsungBrowser = true;
+      vi.mocked(isVirtualKeyboardOpen).mockReturnValue(true);
+
+      const mockTextarea = document.createElement('textarea');
+      mockTerminalInstance.textarea = mockTextarea as any;
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      // Simulate focusout event (Samsung back-button dismiss)
+      mockTextarea.dispatchEvent(new Event('focusout'));
+
+      expect(forceResetKeyboardState).toHaveBeenCalled();
+
+      dispose();
+      mockTerminalInstance.textarea = null;
+    });
+
+    it('should NOT register focusout handler on non-Samsung browsers', () => {
+      (mobileModule as any).isSamsungBrowser = false;
+
+      const mockTextarea = document.createElement('textarea');
+      const addEventSpy = vi.spyOn(mockTextarea, 'addEventListener');
+      mockTerminalInstance.textarea = mockTextarea as any;
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      const focusoutCalls = addEventSpy.mock.calls.filter(([type]) => type === 'focusout');
+      expect(focusoutCalls).toHaveLength(0);
+
+      dispose();
+      mockTerminalInstance.textarea = null;
+    });
+  });
+
+  describe('kbDebounceTimer race fix (Fix 3)', () => {
+    it('should not block ResizeObserver after keyboard debounce timer cleanup', async () => {
+      vi.useFakeTimers();
+
+      const isTouchDeviceMock = vi.mocked(isTouchDevice);
+      const getKeyboardHeightMock = vi.mocked(getKeyboardHeight);
+
+      isTouchDeviceMock.mockReturnValue(true);
+
+      const [kbHeight, setKbHeight] = createSignal(0);
+      getKeyboardHeightMock.mockImplementation(() => kbHeight());
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      // Trigger keyboard height change — starts debounce timer
+      setKbHeight(300);
+
+      // Let debounce timer fire and complete
+      await vi.advanceTimersByTimeAsync(KEYBOARD_REFIT_DEBOUNCE_MS + 50);
+
+      // Clear fit calls from above
+      mockFit.mockClear();
+
+      // Now trigger a ResizeObserver callback manually
+      // The ResizeObserver should NOT be blocked (kbDebounceTimer should be null)
+      const resizeObserverCallback = (globalThis as any).__lastResizeObserverCallback;
+      if (resizeObserverCallback) {
+        resizeObserverCallback([{ contentRect: { width: 900, height: 700 } }]);
+        // RAF should allow fit to be called
+        expect(mockFit).toHaveBeenCalled();
+      }
+
+      dispose();
+      vi.useRealTimers();
     });
   });
 

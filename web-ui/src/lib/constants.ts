@@ -17,17 +17,8 @@ export const MAX_STARTUP_POLL_ERRORS = 10;
 // Terminal Connection
 // =============================================================================
 
-/** Initial delay between WebSocket retry attempts (ms) */
-export const WS_RETRY_DELAY_MS = 2000;
-
-/** Maximum time window for WebSocket reconnection attempts (ms).
- *  Reconnection keeps trying with exponential backoff for this duration.
- *  After this window expires, the connection is considered failed. */
-export const WS_RECONNECT_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
-
-/** Maximum delay between WebSocket retry attempts (ms).
- *  Exponential backoff caps at this value to avoid excessively long waits. */
-export const WS_RETRY_MAX_DELAY_MS = 30_000;
+/** Delay between WebSocket retry attempts (ms) */
+export const WS_RETRY_DELAY_MS = 1000;
 
 // =============================================================================
 // UI Timing
@@ -35,6 +26,20 @@ export const WS_RETRY_MAX_DELAY_MS = 30_000;
 
 /** Delay for CSS transitions to settle before layout operations (ms) */
 export const CSS_TRANSITION_DELAY_MS = 100;
+
+// =============================================================================
+// WebSocket Close Codes
+// =============================================================================
+
+/** WebSocket close codes that should trigger automatic reconnection */
+export const WS_RETRYABLE_CLOSE_CODES = new Set([
+  1001,  // Going Away (server shutdown)
+  1006,  // Abnormal Closure (network drop)
+  1011,  // Unexpected Condition (internal error)
+  1012,  // Service Restart
+  1013,  // Try Again Later
+]);
+
 
 // =============================================================================
 // Session

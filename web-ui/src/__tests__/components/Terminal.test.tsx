@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup } from '@solidjs/testing-library';
+import { createSignal } from 'solid-js';
 import Terminal from '../../components/Terminal';
 import { terminalStore } from '../../stores/terminal';
 import { sessionStore } from '../../stores/session';
+import type { TerminalConnectionState } from '../../types';
 import { isTouchDevice, enableVirtualKeyboardOverlay, isVirtualKeyboardOpen } from '../../lib/mobile';
 
 // Mock xterm.js and addons
@@ -18,6 +20,7 @@ const mockTerminalInstance = {
   getSelection: vi.fn(() => ''),
   clearSelection: vi.fn(),
   scrollToBottom: vi.fn(),
+  scrollLines: vi.fn(),
   refresh: vi.fn(),
   focus: vi.fn(),
   dispose: vi.fn(),
@@ -26,6 +29,8 @@ const mockTerminalInstance = {
   buffer: {
     active: {
       length: 0,
+      viewportY: 0,
+      baseY: 0,
       getLine: vi.fn(() => null) as ReturnType<typeof vi.fn>,
     },
     onBufferChange: vi.fn(() => ({ dispose: vi.fn() })),
@@ -64,7 +69,7 @@ vi.mock('@xterm/addon-fit', () => {
 vi.mock('../../stores/terminal', () => ({
   terminalStore: {
     getConnectionState: vi.fn(),
-    getRetryMessage: vi.fn(),
+    getRetryMessage: vi.fn(() => null),
     getTerminal: vi.fn(),
     setTerminal: vi.fn(),
     connect: vi.fn(() => vi.fn()),
@@ -112,6 +117,7 @@ vi.mock('../../lib/mobile', () => ({
   disableVirtualKeyboardOverlay: vi.fn(),
   resetKeyboardStateIfStale: vi.fn(),
   forceResetKeyboardState: vi.fn(),
+  isSamsungBrowser: false,
 }));
 
 vi.mock('../../lib/touch-gestures', () => ({
@@ -138,7 +144,6 @@ describe('Terminal Component', () => {
     vi.clearAllMocks();
     // Default mock return values
     vi.mocked(terminalStore.getConnectionState).mockReturnValue('disconnected');
-    vi.mocked(terminalStore.getRetryMessage).mockReturnValue(null);
     vi.mocked(sessionStore.isSessionInitializing).mockReturnValue(false);
     vi.mocked(sessionStore.getInitProgressForSession).mockReturnValue(null);
   });
@@ -195,23 +200,13 @@ describe('Terminal Component', () => {
   });
 
   describe('Connection State Overlay', () => {
-    it('should show "Connecting..." when not connected and not initializing', () => {
+    it('should show Connecting overlay before first connection', () => {
       vi.mocked(sessionStore.isSessionInitializing).mockReturnValue(false);
       vi.mocked(terminalStore.getConnectionState).mockReturnValue('connecting');
 
       render(() => <Terminal {...defaultProps} />);
 
       expect(screen.getByText('Connecting...')).toBeInTheDocument();
-    });
-
-    it('should show retry message when available', () => {
-      vi.mocked(sessionStore.isSessionInitializing).mockReturnValue(false);
-      vi.mocked(terminalStore.getConnectionState).mockReturnValue('connecting');
-      vi.mocked(terminalStore.getRetryMessage).mockReturnValue('Reconnecting...');
-
-      render(() => <Terminal {...defaultProps} />);
-
-      expect(screen.getByText('Reconnecting...')).toBeInTheDocument();
     });
 
     it('should not show connection overlay when connected', () => {
@@ -235,22 +230,27 @@ describe('Terminal Component', () => {
       // Connection overlay should not be visible (hidden by init overlay)
     });
 
-    it('should show connection overlay for disconnected state', () => {
+    it('should NOT show overlay after first connection (transparent reconnect via hasConnected latch)', () => {
       vi.mocked(sessionStore.isSessionInitializing).mockReturnValue(false);
-      vi.mocked(terminalStore.getConnectionState).mockReturnValue('disconnected');
+
+      // Use a SolidJS signal to back the mock so useTerminal's createMemo
+      // tracks it and re-evaluates when the signal changes.
+      const [connState, setConnState] = createSignal<TerminalConnectionState>('connecting');
+      vi.mocked(terminalStore.getConnectionState).mockImplementation(() => connState());
 
       render(() => <Terminal {...defaultProps} />);
 
+      // Phase 1: 'connecting' — overlay should show (hasConnected is false)
       expect(screen.getByText('Connecting...')).toBeInTheDocument();
-    });
 
-    it('should show connection overlay for error state', () => {
-      vi.mocked(sessionStore.isSessionInitializing).mockReturnValue(false);
-      vi.mocked(terminalStore.getConnectionState).mockReturnValue('error');
+      // Phase 2: transition to 'connected' — overlay disappears, hasConnected latches true
+      setConnState('connected');
+      expect(screen.queryByText('Connecting...')).not.toBeInTheDocument();
 
-      render(() => <Terminal {...defaultProps} />);
-
-      expect(screen.getByText('Connecting...')).toBeInTheDocument();
+      // Phase 3: transition to 'disconnected' — overlay should NOT reappear
+      // because hasConnected is a one-way latch (transparent reconnect)
+      setConnState('disconnected');
+      expect(screen.queryByText('Connecting...')).not.toBeInTheDocument();
     });
   });
 
@@ -287,15 +287,6 @@ describe('Terminal Component', () => {
       render(() => <Terminal {...defaultProps} />);
 
       expect(terminalStore.getConnectionState).toHaveBeenCalledWith(
-        defaultProps.sessionId,
-        defaultProps.terminalId
-      );
-    });
-
-    it('should get retry message with correct session and terminal IDs', () => {
-      render(() => <Terminal {...defaultProps} />);
-
-      expect(terminalStore.getRetryMessage).toHaveBeenCalledWith(
         defaultProps.sessionId,
         defaultProps.terminalId
       );

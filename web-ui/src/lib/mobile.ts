@@ -85,8 +85,10 @@ export const isSamsungBrowser = typeof navigator !== 'undefined'
 let baselineInnerHeight = typeof window !== 'undefined' ? window.innerHeight : 0;
 const [viewportGrowth, setViewportGrowth] = createSignal(0);
 
-/** Safety-net timer for keyboard close detection (see disableVirtualKeyboardOverlay). */
-let keyboardCloseTimer: ReturnType<typeof setTimeout> | null = null;
+// Stale geometrychange ignore window: Samsung fires a cached stale geometrychange
+// when overlaysContent is toggled. We ignore events within 50ms of the toggle.
+let overlaysContentChangedAt = 0;
+
 
 if (typeof window !== 'undefined') {
   if (nav.virtualKeyboard) {
@@ -95,11 +97,9 @@ if (typeof window !== 'undefined') {
     const vk = nav.virtualKeyboard;
 
     const handleGeometryChange = () => {
-      // Clear safety-net timer — the event fired, so we'll handle state here
-      if (keyboardCloseTimer) {
-        clearTimeout(keyboardCloseTimer);
-        keyboardCloseTimer = null;
-      }
+      // Fix 2: Ignore stale events that fire immediately after overlaysContent toggle.
+      // Samsung fires geometrychange with cached stale boundingRect on toggle.
+      if (Date.now() - overlaysContentChangedAt < 50) return;
 
       // Only update signals when overlaysContent is true (we control layout).
       // When false, the browser handles viewport resizing and boundingRect is 0.
@@ -111,12 +111,9 @@ if (typeof window !== 'undefined') {
           const growth = Math.max(0, window.innerHeight - baselineInnerHeight);
           setViewportGrowth(growth);
         } else if (height <= 0) {
-          // Keyboard closed — reset growth and update baseline.
-          if (isSamsungBrowser) {
-            // Use Math.min to avoid poisoning from transient inflation
-            // (Samsung briefly inflates innerHeight during dismiss animation).
-            baselineInnerHeight = Math.min(baselineInnerHeight, window.innerHeight);
-          }
+          // Keyboard closed — reset growth. Do NOT update baselineInnerHeight here:
+          // Samsung fires geometrychange before the bottom bar returns, so
+          // window.innerHeight is still inflated and would poison the baseline.
           setViewportGrowth(0);
         }
 
@@ -157,29 +154,26 @@ if (typeof window !== 'undefined') {
 // are focused (so the browser handles viewport resizing normally for forms).
 export function enableVirtualKeyboardOverlay(): void {
   if (nav.virtualKeyboard) {
+    // Only stamp the stale-event ignore window when actually toggling.
+    // Re-stamping when already true would restart the 50ms window needlessly,
+    // causing Fix 2 to eat the REAL geometrychange from a keyboard open.
+    if (!nav.virtualKeyboard.overlaysContent) {
+      overlaysContentChangedAt = Date.now();
+    }
     nav.virtualKeyboard.overlaysContent = true;
   }
 }
 
 export function disableVirtualKeyboardOverlay(): void {
   if (nav.virtualKeyboard) {
+    // Only stamp the stale-event ignore window when actually toggling.
+    if (nav.virtualKeyboard.overlaysContent) {
+      overlaysContentChangedAt = Date.now();
+    }
     nav.virtualKeyboard.overlaysContent = false;
-    // Safety-net: if geometrychange doesn't fire within 300ms (e.g. Samsung Internet
-    // back-button dismiss, fast gestures), force-reset keyboard signals.
-    // If geometrychange DOES fire, it resets signals via the else branch (overlaysContent
-    // is already false), so the timeout becomes a harmless no-op.
-    if (keyboardCloseTimer) clearTimeout(keyboardCloseTimer);
-    keyboardCloseTimer = setTimeout(() => {
-      keyboardCloseTimer = null;
-      if (!nav.virtualKeyboard!.overlaysContent && vkOpen()) {
-        setVkOpen(false);
-        setKeyboardHeight(0);
-        setViewportGrowth(0);
-        if (isSamsungBrowser) {
-          baselineInnerHeight = window.innerHeight;
-        }
-      }
-    }, 300);
+    // Don't manually reset signals — let the geometrychange handler do it.
+    // Resetting immediately would cause a layout jump while the keyboard
+    // is still animating closed.
   }
 }
 
@@ -214,14 +208,9 @@ export function resetKeyboardStateIfStale(): void {
 
   const actualHeight = nav.virtualKeyboard.boundingRect.height;
   if (actualHeight <= 0) {
-    // Keyboard is closed — reset all signals unconditionally.
-    // Previous version only reset when keyboardHeight > 0, which left
-    // viewportGrowth lingering and corrupting subsequent calculations.
     setVkOpen(false);
     setKeyboardHeight(0);
     setViewportGrowth(0);
-    // Re-sync baseline to current viewport state
-    baselineInnerHeight = window.innerHeight;
   }
 }
 
@@ -233,9 +222,6 @@ export function forceResetKeyboardState(): void {
   setVkOpen(false);
   setKeyboardHeight(0);
   setViewportGrowth(0);
-  if (isSamsungBrowser) {
-    baselineInnerHeight = window.innerHeight;
-  }
 }
 
 // Samsung Galaxy Fold screen switch detection.
@@ -250,17 +236,6 @@ if (typeof window !== 'undefined' && isSamsungBrowser) {
     if (!vkOpen() && delta > 200) {
       baselineInnerHeight = window.innerHeight;
       setViewportGrowth(0);
-    }
-  });
-}
-
-// Reset stale keyboard state when the app regains foreground.
-// Mobile browsers may dismiss the keyboard while backgrounded (e.g. switching apps,
-// receiving a call) without firing geometrychange. On resume, check actual state.
-if (typeof window !== 'undefined' && isTouchDevice()) {
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      resetKeyboardStateIfStale();
     }
   });
 }
