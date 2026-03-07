@@ -32,6 +32,7 @@ Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2
 21. [Architecture Decisions](#21-architecture-decisions)
 22. [Lessons Learned](#22-lessons-learned)
 23. [Mobile Terminal Design](#23-mobile-terminal-design)
+24. [Automatic Memory Capture](#24-automatic-memory-capture)
 
 **Workers.dev URL:** `https://<CLOUDFLARE_WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` - used only for initial setup. After the setup wizard configures a custom domain, all traffic should go through the custom domain (protected by CF Access). The workers.dev URL should then be gated behind one-click Access in the Cloudflare dashboard.
 
@@ -623,7 +624,57 @@ HSTS is also applied to all redirect responses via `secureRedirect()` helper, in
 
 ### Rate Limiting
 
-Per-user rate limiting via KV (`src/middleware/rate-limit.ts`). Uses `bucketName` from auth as the rate limit key, with IP fallback for unauthenticated requests. Configurable window and max per route. Adds `X-RateLimit-Limit`, `X-RateLimit-Remaining` response headers. All setup routes (`/detect-token`, `/prefill`, `/configure`) are rate-limited.
+Per-user rate limiting via `createRateLimiter()` factory in `src/middleware/rate-limit.ts`. Keyed by `bucketName` (user identifier set by auth middleware), falls back to `CF-Connecting-IP` for unauthenticated requests.
+
+**Storage:** Primary storage is Cloudflare KV with automatic TTL expiry (window duration + 60s buffer). When KV operations fail, falls back to an in-memory `Map` with periodic cleanup every 100 requests to prevent unbounded growth.
+
+**Response Headers:** All rate-limited responses include:
+- `X-RateLimit-Limit`: Maximum requests per window
+- `X-RateLimit-Remaining`: Remaining requests in current window
+
+When the limit is exceeded: HTTP 429 with `{ code: "RATE_LIMIT_ERROR", message: "Rate limit exceeded. Try again in N seconds." }`
+
+**KV Key Pattern:** `{keyPrefix}:{userId}` — e.g., `storage-upload:codeflare-user-john-example-com`. Use `rl-` prefix when the key prefix would collide with application cache keys (e.g., `storage-stats` collides with the stats cache key `storage-stats:{bucketName}`, so the rate limiter uses `rl-storage-stats`).
+
+**Rate limits per endpoint:**
+
+| Endpoint | Method | Limit | Key Prefix |
+|----------|--------|-------|-----------|
+| `/api/storage/upload/*` | POST | 60/min | `storage-upload` |
+| `/api/storage/delete` | POST | 20/min | `storage-delete` |
+| `/api/storage/move` | POST | 20/min | `storage-move` |
+| `/api/storage/seed/*` | POST | 3/min | `storage-seed` |
+| `/api/storage/download` | GET | 120/min | `storage-download` |
+| `/api/storage/preview` | GET | 120/min | `storage-preview` |
+| `/api/storage/browse` | GET | 30/min | `storage-browse` |
+| `/api/storage/stats` | GET | 10/min | `rl-storage-stats` |
+| `/api/sessions/:id` | DELETE | 10/min | `session-delete` |
+| `/api/sessions/:id/stop` | POST | 10/min | `session-stop` |
+| `/api/user/ensure-r2-token` | POST | 5/min | `ensure-r2-token` |
+| `/api/sessions` | POST | 10/min | `session-create` |
+| `/api/container/start` | POST | 10/min | `container-start` |
+| `/api/users/:email` | DELETE | 20/min | `user-mutation` |
+| `/api/setup/detect-token` | POST | 5/min | `setup` |
+| `/api/setup/prefill` | POST | 5/min | `setup` |
+| `/api/setup/configure` | POST | 5/min | `setup` |
+
+**Adding a new rate limiter:**
+
+```typescript
+import { createRateLimiter } from '../../middleware/rate-limit';
+
+const myRateLimiter = createRateLimiter({
+  windowMs: 60_000,    // 1 minute window
+  maxRequests: 10,     // max 10 requests per window
+  keyPrefix: 'my-route', // KV key prefix (must not collide with app cache keys)
+});
+
+// Apply to all routes in a sub-app:
+app.use('*', myRateLimiter);
+
+// Or apply to a specific route inline:
+app.post('/endpoint', myRateLimiter, async (c) => { ... });
+```
 
 **Stress Test Bypass:** When `STRESS_TEST_MODE` is set to `"active"`, all HTTP and WebSocket rate limits are bypassed. This is intended for integration environments only, to allow k6 stress tests with high virtual user counts (1000+) through a single service token identity. The bypass skips all KV rate-limit reads/writes for zero overhead. A one-time warning is logged per isolate when the bypass activates.
 
@@ -1571,7 +1622,9 @@ Two effects can trigger `fitAddon.fit()` simultaneously:
 2. **Active-state effect** (immediate `requestAnimationFrame`)
 3. **ResizeObserver** (immediate `requestAnimationFrame`)
 
-A `kbDebounceTimer` variable (timer ID, not boolean) gates the ResizeObserver and active-state effects. When the keyboard refit starts its debounce timer, `kbDebounceTimer` is set to the timer ID. Both other effects check `kbDebounceTimer !== null` and skip `fit()` when active. The timer callback sets it back to `null`. Using the timer ID (vs. a boolean flag) prevents a race condition where cleanup of the debounce timer doesn't properly clear the gate.
+A `kbDebounceTimer` variable (timer ID, not boolean) gates the ResizeObserver. When the keyboard refit starts its debounce timer, `kbDebounceTimer` is set to the timer ID. The ResizeObserver checks `kbDebounceTimer !== null` and skips `fit()` when active. The timer callback sets it back to `null`. Using the timer ID (vs. a boolean flag) prevents a race condition where cleanup of the debounce timer doesn't properly clear the gate.
+
+The keyboard refit effect also tracks the `closed→open` keyboard transition via a `wasKeyboardOpen` flag. `scrollToBottom()` is called only when the keyboard opens (so the user sees the prompt), not on close or mid-animation height adjustments. This preserves scroll position when users are reading scrollback and the keyboard closes or the height adjusts (e.g. Samsung address bar animation).
 
 #### Visibility Return Keyboard Reset (Fix 6)
 
@@ -1612,3 +1665,85 @@ Horizontal swipe gestures (left/right arrow key simulation) use a `setInterval` 
 #### WS Retryable Close Codes (Fix 5)
 
 The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_CLOSE_CODES`) rather than only on `1006` (Abnormal Closure). This covers server shutdown (1001), unexpected conditions (1011), service restart (1012), and try-again-later (1013). Normal closure (1000) does NOT trigger retry.
+
+---
+
+## 24. Automatic Memory Capture
+
+Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 30 user messages. Zero manual intervention required.
+
+### Architecture
+
+```
+UserPromptSubmit hook (~150ms)           Main agent                    Background Task agent (haiku)
+    |                                        |                              |
+    +-- read stdin JSON                      |                              |
+    +-- jq: count user messages              |                              |
+    +-- check counter (delta < 30?) → exit   |                              |
+    +-- check lock → exit                    |                              |
+    +-- write .vars JSON file                |                              |
+    +-- output JSON + exit 0 ─────────> receive additionalContext           |
+                                        create lock                         |
+                                        spawn Task agent ───────────> read prompt .md + .vars JSON
+                                             |                         read transcript from line offset
+                                        (continues normally)           summarize into MCP memory
+                                                                       compaction check (>1000 → ~300)
+                                                                       write counter file
+                                                                       rm lock file
+```
+
+### Hook Mechanics
+
+The `memory-capture.sh` script runs as a **UserPromptSubmit hook** that uses the `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"..."}}` + `exit 0` protocol to inject a short instruction into the main agent's context on each user message.
+
+1. **Tilde expansion**: Expands `~` in `transcript_path` to `$HOME` (Claude Code may send tilde-prefixed paths).
+2. **Message counting**: `jq -r '.type' "$TRANSCRIPT" | grep -c '^user$'` counts user messages in the JSONL transcript.
+3. **Counter check**: Reads `~/.memory/counter/{session_id}` (line 1: last summarized count, line 2: last line offset). If the delta is < 30, exits silently.
+4. **Lock guard**: Checks for `~/.memory/counter/{session_id}.lock`. If a summary agent is already running, exits. Stale locks (>2 minutes) are removed automatically.
+5. **Vars file**: Writes all variables (transcript path, line offset, date, counts, file paths) to `~/.memory/counter/{session_id}.vars` as JSON — keeps the context string short.
+6. **JSON output + exit 0**: Outputs `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"..."}}` with a short instruction pointing to the prompt file and vars file. Exits with code 0 — no blocking, no loop guard needed.
+
+### Prompt File
+
+The background agent's full instructions live in `~/.claude/hooks/memory-agent-prompt.md` (preseeded alongside the hook script). This keeps the hook's reason string short (~200 chars) while providing detailed instructions for:
+
+- Observation quality (merge related facts, skip trivial events, max 5-8 per window)
+- MCP memory entity naming (`chat-YYYY-MM-DD`)
+- **Automatic compaction**: When total observations exceed 1000, compact to ~300 by archiving old chat entities (>3 days) into `chat-archive-YYYY-MM`, merging redundant observations, and deleting stale data.
+
+### Counter Storage
+
+```
+~/.memory/counter/
+├── {session_id}        # Two lines: last_count, last_line_offset (synced to R2)
+├── {session_id}.lock   # Exists only while background agent is running (excluded from sync)
+└── {session_id}.vars   # Variables JSON for current hook invocation (excluded from sync)
+```
+
+- Counter files are **persisted to R2** — survives container restarts, needed for `--resume` to avoid re-summarizing the entire transcript.
+- Lock and vars files are **excluded from sync** via `--filter "- .memory/counter/*.lock"` and `--filter "- .memory/counter/*.vars"` — they are ephemeral per-invocation state.
+- The `.memory/` directory itself IS synced (it contains the MCP memory JSONL files used across sessions).
+
+### Preseed Deployment
+
+Hook scripts and prompt are deployed via the preseed pipeline:
+
+1. Source files in `preseed/agents/claude/hooks/` (includes `memory-capture.sh` and `memory-agent-prompt.md`)
+2. `scripts/generate-agent-seed.mjs` bakes them into `src/lib/agent-seed.generated.ts`
+3. On first bucket creation: `seedAgentConfigs(overwrite: false)` writes to R2
+4. On "Recreate skills & rules" button: `seedAgentConfigs(overwrite: true)` overwrites in R2
+5. Bisync pulls from R2 to container `~/.claude/hooks/`
+
+### Settings.json Merge
+
+`entrypoint.sh` merges hook configuration into `~/.claude/settings.json` using the same `jq '. * $cfg'` recursive merge pattern as the MCP config. The UserPromptSubmit hook is non-blocking (exit 0) so no special timeout or async configuration is needed. Handles three cases:
+
+- **File doesn't exist**: Creates with hook config
+- **File exists**: Recursive merge preserving user's existing settings (statusLine, permissions, etc.)
+- **File malformed**: Skips with warning, does not overwrite
+
+### Troubleshooting
+
+- **Counter reset**: Delete `~/.memory/counter/{session_id}` to force re-summarization from the beginning of the transcript.
+- **Stuck lock**: Delete `~/.memory/counter/{session_id}.lock` if the background agent crashed without cleanup. Stale locks older than 2 minutes are auto-removed by the hook.
+- **Agent not firing**: Check `~/.claude/settings.json` has the `UserPromptSubmit` hook configured for `memory-capture.sh`. Verify the transcript has 30+ user messages since last capture. Verify the hook outputs `hookSpecificOutput` JSON and exits with code 0.
