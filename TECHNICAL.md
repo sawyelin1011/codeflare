@@ -75,7 +75,7 @@ if (wsRouteResult.isWebSocketRoute) {
 
 **CORS:** Checks static patterns from `env.ALLOWED_ORIGINS` + dynamic origins from KV (cached in memory). Uses `matchesPattern()` with domain-boundary enforcement (dot-prefixed = suffix match, bare domains = exact or subdomain with dot boundary).
 
-**Route Registration:** `/health`, `/api/user`, `/api/users`, `/api/container`, `/api/sessions`, `/api/terminal`, `/api/setup`, `/api/storage`, `/api/presets`, `/api/preferences`, `/public`
+**Route Registration:** `/health`, `/api/user`, `/api/users`, `/api/container`, `/api/sessions`, `/api/terminal`, `/api/setup`, `/api/storage`, `/api/presets`, `/api/preferences`, `/api/llm-keys`, `/public`
 
 **Workers Assets Routing Guardrails (`wrangler.toml`):**
 
@@ -511,6 +511,21 @@ Agent memory (knowledge graph via `@modelcontextprotocol/server-memory`) persist
 
 **Two-phase merge/cleanup:** The merge runs after R2 sync but before bisync baseline establishment. Old files are kept so `--resync` doesn't resurrect them. Cleanup (local-only deletion) runs after bisync baseline succeeds, so periodic bisync propagates the deletions to R2. Direct R2 deletion is unsafe for concurrent sessions — another session's bisync would propagate the deletion locally, destroying the active memory file. The rclone config uses `disable_checksum = true` to prevent `BadDigest` errors from files modified during upload (pre-warm PTY race condition).
 
+### LLM Consultation (consult-llm-mcp)
+
+When `OPENAI_API_KEY` or `GEMINI_API_KEY` env vars are present, `entrypoint.sh` configures the `consult-llm-mcp` MCP server in `~/.claude.json`. This enables Claude Code to query external LLMs via the `consult_llm` MCP tool. Keys are stored in KV as `llm-keys:{bucketName}`, managed via `PUT /api/llm-keys`, and injected as container env vars during `setBucketName()`. Keys are NOT persisted in DO storage — read fresh from KV on each container start.
+
+**Skill trigger phrases:** "discuss with llms", "consult llms", "ask llms", "get a second opinion", "discuss with code llms", "consult code llms".
+
+**Model pairs** (skill sends to both models in parallel):
+
+| Type | OpenAI | Google |
+|------|--------|--------|
+| Default (no qualifier) | `gpt-5.4` | `gemini-3.1-pro-preview` |
+| Code (`"code llms"`) | `gpt-5.3-codex` | `gemini-3.1-pro-preview` |
+
+Skill definition: `preseed/agents/claude/skills/consult-llm/SKILL.md`.
+
 ---
 
 ## 6. Authentication
@@ -816,6 +831,14 @@ GET `/api/preferences`, PATCH `/api/preferences`
 
 `UserPreferences` fields: `lastAgentType` (AgentType, optional — last selected agent), `lastPresetId` (string, optional — last used preset), `workspaceSyncEnabled` (boolean, optional — workspace sync toggle), `fastStartEnabled` (boolean, default: `true` — fast CLI start toggle). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
 
+### LLM API Keys
+
+GET `/api/llm-keys` — returns masked keys (`****` + last 4 chars), never full keys.
+PUT `/api/llm-keys` — set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys.
+DELETE `/api/llm-keys` — removes all LLM keys from KV.
+
+Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`.
+
 ### Public (Onboarding)
 
 GET `/public/onboarding-config`, POST `/public/waitlist` (rate limited)
@@ -1073,6 +1096,8 @@ codeflare/
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls | Worker -> DO |
 | `MANUAL_TAB` | Set to `1` for user-created tabs to skip autostart | Worker -> DO |
 | `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
+| `OPENAI_API_KEY` | OpenAI API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
+| `GEMINI_API_KEY` | Gemini API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
 | `BROWSER` | Points to `open-url` shim that exits 1, forcing CLIs to print OAuth URLs as text | Dockerfile ENV (`/usr/local/bin/open-url`) |
 
@@ -1671,7 +1696,7 @@ The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_
 
 ## 24. Automatic Memory Capture
 
-Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 30 user messages. Zero manual intervention required.
+Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 15 user messages. Zero manual intervention required.
 
 ### Architecture
 
@@ -1680,7 +1705,7 @@ UserPromptSubmit hook (~150ms)           Main agent                    Backgroun
     |                                        |                              |
     +-- read stdin JSON                      |                              |
     +-- jq: count user messages              |                              |
-    +-- check counter (delta < 30?) → exit   |                              |
+    +-- check counter (delta < 15?) → exit   |                              |
     +-- check lock → exit                    |                              |
     +-- write .vars JSON file                |                              |
     +-- output JSON + exit 0 ─────────> receive additionalContext           |
@@ -1699,7 +1724,7 @@ The `memory-capture.sh` script runs as a **UserPromptSubmit hook** that uses the
 
 1. **Tilde expansion**: Expands `~` in `transcript_path` to `$HOME` (Claude Code may send tilde-prefixed paths).
 2. **Message counting**: `jq -r '.type' "$TRANSCRIPT" | grep -c '^user$'` counts user messages in the JSONL transcript.
-3. **Counter check**: Reads `~/.memory/counter/{session_id}` (line 1: last summarized count, line 2: last line offset). If the delta is < 30, exits silently.
+3. **Counter check**: Reads `~/.memory/counter/{session_id}` (line 1: last summarized count, line 2: last line offset). If the delta is < 15, exits silently.
 4. **Lock guard**: Checks for `~/.memory/counter/{session_id}.lock`. If a summary agent is already running, exits. Stale locks (>2 minutes) are removed automatically.
 5. **Vars file**: Writes all variables (transcript path, line offset, date, counts, file paths) to `~/.memory/counter/{session_id}.vars` as JSON — keeps the context string short.
 6. **JSON output + exit 0**: Outputs `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"..."}}` with a short instruction pointing to the prompt file and vars file. Exits with code 0 — no blocking, no loop guard needed.
@@ -1725,15 +1750,80 @@ The background agent's full instructions live in `~/.claude/hooks/memory-agent-p
 - Lock and vars files are **excluded from sync** via `--filter "- .memory/counter/*.lock"` and `--filter "- .memory/counter/*.vars"` — they are ephemeral per-invocation state.
 - The `.memory/` directory itself IS synced (it contains the MCP memory JSONL files used across sessions).
 
+### Session Modes
+
+Users can choose between **Default** and **Advanced** session modes via Settings > Session Defaults. The mode controls which preseed files are deployed on Recreate or new bucket creation.
+
+| Content | Default | Advanced |
+|---------|---------|----------|
+| Memory hooks & prompt | Yes | Yes |
+| CI monitoring, environment, no-local-builds rules | Yes | Yes |
+| Cloudflare stack, ship, ship references skills | Yes | Yes |
+| `consult-llm` skill | No | Yes |
+| `block-attributed-commits` hook | No | Yes |
+| Language rules (32 files: common, TS, Python, Go, Swift) | No | Yes |
+| Cherry-picked agents (8: architect, planner, code-reviewer, etc.) | No | Yes |
+| Cherry-picked commands (8: /plan, /tdd, /verify, etc.) | No | Yes |
+| Cherry-picked skills (10: api-design, security-review, etc.) | No | Yes |
+| Context7 plugin (up-to-date docs lookup) | No | Yes |
+| Superpowers plugin (TDD, debugging, planning skills) | No | Yes |
+
+**Storage**: `sessionMode?: 'default' | 'advanced'` in `UserPreferences` (KV). Undefined = `'default'`.
+
+**Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and embeds `modes` into each `SeedDocument`.
+
+**Resolver**: `resolveSessionMode(prefs)` in `src/lib/session-mode.ts` — single source of truth for the `?? 'default'` fallback.
+
+**When mode takes effect**: Only on explicit "Recreate AI agent skills & rules" click or new bucket creation. Existing users keep all their current R2 files until they Recreate.
+
+**Cleanup on Recreate**: `reconcileAgentConfigs()` seeds mode-appropriate files then deletes preseed-managed files not in the current mode. Strictly scoped to keys from `AGENTS_SEEDED_CONFIGS` — no bucket listing, no prefix scans, never touches user-created files. Partial delete failures return `warnings` without failing the overall operation.
+
+**No migration**: Existing users are unaffected. Changes only happen on explicit action.
+
+### Cherry-Picked ECC Components (Advanced Mode)
+
+The [Everything Claude Code](https://github.com/affaan-m/everything-claude-code) (ECC) plugin has been **decomposed** — instead of installing the full plugin with its 23 hooks, instinct system, and 152 components, we cherry-pick only the valuable agents, commands, and skills and preseed them directly to the filesystem where Claude Code auto-discovers them. No ECC plugin is installed or enabled.
+
+**Rationale**: The ECC plugin imposed ~3,200 tokens/turn of system prompt overhead (hook definitions, 16 agent + 40 command + 65 skill listings). Its instinct/continuous-learning system was non-functional (two bugs: `run-with-flags-shell.sh` didn't forward phase arguments, and async PostToolUse hooks received empty `tool_output`). Four async Stop hooks generated "Async hook Stop completed" notifications every session. The decomposition eliminates all overhead while retaining the useful content.
+
+**Cherry-picked agents (8)**: `architect`, `build-error-resolver`, `code-reviewer`, `doc-updater`, `planner`, `refactor-cleaner`, `security-reviewer`, `tdd-guide`. Preseeded to `~/.claude/agents/*.md` via the manifest pipeline with `"modes": ["advanced"]`.
+
+**Cherry-picked commands (8)**: `build-fix`, `checkpoint`, `code-review`, `plan`, `refactor-clean`, `tdd`, `test-coverage`, `verify`. Preseeded to `~/.claude/commands/*.md`.
+
+**Cherry-picked skills (10 + 1 reference)**: `api-design`, `backend-patterns`, `coding-standards`, `content-hash-cache-pattern`, `database-migrations`, `deployment-patterns`, `frontend-patterns`, `iterative-retrieval`, `search-first`, `security-review` (with `cloud-infrastructure-security.md` reference). Preseeded to `~/.claude/skills/<name>/SKILL.md`. Skills `e2e-testing`, `tdd-workflow`, and `verification-loop` were removed as they assume local test/build execution, which conflicts with the CI-only environment.
+
+**Excluded (123 components)**: All 23 ECC hooks, the instinct/continuous-learning system (observe.sh, instinct-cli.py, homunculus config), all Go/Python/Swift/Java/C++/Django/Spring Boot/ClickHouse skills, multi-model orchestration commands (5 `multi-*` commands), loop system commands, meta-ECC tools (harness-optimizer, skill-stocktake, configure-ecc), content/investor/market-research skills, NanoClaw REPL, session management, and all ECC scripts/lib files.
+
+**Selection criteria**: Components were kept if they (1) are language-agnostic or TypeScript/web-applicable, (2) have zero `${CLAUDE_PLUGIN_ROOT}` dependencies, (3) provide direct development value rather than meta-ECC functionality.
+
+**Rules**: 32 rule files are preseeded to `~/.claude/rules/{common,typescript,python,golang,swift}/` via the manifest with `"modes": ["advanced"]`. Common rules (8 files) cover security, coding style, patterns, performance, testing, git workflow, development workflow, and agents. `common/hooks.md` was removed (low-value generic advice; language-specific hooks files are self-contained). Language-specific rules (5 files each for TypeScript, Python, Go, Swift) provide language-appropriate conventions.
+
+**Plugins (context7 + superpowers only)**: Two plugins remain enabled for advanced mode: Context7 (`context7@claude-plugins-official`) for up-to-date documentation lookup via MCP, and Superpowers (`superpowers@claude-plugins-official`) for structured TDD, debugging, and planning skills. These are preseeded at `plugins/cache/claude-plugins-official/` with `installed_plugins.json` and `known_marketplaces.json`. Plugins persist across sessions via R2 sync.
+
+**Settings merge**: `entrypoint.sh` detects advanced mode by checking for `~/.claude/rules/common/` (only present in advanced mode). When detected, it merges `enabledPlugins` (context7 + superpowers) into `settings.json` via `jq '. * $var'` recursive merge. No `ECC_DISABLED_HOOKS` env var is needed since no ECC hooks exist.
+
+**Context consumption**: Per-turn system prompt overhead is ~9,000 tokens (rules ~7,885 + agent/command/skill/plugin listings ~1,110). On-demand content (agent/skill/command full text) loads only when invoked, ranging from 200–3,200 tokens per activation. Total preseed content is ~131K tokens but only ~7% is always-on.
+
+**Updates**: Cherry-picked files update when the preseed pipeline is redeployed and users click "Recreate AI agent skills & rules". Users cannot update ECC components in-session since there is no ECC plugin installed.
+
 ### Preseed Deployment
 
-Hook scripts and prompt are deployed via the preseed pipeline:
+All preseed content (hooks, rules, agents, commands, skills, plugin caches) is deployed via the manifest pipeline:
 
-1. Source files in `preseed/agents/claude/hooks/` (includes `memory-capture.sh` and `memory-agent-prompt.md`)
-2. `scripts/generate-agent-seed.mjs` bakes them into `src/lib/agent-seed.generated.ts`
-3. On first bucket creation: `seedAgentConfigs(overwrite: false)` writes to R2
-4. On "Recreate skills & rules" button: `seedAgentConfigs(overwrite: true)` overwrites in R2
-5. Bisync pulls from R2 to container `~/.claude/hooks/`
+1. Source files in `preseed/agents/claude/` organized by type: `hooks/`, `rules/`, `agents/`, `commands/`, `skills/`, `plugins/`
+2. `preseed/agents/claude/manifest.json` maps each file to modes (`default`, `advanced`, or both)
+3. `scripts/generate-agent-seed.mjs` reads manifest + files, validates consistency (every file must have a manifest entry and vice versa), generates `src/lib/agent-seed.generated.ts` with `AGENTS_SEEDED_CONFIGS` array
+4. On first bucket creation: `reconcileAgentConfigs(mode, { overwrite: false, cleanup: false })` writes mode-appropriate files to R2
+5. On "Recreate skills & rules" button: `reconcileAgentConfigs(mode, { overwrite: true, cleanup: true })` overwrites in R2 and deletes files not in current mode
+6. Bisync pulls from R2 to container `~/.claude/`
+
+**Manifest structure (121 entries)**:
+- `hooks/` (3): memory-capture.sh, memory-agent-prompt.md, block-attributed-commits.sh
+- `rules/` (33): core (4 default+advanced), common (9), typescript (5), python (5), golang (5), swift (5)
+- `agents/` (8): cherry-picked from ECC (advanced only)
+- `commands/` (8): cherry-picked from ECC (advanced only)
+- `skills/` (19): 3 codeflare-native + 13 cherry-picked from ECC + 3 ship references (advanced only, except cloudflare-stack and ship which are default+advanced)
+- `plugins/` (50): context7 (2), superpowers (46), metadata (2) — all advanced only
 
 ### Settings.json Merge
 
@@ -1747,4 +1837,4 @@ Hook scripts and prompt are deployed via the preseed pipeline:
 
 - **Counter reset**: Delete `~/.memory/counter/{session_id}` to force re-summarization from the beginning of the transcript.
 - **Stuck lock**: Delete `~/.memory/counter/{session_id}.lock` if the background agent crashed without cleanup. Stale locks older than 2 minutes are auto-removed by the hook.
-- **Agent not firing**: Check `~/.claude/settings.json` has the `UserPromptSubmit` hook configured for `memory-capture.sh`. Verify the transcript has 30+ user messages since last capture. Verify the hook outputs `hookSpecificOutput` JSON and exits with code 0.
+- **Agent not firing**: Check `~/.claude/settings.json` has the `UserPromptSubmit` hook configured for `memory-capture.sh`. Verify the transcript has 15+ user messages since last capture. Verify the hook outputs `hookSpecificOutput` JSON and exits with code 0.

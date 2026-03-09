@@ -4,16 +4,17 @@
  */
 import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
-import type { Env, Session, UserPreferences, TabConfig } from '../../types';
+import type { Env, Session, SessionMode, UserPreferences, LlmKeys, TabConfig } from '../../types';
 import { createBucketIfNotExists, getOrCreateScopedR2Token } from '../../lib/r2-admin';
-import { seedGettingStartedDocs, seedAgentConfigs } from '../../lib/r2-seed';
+import { seedGettingStartedDocs, reconcileAgentConfigs } from '../../lib/r2-seed';
+import { resolveSessionMode } from '../../lib/session-mode';
 import { getR2Config } from '../../lib/r2-config';
 import { getContainerContext, getSessionIdFromQuery, getContainerId } from '../../lib/container-helpers';
 import { AuthVariables } from '../../middleware/auth';
 import { createRateLimiter } from '../../middleware/rate-limit';
 import { AppError, ContainerError, NotFoundError, RateLimitError, toError, toErrorMessage } from '../../lib/error-types';
 import { BUCKET_NAME_SETTLE_DELAY_MS, CONTAINER_ID_DISPLAY_LENGTH, getMaxSessions } from '../../lib/constants';
-import { getSessionKey, getPreferencesKey, listAllKvKeys, getSessionPrefix } from '../../lib/kv-keys';
+import { getSessionKey, getPreferencesKey, getLlmKeysKey, listAllKvKeys, getSessionPrefix } from '../../lib/kv-keys';
 import { getDefaultTabConfig } from '../../lib/agent-config';
 import { containerLogger, getStoredBucketName } from './shared';
 import { getContainerInternalCB } from '../../lib/circuit-breakers';
@@ -35,6 +36,8 @@ function buildSetBucketNameBody(params: {
   tabConfig: TabConfig[];
   workspaceSyncEnabled: boolean;
   fastStartEnabled: boolean;
+  openaiApiKey?: string;
+  geminiApiKey?: string;
 }): string {
   return JSON.stringify({
     bucketName: params.bucketName,
@@ -46,6 +49,8 @@ function buildSetBucketNameBody(params: {
     tabConfig: params.tabConfig,
     workspaceSyncEnabled: params.workspaceSyncEnabled,
     fastStartEnabled: params.fastStartEnabled,
+    ...(params.openaiApiKey && { openaiApiKey: params.openaiApiKey }),
+    ...(params.geminiApiKey && { geminiApiKey: params.geminiApiKey }),
   });
 }
 
@@ -128,9 +133,10 @@ export async function validateSessionAndCheckLimits(params: {
 export async function ensureBucketAndSeed(params: {
   env: Env;
   bucketName: string;
+  sessionMode: SessionMode;
   logger: Logger;
 }): Promise<{ r2Config: { accountId: string; endpoint: string } }> {
-  const { env, bucketName, logger } = params;
+  const { env, bucketName, sessionMode, logger } = params;
 
   const r2Config = await getR2Config(env);
   const bucketResult = await createBucketIfNotExists(
@@ -162,9 +168,13 @@ export async function ensureBucketAndSeed(params: {
     }
 
     try {
-      const agentResult = await seedAgentConfigs(env, bucketName, r2Config.endpoint, { overwrite: false });
+      const agentResult = await reconcileAgentConfigs(env, bucketName, r2Config.endpoint, sessionMode, {
+        overwrite: false,
+        cleanup: false,
+      });
       logger.info('Seeded initial agent configs', {
         bucketName,
+        mode: sessionMode,
         writtenCount: agentResult.written.length,
         skippedCount: agentResult.skipped.length,
       });
@@ -195,6 +205,8 @@ export async function configureContainerDO(params: {
   tabConfig: TabConfig[];
   workspaceSyncEnabled: boolean;
   fastStartEnabled: boolean;
+  openaiApiKey?: string;
+  geminiApiKey?: string;
   logger: Logger;
 }): Promise<{ needsBucketUpdate: boolean; setBucketBody: string }> {
   const { container, bucketName, containerId, logger } = params;
@@ -209,6 +221,8 @@ export async function configureContainerDO(params: {
     tabConfig: params.tabConfig,
     workspaceSyncEnabled: params.workspaceSyncEnabled,
     fastStartEnabled: params.fastStartEnabled,
+    openaiApiKey: params.openaiApiKey,
+    geminiApiKey: params.geminiApiKey,
   });
 
   const needsBucketUpdate = storedBucketName !== bucketName;
@@ -373,11 +387,17 @@ app.post('/start', containerStartRateLimiter, async (c) => {
     const preferences = await c.env.KV.get<UserPreferences>(preferencesKey, 'json') || {};
     const workspaceSyncEnabled = preferences.workspaceSyncEnabled !== false;
     const fastStartEnabled = preferences.fastStartEnabled !== false;
+    const sessionMode = resolveSessionMode(preferences);
+
+    // Read LLM API keys (if any) to inject into container env vars
+    const llmKeysKey = getLlmKeysKey(bucketName);
+    const llmKeys = await c.env.KV.get<LlmKeys>(llmKeysKey, 'json');
 
     // Step 2: Ensure R2 bucket exists and seed if new
     const { r2Config } = await ensureBucketAndSeed({
       env: c.env,
       bucketName,
+      sessionMode,
       logger: reqLogger,
     });
 
@@ -402,6 +422,8 @@ app.post('/start', containerStartRateLimiter, async (c) => {
       tabConfig,
       workspaceSyncEnabled,
       fastStartEnabled,
+      openaiApiKey: llmKeys?.openaiApiKey,
+      geminiApiKey: llmKeys?.geminiApiKey,
       logger: reqLogger,
     });
 

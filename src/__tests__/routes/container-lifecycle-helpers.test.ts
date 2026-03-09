@@ -21,8 +21,10 @@ vi.mock('../../lib/r2-admin', () => ({
   getOrCreateScopedR2Token: mockGetOrCreateScopedR2Token,
 }));
 
+const mockReconcileAgentConfigs = vi.hoisted(() => vi.fn());
 vi.mock('../../lib/r2-seed', () => ({
   seedGettingStartedDocs: mockSeedGettingStartedDocs,
+  reconcileAgentConfigs: mockReconcileAgentConfigs,
 }));
 
 vi.mock('../../lib/r2-config', () => ({
@@ -112,6 +114,7 @@ describe('Container lifecycle extracted helpers', () => {
     });
     mockCreateBucketIfNotExists.mockResolvedValue({ success: true, created: false });
     mockSeedGettingStartedDocs.mockResolvedValue({ written: [], skipped: [] });
+    mockReconcileAgentConfigs.mockResolvedValue({ written: [], skipped: [], deleted: [], warnings: [] });
     mockGetOrCreateScopedR2Token.mockResolvedValue({
       accessKeyId: 'scoped-ak',
       secretAccessKey: 'scoped-sk',
@@ -192,6 +195,7 @@ describe('Container lifecycle extracted helpers', () => {
       const result = await ensureBucketAndSeed({
         env: { KV: mockKV as unknown as KVNamespace, CLOUDFLARE_API_TOKEN: 'tok' } as Env,
         bucketName: 'test-bucket',
+        sessionMode: 'default',
         logger: mockLogger as any,
       });
 
@@ -208,6 +212,7 @@ describe('Container lifecycle extracted helpers', () => {
         ensureBucketAndSeed({
           env: { KV: mockKV as unknown as KVNamespace, CLOUDFLARE_API_TOKEN: 'tok' } as Env,
           bucketName: 'test-bucket',
+          sessionMode: 'default',
           logger: mockLogger as any,
         })
       ).rejects.toThrow();
@@ -219,6 +224,7 @@ describe('Container lifecycle extracted helpers', () => {
       await ensureBucketAndSeed({
         env: { KV: mockKV as unknown as KVNamespace, CLOUDFLARE_API_TOKEN: 'tok' } as Env,
         bucketName: 'test-bucket',
+        sessionMode: 'default',
         logger: mockLogger as any,
       });
 
@@ -231,6 +237,7 @@ describe('Container lifecycle extracted helpers', () => {
       await ensureBucketAndSeed({
         env: { KV: mockKV as unknown as KVNamespace, CLOUDFLARE_API_TOKEN: 'tok' } as Env,
         bucketName: 'test-bucket',
+        sessionMode: 'default',
         logger: mockLogger as any,
       });
 
@@ -294,6 +301,34 @@ describe('Container lifecycle extracted helpers', () => {
 
       expect(result.needsBucketUpdate).toBe(false);
       expect(mockLogger.warn).toHaveBeenCalled();
+    });
+
+    it('includes LLM keys in setBucketName body when provided', async () => {
+      mockGetStoredBucketName.mockResolvedValue('old-bucket');
+
+      const paramsWithLlm = {
+        ...baseParams,
+        openaiApiKey: 'sk-test123',
+        geminiApiKey: 'AIzaSy-test456',
+      };
+
+      await configureContainerDO(paramsWithLlm);
+
+      const fetchCall = mockContainer.fetch.mock.calls[0][0] as Request;
+      const body = await fetchCall.json() as Record<string, unknown>;
+      expect(body.openaiApiKey).toBe('sk-test123');
+      expect(body.geminiApiKey).toBe('AIzaSy-test456');
+    });
+
+    it('omits LLM keys from body when not provided', async () => {
+      mockGetStoredBucketName.mockResolvedValue('old-bucket');
+
+      await configureContainerDO(baseParams);
+
+      const fetchCall = mockContainer.fetch.mock.calls[0][0] as Request;
+      const body = await fetchCall.json() as Record<string, unknown>;
+      expect(body).not.toHaveProperty('openaiApiKey');
+      expect(body).not.toHaveProperty('geminiApiKey');
     });
   });
 

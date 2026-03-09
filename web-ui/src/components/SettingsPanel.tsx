@@ -1,4 +1,4 @@
-import { Component, createSignal, createEffect, on, Show, onMount } from 'solid-js';
+import { Component, createSignal, createEffect, on, Show, onMount, JSX } from 'solid-js';
 import {
   mdiClose,
   mdiPaletteOutline,
@@ -6,8 +6,8 @@ import {
   mdiCogOutline,
   mdiFastForward,
   mdiContentPaste,
-  mdiGestureTapButton,
-  mdiLightbulbOnOutline,
+  mdiKeyVariant,
+  mdiChevronDown,
 } from '@mdi/js';
 import Icon from './Icon';
 import Button from './ui/Button';
@@ -16,6 +16,7 @@ import type { Settings } from '../lib/settings';
 import { sessionStore } from '../stores/session';
 import { isTouchDevice, isSamsungBrowser } from '../lib/mobile';
 import { recreateGettingStartedDocs, recreateAgentConfigs } from '../api/storage';
+import { getLlmKeys, updateLlmKeys } from '../api/client';
 import '../styles/settings-panel.css';
 
 interface SettingsPanelProps {
@@ -25,7 +26,83 @@ interface SettingsPanelProps {
   currentUserRole?: 'admin' | 'user';
 }
 
+type AccordionGroup = 'appearance' | 'session' | 'llm' | 'admin';
+
+interface AccordionSectionProps {
+  group: AccordionGroup;
+  title: string;
+  subtitle: string;
+  isOpen: boolean;
+  onToggle: () => void;
+  children: JSX.Element;
+}
+
+/*
+ * AccordionSection — single-open accordion pattern
+ *
+ * - Only one group is expanded at a time; clicking a collapsed header opens it
+ *   and closes the current one. Clicking the open header is a no-op.
+ * - Resets to "Appearance" whenever the parent panel is closed and reopened.
+ * - ARIA follows the WAI-ARIA Accordion Pattern: h3 wraps button (not vice
+ *   versa), button has aria-expanded & aria-controls, content region has
+ *   role="region" and aria-labelledby.
+ * - Collapse animation uses CSS grid-template-rows (0fr → 1fr, 250ms).
+ *   The inner wrapper uses visibility: hidden (delayed) to prevent keyboard
+ *   focus from reaching collapsed content.
+ */
+const AccordionSection: Component<AccordionSectionProps> = (props) => {
+  const headerId = () => `accordion-header-${props.group}`;
+  const panelId = () => `accordion-panel-${props.group}`;
+
+  return (
+    <div class="settings-group">
+      <h3 class="settings-group-heading">
+        <button
+          type="button"
+          class="accordion-header"
+          aria-expanded={props.isOpen}
+          aria-controls={panelId()}
+          id={headerId()}
+          data-testid={headerId()}
+          onClick={() => props.onToggle()}
+        >
+          <span class={`accordion-chevron ${props.isOpen ? 'accordion-chevron--open' : ''}`}>
+            <Icon path={mdiChevronDown} size={20} />
+          </span>
+          <span class="accordion-header-text">
+            <span class="settings-group-title">{props.title}</span>
+            <Show when={!props.isOpen}>
+              <span class="accordion-subtitle" data-testid={`accordion-subtitle-${props.group}`}>
+                {props.subtitle}
+              </span>
+            </Show>
+          </span>
+        </button>
+      </h3>
+      <div
+        class={`accordion-body ${props.isOpen ? 'accordion-body--open' : ''}`}
+        id={panelId()}
+        data-testid={panelId()}
+        role="region"
+        aria-labelledby={headerId()}
+        aria-hidden={!props.isOpen}
+      >
+        <div class="accordion-body-inner">
+          {props.children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const DEFAULT_ACCENT_HEX = '#3b82f6';
+
+const ACCORDION_SUBTITLES: Record<AccordionGroup, string> = {
+  appearance: 'Colors, tips & display preferences',
+  session: 'Startup behavior & workspace sync',
+  llm: 'Optional — connect GPT & Gemini for second opinions',
+  admin: 'Setup wizard & user management',
+};
 
 const SettingsPanel: Component<SettingsPanelProps> = (props) => {
   const [settings, setSettings] = createSignal<Settings>(defaultSettings);
@@ -36,9 +113,31 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
   const [recreateAgentLoading, setRecreateAgentLoading] = createSignal(false);
   const [recreateAgentMessage, setRecreateAgentMessage] = createSignal<string | null>(null);
   const [recreateAgentError, setRecreateAgentError] = createSignal<string | null>(null);
+  const [llmOpenaiKey, setLlmOpenaiKey] = createSignal('');
+  const [llmGeminiKey, setLlmGeminiKey] = createSignal('');
+  const [llmKeysSaving, setLlmKeysSaving] = createSignal(false);
+  const [llmKeysMessage, setLlmKeysMessage] = createSignal<string | null>(null);
+  const [llmKeysError, setLlmKeysError] = createSignal<string | null>(null);
+  const [openGroup, setOpenGroup] = createSignal<AccordionGroup>('appearance');
+
+  // Reset accordion to Appearance when panel is closed then reopened (false → true)
+  createEffect(on(
+    () => props.isOpen,
+    (isOpen, prevIsOpen) => {
+      if (isOpen && prevIsOpen === false) {
+        setOpenGroup('appearance');
+      }
+    }
+  ));
+
+  const handleAccordionClick = (group: AccordionGroup) => {
+    if (openGroup() !== group) setOpenGroup(group);
+  };
+
   const isAdmin = () => props.currentUserRole === 'admin';
   const workspaceSyncEnabled = () => sessionStore.preferences.workspaceSyncEnabled !== false;
   const fastStartEnabled = () => sessionStore.preferences.fastStartEnabled !== false;
+  const currentSessionMode = () => sessionStore.preferences.sessionMode ?? 'default';
 
   const showButtonLabels = () => settings().showButtonLabels !== false;
   const showTips = () => settings().showTips !== false;
@@ -50,6 +149,14 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
     const loaded = loadSettings();
     setSettings(loaded);
     setAccentHexInput(loaded.accentColor || '');
+
+    // Load masked LLM keys
+    getLlmKeys()
+      .then((keys) => {
+        if (keys.openaiApiKey) setLlmOpenaiKey(keys.openaiApiKey);
+        if (keys.geminiApiKey) setLlmGeminiKey(keys.geminiApiKey);
+      })
+      .catch(() => { /* ignore — keys not loaded */ });
   });
 
   // Save settings whenever they change (deferred to skip initial mount)
@@ -77,6 +184,11 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 
   const handleFastStartToggle = () => {
     void sessionStore.updatePreferences({ fastStartEnabled: !fastStartEnabled() });
+  };
+
+  const handleSessionModeChange = (mode: 'default' | 'advanced') => {
+    if (mode === currentSessionMode()) return;
+    void sessionStore.updatePreferences({ sessionMode: mode });
   };
 
   const handleRecreateDocs = async () => {
@@ -125,6 +237,45 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
     }
   };
 
+  const handleSaveLlmKeys = async () => {
+    if (llmKeysSaving()) return;
+
+    setLlmKeysSaving(true);
+    setLlmKeysMessage(null);
+    setLlmKeysError(null);
+
+    try {
+      const payload: { openaiApiKey?: string | null; geminiApiKey?: string | null } = {};
+
+      // Skip masked values (already stored) — only send changes
+      const openai = llmOpenaiKey();
+      if (openai === '') {
+        payload.openaiApiKey = null; // clear
+      } else if (!openai.startsWith('****')) {
+        payload.openaiApiKey = openai; // new value
+      }
+
+      const gemini = llmGeminiKey();
+      if (gemini === '') {
+        payload.geminiApiKey = null; // clear
+      } else if (!gemini.startsWith('****')) {
+        payload.geminiApiKey = gemini; // new value
+      }
+
+      const result = await updateLlmKeys(payload);
+      // Update inputs with masked values from server
+      setLlmOpenaiKey(result.openaiApiKey || '');
+      setLlmGeminiKey(result.geminiApiKey || '');
+      setLlmKeysMessage('Keys saved. Takes effect on next session start.');
+    } catch (error) {
+      setLlmKeysError(
+        error instanceof Error ? error.message : 'Failed to save LLM keys.'
+      );
+    } finally {
+      setLlmKeysSaving(false);
+    }
+  };
+
   return (
     <>
       {/* Backdrop */}
@@ -160,9 +311,13 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
         {/* Content */}
         <div class="settings-content">
           {/* ── Appearance ── */}
-          <div class="settings-group settings-group-1">
-            <h3 class="settings-group-title">Appearance</h3>
-
+          <AccordionSection
+            group="appearance"
+            title="Appearance"
+            subtitle={ACCORDION_SUBTITLES.appearance}
+            isOpen={openGroup() === 'appearance'}
+            onToggle={() => handleAccordionClick('appearance')}
+          >
             {/* Accent Color */}
             <section class="settings-section">
               <div class="settings-section-header">
@@ -228,11 +383,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 
             {/* Tips & Tricks */}
             <section class="settings-section">
-              <div class="settings-section-header">
-                <Icon path={mdiLightbulbOnOutline} size={16} />
-                <h3 class="settings-section-title">Tips & Tricks</h3>
-              </div>
-              <div class="setting-row">
+              <div class="setting-row setting-row--clickable" onClick={(e) => {
+                if (!(e.target as HTMLElement).closest('.toggle')) updateSetting('showTips', !showTips());
+              }}>
                 <label for="settings-show-tips">Show tips on dashboard</label>
                 <button
                   type="button"
@@ -256,11 +409,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
             {/* Button Labels — mobile only */}
             <Show when={isTouchDevice()}>
               <section class="settings-section">
-                <div class="settings-section-header">
-                  <Icon path={mdiGestureTapButton} size={16} />
-                  <h3 class="settings-section-title">Mobile Buttons</h3>
-                </div>
-                <div class="setting-row">
+                <div class="setting-row setting-row--clickable" onClick={(e) => {
+                  if (!(e.target as HTMLElement).closest('.toggle')) updateSetting('showButtonLabels', !showButtonLabels());
+                }}>
                   <label for="settings-button-labels">Show button labels</label>
                   <button
                     type="button"
@@ -285,11 +436,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
             {/* Samsung — Samsung only */}
             <Show when={isSamsungBrowser}>
               <section class="settings-section">
-                <div class="settings-section-header">
-                  <Icon path={mdiGestureTapButton} size={16} />
-                  <h3 class="settings-section-title">Samsung Internet</h3>
-                </div>
-                <div class="setting-row">
+                <div class="setting-row setting-row--clickable" onClick={(e) => {
+                  if (!(e.target as HTMLElement).closest('.toggle')) updateSetting('samsungAddressBarTop', !samsungAddressBarTop());
+                }}>
                   <label for="settings-samsung-bar-top">Address bar at top</label>
                   <button
                     type="button"
@@ -310,11 +459,64 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                 </div>
               </section>
             </Show>
-          </div>
+          </AccordionSection>
 
           {/* ── Session Defaults ── */}
-          <div class="settings-group settings-group-2">
-            <h3 class="settings-group-title">Session Defaults</h3>
+          <AccordionSection
+            group="session"
+            title="Session Defaults"
+            subtitle={ACCORDION_SUBTITLES.session}
+            isOpen={openGroup() === 'session'}
+            onToggle={() => handleAccordionClick('session')}
+          >
+            {/* Session Mode */}
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <h3 class="settings-section-title">Session Mode</h3>
+              </div>
+              <div
+                class="session-mode-control"
+                role="radiogroup"
+                aria-label="Session mode"
+                data-testid="session-mode-control"
+              >
+                <label
+                  class={`session-mode-option ${currentSessionMode() === 'default' ? 'session-mode-option--selected' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="session-mode"
+                    value="default"
+                    checked={currentSessionMode() === 'default'}
+                    onChange={() => handleSessionModeChange('default')}
+                    role="radio"
+                    aria-checked={currentSessionMode() === 'default'}
+                    data-testid="session-mode-default"
+                  />
+                  Default
+                </label>
+                <label
+                  class={`session-mode-option ${currentSessionMode() === 'advanced' ? 'session-mode-option--selected' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="session-mode"
+                    value="advanced"
+                    checked={currentSessionMode() === 'advanced'}
+                    onChange={() => handleSessionModeChange('advanced')}
+                    role="radio"
+                    aria-checked={currentSessionMode() === 'advanced'}
+                    data-testid="session-mode-advanced"
+                  />
+                  Advanced
+                </label>
+              </div>
+              <div class="setting-row setting-row--column-gap">
+                <span class="settings-hint" data-testid="session-mode-hint">
+                  Controls which AI skills and rules are preseeded. Click "Recreate" below to apply.
+                </span>
+              </div>
+            </section>
 
             {/* Agent Startup / Fast Start */}
             <section class="settings-section">
@@ -322,7 +524,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                 <Icon path={mdiFastForward} size={16} />
                 <h3 class="settings-section-title">Agent Startup</h3>
               </div>
-              <div class="setting-row">
+              <div class="setting-row setting-row--clickable" onClick={(e) => {
+                if (!(e.target as HTMLElement).closest('.toggle')) handleFastStartToggle();
+              }}>
                 <label for="settings-fast-start">Fast Start</label>
                 <button
                   type="button"
@@ -349,7 +553,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                 <Icon path={mdiCloudSyncOutline} size={16} />
                 <h3 class="settings-section-title">R2 Sync</h3>
               </div>
-              <div class="setting-row">
+              <div class="setting-row setting-row--clickable" onClick={(e) => {
+                if (!(e.target as HTMLElement).closest('.toggle')) handleWorkspaceSyncToggle();
+              }}>
                 <label for="settings-workspace-sync">Sync Workspace Folder</label>
                 <button
                   type="button"
@@ -438,7 +644,9 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                   <Icon path={mdiContentPaste} size={16} />
                   <h3 class="settings-section-title">Clipboard</h3>
                 </div>
-                <div class="setting-row">
+                <div class="setting-row setting-row--clickable" onClick={(e) => {
+                  if (!(e.target as HTMLElement).closest('.toggle')) updateSetting('clipboardAccess', !clipboardAccess());
+                }}>
                   <label for="settings-clipboard-access">Allow paste from clipboard</label>
                   <button
                     type="button"
@@ -459,12 +667,90 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                 </div>
               </section>
             </Show>
-          </div>
+          </AccordionSection>
+
+          {/* ── LLM API Keys ── */}
+          <AccordionSection
+            group="llm"
+            title="LLM API Keys"
+            subtitle={ACCORDION_SUBTITLES.llm}
+            isOpen={openGroup() === 'llm'}
+            onToggle={() => handleAccordionClick('llm')}
+          >
+            <p class="llm-keys-explanation" data-testid="llm-keys-explanation">
+              Optional. These keys let you consult external AI models (GPT, Gemini) for second opinions while coding. Used by the "Consult LLM" tool in Claude Code sessions.
+            </p>
+            <p class="llm-keys-links" data-testid="llm-keys-links">
+              Get keys: <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">OpenAI Platform</a> · <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Google AI Studio</a>
+            </p>
+
+            <section class="settings-section">
+              <div class="settings-section-header">
+                <Icon path={mdiKeyVariant} size={16} />
+                <h3 class="settings-section-title">Provider Keys</h3>
+              </div>
+              <div class="setting-row setting-row--column-gap">
+                <label for="settings-llm-openai-key">OpenAI API Key</label>
+                <input
+                  type="password"
+                  id="settings-llm-openai-key"
+                  class="llm-key-input"
+                  value={llmOpenaiKey()}
+                  placeholder="sk-..."
+                  autocomplete="off"
+                  onInput={(e) => setLlmOpenaiKey(e.currentTarget.value)}
+                  data-testid="settings-llm-openai-key"
+                />
+              </div>
+              <div class="setting-row setting-row--column-gap">
+                <label for="settings-llm-gemini-key">Gemini API Key</label>
+                <input
+                  type="password"
+                  id="settings-llm-gemini-key"
+                  class="llm-key-input"
+                  value={llmGeminiKey()}
+                  placeholder="AI..."
+                  autocomplete="off"
+                  onInput={(e) => setLlmGeminiKey(e.currentTarget.value)}
+                  data-testid="settings-llm-gemini-key"
+                />
+              </div>
+              <div class="setting-row setting-row--column-gap">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  loading={llmKeysSaving()}
+                  onClick={() => { void handleSaveLlmKeys(); }}
+                  data-testid="settings-llm-keys-save"
+                >
+                  Save Keys
+                </Button>
+                <span class="settings-hint" data-testid="settings-llm-keys-hint">
+                  Keys take effect on next session start. Used by the consult-llm MCP tool.
+                </span>
+                <Show when={llmKeysMessage()}>
+                  {(message) => (
+                    <span class="settings-hint" data-testid="settings-llm-keys-success">{message()}</span>
+                  )}
+                </Show>
+                <Show when={llmKeysError()}>
+                  {(error) => (
+                    <span class="settings-error" data-testid="settings-llm-keys-error">{error()}</span>
+                  )}
+                </Show>
+              </div>
+            </section>
+          </AccordionSection>
 
           {/* ── Administration (admin only) ── */}
           <Show when={isAdmin()}>
-            <div class="settings-group settings-group-3">
-              <h3 class="settings-group-title">Administration</h3>
+            <AccordionSection
+              group="admin"
+              title="Administration"
+              subtitle={ACCORDION_SUBTITLES.admin}
+              isOpen={openGroup() === 'admin'}
+              onToggle={() => handleAccordionClick('admin')}
+            >
               <section class="settings-section">
                 <div class="settings-section-header">
                   <Icon path={mdiCogOutline} size={16} />
@@ -488,7 +774,7 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                   </span>
                 </div>
               </section>
-            </div>
+            </AccordionSection>
           </Show>
 
         </div>
