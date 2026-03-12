@@ -30,33 +30,64 @@ async function seedDocuments(
   const written: string[] = [];
   const skipped: string[] = [];
 
-  for (const doc of documents) {
-    const url = getR2Url(endpoint, bucketName, doc.key);
+  if (!overwrite) {
+    // Phase 1: parallel HEAD checks to determine which docs need writing
+    const headResults = await Promise.allSettled(
+      documents.map(async (doc) => {
+        const url = getR2Url(endpoint, bucketName, doc.key);
+        const res = await r2Client.fetch(url, { method: 'HEAD' });
+        return { doc, exists: res.ok, status: res.status };
+      })
+    );
 
-    if (!overwrite) {
-      const headResponse = await r2Client.fetch(url, { method: 'HEAD' });
-      if (headResponse.ok) {
+    const toWrite: SeedDocument[] = [];
+    for (const result of headResults) {
+      if (result.status === 'rejected') throw new Error(`HEAD check failed: ${result.reason}`);
+      const { doc, exists, status } = result.value;
+      if (exists) {
         skipped.push(doc.key);
-        continue;
-      }
-      if (headResponse.status !== 404) {
-        throw new Error(`Failed to check existing object ${doc.key}: HTTP ${headResponse.status}`);
+      } else if (status === 404) {
+        toWrite.push(doc);
+      } else {
+        throw new Error(`Failed to check existing object ${doc.key}: HTTP ${status}`);
       }
     }
 
-    const putResponse = await r2Client.fetch(url, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': doc.contentType,
-      },
-      body: doc.content,
-    });
-
-    if (!putResponse.ok) {
-      throw new Error(`Failed to seed object ${doc.key}: HTTP ${putResponse.status}`);
+    // Phase 2: parallel PUTs for docs that need writing
+    const putResults = await Promise.allSettled(
+      toWrite.map(async (doc) => {
+        const url = getR2Url(endpoint, bucketName, doc.key);
+        const res = await r2Client.fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': doc.contentType },
+          body: doc.content,
+        });
+        if (!res.ok) throw new Error(`Failed to seed object ${doc.key}: HTTP ${res.status}`);
+        return doc.key;
+      })
+    );
+    for (const result of putResults) {
+      if (result.status === 'rejected') throw new Error(String(result.reason));
+      written.push(result.value);
     }
-
-    written.push(doc.key);
+  } else {
+    // overwrite=true: parallel PUTs for all documents
+    const putResults = await Promise.allSettled(
+      documents.map(async (doc) => {
+        const url = getR2Url(endpoint, bucketName, doc.key);
+        const res = await r2Client.fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': doc.contentType },
+          body: doc.content,
+        });
+        if (!res.ok) throw new Error(`Failed to seed object ${doc.key}: HTTP ${res.status}`);
+        return doc.key;
+      })
+    );
+    for (const result of putResults) {
+      if (result.status === 'rejected') throw new Error(String(result.reason));
+      written.push(result.value);
+    }
   }
 
   return { written, skipped };
@@ -82,19 +113,33 @@ export async function seedGettingStartedDocs(
 
 /**
  * Return only the seed documents that belong to the given session mode.
+ * Throws if duplicate keys exist within the same mode (indicates generator bug).
  */
 export function getConfigsForMode(mode: SessionMode): SeedDocument[] {
-  return AGENTS_SEEDED_CONFIGS.filter((doc) => doc.modes.includes(mode));
+  const docs = AGENTS_SEEDED_CONFIGS.filter((doc) => doc.modes.includes(mode));
+  const seen = new Set<string>();
+  for (const doc of docs) {
+    if (seen.has(doc.key)) throw new Error(`Duplicate key "${doc.key}" in mode "${mode}"`);
+    seen.add(doc.key);
+  }
+  return docs;
 }
 
 /**
  * Return the R2 keys of preseed-managed files that are NOT in the given mode.
  * These are candidates for cleanup on mode switch.
+ *
+ * Keys that have a variant in the target mode (same key, different content per mode)
+ * are excluded — they were just seeded and must not be deleted.
  */
 export function getPreseedKeysNotInMode(mode: SessionMode): string[] {
+  const keysInMode = new Set(
+    AGENTS_SEEDED_CONFIGS.filter((doc) => doc.modes.includes(mode)).map((doc) => doc.key)
+  );
   return AGENTS_SEEDED_CONFIGS
     .filter((doc) => !doc.modes.includes(mode))
-    .map((doc) => doc.key);
+    .map((doc) => doc.key)
+    .filter((k) => !keysInMode.has(k));
 }
 
 /**

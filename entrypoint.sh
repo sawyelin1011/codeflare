@@ -219,7 +219,7 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .codex/state*.sqlite-wal"    # SQLite WAL (ephemeral, corrupt on restore)
 
     # Claude Code — session-specific ephemeral data, regenerated per session
-    --filter "- .claude/plugins/marketplaces/**/.git/**"  # marketplace git clones (~2MB each, reinstalled from remote)
+    --filter "- .claude/plugins/marketplaces/**"  # marketplace git clones (ephemeral, re-cloned from remote on demand)
     --filter "- .claude/cache/**"            # changelog cache
     --filter "- .claude/debug/**"            # debug logs
     --filter "- .claude/file-history/**"     # per-session file edit history, grows unbounded
@@ -314,7 +314,7 @@ initial_sync_from_r2() {
 # Step 2: Establish bisync baseline (after data is restored)
 # IMPORTANT: Uses timeout to prevent infinite hangs
 establish_bisync_baseline() {
-    local BISYNC_TIMEOUT=180  # 3 minutes max for baseline
+    local BISYNC_TIMEOUT=600  # 10 minutes max for baseline (large buckets with many files)
     echo "[entrypoint] Step 2: Establishing bisync baseline (max ${BISYNC_TIMEOUT}s)..." | tee -a /tmp/sync.log
 
     BASELINE_OUTPUT=$(mktemp)
@@ -336,22 +336,22 @@ establish_bisync_baseline() {
         SYNC_RESULT=$?
     fi
     cat "$BASELINE_OUTPUT" >> /tmp/sync.log
-    cat "$BASELINE_OUTPUT"
+    cat "$BASELINE_OUTPUT" >&2
     rm -f "$BASELINE_OUTPUT"
     if [ $SYNC_RESULT -eq 0 ]; then
-        echo "[entrypoint] Step 2 complete: Bisync baseline established"
+        echo "[entrypoint] Step 2 complete: Bisync baseline established" | tee -a /tmp/sync.log
         touch /tmp/.bisync-initialized
         SYNC_STATUS="success"
         return 0
     elif [ $SYNC_RESULT -eq 124 ]; then
-        echo "[entrypoint] WARNING: Bisync baseline timed out after ${BISYNC_TIMEOUT}s"
+        echo "[entrypoint] WARNING: Bisync baseline timed out after ${BISYNC_TIMEOUT}s" | tee -a /tmp/sync.log >&2
         touch /tmp/.bisync-initialized
         SYNC_STATUS="timeout"
         return 0  # Don't fail, just skip daemon
     else
         SYNC_ERROR="rclone bisync --resync failed with code $SYNC_RESULT"
         SYNC_STATUS="failed"
-        echo "[entrypoint] ERROR: $SYNC_ERROR"
+        echo "[entrypoint] ERROR: $SYNC_ERROR" | tee -a /tmp/sync.log >&2
         return 1
     fi
 }
@@ -443,14 +443,34 @@ start_sync_daemon() {
             echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Bisync failed with exit code $SYNC_RESULT (failure $CONSECUTIVE_FAILURES/3)" | tee -a /tmp/sync.log
             update_sync_status "failed" "Bisync exit code $SYNC_RESULT"
 
+            # Exit code 7 with missing listing files = no prior bisync state exists.
+            # Skip straight to --resync instead of waiting for 3 failures.
+            local LISTING_GLOB="/home/user/.cache/rclone/bisync/home_user..r2_${R2_BUCKET_NAME}.path*.lst"
+            local HAS_LISTINGS=false
+            # shellcheck disable=SC2086
+            ls $LISTING_GLOB >/dev/null 2>&1 && HAS_LISTINGS=true
+
+            if [ "$HAS_LISTINGS" = "false" ] && [ $SYNC_RESULT -eq 7 ]; then
+                echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') No listing files found — immediate resync" | tee -a /tmp/sync.log
+                CONSECUTIVE_FAILURES=3  # force resync path below
+            fi
+
             # After 3 consecutive failures (each with 3 internal retries = 9 total attempts),
             # fall back to --resync to re-establish clean bisync state.
             # This merges both sides (files on only one side get copied to the other).
             if [ $CONSECUTIVE_FAILURES -ge 3 ]; then
-                echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') 3 consecutive failures — falling back to --resync" | tee -a /tmp/sync.log
+                echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') 3 consecutive failures — falling back to --resync" | tee -a /tmp/sync.log >&2
                 update_sync_status "failed" "Resync fallback triggered"
-                establish_bisync_baseline
-                CONSECUTIVE_FAILURES=0
+                if establish_bisync_baseline; then
+                    echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Resync fallback succeeded — resuming normal sync" | tee -a /tmp/sync.log >&2
+                    CONSECUTIVE_FAILURES=0
+                else
+                    local LAST_ERRORS
+                    LAST_ERRORS=$(grep -i 'error\|fatal\|failed' /tmp/sync.log | tail -3)
+                    echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') RESYNC FAILED — will retry next cycle. Recent errors:" | tee -a /tmp/sync.log >&2
+                    echo "$LAST_ERRORS" | tee -a /tmp/sync.log >&2
+                    CONSECUTIVE_FAILURES=2  # retry resync after 1 more failure instead of 3
+                fi
             fi
         fi
     done &
@@ -894,29 +914,7 @@ else
 fi
 echo "[entrypoint] Claude Code hooks configured in settings.json"
 
-# Plugins: enable context7 + superpowers for advanced mode (detected by presence of rules/common/)
-# ECC plugin removed — agents, commands, skills are preseeded directly to ~/.claude/ via agent-seed
-if [ -d "$USER_CLAUDE_DIR/rules/common" ]; then
-    PLUGINS_CONFIG='{"enabledPlugins":{"context7@claude-plugins-official":true,"superpowers@claude-plugins-official":true}}'
-    TMP_SETTINGS=$(mktemp)
-    if jq --argjson plugins "$PLUGINS_CONFIG" '. * $plugins' "$SETTINGS_FILE" > "$TMP_SETTINGS" 2>/dev/null; then
-        mv "$TMP_SETTINGS" "$SETTINGS_FILE"
-    else
-        rm -f "$TMP_SETTINGS"
-    fi
-
-    echo "[entrypoint] Plugins enabled (context7, superpowers), cherry-picked agents/commands/skills preseeded"
-
-    # Fix superpowers plugin SessionStart hook quoting bug (5.0.0+)
-    # Upstream uses single quotes around ${CLAUDE_PLUGIN_ROOT} which prevents variable expansion
-    for hooks_json in "$USER_HOME/.claude/plugins/cache/claude-plugins-official/superpowers"/*/hooks/hooks.json; do
-        [ -f "$hooks_json" ] || continue
-        if grep -q "'\${CLAUDE_PLUGIN_ROOT}" "$hooks_json" 2>/dev/null; then
-            sed -i "s|'\${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd'|bash \"\${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\"|g" "$hooks_json"
-            echo "[entrypoint] Fixed superpowers hook quoting in $(dirname "$hooks_json")"
-        fi
-    done
-fi
+# Plugins removed from preseed — users install via marketplace if wanted
 
 # === Fast Start: tool-specific config files ===
 if [ "${FAST_CLI_START:-true}" != "false" ]; then
@@ -965,7 +963,7 @@ fi
 # ============================================================================
 
 echo "[entrypoint] Starting terminal server on port 8080..."
-cd /app/host && HOME="$USER_HOME" TERMINAL_PORT=8080 node server.js &
+cd /app/host && HOME="$USER_HOME" TERMINAL_PORT=8080 node dist/server.js &
 TERMINAL_PID=$!
 echo "$TERMINAL_PID" > /tmp/terminal.pid
 echo "[entrypoint] Terminal server started with PID $TERMINAL_PID"

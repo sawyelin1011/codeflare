@@ -5,6 +5,10 @@ import { AGENTS_SEEDED_CONFIGS } from '../../lib/agent-seed.generated';
  * Validates ECC (Everything Claude Code) rule integration in the generated
  * agent seed configs. ECC rules are language-specific and common rules that
  * should only be available in advanced session mode.
+ *
+ * These checks are scoped to Claude documents only — non-Claude agents
+ * receive rules concatenated into a single instructions file, not as
+ * individual rule documents.
  */
 
 const ECC_SUBDIRS = ['common', 'typescript', 'python', 'golang', 'swift'] as const;
@@ -18,15 +22,19 @@ const ECC_FILES_PER_SUBDIR: Record<string, number> = {
   swift: 5,
 };
 
+function claudeDocs() {
+  return AGENTS_SEEDED_CONFIGS.filter((doc) => doc.key.startsWith('.claude/'));
+}
+
 function eccRules() {
-  return AGENTS_SEEDED_CONFIGS.filter((doc) =>
+  return claudeDocs().filter((doc) =>
     ECC_SUBDIRS.some((dir) => doc.key.startsWith(`.claude/rules/${dir}/`))
   );
 }
 
 function codeflareRules() {
   // Original codeflare rules — directly in .claude/rules/ without a subdirectory
-  return AGENTS_SEEDED_CONFIGS.filter(
+  return claudeDocs().filter(
     (doc) =>
       doc.key.startsWith('.claude/rules/') &&
       !ECC_SUBDIRS.some((dir) => doc.key.startsWith(`.claude/rules/${dir}/`))
@@ -86,13 +94,23 @@ describe('ECC rules in agent-seed', () => {
     }
   });
 
-  it('existing codeflare rules still have default+advanced modes', () => {
-    const cfRules = codeflareRules();
+  it('non-memory codeflare rules have default+advanced modes', () => {
+    const cfRules = codeflareRules().filter(
+      (doc) => doc.key !== '.claude/rules/memory.md'
+    );
     expect(cfRules.length).toBeGreaterThan(0);
     for (const rule of cfRules) {
       expect(rule.modes).toContain('default');
       expect(rule.modes).toContain('advanced');
     }
+  });
+
+  it('memory rule is advanced-only (depends on MCP memory server)', () => {
+    const memoryRule = codeflareRules().find(
+      (doc) => doc.key === '.claude/rules/memory.md'
+    );
+    expect(memoryRule).toBeDefined();
+    expect(memoryRule!.modes).toEqual(['advanced']);
   });
 
   it('total ECC rules count is 23', () => {

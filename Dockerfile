@@ -1,14 +1,21 @@
 # Codeflare Container - Multi-session terminal server with rclone sync
 # Uses node-pty for PTY management and rclone for R2 storage sync
 
-# ---- Stage 1: Builder (compile native addons) ----
+# ---- Stage 1: Builder (compile native addons + TypeScript) ----
 FROM node:24-bookworm-slim@sha256:e8e2e91b1378f83c5b2dd15f0247f34110e2fe895f6ca7719dbb780f929368eb AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends make gcc g++ python3 && rm -rf /var/lib/apt/lists/*
 
 COPY host/package.json host/package-lock.json /app/host/
 WORKDIR /app/host
-RUN npm ci --omit=dev
+# Install all deps (including devDependencies for TypeScript compilation)
+RUN npm ci
+# Copy TypeScript source and config, then compile
+COPY host/tsconfig.json /app/host/
+COPY host/src/ /app/host/src/
+RUN npm run build
+# Remove devDependencies after build to keep runtime image lean
+RUN npm prune --omit=dev
 
 # ---- Stage 2: Runtime ----
 FROM node:24-bookworm-slim@sha256:e8e2e91b1378f83c5b2dd15f0247f34110e2fe895f6ca7719dbb780f929368eb
@@ -64,8 +71,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && ln -s "$(which nvim)" /usr/local/bin/vim
 
 # Install rclone (pinned version — unpinned install.sh broke bisync, see TECHNICAL.md §22.13)
-RUN curl -fsSL https://downloads.rclone.org/v1.73.1/rclone-v1.73.1-linux-amd64.deb -o /tmp/rclone.deb \
-    && echo "4ae039b8ee737bc925a841f6398659584b8b6bdd29c0bb157c40cc234befd732  /tmp/rclone.deb" | sha256sum -c - \
+RUN curl -fsSL https://downloads.rclone.org/v1.73.2/rclone-v1.73.2-linux-amd64.deb -o /tmp/rclone.deb \
+    && echo "2c6bc8e6ee23493907bdae2c599b00b9fcc2def7d1346211ce371323d14ac9d6  /tmp/rclone.deb" | sha256sum -c - \
     && dpkg -i /tmp/rclone.deb \
     && rm /tmp/rclone.deb
 
@@ -93,8 +100,8 @@ RUN YAZI_VERSION="26.1.22" && \
     mv /tmp/yazi/yazi-x86_64-unknown-linux-gnu/yazi /usr/local/bin/yazi && \
     chmod +x /usr/local/bin/yazi && \
     rm -rf /tmp/yazi /tmp/yazi.zip
-RUN LAZYGIT_VERSION="0.59.0" && \
-    LAZYGIT_SHA256="264283f40a40c899d702a338b20622f690221f753f03bac827c1f34e91f516c2" && \
+RUN LAZYGIT_VERSION="0.60.0" && \
+    LAZYGIT_SHA256="6252ca6cf98bc4fd3e0d927b54225910cfa57b065d0ad88263f14592f7f9ab15" && \
     curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_linux_x86_64.tar.gz" -o /tmp/lazygit.tar.gz && \
     echo "${LAZYGIT_SHA256}  /tmp/lazygit.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/lazygit.tar.gz -C /usr/local/bin lazygit && \
@@ -112,7 +119,7 @@ COPY .cache-bust /tmp/.cache-bust
 RUN apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g github:nikolanovoselec/claude-unleashed#12ecd6af335285ff459645c07f3d635b76b62e3b && \
+RUN npm install -g github:nikolanovoselec/claude-unleashed#860c5d2e946681c238e1ef33447a99942bb349dd && \
     rm -f /tmp/.cache-bust && \
     npm cache clean --force && \
     rm -rf /root/.npm
@@ -185,8 +192,8 @@ RUN mkdir -p /app/host
 
 # Copy pre-compiled host server from builder stage
 COPY --from=builder /app/host/node_modules /app/host/node_modules
+COPY --from=builder /app/host/dist /app/host/dist
 COPY host/package.json /app/host/
-COPY host/*.js /app/host/
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh

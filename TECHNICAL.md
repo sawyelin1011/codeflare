@@ -2,43 +2,63 @@
 
 Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2 persistence.
 
-## Table of Contents
-
-1. [Architecture Overview](#1-architecture-overview)
-2. [System Components](#2-system-components)
-   - [Worker (Hono Router)](#21-worker-hono-router)
-   - [Container DO (CodeflareContainer)](#22-container-do-codeflarecontainer)
-   - [Terminal Server (node-pty)](#23-terminal-server-node-pty)
-   - [Frontend (SolidJS + xterm.js)](#24-frontend-solidjs--xtermjs)
-3. [Backend Libraries](#3-backend-libraries)
-4. [Data Flow](#4-data-flow)
-5. [Storage and Sync](#5-storage-and-sync)
-6. [Authentication](#6-authentication)
-7. [Security Model](#7-security-model)
-8. [API Reference](#8-api-reference)
-9. [Container Image](#9-container-image)
-10. [Container Startup](#10-container-startup)
-    - [Fast Start](#fast-start)
-11. [Claude Code Integration](#11-claude-code-integration)
-12. [File Structure](#12-file-structure)
-13. [Environment Variables](#13-environment-variables)
-14. [Configuration](#14-configuration)
-15. [CI/CD (GitHub Actions)](#15-cicd-github-actions)
-16. [Testing](#16-testing)
-17. [Development](#17-development)
-18. [Cost](#18-cost)
-19. [Troubleshooting](#19-troubleshooting)
-20. [Debugging Guide](#20-debugging-guide)
-21. [Architecture Decisions](#21-architecture-decisions)
-22. [Lessons Learned](#22-lessons-learned)
-23. [Mobile Terminal Design](#23-mobile-terminal-design)
-24. [Automatic Memory Capture](#24-automatic-memory-capture)
-
-**Workers.dev URL:** `https://<CLOUDFLARE_WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` - used only for initial setup. After the setup wizard configures a custom domain, all traffic should go through the custom domain (protected by CF Access). The workers.dev URL should then be gated behind one-click Access in the Cloudflare dashboard.
+**Last Updated:** 2026-03-12
 
 ---
 
-## 1. Architecture Overview
+## Table of Contents
+
+### Core Architecture
+1. [Architecture Overview](#architecture-overview)
+2. [System Components](#system-components)
+3. [Data Flow](#data-flow)
+
+### Backend
+4. [Backend Libraries](#backend-libraries)
+5. [Storage and Sync](#storage-and-sync)
+6. [Memory Persistence](#memory-persistence)
+
+### Security & Operations
+7. [Authentication](#authentication)
+8. [Security Model](#security-model)
+9. [Rate Limiting](#rate-limiting)
+
+### APIs & Configuration
+10. [API Reference](#api-reference)
+11. [Environment Variables](#environment-variables)
+12. [Configuration](#configuration)
+
+### Deployment & Infrastructure
+13. [Container Image](#container-image)
+14. [Container Startup](#container-startup)
+15. [Claude Code Integration](#claude-code-integration)
+16. [CI/CD (GitHub Actions)](#cicd-github-actions)
+
+### Development & Testing
+17. [Testing](#testing)
+18. [Development](#development)
+19. [File Structure](#file-structure)
+
+### Operations & Debugging
+20. [Troubleshooting](#troubleshooting)
+21. [Debugging Guide](#debugging-guide)
+22. [Cost Analysis](#cost-analysis)
+
+### Design Documentation
+23. [Architecture Decisions](#architecture-decisions)
+24. [Lessons Learned](#lessons-learned)
+25. [Mobile Terminal Design](#mobile-terminal-design)
+26. [Automatic Memory Capture](#automatic-memory-capture)
+
+**Related Documentation:**
+- [README.md](/home/user/workspace/codeflare/README.md) - Product overview and setup
+- [SECURITY.md](/home/user/workspace/codeflare/SECURITY.md) - Security policy and headers
+- [docs/SETUP_WIZARD.md](/home/user/workspace/codeflare/docs/SETUP_WIZARD.md) - Setup wizard configuration
+- [STRESS_TEST.md](/home/user/workspace/codeflare/STRESS_TEST.md) - Load testing guide
+
+---
+
+## Architecture Overview
 
 Codeflare runs AI coding agents in isolated containers, one per browser session (tab). All sessions for a user share a single R2 bucket for persistent storage, with periodic bidirectional sync (every 60 seconds).
 
@@ -54,11 +74,13 @@ graph TD
     P2 -->|"rclone bisync (every 60s)"| R2
 ```
 
+**Workers.dev URL:** `https://<CLOUDFLARE_WORKER_NAME>.<ACCOUNT_SUBDOMAIN>.workers.dev` - used only for initial setup. After the setup wizard configures a custom domain, all traffic should go through the custom domain (protected by CF Access). The workers.dev URL should then be gated behind one-click Access in the Cloudflare dashboard.
+
 ---
 
-## 2. System Components
+## System Components
 
-### 2.1 Worker (Hono Router)
+### Worker (Hono Router)
 
 **File:** `src/index.ts`
 
@@ -81,7 +103,7 @@ if (wsRouteResult.isWebSocketRoute) {
 
 With SPA fallback (`not_found_handling = "single-page-application"`), control-plane paths must execute Worker logic first via `run_worker_first = ["/", "/api/*", "/public/*", "/health"]`. Missing `/api/*` causes setup/auth flows to break (API endpoints return HTML instead of JSON).
 
-### 2.2 Container DO (CodeflareContainer)
+### Container DO (CodeflareContainer)
 
 **File:** `src/container/index.ts` - Extends `Container` from `@cloudflare/containers`. `defaultPort = 8080`, `sleepAfter = '30m'` (SDK-managed lifecycle, confirmed stable with keepalive heartbeat).
 
@@ -111,7 +133,6 @@ flowchart TD
     NoRenew --> FetchHealth
     FetchHealth --> WriteKV["Write metrics to KV"]
     WriteKV --> ReArm["schedule(5, 'collectMetrics')<br/>(unconditional if container.running)"]
-
 ```
 
 **`onActivityExpired()` Override:** Checks `/activity` for active WS clients. If clients connected -> `renewActivityTimeout()`. If no clients -> `this.stop('SIGTERM')`. If `/activity` returns non-OK or the fetch throws, calls `this.stop('SIGTERM')` -- by the time `onActivityExpired` fires, 30 minutes of zero `renewActivityTimeout()` calls have elapsed (meaning `collectMetrics` saw no active WS clients for 30 min), so an unreachable activity endpoint confirms the container is dead.
@@ -146,13 +167,13 @@ sequenceDiagram
 
 **Internal Endpoints:** `/_internal/setBucketName`, `/_internal/setSessionId`, `/_internal/getBucketName`
 
-### 2.3 Terminal Server (node-pty)
+### Terminal Server (node-pty)
 
-**File:** `host/server.js` - Node.js server inside the container. Single port 8080 for WebSocket + REST + health/metrics.
+**File:** `host/server.ts` - Node.js/TypeScript server inside the container. Single port 8080 for WebSocket + REST + health/metrics.
 
 Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads sync status from `/tmp/sync-status.json` and exposes via `/health`. Activity tracking (WebSocket connection state: `hasActiveConnections`, `connectedClients`, `activeSessions`, `disconnectedForMs`) for hibernation decisions via `GET /activity`.
 
-**Auth-Exempt Paths:** The terminal server validates `Authorization: Bearer <token>` on all HTTP requests. Paths called via `getTcpPort().fetch()` (which bypasses the DO's `fetch()` override that injects the auth header) must be in the `authExemptPaths` Set at `host/server.js`: `['/health', '/activity']`. The `/activity` endpoint is also exempted from auth in the DO-level `fetch()` override so internal health checks don't require token injection.
+**Auth-Exempt Paths:** The terminal server validates `Authorization: Bearer <token>` on all HTTP requests. Paths called via `getTcpPort().fetch()` (which bypasses the DO's `fetch()` override that injects the auth header) must be in the `authExemptPaths` Set at `host/server.ts`: `['/health', '/activity']`. The `/activity` endpoint is also exempted from auth in the DO-level `fetch()` override so internal health checks don't require token injection.
 
 **`GET /activity` Endpoint:** Returns `{ hasActiveConnections: boolean, connectedClients: number, activeSessions: number, disconnectedForMs: number | null }`. Used by both `collectMetrics()` (keepalive heartbeat) and `onActivityExpired()` (idle detection). Active connections = WebSocket clients that are currently connected. `disconnectedForMs` tracks time since all clients disconnected (null if clients are currently connected).
 
@@ -160,7 +181,9 @@ Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads syn
 
 **PTY:** Spawns `bash -l` (login shell for .bashrc) with `xterm-256color`, truecolor support.
 
-### 2.4 Frontend (SolidJS + xterm.js)
+**Terminal emulator response stripping:** The PTY input handler strips terminal emulator responses (CSI sequences like `\x1b[?1;2c` and DA/DSR replies) from WebSocket input before writing to the PTY. These responses are generated by xterm.js in reply to terminal queries issued by CLI tools, and can appear as garbage characters in the terminal when echoed back through the PTY.
+
+### Frontend (SolidJS + xterm.js)
 
 **Directory:** `web-ui/`
 
@@ -235,7 +258,7 @@ function connect() {
 
 ---
 
-## 3. Backend Libraries
+## Backend Libraries
 
 | File | Purpose |
 |------|---------|
@@ -289,7 +312,7 @@ flowchart TD
 
 ---
 
-## 4. Data Flow
+## Data Flow
 
 ### Session Creation to Terminal Connection
 
@@ -380,7 +403,6 @@ flowchart TD
 
     U3 -.- Key["destroy() clearing identifiers<br/>BEFORE onStop() prevents<br/>session resurrection"]
     D3 -.- Key
-
 ```
 
 **Restart (same bucket):** `setBucketName` -> 409 (bucket already set, but stores `sessionId`, `workspaceSyncEnabled`, `tabConfig`, and `fastStartEnabled` in DO storage for KV reconciliation and preference updates) -> `startAndWaitForPorts()` -> `onStart()` re-arms metrics
@@ -435,7 +457,7 @@ flowchart TD
 
 ---
 
-## 5. Storage and Sync
+## Storage and Sync
 
 ### Why rclone bisync (Not s3fs)
 
@@ -490,13 +512,13 @@ Newest file wins (`--conflict-resolve newer`). `--resilient` + `--recover` handl
 
 `--retries 3 --retries-sleep 10s` (rclone v1.66+) on both functions adds bisync-level retries for transient R2 API failures. Each bisync invocation retries up to 3 times with 10s sleep between attempts, before the daemon-level retry logic even kicks in.
 
-**Consecutive failure recovery:** The daemon tracks consecutive bisync failures. After 3 consecutive failures (each with 3 internal retries = 9 total attempts), falls back to `establish_bisync_baseline` (which uses `--resync`) to re-establish clean bisync state. `--resync` merges both sides (files present on only one side get copied to the other), so this is a last resort. The counter resets to 0 on any success or after the resync fallback.
+**Consecutive failure recovery:** The daemon tracks consecutive bisync failures. After 3 consecutive failures (each with 3 internal retries = 9 total attempts), falls back to `establish_bisync_baseline` (which uses `--resync`) to re-establish clean bisync state. `--resync` merges both sides (files present on only one side get copied to the other), so this is a last resort. The counter resets to 0 on any success or after the resync fallback. Resync failures are logged with full command output for diagnostic visibility. The baseline establishment timeout is 600s (10 minutes) to accommodate large initial syncs.
 
 **Bisync exit code handling:** `bisync_with_r2()` uses a temp file approach instead of `| tee` to capture both output and exit code. Piping through `tee` swallows the rclone exit code (the pipe's exit code is `tee`'s, not rclone's), masking bisync failures and breaking error detection in the daemon loop. Both functions redirect with `> "$FILE" 2>&1` (not `2>&1 > "$FILE"`). The old order sent stderr to the parent process's stdout (lost) and only captured stdout in the file. rclone outputs errors and verbose info to stderr, so all diagnostic output was invisible in `/tmp/sync.log`.
 
 **Bisync-initialized flag on timeout:** The bisync-initialized flag (`/tmp/.bisync-initialized`) is now touched on the sync timeout path as well. Previously, if initial sync timed out, the flag was never set, causing the shutdown trap to skip the final bisync — losing any files created during the session.
 
-### Memory Persistence
+## Memory Persistence
 
 Agent memory (knowledge graph via `@modelcontextprotocol/server-memory`) persists across sessions using per-session JSONL files synced to R2.
 
@@ -528,7 +550,7 @@ Skill definition: `preseed/agents/claude/skills/consult-llm/SKILL.md`.
 
 ---
 
-## 6. Authentication
+## Authentication
 
 ### Cloudflare Access Integration
 
@@ -559,7 +581,7 @@ flowchart TD
     A[Request] --> B[Edge routing]
     B --> C[CORS]
     C --> D[Auth Middleware]
-    D --> E["getUserFromRequest()&lt;br/&gt;JWT / service token"]
+    D --> E["getUserFromRequest()<br/>JWT / service token"]
     E --> F[Normalize email]
     F --> G[Check KV allowlist]
     G --> H["getBucketName()"]
@@ -577,11 +599,11 @@ flowchart TD
 
 ---
 
-## 7. Security Model
+## Security Model
 
 ### CF Access Gate
 
-Cloudflare Access protects all authenticated surfaces (see Section 6 for Access application destination strategy).
+Cloudflare Access protects all authenticated surfaces (see Section [Authentication](#authentication) for Access application destination strategy).
 
 ### API Token Containment
 
@@ -637,7 +659,7 @@ HSTS is also applied to all redirect responses via `secureRedirect()` helper, in
 
 64 KiB on all `/api/*` routes (storage routes exempt for file uploads).
 
-### Rate Limiting
+## Rate Limiting
 
 Per-user rate limiting via `createRateLimiter()` factory in `src/middleware/rate-limit.ts`. Keyed by `bucketName` (user identifier set by auth middleware), falls back to `CF-Connecting-IP` for unauthenticated requests.
 
@@ -656,7 +678,7 @@ When the limit is exceeded: HTTP 429 with `{ code: "RATE_LIMIT_ERROR", message: 
 | Endpoint | Method | Limit | Key Prefix |
 |----------|--------|-------|-----------|
 | `/api/storage/upload/*` | POST | 60/min | `storage-upload` |
-| `/api/storage/delete` | POST | 20/min | `storage-delete` | Accepts `keys` and/or `prefixes`. Prefix delete runs server-side (list+batch delete via R2 S3 API) — no per-request rate limit on internal R2 calls. |
+| `/api/storage/delete` | POST | 20/min | `storage-delete` |
 | `/api/storage/move` | POST | 20/min | `storage-move` |
 | `/api/storage/seed/*` | POST | 3/min | `storage-seed` |
 | `/api/storage/download` | GET | 120/min | `storage-download` |
@@ -729,7 +751,7 @@ Cannot be accessed via the web storage API (browse, upload, delete, move). These
 
 ---
 
-## 8. API Reference
+## API Reference
 
 ### Common Response Headers
 
@@ -804,6 +826,8 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 Public before setup; admin-only after. All `adminUsers` must also be in `allowedUsers`. Regular users (`allowedUsers` beyond admins) are optional -- admin-only deployments with 0 regular users are fully supported.
 
+See [docs/SETUP_WIZARD.md](/home/user/workspace/codeflare/docs/SETUP_WIZARD.md) for complete setup configuration details.
+
 ### Storage (R2 File Browser)
 
 | Method | Endpoint | Description |
@@ -849,214 +873,7 @@ GET `/health`, GET `/api/health`
 
 ---
 
-## 9. Container Image
-
-**File:** `Dockerfile` - Base: `node:24-bookworm-slim`, multi-stage build (builder compiles native addons, runtime has no build tools).
-
-### Installed Tools
-
-| Category | Packages |
-|----------|----------|
-| Sync | rclone |
-| Version Control | git, github-cli (gh), lazygit (v0.59.0) |
-| Editors | vim (symlinked to neovim), neovim, nano |
-| Network | curl, openssh-client |
-| Process | procps (ps, pgrep) |
-| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.1.22), fzf, zoxide, bat |
-
-### Global NPM Packages
-
-Versions are pinned in the Dockerfile and updated periodically (`.cache-bust` layer invalidation triggers fresh installs on each deploy). The Dockerfile is the source of truth for version pins - versions listed below are approximate and may drift between documentation updates.
-
-| Package | Version | Provides |
-|---------|---------|----------|
-| `claude-unleashed` | Git commit pin | `cu` / `claude-unleashed` commands (wraps `@anthropic-ai/claude-code`). Used as the "Claude Code" agent in the UI -- provides root permission bypass and controlled update mechanism. |
-| `@openai/codex` | 0.105.0 | `codex` command |
-| `@google/gemini-cli` | 0.30.0 | `gemini` command |
-| `opencode-ai` | 1.2.15 | `opencode` command |
-| `@github/copilot` | 0.0.418 | `copilot` command |
-
-### V8 Compile Cache Warm-Up
-
-Node.js CLIs (codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need V8 cache warm-up. Claude Code is pre-updated and pre-patched at build time via `claude-unleashed --silent --no-consent --help`, which seeds the V8 compile cache.
-
-### OpenCode Database Pre-Initialization
-
-OpenCode uses SQLite with Goose migrations that run on first startup ("Performing one time database migration"). The DB is stored at `~/.local/share/opencode/opencode.db` (XDG data directory). To avoid this overhead at container start, the Dockerfile runs `opencode run "hello"` at build time which triggers the migration, creating the sessions/files/messages schema so the first interactive launch is fast.
-
-### Browser Shims
-
-CLI tools (Claude Code, OpenCode, Gemini) try to open a browser for OAuth. The Dockerfile installs shims (`open-url` for `BROWSER` env var, `xdg-open-shim` for `xdg-open`) that exit 1, forcing CLIs to print auth URLs as plain text in the PTY. The xterm.js link provider then detects and makes these URLs clickable.
-
-Port: 8080 (single port architecture).
-
----
-
-## 10. Container Startup
-
-**File:** `entrypoint.sh`
-
-Uses polling with safety timeouts: poll until success OR background process exits OR safety timeout expires. Exit immediately on success. Safety timeout `SYNC_TIMEOUT=120` (2 min) prevents infinite blocking.
-
-### Parallel Startup
-
-```mermaid
-flowchart TD
-    A[Container Start] --> B["initial_sync_from_r2()"]
-    B -->|"Blocking — waits for sync to complete"| C["configure_tab_autostart()"]
-    C --> D["Start terminal server (:8080)"]
-```
-
-Auto-start uses `cu --silent --no-consent` for fast boot. Auto-updates are disabled by default via `FAST_CLI_START=true` (see [Fast Start](#fast-start) below). Users can enable auto-updates via Settings, or update manually via `cu` in any tab.
-
-**PTY PATH:** The `.bashrc` tab autostart block sets `PATH="/usr/local/bin:/usr/bin:/bin:$PATH"` so that PTY sessions can find globally installed CLI tools.
-
-### Fast Start
-
-**User preference:** `fastStartEnabled` (default: `true`) in `UserPreferences`.
-**Container env var:** `FAST_CLI_START` (default: `'true'`).
-
-When enabled, `entrypoint.sh` disables auto-update checks for all 5 AI tools, eliminating 5-30s of startup delay per tool. Each tool has a different disable mechanism:
-
-| Tool | Disable Mechanism | Type |
-|------|------------------|------|
-| Claude Code (claude-unleashed) | `CLAUDE_UNLEASHED_NO_UPDATE=1`, `CLAUDE_UNLEASHED_CHANNEL=stable` | Env var |
-| OpenCode | `OPENCODE_DISABLE_AUTOUPDATE=1` | Env var |
-| Copilot | `COPILOT_AUTO_UPDATE=false` | Env var |
-| Gemini | `~/.gemini/settings.json` -> `general.enableAutoUpdate: false` | Config file (jq merge) |
-| Codex | `~/.codex/version.json` -> `dismissed_version: "999.0.0"` | Config file (overwrite) |
-
-**Gemini settings.json merge pattern:** Uses `jq '. * {"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}'` to deep-merge into existing settings. This preserves user customizations since the file is synced via rclone from R2. If the file doesn't exist, creates it with only the auto-update keys.
-
-**Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
-
-When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`CLAUDE_UNLEASHED_NO_UPDATE`, `CLAUDE_UNLEASHED_CHANNEL`, `DISABLE_INSTALLATION_CHECKS`) and the entrypoint-level `OPENCODE_DISABLE_AUTOUPDATE`, and skips writing config files and setting `COPILOT_AUTO_UPDATE`, allowing all tools to check for updates normally.
-
----
-
-## 11. Claude Code Integration
-
-The "Claude Code" agent in Codeflare uses [claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) (`cu` command) behind the scenes. claude-unleashed enables `--dangerously-skip-permissions` when running as root inside containers (standard CLI prevents this via `process.getuid() === 0` check), and provides a controlled update mechanism.
-
-**Updater:** claude-unleashed's updater checks npm for latest `@anthropic-ai/claude-code` - disabled at runtime via `CLAUDE_UNLEASHED_NO_UPDATE=1` to avoid ~25-30s startup delay from `npm view` + `npm install` on every container start. Updates happen at Docker build time instead (via `.cache-bust` layer invalidation). Upstream CLI's internal auto-updater is disabled via `DISABLE_INSTALLATION_CHECKS=1`.
-
-### Environment Variables
-
-**Global (Dockerfile ENV):** `NPM_CONFIG_UPDATE_NOTIFIER=false`, `CLAUDE_UNLEASHED_SKIP_CONSENT=1`, `CLAUDE_UNLEASHED_CHANNEL=stable`, `CLAUDE_UNLEASHED_NO_UPDATE=1`, `IS_SANDBOX=1`, `DISABLE_INSTALLATION_CHECKS=1`, `NODE_COMPILE_CACHE=/root/.cache/node-compile-cache`, `BROWSER=/usr/local/bin/open-url`
-
-**Prewarm readiness:** Detected by first PTY output — as soon as the agent produces any terminal output, pre-warm is considered ready. This replaced the previous approach of agent-specific regex patterns and quiescence-based detection, which failed when agents weren't logged in (startup output was completely different, patterns didn't match, causing 20s timeout delays). The 20s hard timeout in `server.js` remains as a safety net for the rare case where a PTY produces no output at all. `host/prewarm-config.js` now only extracts the command name from `tabConfig` for logging.
-
-**Auto-start flags (.bashrc):** `--silent`, `--no-consent`
-
----
-
-## 12. File Structure
-
-```
-codeflare/
-├── src/
-│   ├── index.ts              # Hono router, WebSocket intercept, CORS
-│   ├── types.ts              # TypeScript types
-│   ├── routes/
-│   │   ├── container/        # Container lifecycle API
-│   │   │   ├── index.ts      # Route aggregator
-│   │   │   ├── lifecycle.ts  # Start/destroy
-│   │   │   ├── status.ts     # Health, startup-status
-│   │   │   └── shared.ts     # Shared helpers
-│   │   ├── session/          # Session API
-│   │   │   ├── index.ts      # Route aggregator
-│   │   │   ├── crud.ts       # CRUD operations
-│   │   │   └── lifecycle.ts  # Start/stop/status/batch-status
-│   │   ├── setup/            # Setup wizard
-│   │   │   ├── index.ts      # Route aggregator
-│   │   │   ├── handlers.ts   # Main configure handler
-│   │   │   ├── secrets.ts    # Secret management
-│   │   │   ├── custom-domain.ts # Domain configuration
-│   │   │   ├── access.ts     # CF Access setup
-│   │   │   ├── account.ts    # Account discovery
-│   │   │   ├── credentials.ts # R2 credential setup
-│   │   │   ├── turnstile.ts  # Turnstile widget setup
-│   │   │   └── shared.ts     # Shared helpers
-│   │   ├── storage/          # R2 file browser API
-│   │   │   ├── index.ts      # Route aggregator
-│   │   │   ├── browse.ts     # List objects
-│   │   │   ├── delete.ts     # Delete objects
-│   │   │   ├── download.ts   # Download files
-│   │   │   ├── move.ts       # Move/rename
-│   │   │   ├── preview.ts    # Preview content
-│   │   │   ├── seed.ts       # Seed tutorial docs
-│   │   │   ├── stats.ts      # File/folder counts
-│   │   │   ├── upload.ts     # Upload (single + multipart)
-│   │   │   └── validation.ts # Path validation
-│   │   ├── public/
-│   │   │   └── index.ts      # Onboarding endpoints
-│   │   ├── presets.ts        # Preset CRUD
-│   │   ├── preferences.ts    # User preferences
-│   │   ├── terminal.ts       # Terminal WebSocket proxy
-│   │   ├── user-profile.ts   # User info
-│   │   └── users.ts          # User management
-│   ├── middleware/            # auth.ts, rate-limit.ts
-│   ├── lib/                  # access, access-policy, agent-config, cache-reset, cf-api,
-│   │                         # circuit-breaker, circuit-breakers (per-container CB via
-│   │                         #   getContainerXxxCB(containerId) — no more global singletons),
-│   │                         # constants, container-helpers,
-│   │                         # cors-cache, error-types, jwt, kv-keys, logger, onboarding,
-│   │                         # r2-admin, r2-client, r2-config, r2-seed, schemas,
-│   │                         # session-helpers, tutorial-seed.generated, type-guards,
-│   │                         # user-cleanup, xml-utils
-│   │                         #   escapeXml() — sanitizes user input for XML/HTML interpolation
-│   │                         #   decodeXmlEntities() — decodes &amp; &lt; etc. from R2 S3 API responses
-│   │                         #   FIX-39 audit trail in file header tracks all interpolation sites
-│   ├── container/index.ts    # Container DO class
-│   └── __tests__/            # Backend unit tests (68 files, ~996 tests)
-├── e2e/                      # E2E tests: 12 API files (~55 tests) + 10 UI files (~75 tests, Puppeteer)
-├── host/
-│   ├── server.js             # HTTP/WS server, auth, routing, prewarm, signal handlers (~496 lines)
-│   ├── session.js            # Session class — PTY management, tab lifecycle (~312 lines)
-│   ├── session-manager.js    # SessionManager class, PREWARM_SESSION_ID constant (~177 lines)
-│   ├── metrics.js            # System metrics collection (disk usage, sync status) (~74 lines)
-│   ├── activity-tracker.js   # WebSocket disconnect tracking for idle detection
-│   ├── prewarm-config.js     # PTY pre-warm configuration (first-output readiness)
-│   ├── __tests__/            # Host unit tests (9 files: prewarm, activity tracker, WS input, server prewarm integration, entrypoint sync filter, server security, host fixes, fuzz, memory merge/cleanup)
-│   ├── knip.json             # Dead code detection config for host package
-│   └── package.json
-├── web-ui/
-│   └── src/
-│       ├── components/       # SolidJS components (Terminal, Layout, SessionCard, StorageBrowser, etc.)
-│       ├── stores/           # terminal.ts, terminal-layout.ts, terminal-url-detection.ts, session.ts, storage.ts, setup.ts, tiling.ts, session-presets.ts, session-tabs.ts, preferences.ts, r2-readiness.ts
-│       ├── api/              # client.ts, fetch-helper.ts, storage.ts
-│       ├── hooks/            # useTerminal.ts, useStageTimings.ts
-│       ├── lib/              # constants, schemas, terminal-config, terminal-link-provider, xterm-internals, settings, format, mobile, + others
-│       ├── styles/           # CSS (design tokens, animations, component styles)
-│       └── __tests__/        # Frontend unit tests (68 files)
-├── .oxlintrc.json            # oxlint configuration (root + web-ui)
-├── scripts/                  # generate-tutorial-seed.mjs, fix-broken-sourcemaps.js
-├── tutorials/                # Tutorial content (Getting Started, Examples, etc.)
-├── Dockerfile                # Multi-stage container image
-├── entrypoint.sh             # Container startup script
-├── wrangler.toml             # Cloudflare configuration
-├── vitest.config.ts          # Backend test config
-└── vitest.e2e.config.ts      # E2E test config
-```
-
-### Intentional Schema Duplication (Bundle Boundary)
-
-`src/lib/schemas.ts` (backend) and `web-ui/src/lib/schemas.ts` (frontend) contain similar Zod schemas for API response validation. This is intentional, not a DRY violation. The frontend (`web-ui/`) has its own Vite build pipeline and produces a separate bundle — it cannot import from the backend Workers module. Both schemas validate the same API contract but live in independent build targets.
-
-### Critical Paths Inside Container
-
-| Path | Purpose |
-|------|---------|
-| `/home/user` | User home directory |
-| `/home/user/workspace` | Working directory (synced to R2) |
-| `/home/user/.claude/` | Claude config and credentials |
-| `/home/user/.config/rclone/rclone.conf` | rclone configuration |
-| `/tmp/sync-status.json` | Sync status (read by health server) |
-| `/tmp/sync.log` | Sync log for debugging |
-
----
-
-## 13. Environment Variables
+## Environment Variables
 
 ### Worker Environment
 
@@ -1089,21 +906,21 @@ codeflare/
 | `R2_ACCOUNT_ID` / `R2_ENDPOINT` | rclone endpoint | Worker -> DO or `getR2Config()` fallback |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 compatibility | Mirrors R2 keys |
 | `TERMINAL_PORT` | Always 8080 | Hardcoded |
-| `SYNC_MODE` | Sync strategy (`none`, `full`, or `metadata`) -- see Section 5 | Worker -> DO |
-| `WORKSPACE_SYNC_ENABLED` | Whether workspace sync is enabled (`'true'`/`'false'`). Drives `SYNC_MODE` value. | Worker via `setBucketName` |
+| `SYNC_MODE` | Sync strategy (`none`, `full`, or `metadata`) | Worker -> DO |
+| `WORKSPACE_SYNC_ENABLED` | Whether workspace sync is enabled (`'true'`/`'false'`) | Worker via `setBucketName` |
 | `TAB_CONFIG` | JSON array of terminal tab configurations | Worker -> DO |
-| `TERMINAL_ID` | Unique ID for this terminal instance | Host terminal server (`session.js`) |
+| `TERMINAL_ID` | Unique ID for this terminal instance | Host terminal server |
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls | Worker -> DO |
 | `MANUAL_TAB` | Set to `1` for user-created tabs to skip autostart | Worker -> DO |
-| `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default). Set `'false'` to allow auto-updates. See [Fast Start](#fast-start). | Worker -> DO (from `fastStartEnabled` preference) |
+| `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default) | Worker -> DO |
 | `OPENAI_API_KEY` | OpenAI API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
 | `GEMINI_API_KEY` | Gemini API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
-| `BROWSER` | Points to `open-url` shim that exits 1, forcing CLIs to print OAuth URLs as text | Dockerfile ENV (`/usr/local/bin/open-url`) |
+| `BROWSER` | Points to `open-url` shim that exits 1 | Dockerfile ENV (`/usr/local/bin/open-url`) |
 
 ---
 
-## 14. Configuration
+## Configuration
 
 ### Secrets
 
@@ -1153,7 +970,110 @@ Base image: Node.js 24 Debian (bookworm-slim).
 
 ---
 
-## 15. CI/CD (GitHub Actions)
+## Container Image
+
+**File:** `Dockerfile` - Base: `node:24-bookworm-slim`, multi-stage build (builder compiles native addons, runtime has no build tools).
+
+### Installed Tools
+
+| Category | Packages |
+|----------|----------|
+| Sync | rclone |
+| Version Control | git, github-cli (gh), lazygit (v0.59.0) |
+| Editors | vim (symlinked to neovim), neovim, nano |
+| Network | curl, openssh-client |
+| Process | procps (ps, pgrep) |
+| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.1.22), fzf, zoxide, bat |
+
+### Global NPM Packages
+
+Versions are pinned in the Dockerfile and updated periodically (`.cache-bust` layer invalidation triggers fresh installs on each deploy). The Dockerfile is the source of truth for version pins - versions listed below are approximate and may drift between documentation updates.
+
+| Package | Version | Provides |
+|---------|---------|----------|
+| `claude-unleashed` | Git commit pin | `cu` / `claude-unleashed` commands (wraps `@anthropic-ai/claude-code`). Used as the "Claude Code" agent in the UI -- provides root permission bypass and controlled update mechanism. |
+| `@openai/codex` | 0.105.0 | `codex` command |
+| `@google/gemini-cli` | 0.30.0 | `gemini` command |
+| `opencode-ai` | 1.2.15 | `opencode` command |
+| `@github/copilot` | 0.0.418 | `copilot` command |
+
+### V8 Compile Cache Warm-Up
+
+Node.js CLIs (codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need V8 cache warm-up. Claude Code is pre-updated and pre-patched at build time via `claude-unleashed --silent --no-consent --help`, which seeds the V8 compile cache.
+
+### OpenCode Database Pre-Initialization
+
+OpenCode uses SQLite with Goose migrations that run on first startup ("Performing one time database migration"). The DB is stored at `~/.local/share/opencode/opencode.db` (XDG data directory). To avoid this overhead at container start, the Dockerfile runs `opencode run "hello"` at build time which triggers the migration, creating the sessions/files/messages schema so the first interactive launch is fast.
+
+### Browser Shims
+
+CLI tools (Claude Code, OpenCode, Gemini) try to open a browser for OAuth. The Dockerfile installs shims (`open-url` for `BROWSER` env var, `xdg-open-shim` for `xdg-open`) that exit 1, forcing CLIs to print auth URLs as plain text in the PTY. The xterm.js link provider then detects and makes these URLs clickable.
+
+Port: 8080 (single port architecture).
+
+---
+
+## Container Startup
+
+**File:** `entrypoint.sh`
+
+Uses polling with safety timeouts: poll until success OR background process exits OR safety timeout expires. Exit immediately on success. Safety timeout `SYNC_TIMEOUT=120` (2 min) prevents infinite blocking.
+
+### Parallel Startup
+
+```mermaid
+flowchart TD
+    A[Container Start] --> B["initial_sync_from_r2()"]
+    B -->|"Blocking — waits for sync to complete"| C["configure_tab_autostart()"]
+    C --> D["Start terminal server (:8080)"]
+```
+
+Auto-start uses `cu --silent --no-consent` for fast boot. Auto-updates are disabled by default via `FAST_CLI_START=true` (see [Fast Start](#fast-start) below). Users can enable auto-updates via Settings, or update manually via `cu` in any tab.
+
+**PTY PATH:** The `.bashrc` tab autostart block sets `PATH="/usr/local/bin:/usr/bin:/bin:$PATH"` so that PTY sessions can find globally installed CLI tools.
+
+### Fast Start
+
+**User preference:** `fastStartEnabled` (default: `true`) in `UserPreferences`.
+**Container env var:** `FAST_CLI_START` (default: `'true'`).
+
+When enabled, `entrypoint.sh` disables auto-update checks for all 5 AI tools, eliminating 5-30s of startup delay per tool. Each tool has a different disable mechanism:
+
+| Tool | Disable Mechanism | Type |
+|------|------------------|------|
+| Claude Code (claude-unleashed) | `CLAUDE_UNLEASHED_NO_UPDATE=1`, `CLAUDE_UNLEASHED_CHANNEL=latest` | Env var |
+| OpenCode | `OPENCODE_DISABLE_AUTOUPDATE=1` | Env var |
+| Copilot | `COPILOT_AUTO_UPDATE=false` | Env var |
+| Gemini | `~/.gemini/settings.json` -> `general.enableAutoUpdate: false` | Config file (jq merge) |
+| Codex | `~/.codex/version.json` -> `dismissed_version: "999.0.0"` | Config file (overwrite) |
+
+**Gemini settings.json merge pattern:** Uses `jq '. * {"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}'` to deep-merge into existing settings. This preserves user customizations since the file is synced via rclone from R2. If the file doesn't exist, creates it with only the auto-update keys.
+
+**Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
+
+When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`CLAUDE_UNLEASHED_NO_UPDATE`, `CLAUDE_UNLEASHED_CHANNEL`, `DISABLE_INSTALLATION_CHECKS`) and the entrypoint-level `OPENCODE_DISABLE_AUTOUPDATE`, and skips writing config files and setting `COPILOT_AUTO_UPDATE`, allowing all tools to check for updates normally.
+
+---
+
+## Claude Code Integration
+
+The "Claude Code" agent in Codeflare uses [claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) (`cu` command) behind the scenes. claude-unleashed enables `--dangerously-skip-permissions` when running as root inside containers (standard CLI prevents this via `process.getuid() === 0` check), and provides a controlled update mechanism.
+
+**Updater:** claude-unleashed's updater checks npm for latest `@anthropic-ai/claude-code` - disabled at runtime via `CLAUDE_UNLEASHED_NO_UPDATE=1` to avoid ~25-30s startup delay from `npm view` + `npm install` on every container start. Updates happen at Docker build time instead (via `.cache-bust` layer invalidation). Upstream CLI's internal auto-updater is disabled via `DISABLE_INSTALLATION_CHECKS=1`.
+
+### Environment Variables
+
+**Global (Dockerfile ENV):** `NPM_CONFIG_UPDATE_NOTIFIER=false`, `CLAUDE_UNLEASHED_SKIP_CONSENT=1`, `CLAUDE_UNLEASHED_CHANNEL=latest`, `CLAUDE_UNLEASHED_NO_UPDATE=1`, `IS_SANDBOX=1`, `DISABLE_INSTALLATION_CHECKS=1`, `NODE_COMPILE_CACHE=/root/.cache/node-compile-cache`, `BROWSER=/usr/local/bin/open-url`
+
+**Channel:** claude-unleashed uses `latest` dist-tag (not `stable`). Anthropic's stable channel ships marketplace plugins using `git-subdir` source type, which stable itself doesn't support — causing plugin install failures on container start. The `latest` channel avoids this issue.
+
+**Prewarm readiness:** Detected by first PTY output — as soon as the agent produces any terminal output, pre-warm is considered ready. This replaced the previous approach of agent-specific regex patterns and quiescence-based detection, which failed when agents weren't logged in (startup output was completely different, patterns didn't match, causing 20s timeout delays). The 20s hard timeout in `server.js` remains as a safety net for the rare case where a PTY produces no output at all. `host/prewarm-config.js` now only extracts the command name from `tabConfig` for logging.
+
+**Auto-start flags (.bashrc):** `--silent`, `--no-consent`
+
+---
+
+## CI/CD (GitHub Actions)
 
 Eight workflows covering deploy, testing, fuzzing, penetration testing, stress testing, and supply chain security. Additionally, GitHub's built-in **secret scanning** (with push protection) and **Dependabot security updates** are enabled at the repository level.
 
@@ -1242,13 +1162,13 @@ Six parallel jobs, each running lightweight external probes against the producti
 5. **injection**: Tests host header injection (spoofed `Host` returns 403), `X-Forwarded-Host` has no effect on content, CL/TE request smuggling is rejected, and path traversal payloads (`%2e%2e`, double-encoded, backslash, unicode) are blocked at the auth layer.
 6. **http-methods**: Verifies TRACE returns 405 and WebSocket upgrade without authentication returns 302.
 
-**Requires:** `PENTEST_TARGET` variable set in the `production` GitHub environment (e.g., `https://codeflare.graymatter.ch`). See the full manual test report in `PENTEST.md`.
+**Requires:** `PENTEST_TARGET` variable set in the `production` GitHub environment (e.g., `https://codeflare.graymatter.ch`). See the full manual test report in [PENTEST.md](/home/user/workspace/codeflare/PENTEST.md).
 
 ---
 
-## 16. Testing
+## Testing
 
-### 16.1 Backend Tests
+### Backend Tests
 
 **Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` - tests run in real Workers runtime (not Node.js).
 **Count:** 68 test files, ~996 tests.
@@ -1256,21 +1176,21 @@ Six parallel jobs, each running lightweight external probes against the producti
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
 
-### 16.2 Frontend Tests
+### Frontend Tests
 
 **Config:** `web-ui/vitest.config.ts` with jsdom + `@solidjs/testing-library`.
 **Count:** 68 test files, ~1,324 tests.
 **Run:** `cd web-ui && npm test`
 **Key patterns:** SolidJS stores use getter-based exports. Test by re-importing module after `vi.resetModules()`. Use `render()` from `@solidjs/testing-library` for component tests.
 
-### 16.3 Host Tests
+### Host Tests
 
 **Config:** `host/package.json` with Node.js built-in test runner (`node --test`).
 **Count:** 9 test files, ~86 tests.
 **Run:** `cd host && npm test`
 **Scope:** PTY pre-warm readiness (first-output detection), activity tracker disconnect tracking, WebSocket input classification, server prewarm integration, entrypoint sync filter validation, server security, host module extraction, host fuzz tests, memory merge/cleanup.
 
-### 16.4 Property-Based Fuzz Tests
+### Property-Based Fuzz Tests
 
 **Library:** [fast-check](https://github.com/dubzzz/fast-check). **CI:** `fuzz.yml` runs 50,000 iterations on PRs to main, weekly, and manual dispatch.
 **Local:** Default 1,000 iterations. Override with `FAST_CHECK_NUM_RUNS=50000`.
@@ -1289,11 +1209,11 @@ Six parallel jobs, each running lightweight external probes against the producti
 - `prewarm-config.js` crash on non-string tab command (`host/prewarm-config.js`)
 - `toError`/`toErrorMessage` crash on objects with throwing `toString()` (`src/lib/error-types.ts`)
 
-### 16.5 Vitest Version Split
+### Vitest Version Split
 
 Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/` uses Vitest v4.x (SolidJS testing library compatibility). Each has independent `node_modules` and separate configs. Do not attempt to unify - the version constraint is real.
 
-### 16.6 E2E API Tests
+### E2E API Tests
 
 **Dir:** `e2e/api/` - 12 test files, ~55 tests.
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:api`
@@ -1301,7 +1221,7 @@ Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/`
 
 Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, `presets`, `setup-status`, `health`, `container`, `error-responses`, `rate-limiting`.
 
-### 16.7 E2E UI Tests
+### E2E UI Tests
 
 **Dir:** `e2e/ui/` - 10 test files, ~75 tests (run as desktop + mobile).
 **Run:** `E2E_BASE_URL=https://your-app.example.com npm run test:e2e:ui`
@@ -1310,7 +1230,7 @@ Test files: `sessions`, `storage`, `storage-operations`, `user`, `preferences`, 
 
 Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-panel`, `storage`, `terminal-tabs`, `tiling`, `bookmarks`, `error-states`, `mobile-specific`.
 
-### 16.8 E2E Infrastructure
+### E2E Infrastructure
 
 - **CF Access auth:** E2E API tests use `X-Service-Auth` header. UI tests use `CF-Access-Client-Id`/`CF-Access-Client-Secret` headers via `setExtraHTTPHeaders`. CF Access intercepts browser navigation with login page - UI tests work around this by intercepting requests.
 - **KV eventual consistency:** New KV entries take ~60s to propagate. E2E setup job includes retry loops with 15s waits. Test helpers use `waitForFunction` with generous timeouts.
@@ -1318,7 +1238,7 @@ Test files: `dashboard`, `session-lifecycle`, `header-navigation`, `settings-pan
 - **Screenshot artifacts:** Failed UI tests capture screenshots and HTML dumps to `e2e-artifacts/`. CI uploads these as artifacts with 5-day retention.
 - **Suite prefix isolation:** Each E2E suite prefixes its test sessions/presets with a unique identifier driven by the `E2E_SUITE` env var (default: `'default'`) to avoid cross-suite interference when running in parallel.
 
-### 16.9 E2E Service Token Setup
+### E2E Service Token Setup
 
 Step-by-step for running E2E tests against a deployed worker:
 
@@ -1339,7 +1259,7 @@ npm run test:e2e:ui     # UI desktop tests only
 E2E_MOBILE=1 npm run test:e2e:ui  # UI mobile tests only
 ```
 
-### 16.10 E2E Test Maintenance
+### E2E Test Maintenance
 
 **Rule:** When modifying UI components or API routes, review and update corresponding E2E tests.
 
@@ -1349,7 +1269,7 @@ E2E_MOBILE=1 npm run test:e2e:ui  # UI mobile tests only
 
 ---
 
-## 17. Development
+## Development
 
 ```bash
 npm install && cd web-ui && npm install && cd ..
@@ -1360,38 +1280,121 @@ npm run typecheck    # Type check backend
 npm test             # Backend unit tests
 npm run test:e2e     # E2E API tests
 npm run test:e2e:ui  # E2E UI tests (Puppeteer)
-npm run deploy       # DO NOT run locally -- deploys go through GitHub Actions (see Section 15)
+npm run deploy       # DO NOT run locally -- deploys go through GitHub Actions (see Section 16)
 cd web-ui && npm run dev   # Frontend dev server
 cd web-ui && npm run build # Frontend production build
 ```
 
 ---
 
-## 18. Cost
+## File Structure
 
-### Per-Container Pricing
+```
+codeflare/
+├── src/
+│   ├── index.ts              # Hono router, WebSocket intercept, CORS
+│   ├── types.ts              # TypeScript types
+│   ├── routes/
+│   │   ├── container/        # Container lifecycle API
+│   │   │   ├── index.ts      # Route aggregator
+│   │   │   ├── lifecycle.ts  # Start/destroy
+│   │   │   ├── status.ts     # Health, startup-status
+│   │   │   └── shared.ts     # Shared helpers
+│   │   ├── session/          # Session API
+│   │   │   ├── index.ts      # Route aggregator
+│   │   │   ├── crud.ts       # CRUD operations
+│   │   │   └── lifecycle.ts  # Start/stop/status/batch-status
+│   │   ├── setup/            # Setup wizard
+│   │   │   ├── index.ts      # Route aggregator
+│   │   │   ├── handlers.ts   # Main configure handler
+│   │   │   ├── secrets.ts    # Secret management
+│   │   │   ├── custom-domain.ts # Domain configuration
+│   │   │   ├── access.ts     # CF Access setup
+│   │   │   ├── account.ts    # Account discovery
+│   │   │   ├── credentials.ts # R2 credential setup
+│   │   │   ├── turnstile.ts  # Turnstile widget setup
+│   │   │   └── shared.ts     # Shared helpers
+│   │   ├── storage/          # R2 file browser API
+│   │   │   ├── index.ts      # Route aggregator
+│   │   │   ├── browse.ts     # List objects
+│   │   │   ├── delete.ts     # Delete objects
+│   │   │   ├── download.ts   # Download files
+│   │   │   ├── move.ts       # Move/rename
+│   │   │   ├── preview.ts    # Preview content
+│   │   │   ├── seed.ts       # Seed tutorial docs
+│   │   │   ├── stats.ts      # File/folder counts
+│   │   │   ├── upload.ts     # Upload (single + multipart)
+│   │   │   └── validation.ts # Path validation
+│   │   ├── public/
+│   │   │   └── index.ts      # Onboarding endpoints
+│   │   ├── presets.ts        # Preset CRUD
+│   │   ├── preferences.ts    # User preferences
+│   │   ├── terminal.ts       # Terminal WebSocket proxy
+│   │   ├── user-profile.ts   # User info
+│   │   └── users.ts          # User management
+│   ├── middleware/            # auth.ts, rate-limit.ts
+│   ├── lib/                  # access, access-policy, agent-config, cache-reset, cf-api,
+│   │                         # circuit-breaker, circuit-breakers (per-container CB via
+│   │                         #   getContainerXxxCB(containerId) — no more global singletons),
+│   │                         # constants, container-helpers,
+│   │                         # cors-cache, error-types, jwt, kv-keys, logger, onboarding,
+│   │                         # r2-admin, r2-client, r2-config, r2-seed, schemas,
+│   │                         # session-helpers, tutorial-seed.generated, type-guards,
+│   │                         # user-cleanup, xml-utils
+│   │                         #   escapeXml() — sanitizes user input for XML/HTML interpolation
+│   │                         #   decodeXmlEntities() — decodes &amp; &lt; etc. from R2 S3 API responses
+│   │                         #   FIX-39 audit trail in file header tracks all interpolation sites
+│   ├── container/index.ts    # Container DO class
+│   └── __tests__/            # Backend unit tests (68 files, ~996 tests)
+├── e2e/                      # E2E tests: 12 API files (~55 tests) + 10 UI files (~75 tests, Puppeteer)
+├── host/                        # TypeScript (migrated from JS)
+│   ├── server.ts             # HTTP/WS server, auth, routing, prewarm, signal handlers
+│   ├── session.ts            # Session class — PTY management, tab lifecycle
+│   ├── session-manager.ts    # SessionManager class, PREWARM_SESSION_ID constant
+│   ├── metrics.ts            # System metrics collection (disk usage, sync status)
+│   ├── activity-tracker.ts   # WebSocket disconnect tracking for idle detection
+│   ├── prewarm-config.ts     # PTY pre-warm configuration (first-output readiness)
+│   ├── __tests__/            # Host unit tests (9 files: prewarm, activity tracker, WS input, server prewarm integration, entrypoint sync filter, server security, host fixes, fuzz, memory merge/cleanup)
+│   ├── tsconfig.json         # TypeScript configuration
+│   ├── knip.json             # Dead code detection config for host package
+│   └── package.json
+├── web-ui/
+│   └── src/
+│       ├── components/       # SolidJS components (Terminal, Layout, SessionCard, StorageBrowser, etc.)
+│       ├── stores/           # terminal.ts, terminal-layout.ts, terminal-url-detection.ts, session.ts, storage.ts, setup.ts, tiling.ts, session-presets.ts, session-tabs.ts, preferences.ts, r2-readiness.ts
+│       ├── api/              # client.ts, fetch-helper.ts, storage.ts
+│       ├── hooks/            # useTerminal.ts, useStageTimings.ts
+│       ├── lib/              # constants, schemas, terminal-config, terminal-link-provider, xterm-internals, settings, format, mobile, + others
+│       ├── styles/           # CSS (design tokens, animations, component styles)
+│       └── __tests__/        # Frontend unit tests (68 files)
+├── .oxlintrc.json            # oxlint configuration (root + web-ui)
+├── scripts/                  # generate-tutorial-seed.mjs, generate-agent-seed.mjs, fix-broken-sourcemaps.js
+├── tutorials/                # Tutorial content (Getting Started, Examples, etc.)
+├── Dockerfile                # Multi-stage container image
+├── entrypoint.sh             # Container startup script
+├── wrangler.toml             # Cloudflare configuration
+├── vitest.config.ts          # Backend test config
+└── vitest.e2e.config.ts      # E2E test config
+```
 
-Parameters: 8h/day, 20 days/month = 160h = 576,000s active. Default tier (1 vCPU, 3 GiB, 6 GB). CPU usage: 20% average.
+### Intentional Schema Duplication (Bundle Boundary)
 
-| Resource | Calculation | Free Tier | Billable | Rate | Cost |
-|----------|-------------|-----------|----------|------|------|
-| CPU (active usage) | 0.2 vCPU x 576,000s = 115,200 vCPU-s | 22,500 vCPU-s | 92,700 vCPU-s | $0.000020/vCPU-s | $1.85 |
-| Memory (provisioned) | 3 GiB x 576,000s = 1,728,000 GiB-s | 90,000 GiB-s | 1,638,000 GiB-s | $0.0000025/GiB-s | $4.10 |
-| Disk (provisioned) | 6 GB x 576,000s = 3,456,000 GB-s | 720,000 GB-s | 2,736,000 GB-s | $0.00000007/GB-s | $0.19 |
-| Workers Paid plan | | | | | $5.00 |
-| **Total** | | | | | **~$11.14/user/month** |
+`src/lib/schemas.ts` (backend) and `web-ui/src/lib/schemas.ts` (frontend) contain similar Zod schemas for API response validation. This is intentional, not a DRY violation. The frontend (`web-ui/`) has its own Vite build pipeline and produces a separate bundle — it cannot import from the backend Workers module. Both schemas validate the same API contract but live in independent build targets.
 
-Notes:
-- CPU billed on active usage only. Memory + disk billed on provisioned resources.
-- Hibernated containers (after 30m idle) = zero cost
-- R2: First 10 GB free, $0.015/GB/month after
-- Pricing: [Cloudflare Containers Pricing](https://developers.cloudflare.com/containers/pricing/)
+### Critical Paths Inside Container
 
-Cost scales per ACTIVE SESSION (each session = one container; a session has up to 6 terminal tabs sharing a single container). Idle containers hibernate after `sleepAfter` (30m) of no SDK-proxied requests. Hibernated containers = zero cost.
+| Path | Purpose |
+|------|---------|
+| `/home/user` | User home directory |
+| `/home/user/workspace` | Working directory (synced to R2) |
+| `/home/user/.claude/` | Claude config and credentials |
+| `/home/user/.config/rclone/rclone.conf` | rclone configuration |
+| `/tmp/sync-status.json` | Sync status (read by health server) |
+| `/tmp/sync.log` | Sync log for debugging |
 
 ---
 
-## 19. Troubleshooting
+## Troubleshooting
 
 ### `/api/*` Returns HTML (SPA Swallow)
 
@@ -1415,7 +1418,7 @@ Terminal server not starting (sync blocking). Check: `GET /api/container/startup
 
 ### R2 Sync Issues
 
-- **Bisync empty listing**: Initial `establish_bisync_baseline()` uses `--resync` to create the baseline, handles this case. The periodic daemon never uses `--resync` (see AD14).
+- **Bisync empty listing**: Initial `establish_bisync_baseline()` uses `--resync` to create the baseline, handles this case. The periodic daemon never uses `--resync` (see [Architecture Decisions](#architecture-decisions)).
 - **Transfers 0 files**: Filter order indeterminacy from mixed `--include`/`--exclude`. Use `--filter` flags instead.
 - **Slow sync**: Switch to `SYNC_MODE=metadata` or manually clean large repos from R2.
 - **Missing secrets**: Check `startup-status` response `details.syncError` for the missing variable.
@@ -1468,7 +1471,7 @@ sudo apt-get install -yqq --no-install-recommends \
 
 ---
 
-## 20. Debugging Guide
+## Debugging Guide
 
 ### Container Status
 
@@ -1493,7 +1496,31 @@ wrangler tail codeflare --status error
 
 ---
 
-## 21. Architecture Decisions
+## Cost Analysis
+
+### Per-Container Pricing
+
+Parameters: 8h/day, 20 days/month = 160h = 576,000s active. Default tier (1 vCPU, 3 GiB, 6 GB). CPU usage: 20% average.
+
+| Resource | Calculation | Free Tier | Billable | Rate | Cost |
+|----------|-------------|-----------|----------|------|------|
+| CPU (active usage) | 0.2 vCPU x 576,000s = 115,200 vCPU-s | 22,500 vCPU-s | 92,700 vCPU-s | $0.000020/vCPU-s | $1.85 |
+| Memory (provisioned) | 3 GiB x 576,000s = 1,728,000 GiB-s | 90,000 GiB-s | 1,638,000 GiB-s | $0.0000025/GiB-s | $4.10 |
+| Disk (provisioned) | 6 GB x 576,000s = 3,456,000 GB-s | 720,000 GB-s | 2,736,000 GB-s | $0.00000007/GB-s | $0.19 |
+| Workers Paid plan | | | | | $5.00 |
+| **Total** | | | | | **~$11.14/user/month** |
+
+Notes:
+- CPU billed on active usage only. Memory + disk billed on provisioned resources.
+- Hibernated containers (after 30m idle) = zero cost
+- R2: First 10 GB free, $0.015/GB/month after
+- Pricing: [Cloudflare Containers Pricing](https://developers.cloudflare.com/containers/pricing/)
+
+Cost scales per ACTIVE SESSION (each session = one container; a session has up to 6 terminal tabs sharing a single container). Idle containers hibernate after `sleepAfter` (30m) of no SDK-proxied requests. Hibernated containers = zero cost.
+
+---
+
+## Architecture Decisions
 
 | ID | Decision | Details |
 |----|----------|---------|
@@ -1510,7 +1537,7 @@ wrangler tail codeflare --status error
 | AD11 | Suffix-pattern CORS with credentials | <details><summary><code>matchesPattern()</code> with domain-boundary enforcement</summary><br>Default `ALLOWED_ORIGINS` includes `.workers.dev` as a suffix pattern, with `Access-Control-Allow-Credentials: true` on matching responses.<br><br>**Trade-off**: Any `*.workers.dev` subdomain passes the CORS check. Accepted because: `matchesPattern()` enforces domain boundaries (`evil-workers.dev` does NOT match), custom domains replace the wildcard, `ALLOWED_ORIGINS` is configurable, and CF Access JWT is the primary auth gate.<br><br>**Mitigation**: Setup adds `.workers.dev` suffix and `.{customDomain}` suffix to `setup:allowed_origins` in KV.<br><br>**Future**: Restricting credentialed CORS to exact known hosts would tighten the trust surface.</details> |
 | AD12 | KV-based setup lock (non-atomic) | <details><summary>Read-then-write pattern, acceptable for one-time setup</summary><br>Read `setup:complete`, check if false, perform setup, write true. Not atomic - two simultaneous requests could both proceed.<br><br>**Trade-off**: Accepted because setup is a one-time operation by a single admin. Each sub-step (CF API calls) is individually idempotent - duplicate execution produces the same result. Worst case is redundant API calls, not corrupted state.<br><br>**Future**: Moving to a Durable Object would provide strict serialization, deferred until there's evidence of the race occurring.</details> |
 | AD13 | Per-user scoped R2 tokens | <details><summary>Each container gets an R2 token scoped to its user's bucket only</summary><br>Replaces previous shared credential model. Token lifecycle:<br>1. **Creation**: `getOrCreateScopedR2Token()` creates token with Object Read+Write policy restricted to user's bucket<br>2. **Caching**: Token data cached in KV as `r2token:{email}` - survives container restarts<br>3. **Delivery**: Passed via `setBucketName` body -> container env vars -> rclone config<br>4. **Revocation**: `deleteScopedR2Token()` on user deletion<br><br>**Trade-off**: Requires `API Tokens: Edit` permission on deploy token (broader than ideal). Accepted because manual R2 credential management per user is operationally impractical.</details> |
-| AD14 | Never auto-resync on bisync failure | <details><summary><code>--resilient</code> + <code>--recover</code> for self-healing instead</summary><br>`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses pending deletions - if side A deleted a file and bisync fails before propagating, `--resync` resurrects it from side B.<br><br>**Instead**: `--resilient` (continue past non-critical errors) + `--recover` (reconstruct corrupted listings) + `--max-delete 100` (allow bulk deletions). Daemon retries in 60s on any failure.<br><br>**Manual `--resync`** is safe in `establish_bisync_baseline()` on container startup because one-way restore runs first.</details> |
+| AD14 | Never auto-`--resync` on bisync failure | <details><summary><code>--resilient</code> + <code>--recover</code> for self-healing instead</summary><br>`--resync` makes both sides identical by copying the newer version of every file, then creates a fresh baseline. This permanently loses pending deletions - if side A deleted a file and bisync fails before propagating, `--resync` resurrects it from side B.<br><br>**Instead**: `--resilient` (continue past non-critical errors) + `--recover` (reconstruct corrupted listings) + `--max-delete 100` (allow bulk deletions). Daemon retries in 60s on failure.<br><br>**Manual `--resync`** is safe in `establish_bisync_baseline()` on container startup because one-way restore runs first.</details> |
 | AD15 | TabConfigSchema allows arbitrary command strings | <details><summary><code>z.string().max(200)</code> — no additional security risk</summary><br>Users already have full root shell access inside their own ephemeral container. Restricting tab commands provides no additional security benefit since the container is their sandbox.</details> |
 | AD16 | entrypoint.sh ~680 lines complexity | <details><summary>Battle-tested, rewrite risk > benefit</summary><br>Handles Alpine→Debian migration, PTY pre-warm, rclone sync orchestration, tab autostart, and graceful shutdown. Accumulated complexity reflects real-world edge cases discovered over months of production use. A rewrite risks reintroducing solved bugs for marginal readability gains.</details> |
 | AD17 | collectMetrics density | <details><summary>Extends AD6 scope — alarm() context needs atomicity</summary><br>`collectMetrics` performs activity checking, health probing, and KV status updates in a single alarm callback. Splitting into separate alarms would require coordination logic more complex than the current monolithic approach. The alarm() context provides natural atomicity across these tightly coupled operations.</details> |
@@ -1525,9 +1552,27 @@ wrangler tail codeflare --status error
 | AD26 | Stress test rate-limit bypass | <details><summary>`STRESS_TEST_MODE=active` skips all rate limiting</summary><br>k6 stress tests share a single CF Access service token (single identity), so per-user rate limits (10/min sessions, 5/min containers, 30/min WebSocket) block meaningful load testing above ~5 VUs. Setting `STRESS_TEST_MODE=active` on the integration worker disables all rate-limit KV reads/writes at the top of the middleware, before any I/O. The value must be exactly `"active"` — any other value (including `"true"`) keeps limits enforced. Only set on integration; production must never have this variable.</details> |
 | AD27 | Server-side prefix delete | <details><summary>Server-side list+batch delete via R2 S3 API instead of frontend recursive browse+delete</summary><br>Frontend folder deletion was subject to API rate limits (30/min browse, 20/min delete), causing failures for large folders. R2 has no native "delete prefix" API, and lifecycle rules (Days=0) take up to 24h. Server-side ListObjectsV2 + batch DeleteObjects (1000 keys/call) using `emptyR2Bucket()` is the fastest approach. No `[[r2_buckets]]` binding needed — per-user dynamic buckets use account-level S3 credentials directly.</details> |
 
+#### AD: Stress Test Rate-Limit Bypass is Integration-Only
+- **Status:** Accepted
+- **Context:** `STRESS_TEST_MODE=active` disables all rate limiting. Only set via GitHub Actions workflow for integration environment. AD26 documents the bypass mechanism.
+- **Decision:** No CI guard needed for production deployment. The bypass is controlled via GitHub Actions environment variables, which are scoped to the `integration` environment. Production deployments use `environment: production` and never receive this variable.
+- **Consequences:** Relies on GitHub Actions environment separation. A repo admin could theoretically set the variable for production, but this requires deliberate action, not accidental configuration.
+
+#### AD: Container Secrets Passed as Environment Variables
+- **Status:** Accepted
+- **Context:** Container DO injects R2 credentials, LLM API keys, and auth tokens as plaintext environment variables. Containers are single-tenant (one user per container) and users have full terminal access.
+- **Decision:** Accept plaintext env vars for container secrets. Users can already access all environment variables via their terminal session (`env` command). The secrets are: R2 credentials (bucket-scoped to user's own bucket), LLM API keys (user's own keys), and a container auth token (internal DO-to-container communication).
+- **Consequences:** Any process inside the container can read secrets via `/proc/self/environ`. Acceptable because: (1) containers are single-tenant, (2) users already have equivalent access via terminal, (3) R2 credentials are bucket-scoped, (4) LLM keys belong to the user.
+
+#### AD: Worker Name Derived from Host Header for .workers.dev Domains
+- **Status:** Accepted
+- **Context:** During setup, the worker name is derived from the Host header for `.workers.dev` subdomains. For custom domains, the `CLOUDFLARE_WORKER_NAME` env var is preferred.
+- **Decision:** Accept Host header parsing for `.workers.dev` domains during setup. The exposure window is: (1) only during first-time setup (minutes), (2) requires CF Access JWT authentication, (3) setup is idempotent. For custom domains, the env var set at deploy time takes precedence.
+- **Consequences:** A spoofed Host header on a `.workers.dev` domain during the setup window could theoretically direct configuration to a different worker name, but this requires authenticated access and the window is extremely narrow.
+
 ---
 
-## 22. Lessons Learned
+## Lessons Learned
 
 Architectural principles and design rationale.
 
@@ -1549,7 +1594,7 @@ Architectural principles and design rationale.
 
 ---
 
-## 23. Mobile Terminal Design
+## Mobile Terminal Design
 
 ### Challenge 1: Cursor Duplication ("Orange Square")
 
@@ -1626,12 +1671,6 @@ Second keyboard open (broken):   baselineInnerH=1105, vpGrowth=0,  getKbHeight=4
 ```
 The 47px gap (483 - 436) is exactly the missing `viewportGrowth` compensation.
 
-**Previous attempts that failed:**
-1. `Math.min(baselineInnerHeight, window.innerHeight)` — prevents upward poisoning but doesn't handle all cases
-2. `Math.abs(...) < 100` threshold — still corrupts because the 47px bar change is under 100px
-3. Updating baseline in `forceResetKeyboardState()` — same corruption risk on visibility return
-4. Updating baseline in `resetKeyboardStateIfStale()` — same corruption risk
-
 **Final solution:** Removed ALL `baselineInnerHeight` updates from:
 - `handleGeometryChange` keyboard-close branch (was the primary corruption source)
 - `forceResetKeyboardState()` (called on visibility return, terminal exit)
@@ -1694,7 +1733,7 @@ The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_
 
 ---
 
-## 24. Automatic Memory Capture
+## Automatic Memory Capture
 
 Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 15 user messages. Zero manual intervention required.
 
@@ -1756,74 +1795,109 @@ Users can choose between **Default** and **Advanced** session modes via Settings
 
 | Content | Default | Advanced |
 |---------|---------|----------|
-| Memory hooks & prompt | Yes | Yes |
+| Memory hooks, prompt & rule | No | Yes |
 | CI monitoring, environment, no-local-builds rules | Yes | Yes |
 | Cloudflare stack, ship, ship references skills | Yes | Yes |
-| `consult-llm` skill | No | Yes |
-| `block-attributed-commits` hook | No | Yes |
-| Language rules (32 files: common, TS, Python, Go, Swift) | No | Yes |
-| Cherry-picked agents (8: architect, planner, code-reviewer, etc.) | No | Yes |
-| Cherry-picked commands (8: /plan, /tdd, /verify, etc.) | No | Yes |
-| Cherry-picked skills (10: api-design, security-review, etc.) | No | Yes |
-| Context7 plugin (up-to-date docs lookup) | No | Yes |
-| Superpowers plugin (TDD, debugging, planning skills) | No | Yes |
+| `consult-llm` skill (CC only) | No | Yes |
+| `block-attributed-commits` hook (CC only) | No | Yes |
+| Language rules (23 files: common, TS, Python, Go, Swift) | No | Yes |
+| Agent definitions (7: architect, code-reviewer, etc.) | No | Yes |
+| Commands (5: /brainstorm, /debug, /deploy, /plan, /review) | No | Yes |
+| Cherry-picked skills (8: api-design, backend-patterns, etc.) | No | Yes |
+| Known marketplaces plugin config | Yes | Yes |
 
 **Storage**: `sessionMode?: 'default' | 'advanced'` in `UserPreferences` (KV). Undefined = `'default'`.
 
-**Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and embeds `modes` into each `SeedDocument`.
+**Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and produces adapted versions for all 5 supported agents.
+
+**Multi-agent generation**: The generator produces 121 seed documents from CC's preseed as the single source of truth. For each non-CC agent (Codex, Gemini CLI, Copilot, OpenCode), it: (1) concatenates applicable rules into a single instructions file per mode, (2) adapts skills with tool name remapping, (3) adapts agent definitions with tool name remapping and `model` field removal. Instructions files are variant-per-mode (same R2 key, different content for default vs advanced). See [Multi-Agent Preseed](#multi-agent-preseed) section below.
 
 **Resolver**: `resolveSessionMode(prefs)` in `src/lib/session-mode.ts` — single source of truth for the `?? 'default'` fallback.
 
 **When mode takes effect**: Only on explicit "Recreate AI agent skills & rules" click or new bucket creation. Existing users keep all their current R2 files until they Recreate.
 
-**Cleanup on Recreate**: `reconcileAgentConfigs()` seeds mode-appropriate files then deletes preseed-managed files not in the current mode. Strictly scoped to keys from `AGENTS_SEEDED_CONFIGS` — no bucket listing, no prefix scans, never touches user-created files. Partial delete failures return `warnings` without failing the overall operation.
+**Cleanup on Recreate**: `reconcileAgentConfigs()` seeds mode-appropriate files then deletes preseed-managed files not in the current mode. Strictly scoped to keys from `AGENTS_SEEDED_CONFIGS` — no bucket listing, no prefix scans, never touches user-created files. `getPreseedKeysNotInMode()` excludes variant-per-mode keys (instruction files that exist in both modes with different content) to avoid deleting a file that was just seeded. Partial delete failures return `warnings` without failing the overall operation. `getConfigsForMode()` validates no duplicate keys within a single mode.
 
 **No migration**: Existing users are unaffected. Changes only happen on explicit action.
 
-### Cherry-Picked ECC Components (Advanced Mode)
+### Preseed Components (Advanced Mode)
 
-The [Everything Claude Code](https://github.com/affaan-m/everything-claude-code) (ECC) plugin has been **decomposed** — instead of installing the full plugin with its 23 hooks, instinct system, and 152 components, we cherry-pick only the valuable agents, commands, and skills and preseed them directly to the filesystem where Claude Code auto-discovers them. No ECC plugin is installed or enabled.
+ECC-derived rules, agents, commands, and skills are preseeded directly to the agent config filesystem. No external plugins are installed.
 
-**Rationale**: The ECC plugin imposed ~3,200 tokens/turn of system prompt overhead (hook definitions, 16 agent + 40 command + 65 skill listings). Its instinct/continuous-learning system was non-functional (two bugs: `run-with-flags-shell.sh` didn't forward phase arguments, and async PostToolUse hooks received empty `tool_output`). Four async Stop hooks generated "Async hook Stop completed" notifications every session. The decomposition eliminates all overhead while retaining the useful content.
+**Agents (7)**: `architect`, `build-error-resolver`, `code-reviewer`, `doc-updater`, `refactor-cleaner`, `security-reviewer`, `tdd-guide`. Preseeded to `~/.claude/agents/*.md` (and adapted equivalents for other agents) via the manifest pipeline with `"modes": ["advanced"]`. Each agent definition has YAML frontmatter with `name`, `description`, `tools`, and `model` (CC only).
 
-**Cherry-picked agents (8)**: `architect`, `build-error-resolver`, `code-reviewer`, `doc-updater`, `planner`, `refactor-cleaner`, `security-reviewer`, `tdd-guide`. Preseeded to `~/.claude/agents/*.md` via the manifest pipeline with `"modes": ["advanced"]`.
+**Commands (5)**: `brainstorm`, `debug`, `deploy`, `plan`, `review`. Preseeded to `~/.claude/commands/*.md` (CC only — other agents don't support slash commands).
 
-**Cherry-picked commands (8)**: `build-fix`, `checkpoint`, `code-review`, `plan`, `refactor-clean`, `tdd`, `test-coverage`, `verify`. Preseeded to `~/.claude/commands/*.md`.
+**Skills (12 files, 10 unique skills)**: `cloudflare-stack`, `ship` (+ 2 reference files), `api-design`, `backend-patterns`, `content-hash-cache-pattern`, `database-migrations`, `deployment-patterns`, `frontend-patterns`, `iterative-retrieval`, `search-first`. Preseeded to `~/.claude/skills/<name>/SKILL.md` (and adapted equivalents for agents that support skills). `consult-llm` is CC-only (depends on MCP tool).
 
-**Cherry-picked skills (10 + 1 reference)**: `api-design`, `backend-patterns`, `coding-standards`, `content-hash-cache-pattern`, `database-migrations`, `deployment-patterns`, `frontend-patterns`, `iterative-retrieval`, `search-first`, `security-review` (with `cloud-infrastructure-security.md` reference). Preseeded to `~/.claude/skills/<name>/SKILL.md`. Skills `e2e-testing`, `tdd-workflow`, and `verification-loop` were removed as they assume local test/build execution, which conflicts with the CI-only environment.
+**Rules (27 files, 3 default + 24 advanced-only)**: Core environment rules (`ci-monitoring`, `cloudflare-environment`, `no-local-builds`) in both modes. `memory` rule is advanced-only (depends on MCP memory server). ECC-derived language rules in `{common,typescript,python,golang,swift}/` subdirs (3 + 5*4 = 23 files, advanced only). Common rules cover security, coding style, and git workflow. Language-specific rules provide conventions for TypeScript, Python, Go, and Swift.
 
-**Excluded (123 components)**: All 23 ECC hooks, the instinct/continuous-learning system (observe.sh, instinct-cli.py, homunculus config), all Go/Python/Swift/Java/C++/Django/Spring Boot/ClickHouse skills, multi-model orchestration commands (5 `multi-*` commands), loop system commands, meta-ECC tools (harness-optimizer, skill-stocktake, configure-ecc), content/investor/market-research skills, NanoClaw REPL, session management, and all ECC scripts/lib files.
+**Known marketplaces**: `plugins/known_marketplaces.json` preseeds the official Anthropic plugin marketplace URL for user discovery.
 
-**Selection criteria**: Components were kept if they (1) are language-agnostic or TypeScript/web-applicable, (2) have zero `${CLAUDE_PLUGIN_ROOT}` dependencies, (3) provide direct development value rather than meta-ECC functionality.
-
-**Rules**: 32 rule files are preseeded to `~/.claude/rules/{common,typescript,python,golang,swift}/` via the manifest with `"modes": ["advanced"]`. Common rules (8 files) cover security, coding style, patterns, performance, testing, git workflow, development workflow, and agents. `common/hooks.md` was removed (low-value generic advice; language-specific hooks files are self-contained). Language-specific rules (5 files each for TypeScript, Python, Go, Swift) provide language-appropriate conventions.
-
-**Plugins (context7 + superpowers only)**: Two plugins remain enabled for advanced mode: Context7 (`context7@claude-plugins-official`) for up-to-date documentation lookup via MCP, and Superpowers (`superpowers@claude-plugins-official`) for structured TDD, debugging, and planning skills. These are preseeded at `plugins/cache/claude-plugins-official/` with `installed_plugins.json` and `known_marketplaces.json`. Plugins persist across sessions via R2 sync.
-
-**Settings merge**: `entrypoint.sh` detects advanced mode by checking for `~/.claude/rules/common/` (only present in advanced mode). When detected, it merges `enabledPlugins` (context7 + superpowers) into `settings.json` via `jq '. * $var'` recursive merge. No `ECC_DISABLED_HOOKS` env var is needed since no ECC hooks exist.
-
-**Context consumption**: Per-turn system prompt overhead is ~9,000 tokens (rules ~7,885 + agent/command/skill/plugin listings ~1,110). On-demand content (agent/skill/command full text) loads only when invoked, ranging from 200–3,200 tokens per activation. Total preseed content is ~131K tokens but only ~7% is always-on.
-
-**Updates**: Cherry-picked files update when the preseed pipeline is redeployed and users click "Recreate AI agent skills & rules". Users cannot update ECC components in-session since there is no ECC plugin installed.
+**Updates**: Preseed files update when the pipeline is redeployed and users click "Recreate AI agent skills & rules".
 
 ### Preseed Deployment
 
-All preseed content (hooks, rules, agents, commands, skills, plugin caches) is deployed via the manifest pipeline:
+All preseed content is deployed via the manifest pipeline:
 
 1. Source files in `preseed/agents/claude/` organized by type: `hooks/`, `rules/`, `agents/`, `commands/`, `skills/`, `plugins/`
 2. `preseed/agents/claude/manifest.json` maps each file to modes (`default`, `advanced`, or both)
-3. `scripts/generate-agent-seed.mjs` reads manifest + files, validates consistency (every file must have a manifest entry and vice versa), generates `src/lib/agent-seed.generated.ts` with `AGENTS_SEEDED_CONFIGS` array
+3. `scripts/generate-agent-seed.mjs` reads manifest + files (manifest-driven, ignores non-manifest files like `plugins/cache/`), generates `src/lib/agent-seed.generated.ts` with `AGENTS_SEEDED_CONFIGS` array (121 documents across all agents)
 4. On first bucket creation: `reconcileAgentConfigs(mode, { overwrite: false, cleanup: false })` writes mode-appropriate files to R2
 5. On "Recreate skills & rules" button: `reconcileAgentConfigs(mode, { overwrite: true, cleanup: true })` overwrites in R2 and deletes files not in current mode
-6. Bisync pulls from R2 to container `~/.claude/`
+6. Bisync pulls from R2 to container config directories (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`, `~/.config/opencode/`)
 
-**Manifest structure (121 entries)**:
+**Manifest structure (56 CC source entries)**:
 - `hooks/` (3): memory-capture.sh, memory-agent-prompt.md, block-attributed-commits.sh
-- `rules/` (33): core (4 default+advanced), common (9), typescript (5), python (5), golang (5), swift (5)
-- `agents/` (8): cherry-picked from ECC (advanced only)
-- `commands/` (8): cherry-picked from ECC (advanced only)
-- `skills/` (19): 3 codeflare-native + 13 cherry-picked from ECC + 3 ship references (advanced only, except cloudflare-stack and ship which are default+advanced)
-- `plugins/` (50): context7 (2), superpowers (46), metadata (2) — all advanced only
+- `rules/` (27): core (4 default+advanced), common (3), typescript (5), python (5), golang (5), swift (5)
+- `agents/` (7): architect, build-error-resolver, code-reviewer, doc-updater, refactor-cleaner, security-reviewer, tdd-guide (advanced only)
+- `commands/` (5): brainstorm, debug, deploy, plan, review (advanced only)
+- `skills/` (13): cloudflare-stack, ship (+2 refs), consult-llm, api-design, backend-patterns, content-hash-cache-pattern, database-migrations, deployment-patterns, frontend-patterns, iterative-retrieval, search-first
+- `plugins/` (1): known_marketplaces.json (default+advanced)
+
+### Multi-Agent Preseed
+
+The generator produces adapted config files for 5 agents from CC's preseed as single source of truth. No duplicate preseed files exist on disk.
+
+**Supported agents and their config locations:**
+
+| Agent | Global Instructions | Skills | Custom Agents |
+|-------|-------------------|--------|---------------|
+| CC | `~/.claude/rules/*.md` (individual) | `~/.claude/skills/<name>/SKILL.md` | `~/.claude/agents/*.md` |
+| Codex | `~/.codex/AGENTS.md` (single file) | `~/.codex/skills/<name>/SKILL.md` | N/A |
+| Gemini | `~/.gemini/GEMINI.md` (single file) | `~/.gemini/skills/<name>/SKILL.md` | `~/.gemini/agents/*.md` |
+| Copilot | `~/.copilot/copilot-instructions.md` (single file) | N/A | `~/.copilot/agents/<name>.agent.md` |
+| OpenCode | `~/.config/opencode/AGENTS.md` (single file) | `~/.config/opencode/skills/<name>/SKILL.md` | `~/.config/opencode/agents/*.md` |
+
+**Tool name mapping** (adapted in agent definition frontmatter):
+
+| CC | Codex | Gemini | Copilot | OpenCode |
+|--------|-------|--------|---------|----------|
+| Read | read | read_file | read | read |
+| Write | write | write_file | editFiles | write |
+| Edit | edit | replace | editFiles | edit |
+| Bash | shell | run_shell_command | execute | bash |
+| Grep | grep | search_file_content | search | search |
+| Glob | glob | glob | search | glob |
+
+**What each agent gets:**
+
+| Agent | Instructions | Skills | Agents | Total |
+|-------|-------------|--------|--------|-------|
+| CC | 0 (individual rules) | 13 | 7 | 56 (all categories) |
+| Codex | 2 (default+advanced) | 12 | 0 | 14 |
+| Gemini | 2 | 12 | 7 | 21 |
+| Copilot | 2 | 0 | 7 | 9 |
+| OpenCode | 2 | 12 | 7 | 21 |
+| **Total** | | | | **121** |
+
+**Excluded from non-CC agents**: hooks (CC hook system), commands (CC slash commands), plugins (CC plugin system), `rules/memory.md` (depends on MCP memory server), `consult-llm` skill (depends on CC-specific MCP tool).
+
+**Adaptation pipeline**: For each non-CC agent, the generator: (1) concatenates applicable rules into a single instructions file, (2) remaps tool names in agent definition frontmatter, (3) removes `model` field from frontmatter, (4) replaces `~/.claude/` path references with agent-specific config paths, (5) uses correct file extensions (e.g., `.agent.md` for Copilot agents).
+
+**Per-mode counts**: Default mode seeds 24 files, advanced mode seeds 117 files. Total array size is 121 (includes variant-per-mode duplicates for instructions files).
+
+**Variant-per-mode keys**: Instructions files appear twice in the generated array — once for default mode (3 rules) and once for advanced mode (all rules including memory, ECC), with the same R2 key but different content. `getPreseedKeysNotInMode()` handles this correctly by excluding keys that have a variant in the target mode.
 
 ### Settings.json Merge
 
@@ -1838,3 +1912,4 @@ All preseed content (hooks, rules, agents, commands, skills, plugin caches) is d
 - **Counter reset**: Delete `~/.memory/counter/{session_id}` to force re-summarization from the beginning of the transcript.
 - **Stuck lock**: Delete `~/.memory/counter/{session_id}.lock` if the background agent crashed without cleanup. Stale locks older than 2 minutes are auto-removed by the hook.
 - **Agent not firing**: Check `~/.claude/settings.json` has the `UserPromptSubmit` hook configured for `memory-capture.sh`. Verify the transcript has 15+ user messages since last capture. Verify the hook outputs `hookSpecificOutput` JSON and exits with code 0.
+
