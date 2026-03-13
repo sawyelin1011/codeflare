@@ -2,7 +2,7 @@ import { Component, Show, createSignal, createEffect } from 'solid-js';
 import '@xterm/xterm/css/xterm.css';
 import { useTerminal } from '../hooks/useTerminal';
 import InitProgress from './InitProgress';
-import { isTouchDevice, isVirtualKeyboardOpen, getKeyboardHeight, enableVirtualKeyboardOverlay } from '../lib/mobile';
+import { isTouchDevice, getKeyboardHeight, enableVirtualKeyboardOverlay } from '../lib/mobile';
 import { getRemoveFocusGuard, getIframeInput } from '../lib/xterm-internals';
 import '../styles/terminal.css';
 
@@ -97,12 +97,17 @@ const Terminal: Component<TerminalProps> = (props) => {
           width: '100%',
           flex: '1',
           'min-height': '0',
+          // overflow:hidden prevents xterm's canvas from bleeding into the
+          // padding-bottom area during the brief window between keyboard height
+          // signal update (which shrinks this container via padding on the wrapper)
+          // and the fit() call that resizes the canvas to match.
+          overflow: 'hidden',
           'background-color': isInitializing() ? 'transparent' : 'var(--color-terminal-theme-bg)',
           visibility: isInitializing() ? 'hidden' : 'visible',
           'overflow-anchor': 'none',
           '-webkit-user-select': isTouchDevice() ? 'none' : undefined,
           'user-select': isTouchDevice() ? 'none' : undefined,
-          'touch-action': isTouchDevice() ? (isVirtualKeyboardOpen() ? 'none' : 'pan-y') : undefined,
+          'touch-action': isTouchDevice() ? 'none' : undefined,
         }}
       />
 

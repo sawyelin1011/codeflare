@@ -44,19 +44,26 @@ describe('Terminal Store', () => {
       cols: 80,
       rows: 24,
       onData: vi.fn(() => ({ dispose: vi.fn() })),
-      write: vi.fn(),
+      write: vi.fn((_data: string, cb?: () => void) => { if (cb) cb(); }),
       reset: vi.fn(),
       scrollToBottom: vi.fn(),
       refresh: vi.fn(),
       dispose: vi.fn(),
+      buffer: { active: { viewportY: 100, baseY: 100 } },
     }) as unknown as Terminal;
 
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers();
+    // Write batching uses setTimeout(cb, 33) for 30fps throttle.
+    // Fake timers handle this — tests must advance by ≥33ms to flush writes.
+    // Also stub rAF for any remaining callers (ResizeObserver, etc).
+    vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => { cb(0); return 0; });
+    vi.stubGlobal('cancelAnimationFrame', () => {});
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.useRealTimers();
     // Clean up any connections
     terminalStore.disposeAll();
@@ -529,8 +536,10 @@ describe('Terminal Store', () => {
       const rawData = '\x1b[32mHello World\x1b[0m\r\n';
       wsInstance._simulateMessage(rawData);
 
-      // Should write raw data directly to terminal
-      expect(terminal.write).toHaveBeenCalledWith(rawData);
+      // Flush write batch (30fps throttle = 33ms setTimeout)
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(terminal.write).toHaveBeenCalledWith(rawData, expect.any(Function));
 
       vi.stubGlobal('WebSocket', OriginalWebSocket);
     });
@@ -557,8 +566,11 @@ describe('Terminal Store', () => {
       const pongMsg = JSON.stringify({ type: 'pong' });
       wsInstance._simulateMessage(pongMsg);
 
+      // Flush write batch (30fps throttle = 33ms setTimeout)
+      await vi.advanceTimersByTimeAsync(50);
+
       // Since pong is no longer handled, it falls through to terminal.write
-      expect(terminal.write).toHaveBeenCalledWith(pongMsg);
+      expect(terminal.write).toHaveBeenCalledWith(pongMsg, expect.any(Function));
 
       vi.stubGlobal('WebSocket', OriginalWebSocket);
     });
@@ -585,8 +597,11 @@ describe('Terminal Store', () => {
       const malformedJson = '{not valid json at all';
       wsInstance._simulateMessage(malformedJson);
 
+      // Flush write batch (30fps throttle = 33ms setTimeout)
+      await vi.advanceTimersByTimeAsync(50);
+
       // Should fall through to raw write
-      expect(terminal.write).toHaveBeenCalledWith(malformedJson);
+      expect(terminal.write).toHaveBeenCalledWith(malformedJson, expect.any(Function));
 
       vi.stubGlobal('WebSocket', OriginalWebSocket);
     });

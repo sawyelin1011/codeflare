@@ -5,7 +5,7 @@ import Terminal from '../../components/Terminal';
 import { terminalStore } from '../../stores/terminal';
 import { sessionStore } from '../../stores/session';
 import type { TerminalConnectionState } from '../../types';
-import { isTouchDevice, enableVirtualKeyboardOverlay, isVirtualKeyboardOpen } from '../../lib/mobile';
+import { isTouchDevice, enableVirtualKeyboardOverlay } from '../../lib/mobile';
 
 // Mock xterm.js and addons
 const mockTerminalInstance = {
@@ -21,6 +21,7 @@ const mockTerminalInstance = {
   clearSelection: vi.fn(),
   scrollToBottom: vi.fn(),
   scrollLines: vi.fn(),
+  onScroll: vi.fn(() => ({ dispose: vi.fn() })),
   refresh: vi.fn(),
   focus: vi.fn(),
   dispose: vi.fn(),
@@ -398,20 +399,7 @@ describe('Terminal Component', () => {
       expect(container.style.userSelect).toBe('none');
     });
 
-    it('should set touch-action: pan-y when keyboard is closed on mobile', () => {
-      // jsdom doesn't reflect touch-action via setProperty, so spy on the prototype
-      const spy = vi.spyOn(CSSStyleDeclaration.prototype, 'setProperty');
-
-      render(() => <Terminal {...defaultProps} />);
-
-      const touchActionCalls = spy.mock.calls.filter(([prop]) => prop === 'touch-action');
-      expect(touchActionCalls.length).toBeGreaterThan(0);
-      expect(touchActionCalls[touchActionCalls.length - 1][1]).toBe('pan-y');
-      spy.mockRestore();
-    });
-
-    it('should set touch-action: none when keyboard is open on mobile', () => {
-      vi.mocked(isVirtualKeyboardOpen).mockReturnValue(true);
+    it('should set touch-action: none on mobile (all touch handled in JS)', () => {
       const spy = vi.spyOn(CSSStyleDeclaration.prototype, 'setProperty');
 
       render(() => <Terminal {...defaultProps} />);

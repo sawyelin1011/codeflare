@@ -520,18 +520,18 @@ Newest file wins (`--conflict-resolve newer`). `--resilient` + `--recover` handl
 
 ## Memory Persistence
 
-Agent memory (knowledge graph via `@modelcontextprotocol/server-memory`) persists across sessions using per-session JSONL files synced to R2.
+Agent memory (knowledge graph via `@modelcontextprotocol/server-memory`) persists across sessions using per-session JSONL files synced to R2. **Memory persistence is gated on `SESSION_MODE=advanced`** — in default mode, the entire `.memory/` directory is excluded from rclone sync and merge/cleanup are skipped (MCP memory still works in-session but doesn't survive container recreate).
 
-**Lifecycle:**
+**Lifecycle** (advanced mode only):
 1. Container boots, rclone pulls `~/.memory/session-*.jsonl` files from R2
 2. `entrypoint.sh` runs `merge_memory_files()`: consolidates all session files into `session-{SESSION_ID}.jsonl`, deduplicating entities (by name) and relations (by JSON equality)
 3. `server-memory` MCP server reads/writes `session-{SESSION_ID}.jsonl` during the session
 4. rclone bisync syncs changes back to R2 every 60s and on shutdown
-5. `cleanup_old_memory_files()` removes old session files after bisync baseline is established
+5. `cleanup_old_memory_files()` removes old session files (keeps 3 newest) after bisync baseline is established
 
 **Why per-session JSONL:** Multiple concurrent sessions from the same user write to the same R2 bucket. A shared file would cause last-write-wins data loss. Per-session JSONL files eliminate write conflicts — each session owns its own file, and merge-on-boot consolidates them.
 
-**Two-phase merge/cleanup:** The merge runs after R2 sync but before bisync baseline establishment. Old files are kept so `--resync` doesn't resurrect them. Cleanup (local-only deletion) runs after bisync baseline succeeds, so periodic bisync propagates the deletions to R2. Direct R2 deletion is unsafe for concurrent sessions — another session's bisync would propagate the deletion locally, destroying the active memory file. The rclone config uses `disable_checksum = true` to prevent `BadDigest` errors from files modified during upload (pre-warm PTY race condition).
+**Two-phase merge/cleanup:** The merge runs after R2 sync but before bisync baseline establishment. Old files are kept so `--resync` doesn't resurrect them. Cleanup (local-only deletion, KEEP=3) runs after bisync baseline succeeds, so periodic bisync propagates the deletions to R2. Direct R2 deletion is unsafe for concurrent sessions — another session's bisync would propagate the deletion locally, destroying the active memory file. The rclone config uses `disable_checksum = true` to prevent `BadDigest` errors from files modified during upload (pre-warm PTY race condition).
 
 ### LLM Consultation (consult-llm-mcp)
 
@@ -915,6 +915,7 @@ GET `/health`, GET `/api/health`
 | `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default) | Worker -> DO |
 | `OPENAI_API_KEY` | OpenAI API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
 | `GEMINI_API_KEY` | Gemini API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
+| `SESSION_MODE` | Session mode (`'default'` or `'advanced'`) — controls memory persistence and rclone filters | Worker -> DO via `setBucketName` |
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
 | `BROWSER` | Points to `open-url` shim that exits 1 | Dockerfile ENV (`/usr/local/bin/open-url`) |
 
@@ -1551,6 +1552,9 @@ Cost scales per ACTIVE SESSION (each session = one container; a session has up t
 | AD25 | E2E service email hardcoded | <details><summary><code>e2e-service@codeflare.local</code> is a test identifier</summary><br>The `.local` TLD is RFC 6762 reserved and obviously non-production. The email is a test fixture seeded into KV for E2E authentication, not a secret. Extracting it to an environment variable adds configuration complexity for zero security benefit.</details> |
 | AD26 | Stress test rate-limit bypass | <details><summary>`STRESS_TEST_MODE=active` skips all rate limiting</summary><br>k6 stress tests share a single CF Access service token (single identity), so per-user rate limits (10/min sessions, 5/min containers, 30/min WebSocket) block meaningful load testing above ~5 VUs. Setting `STRESS_TEST_MODE=active` on the integration worker disables all rate-limit KV reads/writes at the top of the middleware, before any I/O. The value must be exactly `"active"` — any other value (including `"true"`) keeps limits enforced. Only set on integration; production must never have this variable.</details> |
 | AD27 | Server-side prefix delete | <details><summary>Server-side list+batch delete via R2 S3 API instead of frontend recursive browse+delete</summary><br>Frontend folder deletion was subject to API rate limits (30/min browse, 20/min delete), causing failures for large folders. R2 has no native "delete prefix" API, and lifecycle rules (Days=0) take up to 24h. Server-side ListObjectsV2 + batch DeleteObjects (1000 keys/call) using `emptyR2Bucket()` is the fastest approach. No `[[r2_buckets]]` binding needed — per-user dynamic buckets use account-level S3 credentials directly.</details> |
+| AD28 | Stress test bypass is integration-only | <details><summary>No CI guard needed — GitHub Actions environment separation controls it</summary><br>`STRESS_TEST_MODE=active` disables all rate limiting. Only set via GitHub Actions workflow scoped to the `integration` environment. Production deployments use `environment: production` and never receive this variable. A repo admin could theoretically set it for production, but this requires deliberate action.</details> |
+| AD29 | Container secrets as env vars | <details><summary>Plaintext env vars acceptable for single-tenant containers</summary><br>Container DO injects R2 credentials, LLM API keys, and auth tokens as plaintext environment variables. Users already have full terminal access (`env` command). Secrets are: R2 credentials (bucket-scoped), LLM keys (user's own), container auth token (internal DO-to-container). Any process can read via `/proc/self/environ` but containers are single-tenant.</details> |
+| AD30 | Worker name from Host header | <details><summary>Host header parsing for `.workers.dev` domains during setup only</summary><br>Worker name derived from Host header for `.workers.dev` subdomains during first-time setup. Custom domains use `CLOUDFLARE_WORKER_NAME` env var instead. Exposure window: only during setup (minutes), requires CF Access JWT, setup is idempotent. Spoofed Host could theoretically direct to wrong worker name but requires authenticated access and extremely narrow window.</details> |
 
 #### AD: Stress Test Rate-Limit Bypass is Integration-Only
 - **Status:** Accepted
@@ -1617,11 +1621,11 @@ Samsung Internet's bottom navigation bar inflates viewport height, causing the V
 The mobile terminal input system uses several techniques to work around browser/OS limitations:
 
 1. **Iframe compositor jail** -- Separate compositor context for Android IME caret containment
-2. **`_syncTextArea` freeze** -- Prevents xterm from interfering with custom input handling
+2. **`_syncTextArea` (NOT frozen)** -- xterm repositions its hidden textarea to the cursor on every render. This must remain active so the browser's focus-scroll targets the cursor position (bottom of terminal) rather than `(0,0)`. Freezing it was a premature optimization (~30 style recalcs/sec on a single hidden element) that caused the scroll-to-top bug (Fix 8). Note: on mobile, CSS `!important` overrides `_syncTextArea`'s positioning (textarea stays at 0,0 for the compositor jail), so Fix 9 adds additional guards.
 3. **`createElement` monkey-patch** -- Uses `input[type=password]` instead of textarea (scoped to `terminal.open()`)
 4. **`isFocused` getter override** -- Live reference via `iframe.contentDocument?.hasFocus()` avoids stale state
 5. **VK API toggle** -- `overlaysContent` must be enabled BEFORE focus to beat the keyboard/layout race
-6. **Four-part scroll fix** -- Disables xterm's touch handlers, sets `touch-action: pan-y`, enables momentum scrolling, and manages pointer-events based on keyboard state
+6. **Touch scroll via `terminal.scrollLines()`** -- When keyboard is closed, vertical swipes in `touch-gestures.ts` scroll the terminal buffer directly via `terminal.scrollLines()`. xterm 6.0.0's `SmoothScrollableElement` uses JS-based scrolling that doesn't support native touch; `.xterm-viewport` no longer has scrollable content. The gesture handler accumulates pixel deltas and converts to line-granularity scroll, with sensitivity derived from terminal font metrics (`fontSize * lineHeight`)
 
 ### Samsung Internet Keyboard Quirks
 
@@ -1682,14 +1686,20 @@ Baseline now only changes at:
 
 #### `kbDebounceTimer` Guard Pattern (Fix 3)
 
-Two effects can trigger `fitAddon.fit()` simultaneously:
+Three code paths can trigger `fitAddon.fit()`:
 1. **Keyboard refit** (debounced 150ms)
 2. **Active-state effect** (immediate `requestAnimationFrame`)
 3. **ResizeObserver** (immediate `requestAnimationFrame`)
 
 A `kbDebounceTimer` variable (timer ID, not boolean) gates the ResizeObserver. When the keyboard refit starts its debounce timer, `kbDebounceTimer` is set to the timer ID. The ResizeObserver checks `kbDebounceTimer !== null` and skips `fit()` when active. The timer callback sets it back to `null`. Using the timer ID (vs. a boolean flag) prevents a race condition where cleanup of the debounce timer doesn't properly clear the gate.
 
-The keyboard refit effect also tracks the `closed→open` keyboard transition via a `wasKeyboardOpen` flag. `scrollToBottom()` is called only when the keyboard opens (so the user sees the prompt), not on close or mid-animation height adjustments. This preserves scroll position when users are reading scrollback and the keyboard closes or the height adjusts (e.g. Samsung address bar animation).
+**Scroll preservation after `fit()`:** Every `fit()` call site must preserve or restore scroll position, because `fit()` recalculates terminal dimensions and can reset the viewport to the top. The rules are:
+
+- **Mobile with keyboard open:** Always call `scrollToBottom()` after `fit()`. The user expects to see the prompt whenever the keyboard is open.
+- **Desktop / mobile without keyboard:** Check `isAtBottom()` *before* `fit()`. If the user was following output (viewport at bottom), call `scrollToBottom()` after `fit()`. If the user had scrolled up into scrollback, preserve their position.
+- **Zero-height guard:** All `fit()` call sites check `containerEl.clientHeight === 0` and bail early. Inactive terminals have `height: 0` via CSS; calling `fit()` on a zero-height container calculates `rows = 0`, which clamps `viewportY` and corrupts scroll state when the terminal re-expands.
+
+This applies to all three `fit()` paths above, plus the init-overlay refit and keyboard lifecycle refit.
 
 #### Visibility Return Keyboard Reset (Fix 6)
 
@@ -1727,6 +1737,43 @@ Horizontal swipe gestures (left/right arrow key simulation) use a `setInterval` 
 
 **Solution:** Register `touchend`/`touchcancel` in capture phase (`{ capture: true }`) matching `touchstart`/`touchmove`. Our handler now fires before xterm's, guaranteeing the repeat timer is always cleared.
 
+#### Scroll-to-Top Reset During Burst Output (Fix 8)
+
+xterm 6.0.0 replaced `.xterm-viewport` (native `overflow-y: scroll` with a scroll-area div) with VS Code's `SmoothScrollableElement` (JS-based scrolling via transforms). Despite this, the terminal would jump to the top of scrollback during burst output. Root cause was a vicious cycle between two performance hacks:
+
+**Root cause — `_syncTextArea` freeze + scroll guard vicious cycle:**
+
+1. `_syncTextArea` was frozen (replaced with a no-op) to avoid ~30 style recalcs/sec on xterm's hidden textarea during burst output. This left the textarea stuck at `(0,0)` instead of following the cursor.
+
+2. With the textarea at `(0,0)`, the browser's focus validation engine would force-scroll containers to reveal the focused element, causing a visual snap to the top.
+
+3. A capture-phase "scroll guard" was added to counteract this — intercepting native scroll events on `.xterm-viewport`, `.xterm-screen`, `.xterm-scrollable-element`, and `.xterm`, forcing `scrollTop/scrollLeft` back to `0`.
+
+4. **The scroll guard was the actual bug.** xterm 6.0.0's `SmoothScrollableElement` still uses `.xterm-viewport`'s native `scrollTop` as the synchronization mechanism between the scrollbar and `viewportY`. Forcing `scrollTop = 0` on viewport scroll events told xterm the user scrolled to the absolute top of the buffer, setting `viewportY = 0`.
+
+**Solution:** Remove both hacks. `_syncTextArea` stays active so the textarea follows the cursor — the browser's focus-scroll then targets the cursor position (bottom of terminal), not `(0,0)`. The scroll guard is no longer needed because the focus-scroll no longer causes a snap to top. The ~30 style recalcs/sec on a single hidden element is negligible compared to the scroll corruption it was preventing.
+
+**Additional hardening:**
+
+- All `fitAddon.fit()` call sites are guarded with `containerEl.clientHeight === 0` checks to prevent zero-row dimension calculations during CSS visibility transitions (inactive terminals have `height: 0`).
+- All `scrollToBottom()` call sites check `viewportY >= baseY` before scrolling to preserve manual scrollback position.
+- The post-write scroll snap in `flushWriteBuffer()` is deferred to the next animation frame via `requestAnimationFrame`, allowing xterm's `RenderService` and `SmoothScrollableElement` to complete their internal layout pass before checking `viewportY`.
+- `refitAllTerminals()` skips the resize WS message if dimensions didn't change.
+
+#### Mobile Scroll-to-Top on Every Write (Fix 9)
+
+Same root cause as Fix 8 but on mobile: the `.xterm-helper-textarea` is pinned to `position: fixed; top: 0; left: 0` via CSS `!important` (needed for the iframe compositor jail), which defeats `_syncTextArea()`'s cursor-following. The browser's focus-validation engine scrolls `.xterm-viewport` (which still has `overflow-y: scroll` from xterm's default CSS, even though it's empty in 6.0.0) to reveal the textarea at (0,0), resetting xterm's internal ydisp to 0.
+
+**Symptoms:** Terminal jumps to top of scrollback buffer (showing the welcome banner) on EVERY output write when keyboard is closed, and intermittently when keyboard is open. Happens on all mobile browsers (Chrome Android, Samsung Internet, etc.).
+
+**Three-layer fix:**
+
+1. **CSS: Kill native scroll on viewport** — `@media (pointer: coarse) { .xterm .xterm-viewport { overflow: hidden !important; } }`. Since xterm 6.0.0's viewport div is empty (SmoothScrollableElement handles scrolling), this has no side effects.
+
+2. **Synchronous post-write scroll guard** — `flushWriteBuffer()` now checks `viewportY < baseY` both synchronously (inside the write callback) AND in `requestAnimationFrame`. The synchronous check catches resets that happen during the write/render cycle, before the browser paints the wrong frame.
+
+3. **Scroll-drop detector** — `useTerminal` subscribes to xterm's `onScroll` event on mobile and monitors for sudden ydisp drops to 0 when ybase is high. If detected, immediately corrects via `queueMicrotask(() => scrollToBottom())`. This catches resets from ANY source (write path, resize, keyboard, browser focus-validation) regardless of the triggering mechanism.
+
 #### WS Retryable Close Codes (Fix 5)
 
 The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_CLOSE_CODES`) rather than only on `1006` (Abnormal Closure). This covers server shutdown (1001), unexpected conditions (1011), service restart (1012), and try-again-later (1013). Normal closure (1000) does NOT trigger retry.
@@ -1735,7 +1782,7 @@ The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_
 
 ## Automatic Memory Capture
 
-Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 15 user messages. Zero manual intervention required.
+Conversation context (decisions, debugging insights, solutions) is automatically summarized into MCP memory every 30 user messages. Zero manual intervention required.
 
 ### Architecture
 
@@ -1770,7 +1817,7 @@ The `memory-capture.sh` script runs as a **UserPromptSubmit hook** that uses the
 
 ### Prompt File
 
-The background agent's full instructions live in `~/.claude/hooks/memory-agent-prompt.md` (preseeded alongside the hook script). This keeps the hook's reason string short (~200 chars) while providing detailed instructions for:
+The background agent's full instructions live in `~/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md` (preseeded alongside the hook script). This keeps the hook's reason string short (~200 chars) while providing detailed instructions for:
 
 - Observation quality (merge related facts, skip trivial events, max 5-8 per window)
 - MCP memory entity naming (`chat-YYYY-MM-DD`)
@@ -1785,9 +1832,9 @@ The background agent's full instructions live in `~/.claude/hooks/memory-agent-p
 └── {session_id}.vars   # Variables JSON for current hook invocation (excluded from sync)
 ```
 
-- Counter files are **persisted to R2** — survives container restarts, needed for `--resume` to avoid re-summarizing the entire transcript.
-- Lock and vars files are **excluded from sync** via `--filter "- .memory/counter/*.lock"` and `--filter "- .memory/counter/*.vars"` — they are ephemeral per-invocation state.
-- The `.memory/` directory itself IS synced (it contains the MCP memory JSONL files used across sessions).
+- All counter files are **excluded from sync** via `--filter "- .memory/counter/**"` — they are ephemeral per-session state (each session gets a new sessionID, old counters are orphans).
+- In **advanced mode**, the `.memory/` directory itself IS synced (it contains the MCP memory JSONL files used across sessions).
+- In **default mode**, the entire `.memory/**` directory is excluded from sync via a conditional `SESSION_MODE` check.
 
 ### Session Modes
 
@@ -1795,7 +1842,7 @@ Users can choose between **Default** and **Advanced** session modes via Settings
 
 | Content | Default | Advanced |
 |---------|---------|----------|
-| Memory hooks, prompt & rule | No | Yes |
+| Memory plugin & rule | No | Yes |
 | CI monitoring, environment, no-local-builds rules | Yes | Yes |
 | Cloudflare stack, ship, ship references skills | Yes | Yes |
 | `consult-llm` skill (CC only) | No | Yes |
@@ -1810,7 +1857,7 @@ Users can choose between **Default** and **Advanced** session modes via Settings
 
 **Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and produces adapted versions for all 5 supported agents.
 
-**Multi-agent generation**: The generator produces 121 seed documents from CC's preseed as the single source of truth. For each non-CC agent (Codex, Gemini CLI, Copilot, OpenCode), it: (1) concatenates applicable rules into a single instructions file per mode, (2) adapts skills with tool name remapping, (3) adapts agent definitions with tool name remapping and `model` field removal. Instructions files are variant-per-mode (same R2 key, different content for default vs advanced). See [Multi-Agent Preseed](#multi-agent-preseed) section below.
+**Multi-agent generation**: The generator produces 123 seed documents from CC's preseed as the single source of truth. For each non-CC agent (Codex, Gemini CLI, Copilot, OpenCode), it: (1) concatenates applicable rules into a single instructions file per mode, (2) adapts skills with tool name remapping, (3) adapts agent definitions with tool name remapping and `model` field removal. Instructions files are variant-per-mode (same R2 key, different content for default vs advanced). See [Multi-Agent Preseed](#multi-agent-preseed) section below.
 
 **Resolver**: `resolveSessionMode(prefs)` in `src/lib/session-mode.ts` — single source of truth for the `?? 'default'` fallback.
 
@@ -1847,13 +1894,13 @@ All preseed content is deployed via the manifest pipeline:
 5. On "Recreate skills & rules" button: `reconcileAgentConfigs(mode, { overwrite: true, cleanup: true })` overwrites in R2 and deletes files not in current mode
 6. Bisync pulls from R2 to container config directories (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`, `~/.config/opencode/`)
 
-**Manifest structure (56 CC source entries)**:
-- `hooks/` (3): memory-capture.sh, memory-agent-prompt.md, block-attributed-commits.sh
+**Manifest structure (58 CC source entries)**:
+- `hooks/` (1): block-attributed-commits.sh (advanced only)
 - `rules/` (27): core (4 default+advanced), common (3), typescript (5), python (5), golang (5), swift (5)
 - `agents/` (7): architect, build-error-resolver, code-reviewer, doc-updater, refactor-cleaner, security-reviewer, tdd-guide (advanced only)
 - `commands/` (5): brainstorm, debug, deploy, plan, review (advanced only)
 - `skills/` (13): cloudflare-stack, ship (+2 refs), consult-llm, api-design, backend-patterns, content-hash-cache-pattern, database-migrations, deployment-patterns, frontend-patterns, iterative-retrieval, search-first
-- `plugins/` (1): known_marketplaces.json (default+advanced)
+- `plugins/` (4): known_marketplaces.json (default+advanced), codeflare-memory plugin (3 files, advanced only: plugin.json, memory-capture.sh, memory-agent-prompt.md), codeflare-hooks plugin (2 files, advanced only: plugin.json, block-attributed-commits.sh)
 
 ### Multi-Agent Preseed
 
@@ -1884,32 +1931,41 @@ The generator produces adapted config files for 5 agents from CC's preseed as si
 
 | Agent | Instructions | Skills | Agents | Total |
 |-------|-------------|--------|--------|-------|
-| CC | 0 (individual rules) | 13 | 7 | 56 (all categories) |
+| CC | 0 (individual rules) | 13 | 7 | 58 (all categories) |
 | Codex | 2 (default+advanced) | 12 | 0 | 14 |
 | Gemini | 2 | 12 | 7 | 21 |
 | Copilot | 2 | 0 | 7 | 9 |
 | OpenCode | 2 | 12 | 7 | 21 |
-| **Total** | | | | **121** |
+| **Total** | | | | **123** |
 
-**Excluded from non-CC agents**: hooks (CC hook system), commands (CC slash commands), plugins (CC plugin system), `rules/memory.md` (depends on MCP memory server), `consult-llm` skill (depends on CC-specific MCP tool).
+**Excluded from non-CC agents**: hooks (CC hook system), commands (CC slash commands), plugins (CC plugin system, including codeflare-memory), `rules/memory.md` (depends on MCP memory server), `consult-llm` skill (depends on CC-specific MCP tool).
 
 **Adaptation pipeline**: For each non-CC agent, the generator: (1) concatenates applicable rules into a single instructions file, (2) remaps tool names in agent definition frontmatter, (3) removes `model` field from frontmatter, (4) replaces `~/.claude/` path references with agent-specific config paths, (5) uses correct file extensions (e.g., `.agent.md` for Copilot agents).
 
-**Per-mode counts**: Default mode seeds 24 files, advanced mode seeds 117 files. Total array size is 121 (includes variant-per-mode duplicates for instructions files).
+**Per-mode counts**: Default mode seeds 24 files, advanced mode seeds 119 files. Total array size is 123 (includes variant-per-mode duplicates for instructions files).
 
 **Variant-per-mode keys**: Instructions files appear twice in the generated array — once for default mode (3 rules) and once for advanced mode (all rules including memory, ECC), with the same R2 key but different content. `getPreseedKeysNotInMode()` handles this correctly by excluding keys that have a variant in the target mode.
 
 ### Settings.json Merge
 
-`entrypoint.sh` merges hook configuration into `~/.claude/settings.json` using the same `jq '. * $cfg'` recursive merge pattern as the MCP config. The UserPromptSubmit hook is non-blocking (exit 0) so no special timeout or async configuration is needed. Handles three cases:
+`entrypoint.sh` merges settings into `~/.claude/settings.json` using `jq '. * $cfg'` recursive merge. In advanced mode, this includes `skipDangerousModePermissionPrompt` plus hook registrations (PreToolUse and UserPromptSubmit). In default mode, only `skipDangerousModePermissionPrompt` is merged (no hooks). Handles three cases:
 
-- **File doesn't exist**: Creates with hook config
+- **File doesn't exist**: Creates with settings config
 - **File exists**: Recursive merge preserving user's existing settings (statusLine, permissions, etc.)
 - **File malformed**: Skips with warning, does not overwrite
+
+### Plugin Enablement
+
+`entrypoint.sh` merges `enabledPlugins` into `~/.claude/.claude.json` to enable both the `codeflare-memory` and `codeflare-hooks` plugins. This is permanent (not mode-gated) because missing plugins are silently skipped by Claude Code — when the plugin files are absent in default mode, the plugins simply don't load. Plugins are used for file organization and delivery via R2 sync only — hook registration is done via `settings.json` (see above).
+
+- **codeflare-memory**: Scripts for memory capture (hook registered in settings.json, scripts delivered via plugin)
+- **codeflare-hooks**: Scripts for commit attribution blocking (hook registered in settings.json, scripts delivered via plugin)
 
 ### Troubleshooting
 
 - **Counter reset**: Delete `~/.memory/counter/{session_id}` to force re-summarization from the beginning of the transcript.
 - **Stuck lock**: Delete `~/.memory/counter/{session_id}.lock` if the background agent crashed without cleanup. Stale locks older than 2 minutes are auto-removed by the hook.
-- **Agent not firing**: Check `~/.claude/settings.json` has the `UserPromptSubmit` hook configured for `memory-capture.sh`. Verify the transcript has 15+ user messages since last capture. Verify the hook outputs `hookSpecificOutput` JSON and exits with code 0.
+- **Agent not firing**: Check `~/.claude/settings.json` has `UserPromptSubmit` hook entry pointing to `memory-capture.sh`. Verify the script exists at `~/.claude/plugins/codeflare-memory/scripts/memory-capture.sh`. Verify the transcript has 30+ user messages since last capture. Check `rules/memory.md` is loaded (advanced mode only).
+- **Attribution blocking not working**: Check `~/.claude/settings.json` has `PreToolUse` hook entry pointing to `block-attributed-commits.sh`. Verify the script exists at `~/.claude/plugins/codeflare-hooks/scripts/block-attributed-commits.sh`.
+- **Default mode has hooks**: If `settings.json` has hook entries in default mode, the entrypoint SESSION_MODE gating may have failed. Remove them: `jq 'del(.hooks)' ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json`.
 

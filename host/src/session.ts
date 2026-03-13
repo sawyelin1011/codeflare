@@ -10,8 +10,7 @@ import type { IPty } from 'node-pty';
 import { WebSocket } from 'ws';
 import HeadlessPkg from '@xterm/headless';
 const { Terminal: HeadlessTerminal } = HeadlessPkg;
-import SerializePkg from '@xterm/addon-serialize';
-const { SerializeAddon } = SerializePkg;
+import { SerializeAddon } from '@xterm/addon-serialize';
 
 import type {
   SessionOptions,

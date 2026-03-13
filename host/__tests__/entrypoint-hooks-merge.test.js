@@ -16,59 +16,46 @@ function extractMainExecution() {
 }
 
 // ============================================================================
-// Test: settings.json hooks merge in entrypoint.sh
+// Test: settings.json configuration in entrypoint.sh
 // ============================================================================
-describe('settings.json hooks merge', () => {
-  it('merges hook config into ~/.claude/settings.json', () => {
+describe('settings.json configuration', () => {
+  it('configures settings.json with skipDangerousModePermissionPrompt', () => {
     assert.ok(
-      entrypoint.includes('settings.json'),
-      'entrypoint should reference settings.json'
-    );
-    assert.ok(
-      entrypoint.includes('hooks'),
-      'entrypoint should configure hooks'
+      entrypoint.includes('skipDangerousModePermissionPrompt'),
+      'entrypoint should configure skipDangerousModePermissionPrompt in settings.json'
     );
   });
 
-  it('configures UserPromptSubmit hook for memory-capture.sh', () => {
+  it('advanced mode SETTINGS_CONFIG includes hooks', () => {
+    // Advanced mode should merge PreToolUse and UserPromptSubmit hooks into settings.json
     assert.ok(
-      entrypoint.includes('memory-capture.sh'),
-      'entrypoint should reference memory-capture.sh hook script'
+      entrypoint.includes('PreToolUse'),
+      'entrypoint should configure PreToolUse hook for advanced mode'
     );
     assert.ok(
       entrypoint.includes('UserPromptSubmit'),
-      'entrypoint should configure UserPromptSubmit hook event'
+      'entrypoint should configure UserPromptSubmit hook for advanced mode'
     );
-  });
-
-  it('configures PreToolUse hook for block-attributed-commits.sh', () => {
     assert.ok(
       entrypoint.includes('block-attributed-commits.sh'),
-      'entrypoint should reference block-attributed-commits.sh hook script'
+      'PreToolUse hook should point to codeflare-hooks plugin script'
     );
     assert.ok(
-      entrypoint.includes('PreToolUse'),
-      'entrypoint should configure PreToolUse hook event'
+      entrypoint.includes('memory-capture.sh'),
+      'UserPromptSubmit hook should point to codeflare-memory plugin script'
     );
   });
 
-  it('does not mark memory-capture hook as async', () => {
-    // UserPromptSubmit hooks deliver additionalContext via exit 0 — async is not needed
-    // Check that the hooks config block does not contain "async"
-    const hooksStart = entrypoint.indexOf('"hooks":{');
-    const hooksEnd = entrypoint.indexOf('}}\'\n', hooksStart);
-    const hooksBlock = entrypoint.slice(hooksStart, hooksEnd);
+  it('SESSION_MODE gates hook registration', () => {
     assert.ok(
-      !hooksBlock.includes('"async"'),
-      'memory-capture hook should not be configured as async'
+      entrypoint.includes('SESSION_MODE:-default') && entrypoint.includes('"hooks"'),
+      'hook registration should be gated on SESSION_MODE'
     );
   });
 
   it('uses jq recursive merge to preserve existing settings', () => {
-    // Should use jq '. * $cfg' pattern for recursive merge
     const main = extractMainExecution();
     assert.ok(main, 'MAIN EXECUTION section should exist');
-    // Find the settings.json merge block
     assert.ok(
       entrypoint.includes('. * $'),
       'should use jq recursive merge (. * $var) for settings.json'
@@ -76,10 +63,8 @@ describe('settings.json hooks merge', () => {
   });
 
   it('creates settings.json when it does not exist', () => {
-    // Should handle case where settings.json doesn't exist
     const main = extractMainExecution();
     assert.ok(main, 'MAIN EXECUTION section should exist');
-    // Should have an else branch that creates the file
     assert.ok(
       main.includes('settings.json') && main.includes('else'),
       'should have else branch for creating settings.json when missing'
@@ -93,19 +78,67 @@ describe('settings.json hooks merge', () => {
     );
   });
 
-  it('hooks merge runs before bisync baseline', () => {
+  it('settings merge runs before bisync baseline', () => {
     const main = extractMainExecution();
     assert.ok(main, 'MAIN EXECUTION section should exist');
 
-    const hooksIdx = main.indexOf('memory-capture.sh');
+    const settingsIdx = main.indexOf('settings.json');
     const bisyncBaselineIdx = main.indexOf('establish_bisync_baseline');
 
-    assert.ok(hooksIdx > -1, 'hooks config should exist in main execution');
+    assert.ok(settingsIdx > -1, 'settings config should exist in main execution');
     assert.ok(bisyncBaselineIdx > -1, 'establish_bisync_baseline should exist');
     assert.ok(
-      hooksIdx < bisyncBaselineIdx,
-      'hooks merge must run before bisync baseline'
+      settingsIdx < bisyncBaselineIdx,
+      'settings merge must run before bisync baseline'
     );
+  });
+});
+
+// ============================================================================
+// Test: plugin enablement
+// ============================================================================
+describe('plugin enablement', () => {
+  it('enables codeflare-memory plugin in .claude.json', () => {
+    const main = extractMainExecution();
+    assert.ok(main, 'MAIN EXECUTION section should exist');
+    assert.ok(
+      main.includes('codeflare-memory'),
+      'entrypoint should reference codeflare-memory plugin'
+    );
+    assert.ok(
+      main.includes('enabledPlugins'),
+      'entrypoint should configure enabledPlugins in .claude.json'
+    );
+  });
+
+  it('enables codeflare-hooks plugin alongside codeflare-memory', () => {
+    const pluginsMatch = entrypoint.match(/PLUGINS_CONFIG='(\{.*?\})'/);
+    assert.ok(pluginsMatch, 'PLUGINS_CONFIG assignment should exist');
+    const pluginsConfig = JSON.parse(pluginsMatch[1]);
+    assert.ok(
+      pluginsConfig.enabledPlugins['codeflare-memory'] === true,
+      'codeflare-memory should be enabled'
+    );
+    assert.ok(
+      pluginsConfig.enabledPlugins['codeflare-hooks'] === true,
+      'codeflare-hooks should be enabled'
+    );
+  });
+
+  it('plugin enablement uses jq merge into .claude.json', () => {
+    const main = extractMainExecution();
+    assert.ok(main, 'MAIN EXECUTION section should exist');
+    assert.ok(
+      main.includes('enabledPlugins') && main.includes('. * $'),
+      'plugin enablement should use jq recursive merge'
+    );
+  });
+
+  it('plugin enablement is NOT mode-gated (permanent)', () => {
+    const main = extractMainExecution();
+    assert.ok(main, 'MAIN EXECUTION section should exist');
+    const pluginIdx = main.indexOf('"codeflare-memory"');
+    assert.ok(pluginIdx > -1, 'should have codeflare-memory plugin reference');
   });
 });
 
@@ -133,6 +166,37 @@ describe('rclone memory counter exclusion', () => {
 });
 
 // ============================================================================
+// Test: SESSION_MODE-based .memory/** exclusion
+// ============================================================================
+describe('SESSION_MODE-based memory exclusion', () => {
+  it('default mode excludes entire .memory/ directory', () => {
+    assert.ok(
+      entrypoint.includes('SESSION_MODE:-default') && entrypoint.includes('.memory/**'),
+      'should conditionally exclude .memory/** based on SESSION_MODE'
+    );
+  });
+
+  it('.memory/** exclusion is NOT in RCLONE_FILTERS_COMMON array literal', () => {
+    // .memory/** should be added conditionally AFTER the array, not inside it
+    const filtersStart = entrypoint.indexOf('RCLONE_FILTERS_COMMON=(');
+    const filtersEnd = entrypoint.indexOf(')', filtersStart);
+    assert.ok(filtersStart > -1, 'RCLONE_FILTERS_COMMON should exist');
+    const filtersBlock = entrypoint.slice(filtersStart, filtersEnd);
+    assert.ok(
+      !filtersBlock.includes('"- .memory/**"'),
+      '.memory/** should NOT be in the static RCLONE_FILTERS_COMMON array'
+    );
+  });
+
+  it('uses += to append .memory/** filter conditionally', () => {
+    assert.ok(
+      entrypoint.includes("RCLONE_FILTERS_COMMON+=('--filter' '- .memory/**')"),
+      'should use += to append .memory/** filter when SESSION_MODE is not advanced'
+    );
+  });
+});
+
+// ============================================================================
 // Test: counter directory creation
 // ============================================================================
 describe('memory counter directory creation', () => {
@@ -144,6 +208,37 @@ describe('memory counter directory creation', () => {
     assert.ok(
       entrypoint.includes('mkdir -p') && entrypoint.includes('.memory/counter'),
       'entrypoint should create .memory/counter directory'
+    );
+  });
+});
+
+// ============================================================================
+// Test: merge_memory_files and cleanup_old_memory_files SESSION_MODE gating
+// ============================================================================
+describe('memory functions SESSION_MODE gating', () => {
+  it('merge_memory_files is gated on SESSION_MODE=advanced', () => {
+    const main = extractMainExecution();
+    assert.ok(main, 'MAIN EXECUTION section should exist');
+    // Find the merge_memory_files call and check it's inside a SESSION_MODE check
+    const mergeIdx = main.indexOf('merge_memory_files');
+    assert.ok(mergeIdx > -1, 'merge_memory_files should exist in main execution');
+    // Check the preceding lines include SESSION_MODE check
+    const preceding = main.slice(Math.max(0, mergeIdx - 200), mergeIdx);
+    assert.ok(
+      preceding.includes('SESSION_MODE:-default'),
+      'merge_memory_files call should be gated on SESSION_MODE'
+    );
+  });
+
+  it('cleanup_old_memory_files is gated on SESSION_MODE=advanced', () => {
+    const main = extractMainExecution();
+    assert.ok(main, 'MAIN EXECUTION section should exist');
+    const cleanupIdx = main.indexOf('cleanup_old_memory_files');
+    assert.ok(cleanupIdx > -1, 'cleanup_old_memory_files should exist in main execution');
+    const preceding = main.slice(Math.max(0, cleanupIdx - 200), cleanupIdx);
+    assert.ok(
+      preceding.includes('SESSION_MODE:-default'),
+      'cleanup_old_memory_files call should be gated on SESSION_MODE'
     );
   });
 });

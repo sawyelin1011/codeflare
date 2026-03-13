@@ -48,7 +48,7 @@ describe('agent-seed manifest.json', () => {
     }
   });
 
-  it('"advanced" is a superset of "default" — all default keys also appear in advanced', () => {
+  it('"advanced" is a superset of "default" -- all default keys also appear in advanced', () => {
     const defaultKeys = new Set(
       AGENTS_SEEDED_CONFIGS.filter((doc) => doc.modes.includes('default')).map((doc) => doc.key)
     );
@@ -159,6 +159,28 @@ describe('multi-agent documents', () => {
     for (const doc of nonClaude) {
       expect(doc.key).not.toContain('consult-llm');
     }
+  });
+
+  it('codeflare-memory plugin files are advanced-only', () => {
+    const pluginDocs = claudeDocs().filter((d) => d.key.includes('codeflare-memory'));
+    expect(pluginDocs.length).toBe(3);
+    for (const doc of pluginDocs) {
+      expect(doc.modes).toEqual(['advanced']);
+    }
+  });
+
+  it('codeflare-memory plugin is excluded from non-Claude agents', () => {
+    const nonClaude = AGENTS_SEEDED_CONFIGS.filter((d) => !d.key.startsWith('.claude/'));
+    for (const doc of nonClaude) {
+      expect(doc.key).not.toContain('codeflare-memory');
+    }
+  });
+
+  it('no standalone memory hook files remain in hooks/ directory', () => {
+    const memoryHooks = claudeDocs().filter(
+      (d) => d.key.startsWith('.claude/hooks/memory')
+    );
+    expect(memoryHooks).toHaveLength(0);
   });
 
   it('non-Claude agent definitions have no model field in frontmatter', () => {

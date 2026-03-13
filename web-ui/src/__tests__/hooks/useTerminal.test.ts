@@ -31,6 +31,7 @@ const mockTerminalInstance = {
   options: { fontFamily: 'monospace', theme: {} },
   textarea: null,
   scrollLines: vi.fn(),
+  onScroll: vi.fn(() => ({ dispose: vi.fn() })),
   buffer: {
     active: { length: 0, cursorY: 0, viewportY: 0, baseY: 0, getLine: vi.fn(() => null) },
     onBufferChange: vi.fn(() => ({ dispose: vi.fn() })),
@@ -39,12 +40,7 @@ const mockTerminalInstance = {
     registerCsiHandler: vi.fn(() => ({ dispose: vi.fn() })),
   },
   registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
-  _core: {
-    viewport: {
-      handleTouchStart: vi.fn(),
-      handleTouchMove: vi.fn(),
-    },
-  },
+  _core: {},
 };
 
 // MOCK-DRIFT RISK: Terminal constructor returns a static mock object.
@@ -536,7 +532,53 @@ describe('useTerminal hook', () => {
       vi.useRealTimers();
     });
 
-    it('should NOT scroll to bottom on mid-animation height adjustments while keyboard stays open', async () => {
+    it('should scroll to bottom on close→reopen even if close debounce was cancelled', async () => {
+      vi.useFakeTimers();
+
+      const isTouchDeviceMock = vi.mocked(isTouchDevice);
+      const getKeyboardHeightMock = vi.mocked(getKeyboardHeight);
+      const isVirtualKeyboardOpenMock = vi.mocked(isVirtualKeyboardOpen);
+
+      isTouchDeviceMock.mockReturnValue(true);
+
+      const [kbHeight, setKbHeight] = createSignal(0);
+      const [kbOpen, setKbOpen] = createSignal(false);
+      getKeyboardHeightMock.mockImplementation(() => kbHeight());
+      isVirtualKeyboardOpenMock.mockImplementation(() => kbOpen());
+
+      const dispose = createRoot((dispose) => {
+        const result = useTerminal(defaultProps);
+        result.containerRef(containerEl);
+        return dispose;
+      });
+
+      // Open keyboard and let debounce complete
+      setKbHeight(300);
+      setKbOpen(true);
+      await vi.advanceTimersByTimeAsync(200);
+
+      mockScrollToBottom.mockClear();
+      mockFit.mockClear();
+
+      // Close keyboard but reopen BEFORE the close debounce fires (within 150ms).
+      setKbHeight(0);
+      setKbOpen(false);
+      // Advance only 50ms — not enough for close debounce to fire
+      await vi.advanceTimersByTimeAsync(50);
+
+      // Reopen keyboard — the close debounce was cancelled
+      setKbHeight(300);
+      setKbOpen(true);
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(mockFit).toHaveBeenCalled();
+      expect(mockScrollToBottom).toHaveBeenCalled();
+
+      dispose();
+      vi.useRealTimers();
+    });
+
+    it('should scroll to bottom on mid-animation height adjustments while keyboard stays open', async () => {
       vi.useFakeTimers();
 
       const isTouchDeviceMock = vi.mocked(isTouchDevice);
@@ -569,7 +611,9 @@ describe('useTerminal hook', () => {
       await vi.advanceTimersByTimeAsync(200);
 
       expect(mockFit).toHaveBeenCalled();
-      expect(mockScrollToBottom).not.toHaveBeenCalled();
+      // Always scroll to bottom when keyboard is open — fit() can reset scroll
+      // position, so we must re-anchor to prevent "jump to top"
+      expect(mockScrollToBottom).toHaveBeenCalled();
 
       dispose();
       vi.useRealTimers();
@@ -616,50 +660,6 @@ describe('useTerminal hook', () => {
 
       dispose();
       vi.useRealTimers();
-    });
-  });
-
-  describe('mobile viewport touch handler disable', () => {
-    it('should disable xterm viewport touch handlers on mobile', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      isTouchDeviceMock.mockReturnValue(true);
-
-      // Save original references
-      const originalHandleTouchStart = mockTerminalInstance._core.viewport.handleTouchStart;
-      const originalHandleTouchMove = mockTerminalInstance._core.viewport.handleTouchMove;
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      // Handlers should be replaced with no-ops, not the original vi.fn()
-      expect(mockTerminalInstance._core.viewport.handleTouchStart).not.toBe(originalHandleTouchStart);
-      expect(mockTerminalInstance._core.viewport.handleTouchMove).not.toBe(originalHandleTouchMove);
-
-      dispose();
-    });
-
-    it('should NOT disable viewport touch handlers on desktop', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      isTouchDeviceMock.mockReturnValue(false);
-
-      // Save original references
-      const originalHandleTouchStart = mockTerminalInstance._core.viewport.handleTouchStart;
-      const originalHandleTouchMove = mockTerminalInstance._core.viewport.handleTouchMove;
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      // Handlers should remain the original functions
-      expect(mockTerminalInstance._core.viewport.handleTouchStart).toBe(originalHandleTouchStart);
-      expect(mockTerminalInstance._core.viewport.handleTouchMove).toBe(originalHandleTouchMove);
-
-      dispose();
     });
   });
 
@@ -713,10 +713,6 @@ describe('useTerminal hook', () => {
 
       // setupMobileInput should be called on mobile devices
       expect(setupMobileInput).toHaveBeenCalled();
-
-      // Viewport touch handlers should be overridden (replaced with no-ops)
-      const touchStartHandler = mockTerminalInstance._core.viewport.handleTouchStart;
-      expect(touchStartHandler()).toBeUndefined();
 
       dispose();
     });
@@ -838,100 +834,7 @@ describe('useTerminal hook', () => {
     });
   });
 
-  describe('mobile pointer-events toggle on .xterm-screen', () => {
-    let screenEl: HTMLDivElement;
-
-    beforeEach(() => {
-      screenEl = document.createElement('div');
-      screenEl.classList.add('xterm-screen');
-      containerEl.appendChild(screenEl);
-    });
-
-    it('should set pointer-events: none on .xterm-screen when keyboard closed on mobile', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      const isVirtualKeyboardOpenMock = vi.mocked(isVirtualKeyboardOpen);
-
-      isTouchDeviceMock.mockReturnValue(true);
-
-      const [kbOpen, _setKbOpen] = createSignal(false);
-      isVirtualKeyboardOpenMock.mockImplementation(() => kbOpen());
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      expect(screenEl.style.pointerEvents).toBe('none');
-
-      dispose();
-    });
-
-    it('should restore pointer-events on .xterm-screen when keyboard opens', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      const isVirtualKeyboardOpenMock = vi.mocked(isVirtualKeyboardOpen);
-
-      isTouchDeviceMock.mockReturnValue(true);
-
-      const [kbOpen, setKbOpen] = createSignal(false);
-      isVirtualKeyboardOpenMock.mockImplementation(() => kbOpen());
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      // Keyboard opens
-      setKbOpen(true);
-
-      expect(screenEl.style.pointerEvents).toBe('');
-
-      dispose();
-    });
-
-    it('should NOT touch pointer-events on desktop', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      const isVirtualKeyboardOpenMock = vi.mocked(isVirtualKeyboardOpen);
-
-      isTouchDeviceMock.mockReturnValue(false);
-
-      const [kbOpen, _setKbOpen] = createSignal(false);
-      isVirtualKeyboardOpenMock.mockImplementation(() => kbOpen());
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      expect(screenEl.style.pointerEvents).toBe('');
-
-      dispose();
-    });
-
-    it('should restore pointer-events on cleanup', () => {
-      const isTouchDeviceMock = vi.mocked(isTouchDevice);
-      const isVirtualKeyboardOpenMock = vi.mocked(isVirtualKeyboardOpen);
-
-      isTouchDeviceMock.mockReturnValue(true);
-
-      const [kbOpen, _setKbOpen] = createSignal(false);
-      isVirtualKeyboardOpenMock.mockImplementation(() => kbOpen());
-
-      const dispose = createRoot((dispose) => {
-        const result = useTerminal(defaultProps);
-        result.containerRef(containerEl);
-        return dispose;
-      });
-
-      // pointer-events should be 'none' while mounted on mobile with keyboard closed
-      expect(screenEl.style.pointerEvents).toBe('none');
-
-      dispose();
-
-      // After cleanup, pointer-events should be restored
-      expect(screenEl.style.pointerEvents).toBe('');
-    });
-  });
+  // Pointer-events toggle tests removed — xterm 6.0.0 moved scrolling to
+  // SmoothScrollableElement (JS-based). Touch scrolling when keyboard is closed
+  // is now handled by touch-gestures.ts via terminal.scrollLines().
 });

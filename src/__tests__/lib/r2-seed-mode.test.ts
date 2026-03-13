@@ -18,9 +18,9 @@ const { mockFetch, mockCreateR2Client, mockGetR2Url, testState } = vi.hoisted(()
           modes: ['default', 'advanced'] as ('default' | 'advanced')[],
         },
         {
-          key: '.claude/hooks/block-attributed-commits.sh',
-          contentType: 'application/x-shellscript; charset=utf-8',
-          content: '#!/bin/bash',
+          key: '.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json',
+          contentType: 'application/json; charset=utf-8',
+          content: '{"name":"codeflare-hooks"}',
           modes: ['advanced'] as ('default' | 'advanced')[],
         },
         {
@@ -128,7 +128,7 @@ describe('getPreseedKeysNotInMode', () => {
   it('returns advanced-only keys for "default" mode', () => {
     const keys = getPreseedKeysNotInMode('default');
     expect(keys).toEqual([
-      '.claude/hooks/block-attributed-commits.sh',
+      '.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json',
       '.claude/skills/consult-llm/SKILL.md',
     ]);
   });
@@ -180,12 +180,12 @@ describe('deleteNonModeConfigs', () => {
   });
 
   it('deletes advanced-only keys for "default" mode', async () => {
-    mockFetch.mockResolvedValue(new Response('', { status: 204 }));
+    mockFetch.mockResolvedValue(new Response(null, { status: 204 }));
 
     const result = await deleteNonModeConfigs(env, bucket, endpoint, 'default');
 
     expect(result.deleted).toEqual([
-      '.claude/hooks/block-attributed-commits.sh',
+      '.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json',
       '.claude/skills/consult-llm/SKILL.md',
     ]);
     expect(result.warnings).toEqual([]);
@@ -211,7 +211,7 @@ describe('deleteNonModeConfigs', () => {
 
   it('returns warnings for partial delete failure', async () => {
     mockFetch
-      .mockResolvedValueOnce(new Response('', { status: 204 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
       .mockResolvedValueOnce(new Response('', { status: 500 }));
 
     const result = await deleteNonModeConfigs(env, bucket, endpoint, 'default');

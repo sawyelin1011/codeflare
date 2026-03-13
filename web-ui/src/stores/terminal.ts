@@ -74,6 +74,68 @@ const abortControllers = new Map<string, AbortController>();
 // Bug 1 fix: Store inputDisposable outside the connect function to properly clean up
 const inputDisposables = new Map<string, { dispose: () => void }>();
 
+// Write batching — coalesce rapid WebSocket messages into a single terminal.write()
+// at 30fps (every ~33ms). At 60fps each frame triggers a render pass with layout
+// invalidation; halving to 30fps cuts renderRows style recalcs roughly in half
+// during burst output while keeping latency imperceptible (~33ms vs ~16ms).
+const WRITE_FLUSH_INTERVAL_MS = 33;
+const writeBuffers = new Map<string, string[]>();
+const pendingFlushes = new Map<string, number>();
+
+function flushWriteBuffer(key: string, terminal: Terminal): void {
+  pendingFlushes.delete(key);
+  const buffer = writeBuffers.get(key);
+  if (!buffer || buffer.length === 0) return;
+
+  const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
+  const data = buffer.join('');
+  buffer.length = 0;
+
+  terminal.write(data, () => {
+    // Post-write scroll guard: if user was following output but xterm's internal
+    // scroll state got reset (e.g. SmoothScrollableElement race during burst),
+    // snap back to bottom. If user had scrolled up, leave them alone.
+    //
+    // Fix 9: On mobile, check BOTH synchronously (catch reset before paint)
+    // AND in rAF (catch reset during render pass). The mobile textarea at
+    // position:fixed(0,0) can cause the browser's focus-validation to scroll
+    // xterm containers, resetting ydisp to 0 between write and next paint.
+    if (wasAtBottom && terminal.buffer.active.viewportY < terminal.buffer.active.baseY) {
+      terminal.scrollToBottom();
+    }
+    // Deferred check: xterm's RenderService and SmoothScrollableElement
+    // finish their internal layout pass in rAF, so check again.
+    requestAnimationFrame(() => {
+      if (wasAtBottom && terminal.buffer.active.viewportY < terminal.buffer.active.baseY) {
+        terminal.scrollToBottom();
+      }
+    });
+  });
+}
+
+function scheduleWrite(key: string, terminal: Terminal, data: string): void {
+  let buffer = writeBuffers.get(key);
+  if (!buffer) {
+    buffer = [];
+    writeBuffers.set(key, buffer);
+  }
+  buffer.push(data);
+
+  if (!pendingFlushes.has(key)) {
+    const timerId = window.setTimeout(() => flushWriteBuffer(key, terminal), WRITE_FLUSH_INTERVAL_MS);
+    pendingFlushes.set(key, timerId);
+  }
+}
+
+function cancelPendingFlush(key: string): void {
+  const timerId = pendingFlushes.get(key);
+  if (timerId !== undefined) {
+    clearTimeout(timerId);
+    pendingFlushes.delete(key);
+  }
+  writeBuffers.delete(key);
+}
+
 // L26: FitAddon management and layout resize delegated to terminal-layout.ts
 // Register layout module dependencies at module init
 registerLayoutDeps(
@@ -281,7 +343,7 @@ function connect(
         }
       }
 
-      terminal.write(messageData);
+      scheduleWrite(key, terminal, messageData);
     }
 
     function handleWebSocketClose(event: CloseEvent): void {
@@ -328,6 +390,7 @@ function connect(
   // Return cleanup function
   return () => {
     controller.abort();
+    cancelPendingFlush(key);
 
     // Bug 1 fix: Dispose input handler from the external Map
     const disposable = inputDisposables.get(key);
@@ -350,6 +413,9 @@ function connect(
 // Disconnect from terminal
 function disconnect(sessionId: string, terminalId: string): void {
   const key = makeKey(sessionId, terminalId);
+
+  // Cancel any buffered writes waiting for the next animation frame
+  cancelPendingFlush(key);
 
   // Abort any in-flight retry loops for this key (THE BUG FIX)
   const controller = abortControllers.get(key);
@@ -423,6 +489,8 @@ function disposeSession(sessionId: string): void {
   cleanupFitAddonsByPrefix(prefix);
   cleanupMapByPrefix(abortControllers, prefix, (controller) => controller.abort());
   cleanupMapByPrefix(inputDisposables, prefix, (disposable) => disposable.dispose());
+  cleanupMapByPrefix(pendingFlushes, prefix, (rafId) => clearTimeout(rafId));
+  cleanupMapByPrefix(writeBuffers, prefix);
 
   // Clean up state
   setState(produce((s) => {
@@ -460,6 +528,13 @@ function disposeAll(): void {
     clearTimeout(timeout);
   }
   retryTimeouts.clear();
+
+  // Cancel all pending write flushes
+  for (const rafId of pendingFlushes.values()) {
+    clearTimeout(rafId);
+  }
+  pendingFlushes.clear();
+  writeBuffers.clear();
 
   // Abort all retry loops
   for (const controller of abortControllers.values()) {
@@ -594,6 +669,13 @@ function disconnectAll(): void {
     clearTimeout(timeout);
   }
   retryTimeouts.clear();
+
+  // Cancel all pending write flushes
+  for (const rafId of pendingFlushes.values()) {
+    clearTimeout(rafId);
+  }
+  pendingFlushes.clear();
+  writeBuffers.clear();
 
   // Abort all retry loops
   for (const controller of abortControllers.values()) {

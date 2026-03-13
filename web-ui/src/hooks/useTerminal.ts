@@ -10,7 +10,7 @@ import { attachSwipeGestures } from '../lib/touch-gestures';
 import { registerMultiLineLinkProvider } from '../lib/terminal-link-provider';
 import { setupMobileInput } from '../lib/terminal-mobile-input';
 import { loadSettings } from '../lib/settings';
-import { getXtermViewport, getIframeInput } from '../lib/xterm-internals';
+import { getIframeInput } from '../lib/xterm-internals';
 
 /** DECTCEM (DEC Text Cursor Enable Mode) — the CSI parameter for cursor show/hide sequences */
 export const DECTCEM_CURSOR_PARAM = 25;
@@ -39,6 +39,10 @@ interface UseTerminalResult {
   initProgress: () => ReturnType<typeof sessionStore.getInitProgressForSession>;
 }
 
+function isAtBottom(t: Terminal): boolean {
+  return t.buffer.active.viewportY >= t.buffer.active.baseY;
+}
+
 export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   let containerEl: HTMLDivElement | undefined;
   let term: Terminal | undefined;
@@ -51,8 +55,8 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   let cursorShowDisposable: { dispose: () => void } | undefined;
   let hasInitialScrolled = false;
   let kbDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let wasKeyboardOpen = false;
   let handleContextMenu: ((e: MouseEvent) => void) | undefined;
+  let scrollDropDisposable: { dispose: () => void } | undefined;
 
   const [dimensions, setDimensions] = createSignal({ cols: 80, rows: 24 });
   const [terminalInstance, setTerminalInstance] = createSignal<Terminal | undefined>(undefined);
@@ -191,11 +195,8 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   function setupMobileTerminal() {
     if (!term) return;
 
-    const viewport = getXtermViewport(term);
-    if (viewport) {
-      viewport.handleTouchStart = () => {};
-      viewport.handleTouchMove = () => false;
-    }
+    // xterm 6.0.0: touch scrolling when keyboard is closed is handled by
+    // touch-gestures.ts via terminal.scrollLines() (direct buffer scroll).
 
     const mobileCleanup = setupMobileInput(term, props, {
       refreshCursorLine: () => {
@@ -215,6 +216,30 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
 
     if (isTouchDevice()) {
       setupMobileTerminal();
+
+      // Fix 9: Scroll-drop detector for mobile. On every scroll event from xterm,
+      // check if ydisp dropped significantly (indicating a jump-to-top reset).
+      // This catches resets from ANY source — write path, resize, keyboard,
+      // browser focus-validation, etc. Corrects immediately before the browser
+      // paints the wrong scroll position.
+      //
+      // xterm 6.0.0's public onScroll fires with ydisp as a plain number.
+      let lastKnownYdisp = 0;
+      scrollDropDisposable = t.onScroll((ydisp: number) => {
+        const ybase = t.buffer.active.baseY;
+
+        // If ydisp dropped to 0 (or near 0) while ybase is high, something
+        // reset the scroll position. Immediately correct unless user is genuinely
+        // scrolling near the top (lastKnownYdisp was also low).
+        if (ydisp === 0 && ybase > 5 && lastKnownYdisp > ybase * 0.5) {
+          queueMicrotask(() => {
+            if (t.buffer.active.viewportY < t.buffer.active.baseY) {
+              t.scrollToBottom();
+            }
+          });
+        }
+        lastKnownYdisp = ydisp;
+      });
     }
 
     terminalStore.setTerminal(props.sessionId, props.terminalId, t);
@@ -224,6 +249,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         if (!fitAddon || !containerEl || !term) return;
+        if (containerEl.clientHeight === 0) return;
         fitAddon.fit();
         setDimensions({ cols: term.cols, rows: term.rows });
       });
@@ -235,8 +261,18 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       if (fitAddon && shouldResize) {
         if (kbDebounceTimer !== null) return;
         requestAnimationFrame(() => {
-          if (!fitAddon || !term || kbDebounceTimer !== null) return;
+          if (!fitAddon || !term || !containerEl || kbDebounceTimer !== null) return;
+          if (containerEl.clientHeight === 0) return;
+          const wasBottom = isAtBottom(term);
           fitAddon.fit();
+          // fit() recalculates rows/cols and can reset the scroll position.
+          // On mobile with keyboard open: always anchor to bottom (user expects prompt).
+          // On desktop/mobile without keyboard: preserve position if user was following output.
+          if (isTouchDevice() && isVirtualKeyboardOpen()) {
+            term.scrollToBottom();
+          } else if (wasBottom) {
+            term.scrollToBottom();
+          }
           const cols = term.cols;
           const rows = term.rows;
           setDimensions({ cols, rows });
@@ -287,57 +323,74 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       const currentFont = t.options.fontFamily;
       document.fonts.ready.then(() => {
         if (term?.element && currentFont) {
+          const wasBottom = isAtBottom(term);
           term.options.fontFamily = currentFont;
           fitAddon?.fit();
+          if (wasBottom) term.scrollToBottom();
         }
       });
     }
   });
 
-  // Virtual keyboard scroll lock
-  createEffect(() => {
-    if (!containerEl || !isTouchDevice()) return;
-    const kbOpen = isVirtualKeyboardOpen();
-    const viewport = containerEl.querySelector('.xterm-viewport') as HTMLElement | null;
-    if (!viewport) return;
-    viewport.style.overflowY = kbOpen ? 'hidden' : '';
-    onCleanup(() => { viewport.style.overflowY = ''; });
-  });
+  // xterm 6.0.0 moved scrolling from .xterm-viewport (native overflow) to
+  // SmoothScrollableElement (JS-based). Touch scrolling when keyboard is closed
+  // is handled by touch-gestures.ts via terminal.scrollLines() — no need for
+  // pointer-events or overflow-y tricks on viewport/scrollable-element.
 
-  // Pointer-events toggle: when keyboard closed, disable canvas interaction so touches
-  // fall through to .xterm-viewport for native scroll. When keyboard opens, restore.
+  // Refit on keyboard height change — leading + trailing edge pattern.
+  //
+  // Problem: When the keyboard opens, padding-bottom increases instantly (SolidJS
+  // reactive binding), shrinking the terminal container. But if fit() is delayed
+  // (debounced), xterm's canvas stays at the old (larger) dimensions for ~150ms.
+  // During this gap the canvas overflows the container, hiding the prompt behind
+  // the keyboard and causing a visible content jump when fit() finally fires.
+  //
+  // Solution: Call fit() + scrollToBottom() immediately via queueMicrotask on the
+  // FIRST keyboard height change (leading edge). The microtask runs after SolidJS
+  // has applied the padding-bottom DOM update but before the browser paints —
+  // eliminating the visual gap. Subsequent height changes during the keyboard
+  // animation are debounced (trailing edge) to avoid excessive refitting.
+  // The PTY resize message is only sent on the trailing edge.
   createEffect(() => {
-    if (!containerEl || !isTouchDevice()) return;
-    const screen = containerEl.querySelector('.xterm-screen') as HTMLElement | null;
-    if (!screen) return;
-    const kbOpen = isVirtualKeyboardOpen();
-    screen.style.pointerEvents = kbOpen ? '' : 'none';
-    onCleanup(() => { screen.style.pointerEvents = ''; });
-  });
-
-  // Refit on keyboard height change
-  createEffect(() => {
-    const _kbHeight = getKeyboardHeight();
-    const kbOpen = isVirtualKeyboardOpen();
+    const kbHeight = getKeyboardHeight();
+    const _kbOpen = isVirtualKeyboardOpen();
     if (!isTouchDevice()) return;
     if (!term || !fitAddon) return;
     if (!(props.active || props.alwaysObserveResize)) return;
 
+    // Leading edge: immediate fit on first REAL keyboard change (height > 0).
+    // Skip the initial mount-time run (kbHeight=0) — the onMount double-rAF
+    // handles that. queueMicrotask ensures we run after all SolidJS effects in
+    // this batch (including the padding-bottom DOM update) but before the
+    // browser's rendering pipeline (layout, ResizeObserver, rAF, paint).
+    if (kbDebounceTimer === null && kbHeight > 0) {
+      queueMicrotask(() => {
+        if (!fitAddon || !term || !containerEl) return;
+        if (containerEl.clientHeight === 0) return;
+        fitAddon.fit();
+        // Read signal at execution time — not the stale closure capture
+        if (isVirtualKeyboardOpen()) {
+          term.scrollToBottom();
+        }
+        setDimensions({ cols: term.cols, rows: term.rows });
+      });
+    }
+
+    // Trailing edge: debounced fit after keyboard animation settles.
+    // Sends PTY resize message only here to avoid flooding the server
+    // with intermediate dimensions during the ~300ms animation.
     if (kbDebounceTimer !== null) clearTimeout(kbDebounceTimer);
     kbDebounceTimer = setTimeout(() => {
       kbDebounceTimer = null;
-      if (!fitAddon || !term) return;
+      if (!fitAddon || !term || !containerEl) return;
+      if (containerEl.clientHeight === 0) return;
       fitAddon.fit();
-      // Scroll to bottom only when keyboard transitions closed→open (user wants
-      // to see the prompt). On close or mid-animation height adjustments, preserve
-      // scroll position so users don't lose their place in scrollback.
-      if (kbOpen && !wasKeyboardOpen) {
+      // Read signal at execution time — not the stale closure capture
+      if (isVirtualKeyboardOpen()) {
         term.scrollToBottom();
       }
-      wasKeyboardOpen = kbOpen;
       setDimensions({ cols: term.cols, rows: term.rows });
       terminalStore.resize(props.sessionId, props.terminalId, term.cols, term.rows);
-      window.scrollTo(0, 0);
     }, KEYBOARD_REFIT_DEBOUNCE_MS);
     onCleanup(() => {
       if (kbDebounceTimer !== null) {
@@ -370,7 +423,11 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       resetKeyboardStateIfStale();
       enableVirtualKeyboardOverlay();
       requestAnimationFrame(() => {
-        if (fitAddon && term) fitAddon.fit();
+        if (fitAddon && term && containerEl && containerEl.clientHeight > 0) {
+          const wasBottom = isAtBottom(term);
+          fitAddon.fit();
+          if (wasBottom) term.scrollToBottom();
+        }
       });
 
       // Fix 1: Samsung back-button keyboard dismiss detection via focusout.
@@ -403,9 +460,14 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   createEffect(() => {
     if (props.active && fitAddon && term) {
       requestAnimationFrame(() => {
-        if (!fitAddon || !term) return;
+        if (!fitAddon || !term || !containerEl) return;
+        if (containerEl.clientHeight === 0) return;
+        const wasBottom = isAtBottom(term);
         fitAddon.fit();
-        if (!isTouchDevice() || !hasInitialScrolled) {
+        // First activation: always scroll to bottom so user sees the prompt.
+        // Subsequent activations: only if user was already following output,
+        // or if the mobile keyboard is open (user expects to see the prompt).
+        if (!hasInitialScrolled || wasBottom || (isTouchDevice() && isVirtualKeyboardOpen())) {
           term.scrollToBottom();
           hasInitialScrolled = true;
         }
@@ -422,9 +484,11 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     if (!initializing && fitAddon && term && props.active) {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (!fitAddon || !term) return;
+          if (!fitAddon || !term || !containerEl) return;
+          if (containerEl.clientHeight === 0) return;
+          const wasBottom = isAtBottom(term);
           fitAddon.fit();
-          term.scrollToBottom();
+          if (wasBottom) term.scrollToBottom();
           term.refresh(0, term.rows - 1);
           terminalStore.resize(props.sessionId, props.terminalId, term.cols, term.rows);
         });
@@ -435,6 +499,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   onCleanup(() => {
     cleanup?.();
     cleanupGestures?.();
+    scrollDropDisposable?.dispose();
     bufferChangeDisposable?.dispose();
     cursorHideDisposable?.dispose();
     cursorShowDisposable?.dispose();

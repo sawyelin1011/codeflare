@@ -1,15 +1,25 @@
 {
-  "hooks/block-attributed-commits.sh": {
+  "plugins/codeflare-hooks/.claude-plugin/plugin.json": {
     "modes": [
       "advanced"
     ]
   },
-  "hooks/memory-agent-prompt.md": {
+  "plugins/codeflare-hooks/scripts/block-attributed-commits.sh": {
     "modes": [
       "advanced"
     ]
   },
-  "hooks/memory-capture.sh": {
+  "plugins/codeflare-memory/.claude-plugin/plugin.json": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-memory/scripts/memory-capture.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-memory/scripts/memory-agent-prompt.md": {
     "modes": [
       "advanced"
     ]

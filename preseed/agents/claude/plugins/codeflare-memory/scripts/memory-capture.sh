@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # UserPromptSubmit hook — triggers main agent to summarize conversation into MCP memory.
-# Injects additionalContext when 15+ new user messages since last summary.
+# Injects additionalContext when 30+ new user messages since last summary.
 # The main agent spawns a background Task agent to do the actual work.
 set -e
 
@@ -28,7 +28,7 @@ if [[ -f "$COUNTER_FILE" ]]; then
 fi
 
 DELTA=$((CURRENT_COUNT - last_count))
-[[ $DELTA -lt 15 ]] && exit 0
+[[ $DELTA -lt 30 ]] && exit 0
 
 LOCK_FILE="$COUNTER_DIR/${SESSION_ID}.lock"
 if [[ -f "$LOCK_FILE" ]]; then
@@ -55,7 +55,7 @@ jq -n \
   > "$VARS_FILE"
 
 # UserPromptSubmit: exit 0 with additionalContext (no blocking)
-CONTEXT="Spawn a background haiku Task agent. Create ${LOCK_FILE} before spawning. Agent must read ${USER_HOME}/.claude/hooks/memory-agent-prompt.md and ${VARS_FILE}, then execute."
+CONTEXT="Spawn a background haiku Task agent. Create ${LOCK_FILE} before spawning. Agent must read ${USER_HOME}/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md and ${VARS_FILE}, then execute."
 
 jq -n --arg ctx "$CONTEXT" '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}}'
 exit 0

@@ -6,10 +6,14 @@ const SWIPE_THRESHOLD = 20; // px minimum delta to qualify as a swipe
 const LONG_PRESS_MS = 500; // after this delay, yield to browser text-selection
 const REPEAT_INTERVAL = 80; // ms between repeated key sends while finger held
 const DIRECTION_LOCK_RATIO = 1.5; // one axis must exceed the other by this factor
-
+// Inertia scrolling: after finger lifts, continue scrolling with decaying velocity
+const INERTIA_FRICTION = 0.993; // velocity decay per ms (≈400ms of meaningful scroll)
+const INERTIA_MIN_VELOCITY = 0.05; // px/ms — stop inertia below this
+const VELOCITY_SAMPLE_COUNT = 4; // number of recent touch samples for velocity calc
+const VELOCITY_MAX_AGE_MS = 300; // ignore velocity samples older than this
 // ANSI escape sequences for arrow keys.
-// Horizontal swipes always active; vertical swipes only when keyboard is open
-// (to avoid conflicting with native terminal scrolling).
+// Horizontal swipes always active; vertical swipes send arrow keys only when
+// keyboard is open (when closed, vertical swipes scroll the terminal buffer).
 const ARROW: Record<string, string> = {
   left: '\x1b[D',
   right: '\x1b[C',
@@ -32,11 +36,19 @@ export function sendTerminalKey(terminal: Terminal, sequence: string): void {
   }
 }
 
+function getScrollPxPerLine(terminal: Terminal): number {
+  const fontSize = typeof terminal.options.fontSize === 'number' ? terminal.options.fontSize : 14;
+  const lineHeight = typeof terminal.options.lineHeight === 'number' ? terminal.options.lineHeight : 1.2;
+  return Math.max(12, Math.round(fontSize * lineHeight));
+}
+
 /**
- * Attach swipe-to-arrow-key gestures to a terminal container.
+ * Attach touch gestures to a terminal container.
  * Horizontal swipes (left/right) always map to arrow left/right.
- * Vertical swipes (up/down) map to arrow up/down only when keyboard is open
- * (when keyboard is closed, vertical scrolling uses native xterm behavior).
+ * Vertical swipes (up/down) map to arrow up/down when keyboard is open.
+ * When keyboard is closed, vertical swipes scroll the terminal buffer
+ * via terminal.scrollLines() (xterm 6.0.0's SmoothScrollableElement
+ * doesn't support touch natively).
  * Returns a cleanup function, or undefined if touch is not supported.
  */
 export function attachSwipeGestures(
@@ -54,6 +66,52 @@ export function attachSwipeGestures(
   let longPressTimer: ReturnType<typeof setTimeout> | null = null;
   let repeatTimer: ReturnType<typeof setInterval> | null = null;
   let cancelled = false;
+  let scrollMode = false;
+  let lastScrollY = 0;
+  let scrollAccumulator = 0;
+  const scrollPxPerLine = getScrollPxPerLine(terminal);
+
+  // Inertia scrolling state
+  let velocitySamples: { y: number; time: number }[] = [];
+  let inertiaRaf: number | null = null;
+
+  function cancelInertia() {
+    if (inertiaRaf !== null) {
+      cancelAnimationFrame(inertiaRaf);
+      inertiaRaf = null;
+    }
+  }
+
+  function startInertia(velocityPxPerMs: number) {
+    let velocity = velocityPxPerMs;
+    let lastTime = performance.now();
+    let accumulator = 0;
+
+    function frame() {
+      const now = performance.now();
+      const dt = now - lastTime;
+      lastTime = now;
+
+      // Exponential decay: v *= friction^dt (frame-rate independent)
+      velocity *= Math.pow(INERTIA_FRICTION, dt);
+      accumulator += velocity * dt;
+
+      const lines = Math.trunc(accumulator / scrollPxPerLine);
+      if (lines !== 0) {
+        terminal.scrollLines(lines);
+        accumulator -= lines * scrollPxPerLine;
+      }
+
+      if (Math.abs(velocity) > INERTIA_MIN_VELOCITY) {
+        inertiaRaf = requestAnimationFrame(frame);
+      } else {
+        inertiaRaf = null;
+      }
+    }
+
+    cancelInertia();
+    inertiaRaf = requestAnimationFrame(frame);
+  }
 
   function clearTimers() {
     if (longPressTimer !== null) {
@@ -70,6 +128,10 @@ export function attachSwipeGestures(
     clearTimers();
     lockedDirection = null;
     cancelled = false;
+    scrollMode = false;
+    lastScrollY = 0;
+    scrollAccumulator = 0;
+    velocitySamples = [];
   }
 
   function resolveDirection(dx: number, dy: number): Direction | null {
@@ -86,7 +148,7 @@ export function attachSwipeGestures(
       if (isKeyboardOpen?.()) {
         return dy < 0 ? 'up' : 'down';
       }
-      // Keyboard closed — let native scroll handle vertical
+      // Keyboard closed — scroll mode handles this (see onTouchMove)
       return null;
     }
 
@@ -100,9 +162,12 @@ export function attachSwipeGestures(
   // --- Event handlers ---
 
   function onTouchStart(e: TouchEvent) {
+    // Cancel any running inertia animation when a new touch begins
+    cancelInertia();
+
     if (e.touches.length !== 1) {
+      resetState();
       cancelled = true;
-      clearTimers();
       return;
     }
 
@@ -121,23 +186,68 @@ export function attachSwipeGestures(
   function onTouchMove(e: TouchEvent) {
     if (cancelled || e.touches.length !== 1) return;
 
-    // When keyboard is open, block ALL touch scroll to prevent xterm's
-    // internal Gesture handler from scrolling the terminal.
-    // We handle navigation via swipe gestures instead.
     const kbOpen = isKeyboardOpen?.() ?? false;
+
+    // When keyboard is open, block ALL native touch behavior — we handle
+    // navigation via swipe gestures (arrow keys) instead.
     if (kbOpen) {
       e.preventDefault();
-      e.stopPropagation();
     }
 
     const touch = e.touches[0];
     const dx = touch.clientX - startX;
     const dy = touch.clientY - startY;
 
+    // Already in scroll mode — accumulate delta and scroll terminal buffer
+    if (scrollMode) {
+      e.preventDefault();
+      const deltaY = lastScrollY - touch.clientY; // positive = finger up = scroll down
+      lastScrollY = touch.clientY;
+      scrollAccumulator += deltaY;
+
+      // Track velocity for inertia: store recent positions with timestamps
+      const now = performance.now();
+      velocitySamples.push({ y: touch.clientY, time: now });
+      if (velocitySamples.length > VELOCITY_SAMPLE_COUNT) velocitySamples.shift();
+
+      const lines = Math.trunc(scrollAccumulator / scrollPxPerLine);
+      if (lines !== 0) {
+        terminal.scrollLines(lines);
+        scrollAccumulator -= lines * scrollPxPerLine;
+      }
+      return;
+    }
+
     // If we haven't locked a direction yet, try to resolve one
     if (lockedDirection === null) {
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+
+      // Keyboard closed + vertical-dominant swipe → enter scroll mode.
+      // xterm 6.0.0 moved scrolling to SmoothScrollableElement which uses
+      // JS-based scrolling (not native overflow). pointer-events:none would
+      // kill it, and .xterm-viewport no longer has scrollable content. So
+      // we scroll the buffer directly via terminal.scrollLines().
+      if (!kbOpen && absDy >= SWIPE_THRESHOLD && absDy >= absDx * DIRECTION_LOCK_RATIO) {
+        scrollMode = true;
+        lastScrollY = touch.clientY;
+        scrollAccumulator = startY - touch.clientY; // pre-seed with threshold movement
+        if (longPressTimer !== null) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+        // Immediately scroll if the threshold crossing already covers a full line
+        const lines = Math.trunc(scrollAccumulator / scrollPxPerLine);
+        if (lines !== 0) {
+          terminal.scrollLines(lines);
+          scrollAccumulator -= lines * scrollPxPerLine;
+        }
+        e.preventDefault();
+        return;
+      }
+
       const dir = resolveDirection(dx, dy);
-      if (dir === null) return; // not enough movement or vertical swipe
+      if (dir === null) return;
 
       lockedDirection = dir;
 
@@ -156,15 +266,32 @@ export function attachSwipeGestures(
         }, REPEAT_INTERVAL);
       }
     }
-
-    // When keyboard is closed, do NOT preventDefault — let the browser
-    // handle native vertical scrolling. Horizontal swipe keys still fire
-    // via sendKey() above, but we don't block the scroll gesture.
-    // (Previously this called e.preventDefault() which killed vertical scroll
-    //  whenever a horizontal direction locked first.)
   }
 
   function onTouchEnd() {
+    // Start inertia scrolling if we were in scroll mode with enough velocity
+    if (scrollMode && velocitySamples.length >= 2) {
+      const now = performance.now();
+      const first = velocitySamples[0];
+      const last = velocitySamples[velocitySamples.length - 1];
+      const dt = last.time - first.time;
+
+      // Only start inertia if samples are recent and span meaningful time
+      if (dt > 0 && dt < VELOCITY_MAX_AGE_MS && (now - last.time) < 50) {
+        // Velocity in px/ms: positive = finger moving up = scroll down (content moves up)
+        const velocity = (first.y - last.y) / dt;
+        if (Math.abs(velocity) > INERTIA_MIN_VELOCITY) {
+          startInertia(velocity);
+        }
+      }
+    }
+    resetState();
+  }
+
+  // touchcancel: gesture interrupted by the system (e.g. phone call, notification).
+  // Do NOT launch inertia — just stop everything cleanly.
+  function onTouchCancel() {
+    cancelInertia();
     resetState();
   }
 
@@ -175,13 +302,14 @@ export function attachSwipeGestures(
   container.addEventListener('touchstart', onTouchStart, { capture: true, passive: true });
   container.addEventListener('touchmove', onTouchMove, { capture: true, passive: false });
   container.addEventListener('touchend', onTouchEnd, { capture: true, passive: true });
-  container.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: true });
+  container.addEventListener('touchcancel', onTouchCancel, { capture: true, passive: true });
 
   return () => {
     resetState();
+    cancelInertia();
     container.removeEventListener('touchstart', onTouchStart, { capture: true } as EventListenerOptions);
     container.removeEventListener('touchmove', onTouchMove, { capture: true } as EventListenerOptions);
     container.removeEventListener('touchend', onTouchEnd, { capture: true } as EventListenerOptions);
-    container.removeEventListener('touchcancel', onTouchEnd, { capture: true } as EventListenerOptions);
+    container.removeEventListener('touchcancel', onTouchCancel, { capture: true } as EventListenerOptions);
   };
 }

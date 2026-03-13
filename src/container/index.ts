@@ -42,8 +42,9 @@ export function validateBucketNameInput(input: {
   r2Endpoint?: unknown;
   workspaceSyncEnabled?: unknown;
   fastStartEnabled?: unknown;
+  sessionMode?: unknown;
 }): string | null {
-  const { bucketName, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled } = input;
+  const { bucketName, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, sessionMode } = input;
 
   if (typeof bucketName !== 'string' || bucketName.trim() === '') {
     return 'bucketName must be a non-empty string';
@@ -59,6 +60,9 @@ export function validateBucketNameInput(input: {
   }
   if (fastStartEnabled !== undefined && typeof fastStartEnabled !== 'boolean') {
     return 'fastStartEnabled must be a boolean when provided';
+  }
+  if (sessionMode !== undefined && typeof sessionMode !== 'string') {
+    return 'sessionMode must be a string when provided';
   }
   if (r2AccountId !== undefined && (typeof r2AccountId !== 'string' || r2AccountId.trim() === '')) {
     return 'r2AccountId must be a non-empty string when provided';
@@ -107,6 +111,7 @@ export class container extends Container<Env> {
   private _tabConfig: TabConfig[] | null = null;
   private _openaiApiKey: string | null = null;
   private _geminiApiKey: string | null = null;
+  private _sessionMode: string = 'default';
   private _containerAuthToken: string | null = null;
   private _sessionId: string | null = null;
 
@@ -167,6 +172,7 @@ export class container extends Container<Env> {
     tabConfig?: TabConfig[];
     openaiApiKey?: string;
     geminiApiKey?: string;
+    sessionMode?: string;
   }): Promise<void> {
     this._bucketName = name;
     await this.ctx.storage.put('bucketName', name);
@@ -188,6 +194,9 @@ export class container extends Container<Env> {
     // Store LLM API keys (not persisted to DO storage — read fresh from KV each start)
     if (r2Creds?.openaiApiKey) this._openaiApiKey = r2Creds.openaiApiKey;
     if (r2Creds?.geminiApiKey) this._geminiApiKey = r2Creds.geminiApiKey;
+
+    // Store session mode (not persisted — re-sent every start, same as LLM keys)
+    if (r2Creds?.sessionMode) this._sessionMode = r2Creds.sessionMode;
 
     // Use Worker-provided R2 credentials (most reliable — Worker definitely has secrets)
     if (r2Creds?.r2AccessKeyId) this._r2AccessKeyId = r2Creds.r2AccessKeyId;
@@ -267,6 +276,8 @@ export class container extends Container<Env> {
       // LLM API keys (injected for consult-llm-mcp MCP server)
       ...(this._openaiApiKey && { OPENAI_API_KEY: this._openaiApiKey }),
       ...(this._geminiApiKey && { GEMINI_API_KEY: this._geminiApiKey }),
+      // Session mode (controls memory persistence in entrypoint.sh)
+      SESSION_MODE: this._sessionMode,
     };
   }
 
@@ -295,7 +306,7 @@ export class container extends Container<Env> {
    */
   private async handleSetBucketName(request: Request): Promise<Response> {
     try {
-      const { bucketName, sessionId, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey } =
+      const { bucketName, sessionId, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey, sessionMode } =
         await request.json() as {
           bucketName: string;
           sessionId?: string;
@@ -308,6 +319,7 @@ export class container extends Container<Env> {
           tabConfig?: TabConfig[];
           openaiApiKey?: string;
           geminiApiKey?: string;
+          sessionMode?: string;
         };
 
       // FIX-28: Idempotency — once bucket name is set, reject subsequent calls.
@@ -343,13 +355,17 @@ export class container extends Container<Env> {
           prefsChanged = true;
         }
 
-        // Always update LLM keys on restart (read fresh from KV each start)
+        // Always update LLM keys and session mode on restart (read fresh each start)
         if (openaiApiKey !== undefined) {
           this._openaiApiKey = openaiApiKey || null;
           prefsChanged = true;
         }
         if (geminiApiKey !== undefined) {
           this._geminiApiKey = geminiApiKey || null;
+          prefsChanged = true;
+        }
+        if (sessionMode) {
+          this._sessionMode = sessionMode;
           prefsChanged = true;
         }
 
@@ -366,7 +382,7 @@ export class container extends Container<Env> {
       // FIX-15: Validate inputs
       const validationError = validateBucketNameInput({
         bucketName, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint,
-        workspaceSyncEnabled, fastStartEnabled,
+        workspaceSyncEnabled, fastStartEnabled, sessionMode,
       });
       if (validationError) {
         return new Response(JSON.stringify({ error: validationError }), {
@@ -392,6 +408,7 @@ export class container extends Container<Env> {
         tabConfig,
         openaiApiKey,
         geminiApiKey,
+        sessionMode,
       });
 
       return new Response(JSON.stringify({ success: true, bucketName }), {

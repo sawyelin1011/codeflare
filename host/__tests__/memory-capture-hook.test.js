@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const hookScript = readFileSync(
-  resolve(__dirname, '../../preseed/agents/claude/hooks/memory-capture.sh'),
+  resolve(__dirname, '../../preseed/agents/claude/plugins/codeflare-memory/scripts/memory-capture.sh'),
   'utf8'
 );
 
@@ -45,8 +45,8 @@ describe('memory-capture.sh hook script', () => {
     assert.ok(hookScript.includes('last_line'));
   });
 
-  it('exits when delta < 15 user messages', () => {
-    assert.ok(hookScript.includes('15'));
+  it('exits when delta < 30 user messages', () => {
+    assert.ok(hookScript.includes('30'));
     assert.ok(hookScript.includes('exit 0'));
   });
 

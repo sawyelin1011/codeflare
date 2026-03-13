@@ -39,14 +39,6 @@
           animation: spin 1s linear infinite;
         }
 
-        /* Reserve space for scrollbar to prevent FitAddon column miscalculation.
-   Without this, xterm may measure a 15px fallback scrollbar width at
-   construction time (before global 8px CSS applies), causing columns
-   to be too narrow and text to clip at the right edge. */
-.xterm-viewport {
-  scrollbar-gutter: stable;
-}
-
 /* Hide xterm's cursor entirely. The server-side CLI (Claude Code, bash,
            etc.) renders its own cursor via ANSI escape sequences. xterm's extra
            cursor is a duplicate that gets out of sync (different position/color).
@@ -106,9 +98,16 @@
             pointer-events: none !important;
           }
 
-          .xterm-viewport {
+          /* Fix 9: Kill native scroll on .xterm-viewport on mobile.
+             xterm 6.0.0's viewport div is EMPTY (SmoothScrollableElement handles
+             scrolling now), but the default CSS still has overflow-y:scroll. On
+             mobile, the browser's focus-validation engine can scroll this
+             container to reveal the textarea at position:fixed(0,0), resetting
+             xterm's internal ydisp to 0 — the same mechanism as Fix 8.
+             overflow:hidden prevents any native scroll from occurring. */
+          .xterm .xterm-viewport {
+            overflow: hidden !important;
             overscroll-behavior: contain;
-            -webkit-overflow-scrolling: touch;
           }
         }
 

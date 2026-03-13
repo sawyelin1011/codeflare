@@ -236,9 +236,8 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .codex/tmp/**"               # temp lock files
     --filter "- .codex/version.json"         # version check cache
 
-    # Memory capture — persist counter files (2 lines each, needed for --resume), exclude ephemeral lock/vars
-    --filter "- .memory/counter/*.lock"
-    --filter "- .memory/counter/*.vars"
+    # Memory capture — exclude all counter files (ephemeral per-session)
+    --filter "- .memory/counter/**"
 
     # Perl CPAN cache — created by Perl module installs during build, regenerated
     --filter "- .cpan/**"
@@ -251,6 +250,11 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .local/share/opencode/opencode.db-shm"
     --filter "- .local/share/opencode/opencode.db-wal"
 )
+
+# In default mode, exclude entire .memory/ directory (no persistent memory)
+if [ "${SESSION_MODE:-default}" != "advanced" ]; then
+    RCLONE_FILTERS_COMMON+=('--filter' '- .memory/**')
+fi
 
 if [ "$SYNC_MODE" = "metadata" ]; then
     RCLONE_FILTERS=(
@@ -765,11 +769,11 @@ merge_memory_files() {
 
 cleanup_old_memory_files() {
     local MEMORY_DIR="$USER_HOME/.memory"
-    local KEEP=10
+    local KEEP=3
     local count=0
 
-    # Keep the 10 newest session files (by mtime), delete the rest.
-    # 10 >= MAX_SESSIONS_ADMIN, so no active session's file is ever deleted.
+    # Keep the 3 newest session files (by mtime), delete the rest.
+    # Matches typical concurrent session count; old counters are orphans anyway.
     # Bisync propagates local deletions to R2 on the next cycle.
     while IFS= read -r f; do
         rm -f "$f"
@@ -827,7 +831,7 @@ fi
 
 # Merge memory files from previous sessions (after R2 sync pulls them down)
 # Old files kept — cleanup happens after bisync baseline (Phase 2)
-if [ -n "${SESSION_ID:-}" ]; then
+if [ -n "${SESSION_ID:-}" ] && [ "${SESSION_MODE:-default}" = "advanced" ]; then
     merge_memory_files
 fi
 
@@ -897,24 +901,42 @@ if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; then
     echo "[entrypoint] consult-llm MCP server configured for Claude Code"
 fi
 
-# Configure Claude Code hooks in ~/.claude/settings.json
-# Hooks: PreToolUse (block attributed commits), UserPromptSubmit (memory capture)
-HOOKS_CONFIG='{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$USER_HOME"'/.claude/hooks/block-attributed-commits.sh"}]}],"UserPromptSubmit":[{"hooks":[{"type":"command","command":"bash '"$USER_HOME"'/.claude/hooks/memory-capture.sh"}]}]}}'
+# Configure Claude Code settings.json with hooks (advanced) or just settings (default)
+PLUGIN_DIR="$USER_HOME/.claude/plugins"
+if [ "${SESSION_MODE:-default}" = "advanced" ]; then
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
+    echo "[entrypoint] Advanced mode: configuring settings.json with hooks"
+else
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true}'
+    echo "[entrypoint] Default mode: configuring settings.json without hooks"
+fi
 SETTINGS_FILE="$USER_CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ]; then
     TMP_SETTINGS=$(mktemp)
-    if jq --argjson cfg "$HOOKS_CONFIG" '. * $cfg' "$SETTINGS_FILE" > "$TMP_SETTINGS" 2>/dev/null; then
+    if jq --argjson cfg "$SETTINGS_CONFIG" '. * $cfg' "$SETTINGS_FILE" > "$TMP_SETTINGS" 2>/dev/null; then
         mv "$TMP_SETTINGS" "$SETTINGS_FILE"
     else
-        echo "[entrypoint] WARNING: Could not merge hooks config (malformed settings.json?)"
+        echo "[entrypoint] WARNING: Could not merge settings config (malformed settings.json?)"
         rm -f "$TMP_SETTINGS"
     fi
 else
-    echo "$HOOKS_CONFIG" | jq '.' > "$SETTINGS_FILE"
+    echo "$SETTINGS_CONFIG" | jq '.' > "$SETTINGS_FILE"
 fi
-echo "[entrypoint] Claude Code hooks configured in settings.json"
 
-# Plugins removed from preseed — users install via marketplace if wanted
+# Enable plugins (silently skipped if plugin files absent in default mode)
+PLUGINS_CONFIG='{"enabledPlugins":{"codeflare-memory":true,"codeflare-hooks":true}}'
+if [ -f "$USER_CLAUDE_JSON" ]; then
+    TMP_PLUGINS=$(mktemp)
+    if jq --argjson cfg "$PLUGINS_CONFIG" '. * $cfg' "$USER_CLAUDE_JSON" > "$TMP_PLUGINS" 2>/dev/null; then
+        mv "$TMP_PLUGINS" "$USER_CLAUDE_JSON"
+    else
+        echo "[entrypoint] WARNING: Could not merge plugin enablement (malformed .claude.json?)"
+        rm -f "$TMP_PLUGINS"
+    fi
+else
+    echo "$PLUGINS_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
+fi
+echo "[entrypoint] codeflare-memory and codeflare-hooks plugins enabled in .claude.json"
 
 # === Fast Start: tool-specific config files ===
 if [ "${FAST_CLI_START:-true}" != "false" ]; then
@@ -945,7 +967,7 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
         echo "[entrypoint] Establishing bisync baseline in background..."
         if establish_bisync_baseline; then
             # Cleanup old memory files AFTER baseline — bisync will propagate deletions to R2
-            if [ -n "${SESSION_ID:-}" ]; then
+            if [ -n "${SESSION_ID:-}" ] && [ "${SESSION_MODE:-default}" = "advanced" ]; then
                 cleanup_old_memory_files
             fi
             echo "[entrypoint] Bisync baseline established, starting daemon..."
