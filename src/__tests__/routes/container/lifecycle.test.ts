@@ -96,6 +96,7 @@ vi.mock('../../../lib/kv-keys', () => ({
   getSessionKey: vi.fn((bucket: string, sessionId: string) => `session:${bucket}:${sessionId}`),
   getPreferencesKey: vi.fn((bucket: string) => `preferences:${bucket}`),
   getLlmKeysKey: vi.fn((bucket: string) => `llm-keys:${bucket}`),
+  getDeployKeysKey: vi.fn((bucket: string) => `deploy-keys:${bucket}`),
   listAllKvKeys: vi.fn(async () => []),
   getSessionPrefix: vi.fn((bucket: string) => `session:${bucket}:`),
 }));
@@ -324,7 +325,7 @@ describe('Container Lifecycle - Scoped R2 Tokens', () => {
       method: 'POST',
     });
 
-    // Request should have failed — no container.fetch with account-level creds
+    // Request should have failed - no container.fetch with account-level creds
     expect(res.status).toBe(500);
 
     // Verify setBucketName was NOT called (no fallback)

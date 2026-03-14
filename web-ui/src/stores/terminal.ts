@@ -87,45 +87,44 @@ function flushWriteBuffer(key: string, terminal: Terminal): void {
   const buffer = writeBuffers.get(key);
   if (!buffer || buffer.length === 0) return;
 
-  const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
-  const prevViewportY = terminal.buffer.active.viewportY;
+  const beforeBaseY = terminal.buffer.active.baseY;
+  const beforeY = terminal.buffer.active.viewportY;
+  const wasAtBottom = beforeY >= beforeBaseY;
+  const beforeDistFromBottom = beforeBaseY - beforeY;
   const data = buffer.join('');
   buffer.length = 0;
 
+  // Fix 15: Distance-based post-write scroll guard.
+  //
+  // For bottom-following users: if xterm moved them away from bottom after
+  // the write, scroll back to bottom. (Same as Fix 13.)
+  //
+  // For scrolled-up users: if the write caused scrollback trimming, xterm
+  // should preserve the viewport position by shifting both baseY and viewportY.
+  // If the distance-from-bottom drifted significantly (>5 lines), correct it.
+  // This handles cases where xterm's internal trim adjustment doesn't perfectly
+  // preserve the user's reading position.
   terminal.write(data, () => {
-    // Post-write scroll guard: if user was following output but xterm's internal
-    // scroll state got reset (e.g. SmoothScrollableElement race during burst),
-    // snap back to bottom. If user had scrolled up, leave them alone.
-    //
-    // Fix 9: On mobile, check BOTH synchronously (catch reset before paint)
-    // AND in rAF (catch reset during render pass). The mobile textarea at
-    // position:fixed(0,0) can cause the browser's focus-validation to scroll
-    // xterm containers, resetting ydisp to 0 between write and next paint.
-    if (wasAtBottom && terminal.buffer.active.viewportY < terminal.buffer.active.baseY) {
-      terminal.scrollToBottom();
-    } else if (!wasAtBottom && prevViewportY > 0 && terminal.buffer.active.baseY > 5) {
-      // Fix 11: User was scrolled up. If viewportY dropped significantly
-      // during write (e.g. CLI virtual scroll removing lines above viewport),
-      // restore the user's scroll position rather than jumping to top.
-      const drop = prevViewportY - terminal.buffer.active.viewportY;
-      if (drop > 3) {
-        const target = Math.min(prevViewportY, terminal.buffer.active.baseY);
-        terminal.scrollLines(target - terminal.buffer.active.viewportY);
+    const afterBaseY = terminal.buffer.active.baseY;
+    const afterY = terminal.buffer.active.viewportY;
+
+    if (wasAtBottom) {
+      if (afterY < afterBaseY) {
+        terminal.scrollToBottom();
+      }
+      return;
+    }
+
+    // Scrolled-up user: check if trim shifted position
+    const afterDistFromBottom = afterBaseY - afterY;
+    const drift = Math.abs(afterDistFromBottom - beforeDistFromBottom);
+    if (drift > 5) {
+      const targetY = Math.max(0, afterBaseY - beforeDistFromBottom);
+      const delta = targetY - afterY;
+      if (delta !== 0) {
+        terminal.scrollLines(delta);
       }
     }
-    // Deferred check: xterm's RenderService and SmoothScrollableElement
-    // finish their internal layout pass in rAF, so check again.
-    requestAnimationFrame(() => {
-      if (wasAtBottom && terminal.buffer.active.viewportY < terminal.buffer.active.baseY) {
-        terminal.scrollToBottom();
-      } else if (!wasAtBottom && prevViewportY > 0 && terminal.buffer.active.baseY > 5) {
-        const drop = prevViewportY - terminal.buffer.active.viewportY;
-        if (drop > 3) {
-          const target = Math.min(prevViewportY, terminal.buffer.active.baseY);
-          terminal.scrollLines(target - terminal.buffer.active.viewportY);
-        }
-      }
-    });
   });
 }
 

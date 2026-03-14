@@ -74,7 +74,7 @@ Multiple layers of automated supply chain analysis:
 | **CodeQL** | `codeql.yml` | Static analysis for JS/TS vulnerabilities (XSS, injection, data flow issues). Runs on push, PRs, and weekly. |
 | **OSSF Scorecard** | `scorecard.yml` | Repository security posture: branch protection, dependency pinning, CI best practices. Runs on push to main and weekly. |
 | **Dependency Review** | `test.yml` | `actions/dependency-review-action` blocks PRs that introduce dependencies with known vulnerabilities. |
-| **npm audit** | `test.yml` | `npm audit --audit-level=high` for both backend and frontend. Fails on HIGH+ severity advisories. |
+| **npm audit** | `test.yml` | `npm audit --audit-level=high --omit=dev` for both backend and frontend. Fails on HIGH+ severity advisories in production dependencies. Dev-only vulnerabilities (e.g. transitive devDep issues in undici/yauzl) are excluded. |
 | **Trivy** | `deploy.yml` | Container image vulnerability scanning (HIGH/CRITICAL severity). Blocks deploy on findings. Uses `.trivyignore` for accepted risks. |
 | **Dependabot** | `.github/dependabot.yml` | Automated dependency update PRs for npm (backend, frontend, host), Docker, and GitHub Actions. |
 
@@ -106,6 +106,26 @@ Enabled at the repository level (Settings > Code security and analysis):
 - **Route validation:** WebSocket upgrade requests are validated against allowed routes before Hono routing (workerd bug workaround).
 - **Auth on connect:** WebSocket connections go through the same CF Access auth middleware as HTTP requests.
 - **Container-scoped tokens:** WebSocket traffic proxied to containers includes the DO-scoped `Authorization: Bearer` token.
+
+### Push & Deploy Credentials
+
+Users can connect their GitHub and Cloudflare accounts via Settings > Push & Deploy. Tokens are stored and injected into container sessions as environment variables.
+
+**Storage:**
+- Tokens are stored in Cloudflare KV, encrypted at rest with AES-256-GCM.
+- Tokens are validated against provider APIs (GitHub, Cloudflare) before storage. Invalid or revoked tokens are rejected.
+
+**Injection:**
+- Tokens are injected as environment variables at container startup: `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`.
+- Container isolation ensures tokens are per-user. A user's tokens are only injected into their own sessions.
+
+**Token scope and expiry:**
+- GitHub tokens are fine-grained PATs with scoped repository access and 90-day expiry.
+- Cloudflare API tokens follow the same scoping principle as the deployment token (minimum required permissions).
+
+**Access control:**
+- Tokens are only accessible to the authenticated user who stored them. KV keys are scoped by user identity.
+- The admin API token (`CLOUDFLARE_API_TOKEN` used by the Worker itself) remains separate and is never injected into containers.
 
 ### Automated Penetration Testing
 

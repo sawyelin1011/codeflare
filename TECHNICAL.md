@@ -531,7 +531,7 @@ Agent memory (knowledge graph via `@modelcontextprotocol/server-memory`) persist
 
 **Why per-session JSONL:** Multiple concurrent sessions from the same user write to the same R2 bucket. A shared file would cause last-write-wins data loss. Per-session JSONL files eliminate write conflicts — each session owns its own file, and merge-on-boot consolidates them.
 
-**Two-phase merge/cleanup:** The merge runs after R2 sync but before bisync baseline establishment. Old files are kept so `--resync` doesn't resurrect them. Cleanup (local-only deletion, KEEP=3) runs after bisync baseline succeeds, so periodic bisync propagates the deletions to R2. Direct R2 deletion is unsafe for concurrent sessions — another session's bisync would propagate the deletion locally, destroying the active memory file. The rclone config uses `disable_checksum = true` to prevent `BadDigest` errors from files modified during upload (pre-warm PTY race condition).
+**Two-phase merge/cleanup:** The merge runs after R2 sync but before bisync baseline establishment. Old files are kept so `--resync` doesn't resurrect them. Cleanup (local-only deletion, KEEP=3) runs after bisync baseline succeeds, so periodic bisync propagates the deletions to R2. Direct R2 deletion is unsafe for concurrent sessions — another session's bisync would propagate the deletion locally, destroying the active memory file. The rclone config uses `disable_checksum = true` to skip `X-Amz-Meta-Md5chksum` metadata on multipart uploads, and `--s3-upload-cutoff 0` forces all uploads through the multipart path to prevent `BadDigest` errors — single-part PutObject pre-computes `Content-MD5` in a separate read pass, so files modified between hash and upload (TOCTOU race) cause R2 to reject with HTTP 400.
 
 ### LLM Consultation (consult-llm-mcp)
 
@@ -549,6 +549,28 @@ When `OPENAI_API_KEY` or `GEMINI_API_KEY` env vars are present, `entrypoint.sh` 
 If the user names a specific model, only that model is queried. All supported models: `gpt-5.4`, `gpt-5.2`, `gpt-5.3-codex`, `gpt-5.2-codex`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro`.
 
 Skill definition: `preseed/agents/claude/skills/consult-llm/SKILL.md`.
+
+### Push & Deploy (deploy-keys)
+
+Optional feature that lets users connect GitHub and Cloudflare accounts once in Settings. Tokens are stored in KV (`deploy-keys:{bucketName}`), validated against provider APIs on save, and injected as environment variables into every container session.
+
+**Environment variables injected:** `GH_TOKEN` (GitHub fine-grained PAT), `CLOUDFLARE_API_TOKEN` (Cloudflare API token), `CLOUDFLARE_ACCOUNT_ID` (auto-fetched from CF API).
+
+**Backend:** `src/routes/deploy-keys.ts` — GET returns masked tokens, PUT validates against GitHub/Cloudflare APIs before storing, DELETE clears all. Follows the same pattern as `llm-keys.ts`.
+
+**Container injection:** Deploy keys are read from KV in `src/routes/container/lifecycle.ts` and passed to the Container DO via `buildSetBucketNameBody()`. The DO injects them as `envVars`. Keys are sent as explicit `null` when absent (not omitted) to ensure revocation propagates on session restart.
+
+**Git credential helper:** `entrypoint.sh` configures `git config --global credential.helper` when `GH_TOKEN` is present, enabling `git push` without `gh auth login`.
+
+**Token scopes:** GitHub (19 permissions pre-filled via template URL), Cloudflare (13 scopes pre-filled). Both URLs use provider-specific template mechanisms to pre-select permissions.
+
+**Frontend:** `web-ui/src/components/settings/DeployKeysSection.tsx` — self-contained component with connect/disconnect flows for both providers, multi-account Cloudflare dropdown, and token masking.
+
+**Preseed rule:** `preseed/agents/claude/rules/deploy-credentials.md` — comprehensive capability reference telling agents what commands are available with each token.
+
+**Known gotchas:**
+- `printf '%s' "$SECRET" | gh secret set` can store empty values — use file redirect (`< tmpfile`) instead.
+- `cloudflare/wrangler-action@v3` bundles an old wrangler. Use `npx --yes wrangler deploy` with `env:` block for secrets.
 
 ---
 
@@ -1089,7 +1111,7 @@ Eight workflows covering deploy, testing, fuzzing, penetration testing, stress t
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
 | `deploy.yml` | Push to `main` + `workflow_dispatch` (production/integration) | Full pipeline: tests, typecheck, Docker build, Trivy vulnerability scan, wrangler deploy, worker secrets |
-| `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, dead code check (knip), `npm audit`, dependency review |
+| `test.yml` | PRs to `main` + `workflow_dispatch` | PR checks: lint (oxlint), tests, typecheck, build verification, dead code check (knip), `npm audit --omit=dev`, dependency review |
 | `e2e.yml` | `workflow_dispatch` (integration/production) | E2E tests against deployed worker - sequential jobs with dependency chains: `setup` -> `e2e-api` -> `e2e-ui-desktop` -> `e2e-ui-mobile` |
 | `codeql.yml` | Push to `main`, PRs to `main`, weekly (Monday 06:00 UTC) | CodeQL static analysis for JavaScript/TypeScript vulnerabilities, uploads SARIF to GitHub Security |
 | `fuzz.yml` | PRs to `main`, weekly (Sunday 04:00 UTC) + `workflow_dispatch` | Property-based fuzzing with fast-check (50,000 iterations) |
@@ -1149,7 +1171,7 @@ Eight workflows covering deploy, testing, fuzzing, penetration testing, stress t
 ### Test Workflow Detail
 
 Two parallel jobs:
-- **test**: Lint (oxlint), build frontend, run backend + frontend tests, typecheck both, dead code check (knip), `npm audit --audit-level=high` for backend and frontend
+- **test**: Lint (oxlint), build frontend, run backend + frontend tests, typecheck both, dead code check (knip), `npm audit --audit-level=high --omit=dev` for backend and frontend
 - **dependency-review**: Runs `actions/dependency-review-action` on PRs - blocks merging if new dependencies introduce known vulnerabilities
 
 ### E2E Workflow Detail
@@ -1220,7 +1242,7 @@ Six parallel jobs, each running lightweight external probes against the producti
 
 ### Vitest Version Split
 
-Root uses Vitest v3.x (required by `@cloudflare/vitest-pool-workers`). `web-ui/` uses Vitest v4.x (SolidJS testing library compatibility). Each has independent `node_modules` and separate configs. Do not attempt to unify - the version constraint is real.
+Both root and `web-ui/` use Vitest v3.x. Vitest 4.x is incompatible with `@cloudflare/vitest-pool-workers` (the constraint comes from the Workers runtime integration). Each has independent `node_modules` and separate configs. Do not attempt to upgrade to v4 - the version constraint is real.
 
 ### E2E API Tests
 
@@ -1796,31 +1818,64 @@ Same root cause as Fix 9, manifesting on desktop: during long sessions where ter
 
 1. **CSS: Global viewport overflow fix** — Moved `.xterm .xterm-viewport { overflow: hidden !important; }` from inside `@media (pointer: coarse)` to global scope, applying to all devices. This is the primary fix — it strips `.xterm-viewport` of scroll-container status so the browser cannot trigger native scroll events on it.
 
-2. **JS: Universal scroll-drop detector with improved heuristic** — Removed the `if (isTouchDevice())` gate. Replaced the `lastKnownYdisp > ybase * 0.5` heuristic with:
-   - **`wasFollowingOutput`** — tracks whether the user was at the bottom of the buffer before the drop. Strictly more precise than the old "bottom half" threshold — catches 100% of following-output resets, zero false positives from users browsing scrollback.
-   - **User-intent suppression** — listens for `wheel`, `pointerdown`, and navigation `keydown` (PageUp/PageDown/Home/End). Suppresses correction for 250ms after intentional user scroll to avoid fighting legitimate scrollback on desktop (mouse wheel, scrollbar drag, keyboard navigation).
-   - **`ybase > 5` threshold** — retained from Fix 9 to prevent false positives during init/restore when the buffer is nearly empty.
+2. **JS: Universal scroll-drop detector** — Removed the `if (isTouchDevice())` gate. Detects browser focus-reset (viewport snaps to `ydisp === 0`) and corrects via `scrollToBottom()`. Uses `wasFollowingOutput` tracking, user-intent suppression (150ms grace after wheel/pointerdown/keydown + external intent API for floating buttons), `ybase > 5` threshold, and `isCorrectingScroll` re-entrancy guard. See Fix 13 below for the full overhaul.
 
-#### Virtual Scroll Viewport Jump (Fix 11)
+#### Scroll Stability Overhaul (Fix 13)
 
-CLI applications like Claude Code use virtual scrolling in their TUI (controlled by `CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL`). When a session grows long, the TUI removes old lines from the top of the terminal 1:1 as new lines are added, keeping the visible entry count roughly constant. The welcome banner/logo stays at line 0.
+Fixes 9-12 introduced three overlapping scroll-correction mechanisms that fought each other during output, causing terminal oscillation (especially on mobile with keyboard open). Fix 13 replaces them with a minimal, targeted approach.
 
-This line removal sends ANSI escape sequences that modify buffer content above the viewport, causing xterm.js to recalculate `viewportY`. The recalculation can reset `viewportY` to 0 (jumping to top). Two symptoms:
+**Root cause of oscillation:** The `wasFollowing && ydisp < ybase` check was too broad — it treated ANY scroll away from bottom as suspicious, fighting legitimate programmatic scrolls (floating buttons) and xterm's native scrollback trimming. The `drop > 3` heuristic detected xterm's own viewport adjustments during trimming as errors and reversed them, causing the very jumps it was meant to prevent. Three independent correction mechanisms (post-write sync, post-write rAF, onScroll detector) could trigger each other in a cascade.
 
-- **User scrolled up**: viewport jumps to top permanently — no existing guard corrected this because `wasAtBottom` and `wasFollowingOutput` were both false.
-- **User at bottom**: brief flash to top then back — existing guards corrected it but too late (one rendered frame at wrong position).
+**Fix 13 changes:**
 
-**Two-layer fix:**
+1. **Narrowed scroll-reset detection** (`hooks/useTerminal.ts`) — changed from `ydisp < ybase` to `ydisp === 0`. The browser focus-reset bug always snaps to position 0 (scroll origin). Any other ydisp value is either a legitimate scroll or xterm's native scrollback trimming.
 
-1. **Post-write scroll guard** (`stores/terminal.ts`) — now also handles the scrolled-up case. Records `prevViewportY` before each write. If `!wasAtBottom` and `viewportY` dropped by more than 3 lines during the write, restores to `min(prevViewportY, baseY)` via `scrollLines()`. Checks both synchronously and in rAF.
+2. **Removed `drop > 3` heuristic** — xterm.js natively adjusts viewportY when trimming scrollback lines to maintain visual stability. The heuristic was counterproductive.
 
-2. **Scroll-drop detector** (`hooks/useTerminal.ts`) — broadened from `ydisp === 0` to two cases:
-   - `wasFollowing && ydisp < ybase` — catches any drop from bottom (not just to 0), replacing the original Fix 9 check.
-   - `!wasFollowing && drop > 3` — new: catches viewport drops when user was scrolled up. Tracks `previousYdisp` to measure drop magnitude. Restores to `min(previousYdisp, ybase)`.
+3. **Simplified post-write guard** (`stores/terminal.ts`) — kept only `wasAtBottom → scrollToBottom` sync check. Removed `drop > 3` and rAF duplicate that fought with the onScroll detector.
 
-Both layers use a `> 3` line threshold to avoid fighting normal single-line scroll adjustments while catching the multi-line viewport resets from virtual scroll re-renders.
+4. **Added re-entrancy guard** — `isCorrectingScroll` boolean prevents `scrollToBottom()` inside corrections from re-triggering the detector via synchronous `onScroll`.
 
-**Fallback:** If the fix proves insufficient, setting `CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1` in the PTY environment eliminates the root cause entirely by preventing the TUI from removing old lines. Trade-off: unbounded terminal buffer growth until xterm's scrollback limit (10,000) is reached.
+5. **External scroll intent API** (`lib/terminal-scroll-intent.ts`) — keyed by session:terminal. Floating buttons call `markScrollIntent()` before `scrollPages()`/`scrollToBottom()` so the detector recognizes out-of-tree UI actions.
+
+6. **Reduced grace window** from 250ms to 150ms for tighter intent tracking.
+
+7. **Reduced scrollback** from 10,000 to 400 lines (both frontend and headless). Virtual scroll is disabled (`CLAUDE_CODE_DISABLE_VIRTUAL_SCROLL=1`), so xterm's scrollback buffer is the only history cap.
+
+#### Distance-Based Scroll Stability (Fix 15, supersedes Fix 14)
+
+Fixes 13-14 used absolute `ydisp === 0` to detect browser focus resets. This false-positived during scrollback trimming: xterm legitimately decrements ydisp as old lines are removed (399→398→...→1→0). Fix 14 misidentified this as a browser bug and applied incorrect corrections (`scrollLines` with absolute position instead of delta), pinning users at the top.
+
+**Root cause:** The correct invariant is **distance from bottom** (`baseY - ydisp`), not absolute `ydisp`. During normal trimming, distance stays constant (both baseY and ydisp shift together). During a browser focus reset, ydisp snaps to 0 while baseY stays large, causing distance to jump dramatically.
+
+**Fix 15 changes:**
+
+1. **Distance-based detection** — tracks `distanceFromBottom = baseY - ydisp` across onScroll events. A browser reset is detected when `ydisp` drops to 0 AND `distanceDrift > 20` (impossible during normal trimming which changes distance by at most 1-2 lines).
+
+2. **Distance-based restoration** — restores using `targetY = currentBaseY - savedDistanceFromBottom`, applied as a **delta** (`targetY - currentY`). This is trim-safe because it uses the user's relative position, not absolute coordinates.
+
+3. **Write-side distance guard** — `flushWriteBuffer` now tracks `beforeDistFromBottom` and corrects scrolled-up users if trim drifted their position by more than 5 lines. Previously only bottom-following users were corrected.
+
+4. **Tighter reset detection** — requires `previousYdisp > 20` AND `ybase > 20` AND `distanceDrift > 20`. Normal scrollback trimming never produces this signature; browser focus resets always do.
+
+#### Keyboard-Open Scroll Suppression (Fix 16)
+
+With keyboard open, the terminal is in bottom-anchored mode: output auto-follows, touch scrolling is blocked (swipes send arrow keys instead). However, multiple independent scroll mechanisms were fighting each other during output with keyboard open:
+
+1. `flushWriteBuffer` callback called `scrollToBottom()` every 33ms
+2. Keyboard height change effect called `scrollToBottom()` (leading + trailing edge)
+3. ResizeObserver called `scrollToBottom()` ~18 times during 300ms keyboard animation
+4. Fix 15 scroll-reset detector could fire on side effects of the above
+
+This caused visible oscillation (jump up, snap back down) during output with keyboard open.
+
+**Fix 16 changes:**
+
+1. **Skip scroll-reset detector when keyboard open** — the detector is for browser focus-reset bugs which can't happen in keyboard-open mode (touch events are blocked, user can't scroll). Early return in `onScroll` handler when `isVirtualKeyboardOpen()`.
+
+2. **Remove ResizeObserver scrollToBottom when keyboard open** — the keyboard height change effect already handles fit + scrollToBottom during animation. ResizeObserver adding concurrent scrolls was redundant and caused thrash.
+
+The write callback's `scrollToBottom()` remains the single source of truth for bottom-anchoring during keyboard-open output.
 
 #### WS Retryable Close Codes (Fix 5)
 

@@ -332,6 +332,7 @@ establish_bisync_baseline() {
         --recover \
         --check-sync=false \
         --ignore-checksum \
+        --s3-upload-cutoff 0 \
         --max-delete 100 \
         --retries 3 --retries-sleep 10s \
         --transfers 32 --checkers 32 -v > "$BASELINE_OUTPUT" 2>&1; then
@@ -394,6 +395,7 @@ bisync_with_r2() {
         --recover \
         --check-sync=false \
         --ignore-checksum \
+        --s3-upload-cutoff 0 \
         --max-delete 100 \
         --retries 3 --retries-sleep 10s \
         --transfers 32 --checkers 32 "${verbose_args[@]}" > "$SYNC_OUTPUT" 2>&1; then
@@ -937,6 +939,12 @@ else
     echo "$PLUGINS_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
 fi
 echo "[entrypoint] codeflare-memory and codeflare-hooks plugins enabled in .claude.json"
+
+# Configure git credential helper for pre-configured deploy tokens
+if [ -n "${GH_TOKEN:-}" ]; then
+    git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f'
+    echo "[entrypoint] Git credential helper configured for GH_TOKEN"
+fi
 
 # === Fast Start: tool-specific config files ===
 if [ "${FAST_CLI_START:-true}" != "false" ]; then
