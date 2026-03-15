@@ -3,7 +3,8 @@ import { z } from 'zod';
 import type { Env } from '../../types';
 import { ValidationError, toError } from '../../lib/error-types';
 import { resetSetupCache } from '../../lib/cache-reset';
-import { listAllKvKeys, emailFromKvKey } from '../../lib/kv-keys';
+import { listAllKvKeys, emailFromKvKey, getPreferencesKey } from '../../lib/kv-keys';
+import { getBucketName } from '../../lib/access';
 import { cleanupUserData } from '../../lib/user-cleanup';
 import { authMiddleware, requireAdmin, type AuthVariables } from '../../middleware/auth';
 import { setupRateLimiter, logger, getWorkerNameFromHostname } from './shared';
@@ -15,7 +16,7 @@ import { handleConfigureCustomDomain } from './custom-domain';
 import { handleCreateAccessApp } from './access';
 import { handleConfigureTurnstile } from './turnstile';
 import handlers from './handlers';
-import { isOnboardingLandingPageActive } from '../../lib/onboarding';
+import { isOnboardingLandingPageActive, isSaasModeActive } from '../../lib/onboarding';
 
 const ConfigureBodySchema = z.object({
   customDomain: z
@@ -85,6 +86,16 @@ app.post('/configure', async (c) => {
   const { customDomain, allowedUsers, adminUsers, allowedOrigins } = parsed.data;
   const token = c.env.CLOUDFLARE_API_TOKEN;
 
+  // During reconfiguration, prevent admin from removing themselves
+  const currentUser = c.get('user');
+  if (currentUser?.email) {
+    const normalizedCurrentEmail = currentUser.email.trim().toLowerCase();
+    const normalizedAdminList = adminUsers.map(e => e.trim().toLowerCase());
+    if (!normalizedAdminList.includes(normalizedCurrentEmail)) {
+      throw new ValidationError('You cannot remove yourself from the admin list');
+    }
+  }
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -114,7 +125,8 @@ app.post('/configure', async (c) => {
     };
 
     try {
-      // Acquire KV-based lock to prevent concurrent configure runs
+      // Acquire KV-based lock to prevent concurrent configure runs (60s timeout).
+      // If lock exists and is not stale, another setup is in progress.
       const existingLock = await c.env.KV.get(lockKey);
       if (existingLock) {
         const lockTime = parseInt(existingLock, 10);
@@ -124,6 +136,7 @@ app.post('/configure', async (c) => {
         }
         logger.warn('Overriding stale setup lock', { lockAge: Date.now() - lockTime });
       }
+      // Write lock with 5-minute expiry to ensure cleanup if request dies
       await c.env.KV.put(lockKey, String(Date.now()), { expirationTtl: 300 });
       lockAcquired = true;
 
@@ -144,43 +157,84 @@ app.post('/configure', async (c) => {
       const normalizedAllowed = [...new Set(allowedUsers.map(e => e.trim().toLowerCase()))];
       const normalizedAdmins = [...new Set(adminUsers.map(e => e.trim().toLowerCase()))];
 
-      // Remove stale users not in the new allowedUsers list (full cleanup)
-      const allowedSet = new Set(normalizedAllowed);
-      const existingUserKeys = await listAllKvKeys(c.env.KV, 'user:');
-      const staleEmails = existingUserKeys
-        .filter(key => !allowedSet.has(emailFromKvKey(key.name)))
-        .map(key => emailFromKvKey(key.name));
+      // Remove stale users not in the new allowedUsers list (full cleanup).
+      // In SaaS mode, only clean up removed admins — JIT-provisioned regular
+      // users are managed via User Management, not setup.
+      {
+        const allowedSet = new Set(normalizedAllowed);
+        const existingUserKeys = await listAllKvKeys(c.env.KV, 'user:');
+        const isSaasMode = isSaasModeActive(c.env.SAAS_MODE);
 
-      if (staleEmails.length > 0) {
-        await runStep('cleanup_stale_users', async () => {
-          for (const staleEmail of staleEmails) {
-            logger.info('Removing stale user with full cleanup', { email: staleEmail });
-            await cleanupUserData(staleEmail, c.env);
+        const staleEmails: string[] = [];
+        for (const key of existingUserKeys) {
+          const email = emailFromKvKey(key.name);
+          if (allowedSet.has(email)) continue;
+
+          if (isSaasMode) {
+            // In SaaS mode, only remove users who were admins (not JIT regular users)
+            const userData = await c.env.KV.get(key.name, 'json') as { role?: string } | null;
+            if (userData?.role === 'admin') {
+              staleEmails.push(email);
+            }
+          } else {
+            staleEmails.push(email);
           }
-        });
+        }
+
+        if (staleEmails.length > 0) {
+          await runStep('cleanup_stale_users', async () => {
+            for (const staleEmail of staleEmails) {
+              logger.info('Removing stale user with full cleanup', { email: staleEmail });
+              await cleanupUserData(staleEmail, c.env);
+            }
+          });
+        }
       }
 
-      // Store users in KV with role
+      // Store users in KV with role.
+      // In SaaS mode, preserve existing fields (e.g. accessTier) for admin users
+      // that may already exist from JIT provisioning.
       const adminSet = new Set(normalizedAdmins);
-      const userWrites = normalizedAllowed.map(email => {
+      const isSaas = isSaasModeActive(c.env.SAAS_MODE);
+      const userWrites = normalizedAllowed.map(async (email) => {
         const role = adminSet.has(email) ? 'admin' : 'user';
-        return c.env.KV.put(
-          `user:${email}`,
-          JSON.stringify({ addedBy: 'setup', addedAt: new Date().toISOString(), role })
-        );
+        const base = { addedBy: 'setup', addedAt: new Date().toISOString(), role };
+        if (isSaas) {
+          // Merge with existing KV entry to preserve accessTier and other fields
+          const existing = await c.env.KV.get(`user:${email}`, 'json') as Record<string, unknown> | null;
+          const merged = { ...existing, ...base, accessTier: 'advanced' };
+          return c.env.KV.put(`user:${email}`, JSON.stringify(merged));
+        }
+        // In non-SaaS mode, explicitly set accessTier for admins
+        const entry = role === 'admin' ? { ...base, accessTier: 'advanced' } : base;
+        return c.env.KV.put(`user:${email}`, JSON.stringify(entry));
       });
       await Promise.all(userWrites);
+
+      // Auto-set advanced session mode for admin users so their first
+      // session seeds advanced skills and agent rules.
+      const adminPrefsWrites = normalizedAdmins.map(async (email) => {
+        const bucketName = getBucketName(email, workerName);
+        const prefsKey = getPreferencesKey(bucketName);
+        const existingPrefs = await c.env.KV.get(prefsKey, 'json');
+        if (!existingPrefs) {
+          await c.env.KV.put(prefsKey, JSON.stringify({ sessionMode: 'advanced' }));
+        }
+      });
+      await Promise.all(adminPrefsWrites);
 
       // Step 4 & 5: Custom domain + CF Access
       await runStep('configure_custom_domain', () =>
         handleConfigureCustomDomain(token, accountId, customDomain, c.req.url, steps, workerName)
       );
       await runStep('create_access_app', () =>
-        handleCreateAccessApp(token, accountId, customDomain, allowedUsers, adminUsers, steps, c.env.KV, workerName)
+        handleCreateAccessApp(token, accountId, customDomain, allowedUsers, adminUsers, steps, c.env.KV, workerName, isSaasModeActive(c.env.SAAS_MODE))
       );
 
       const onboardingLandingActive = isOnboardingLandingPageActive(c.env.ONBOARDING_LANDING_PAGE);
-      if (onboardingLandingActive) {
+      const saasMode = isSaasModeActive(c.env.SAAS_MODE);
+      // Turnstile is needed for onboarding landing (waitlist) AND SaaS mode (access requests)
+      if (onboardingLandingActive || saasMode) {
         await runStep('configure_turnstile', () =>
           handleConfigureTurnstile(token, accountId, customDomain, steps, c.env.KV, workerName, c.req.url)
         );

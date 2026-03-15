@@ -62,6 +62,13 @@ export interface Env {
   // Bypass all rate limits for stress testing (set to 'active' to enable)
   STRESS_TEST_MODE?: string;
 
+  // SaaS mode: custom login page with JIT provisioning and admin approval gate.
+  // When 'active', new users are auto-provisioned with 'pending' tier on first login.
+  SAAS_MODE?: string;
+  // Comma-separated CF Access IdP UUIDs to show on login page alongside social providers.
+  // Use for custom OIDC/SAML providers (e.g., Authentik, Okta).
+  SAAS_EXTRA_IDPS?: string;
+
 }
 
 /**
@@ -76,6 +83,7 @@ export interface AccessUser {
   email: string;
   authenticated: boolean;
   role?: UserRole;
+  accessTier?: AccessTier;
 }
 
 /**
@@ -110,6 +118,9 @@ export type AgentType = z.infer<typeof AgentTypeSchema>;
 
 export const SessionModeSchema = z.enum(['default', 'advanced']);
 export type SessionMode = z.infer<typeof SessionModeSchema>;
+
+export const AccessTierSchema = z.enum(['pending', 'standard', 'advanced', 'blocked']);
+export type AccessTier = z.infer<typeof AccessTierSchema>;
 
 /**
  * Configuration for a single terminal tab

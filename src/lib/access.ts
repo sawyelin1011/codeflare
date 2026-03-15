@@ -1,7 +1,8 @@
-import type { AccessUser, Env, UserRole } from '../types';
+import type { AccessTier, AccessUser, Env, UserRole } from '../types';
 import { verifyAccessJWT } from './jwt';
 import { AuthError, ForbiddenError } from './error-types';
 import { createLogger } from './logger';
+import { isSaasModeActive } from './onboarding';
 
 const logger = createLogger('access');
 
@@ -15,6 +16,8 @@ let authConfigCachedAt = 0;
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
+
+const VALID_ACCESS_TIERS = new Set<string>(['pending', 'standard', 'advanced', 'blocked']);
 
 /**
  * Reset cached auth config. Call when setup completes or config changes.
@@ -144,7 +147,7 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
       }
     }
 
-    // JWT verification failed
+    // JWT verification failed for all expected audiences
     return { email: '', authenticated: false };
   }
 
@@ -161,8 +164,9 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     return { email: normalizeEmail(email), authenticated: true };
   }
 
-  // Service token authentication
-  // When CF Access validates service token, it passes through cf-access-client-id
+  // Service token authentication (fallback)
+  // When CF Access validates a service token, it passes through cf-access-client-id header.
+  // Only used if no JWT was available (JWT takes precedence).
   const serviceTokenClientId = request.headers.get('cf-access-client-id');
 
   if (serviceTokenClientId) {
@@ -212,14 +216,14 @@ export function getBucketName(email: string, workerName?: string): string {
 }
 
 /**
- * Resolve a user entry from KV, returning role information.
+ * Resolve a user entry from KV, returning role and access tier information.
  * Defaults missing role to 'user' for backward compatibility with
  * entries created before role support was added.
  */
 export async function resolveUserFromKV(
   kv: KVNamespace,
   email: string
-): Promise<{ addedBy: string; addedAt: string; role: UserRole } | null> {
+): Promise<{ addedBy: string; addedAt: string; role: UserRole; accessTier?: AccessTier } | null> {
   const normalizedEmail = normalizeEmail(email);
   const raw = await kv.get(`user:${normalizedEmail}`);
   if (!raw) return null;
@@ -230,12 +234,49 @@ export async function resolveUserFromKV(
     return null;
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
-  const obj = parsed as { addedBy?: unknown; addedAt?: unknown; role?: unknown };
+  const obj = parsed as { addedBy?: unknown; addedAt?: unknown; role?: unknown; accessTier?: unknown };
+  const rawTier = typeof obj.accessTier === 'string' ? obj.accessTier : undefined;
   return {
     addedBy: typeof obj.addedBy === 'string' ? obj.addedBy : 'unknown',
     addedAt: typeof obj.addedAt === 'string' ? obj.addedAt : '',
     role: obj.role === 'admin' ? 'admin' : 'user',
+    accessTier: rawTier && VALID_ACCESS_TIERS.has(rawTier) ? (rawTier as AccessTier) : undefined,
   };
+}
+
+/**
+ * Resolve an existing user from KV, or auto-provision a new one in SaaS mode.
+ * New users are always created with 'pending' tier (requires admin approval).
+ *
+ * Throws ForbiddenError when the user is not in KV and SaaS mode is off.
+ */
+export async function resolveOrProvisionUser(
+  kv: KVNamespace,
+  email: string,
+  env: Env
+): Promise<{ role: UserRole; accessTier: AccessTier }> {
+  const normalizedEmail = normalizeEmail(email);
+  const kvEntry = await resolveUserFromKV(kv, normalizedEmail);
+
+  if (kvEntry) {
+    return { role: kvEntry.role, accessTier: kvEntry.accessTier ?? 'advanced' };
+  }
+
+  if (isSaasModeActive(env.SAAS_MODE)) {
+    // Note: concurrent first-login requests may both reach this point and write
+    // identical records. This is benign — both produce the same {role:'user',
+    // accessTier:'pending'} entry. KV eventual consistency prevents true atomicity.
+    await kv.put(`user:${normalizedEmail}`, JSON.stringify({
+      addedBy: 'jit',
+      addedAt: new Date().toISOString(),
+      role: 'user',
+      accessTier: 'pending',
+    }));
+
+    return { role: 'user', accessTier: 'pending' };
+  }
+
+  throw new ForbiddenError('User not in allowlist');
 }
 
 /**
@@ -269,11 +310,20 @@ export async function authenticateRequest(
     const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
     return { user: { ...rawUser, email: normalizedEmail }, bucketName };
   }
+
+  // SaaS mode: use resolveOrProvisionUser for JIT provisioning + accessTier
+  if (isSaasModeActive(env.SAAS_MODE)) {
+    const { role, accessTier } = await resolveOrProvisionUser(env.KV, normalizedEmail, env);
+    const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
+    return { user: { ...rawUser, email: normalizedEmail, role, accessTier }, bucketName };
+  }
+
+  // Non-SaaS mode: existing allowlist behavior
   const kvEntry = await resolveUserFromKV(env.KV, normalizedEmail);
   if (!kvEntry) {
     throw new ForbiddenError('User not in allowlist');
   }
-  const role = kvEntry.role;
+  const { role, accessTier } = kvEntry;
   const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
-  return { user: { ...rawUser, email: normalizedEmail, role }, bucketName };
+  return { user: { ...rawUser, email: normalizedEmail, role, accessTier }, bucketName };
 }

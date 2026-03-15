@@ -2,7 +2,7 @@
 
 Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2 persistence.
 
-**Last Updated:** 2026-03-13
+**Last Updated:** 2026-03-15
 
 ---
 
@@ -20,40 +20,42 @@ Browser-based cloud IDE on Cloudflare Workers with per-session containers and R2
 
 ### Security & Operations
 7. [Authentication](#authentication)
-8. [Security Model](#security-model)
-9. [Rate Limiting](#rate-limiting)
+8. [SaaS Mode Authentication](#saas-mode-authentication)
+9. [Security Model](#security-model)
+10. [Rate Limiting](#rate-limiting)
 
 ### APIs & Configuration
-10. [API Reference](#api-reference)
-11. [Environment Variables](#environment-variables)
-12. [Configuration](#configuration)
+11. [API Reference](#api-reference)
+    - [Setup Wizard](#setup)
+12. [Environment Variables](#environment-variables)
+13. [Configuration](#configuration)
 
 ### Deployment & Infrastructure
-13. [Container Image](#container-image)
-14. [Container Startup](#container-startup)
-15. [Claude Code Integration](#claude-code-integration)
-16. [CI/CD (GitHub Actions)](#cicd-github-actions)
+14. [Container Image](#container-image)
+15. [Container Startup](#container-startup)
+16. [Claude Code Integration](#claude-code-integration)
+17. [CI/CD (GitHub Actions)](#cicd-github-actions)
 
 ### Development & Testing
-17. [Testing](#testing)
-18. [Development](#development)
-19. [File Structure](#file-structure)
+18. [Testing](#testing)
+19. [Development](#development)
+20. [File Structure](#file-structure)
 
 ### Operations & Debugging
-20. [Troubleshooting](#troubleshooting)
-21. [Debugging Guide](#debugging-guide)
-22. [Cost Analysis](#cost-analysis)
+21. [Troubleshooting](#troubleshooting)
+22. [Debugging Guide](#debugging-guide)
+23. [Cost Analysis](#cost-analysis)
 
 ### Design Documentation
-23. [Architecture Decisions](#architecture-decisions)
-24. [Lessons Learned](#lessons-learned)
-25. [Mobile Terminal Design](#mobile-terminal-design)
-26. [Automatic Memory Capture](#automatic-memory-capture)
+24. [Architecture Decisions](#architecture-decisions)
+25. [Lessons Learned](#lessons-learned)
+26. [Mobile Terminal Design](#mobile-terminal-design)
+27. [Automatic Memory Capture](#automatic-memory-capture)
 
 **Related Documentation:**
 - [README.md](README.md) - Product overview and setup
 - [SECURITY.md](SECURITY.md) - Security policy and headers
-- [docs/SETUP_WIZARD.md](docs/SETUP_WIZARD.md) - Setup wizard configuration
+- [docs/SETUP_WIZARD.md](docs/SETUP_WIZARD.md) - Setup wizard reference (content merged into [API Reference: Setup](#setup))
 - [STRESS_TEST.md](STRESS_TEST.md) - Load testing guide
 
 ---
@@ -187,7 +189,7 @@ Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads syn
 
 **Directory:** `web-ui/`
 
-Key files: `App.tsx` (root), `Terminal.tsx` (xterm.js), `TerminalTabs.tsx`, `Layout.tsx` (orchestrates dashboard/terminal views, manages WS disconnect/reconnect lifecycle), `SessionStatCard.tsx` (dashboard card with three-color status dot and metrics), `StorageBrowser.tsx` (R2 browser with toolbar), `StoragePanel.tsx` (slide-in drawer), `SettingsPanel.tsx`, `Dashboard.tsx`, `OnboardingLanding.tsx`, `KittScanner.tsx`.
+Key files: `App.tsx` (root), `Terminal.tsx` (xterm.js), `TerminalTabs.tsx`, `Layout.tsx` (orchestrates dashboard/terminal views, manages WS disconnect/reconnect lifecycle), `SessionStatCard.tsx` (dashboard card with three-color status dot and metrics), `StorageBrowser.tsx` (R2 browser with toolbar), `StoragePanel.tsx` (slide-in drawer), `SettingsPanel.tsx`, `Dashboard.tsx`, `OnboardingLanding.tsx`, `OnboardingPage.tsx` (guided setup), `KittScanner.tsx`.
 
 Stores: `terminal.ts` (WebSocket state, compound key `sessionId:terminalId`, scheduled disconnect/reconnect), `terminal-url-detection.ts` (URL detection signals for floating buttons), `terminal-layout.ts` (terminal layout state), `session.ts` (CRUD, `terminalsPerSession`, `stopSession()` sets `'stopping'` and polls, `refreshSessionStatuses()` for lightweight dashboard polling — also updates storage stats from batch-status via `updateStatsFromBatch()`), `storage.ts` (R2 operations), `setup.ts`, `tiling.ts` (tiled terminal layout), `session-presets.ts` (preset/bookmark management), `session-tabs.ts` (tab configuration).
 
@@ -246,7 +248,21 @@ function connect() {
 
 **R2 Storage Stats Caching:** `GET /api/storage/stats` paginates all R2 objects and caches results in KV (`storage-stats:{bucketName}`, 60s TTL). `batch-status` piggybacks cached stats (no TTL check — relies on cache being fresh). Mutation endpoints (upload, delete, move, seed) invalidate the KV cache after successful operations. Dashboard calls `storageStore.fetchStats()` on mount, which hits `/api/storage/stats` and refreshes from R2 if the cache is stale or missing.
 
-**Conditional Logout:** Depends on `onboardingActive` flag: active -> redirect to `/` (landing page), inactive -> redirect to `/cdn-cgi/access/logout`.
+**Logout:** Always redirects to `/auth/logout` (backend route in `auth-redirects.ts`). The backend redirects to `https://{authDomain}/cdn-cgi/access/logout?returnTo=https://{customDomain}/`, ensuring the user lands back on the login page instead of the Cloudflare team URL.
+
+**Header User Dropdown:** Clicking the avatar/username in both Header (terminal view) and Dashboard opens a dropdown with three items: Profile (`/app/subscribe`), Guided Setup (`/app/onboarding`), and Logout. Profile and Guided Setup use plain `<a href>` tags with no `onClick` handlers — SolidJS Router's top-level DOM listener intercepts clicks for client-side navigation (no full page reload, no white flash on dark backgrounds). This is critical for mobile: previous attempts using `<button>` + `window.location.href` or `onClick` handlers failed due to touch event race conditions with Portal DOM removal. Logout uses `window.location.href` since it's a real server redirect. Dashboard dropdown uses `Portal` with the dropdown nested inside the overlay as a child (not a sibling) — `stopPropagation` on the dropdown div prevents touch events from reaching the overlay's `onClick`. Desktop: positioned below avatar via `getBoundingClientRect()`. Mobile: bottom sheet.
+
+**Onboarding Page (`/app/onboarding`):** Guided setup page for new users. Three sections: (1) Connect GitHub — saves PAT via `updateDeployKeys`, (2) Connect Cloudflare — saves API token, (3) Coding Agents — informational cards linking to signup pages for 6 supported agents. Reuses `ProviderRow` and `BrandIcons` from settings. "Skip and Continue to Codeflare" button always visible. Uses standalone `.onboarding-page` container (`position: fixed; inset: 0; overflow-y: auto`) instead of `.login-page` — same pattern as `.setup-wizard` — because `.login-page` has `overflow: hidden` that blocks scrolling. **First-time redirect:** In SaaS mode, `AppContent` checks `onboardingComplete` from `/api/user` — if `false`, redirects to `/app/onboarding`. The Skip/Continue buttons call `POST /api/user/onboarding-complete` which sets `onboardingComplete: true` in the user's KV entry. Subsequent visits go directly to the dashboard. Users can always revisit via the header dropdown ("Guided Setup").
+
+**Font consistency:** Login, subscribe, and onboarding pages all use `JetBrains Mono` monospace font via `font-family` on `.login-content` and `.onboarding-content` root containers. All child text inherits — no sans-serif fallback.
+
+**Admin Protection:** Admin users always have `advanced` access tier and can switch between default/advanced session modes freely. `canUseAdvanced()` in SettingsPanel returns `true` for admins regardless of stored `accessTier` — prevents admin lockout when JIT-provisioned with `pending` tier before being promoted. Backend rejects both tier changes (`PATCH /api/users/:email`) and deletions (`DELETE /api/users/:email`) for admin-role users. Frontend hides tier dropdown and delete button for admins in UserManagement.
+
+**Live Access Tier Refresh:** `SettingsPanel` re-fetches `/api/user` each time it opens, updating a `liveAccessTier` signal. This ensures tier upgrades (admin promotes user from `standard` to `advanced`) take effect without a full page reload — the user just needs to close and reopen Settings.
+
+**Auto-advanced session mode:** When a user is promoted to `advanced` tier via `PATCH /api/users/:email`, the backend also writes `sessionMode: 'advanced'` to their preferences (`user-prefs:{bucketName}`) if no `sessionMode` is set yet. This ensures their first bucket creation seeds advanced skills and agent rules. Existing user preferences (where `sessionMode` is already set) are not overridden. Admin users created by setup also get `sessionMode: 'advanced'` in their preferences automatically.
+
+**Bucket creation and seeding:** R2 buckets are auto-created on first access from two paths: (1) `POST /api/container/start` via `ensureBucketAndSeed` and (2) `GET /api/storage/browse` when the dashboard loads the storage panel. Both paths read `sessionMode` from user preferences (`user-prefs:{bucketName}`) via `resolveSessionMode()` and pass it to `seedAgentConfigs()`/`reconcileAgentConfigs()` so the correct mode-specific files are seeded. The storage browser path typically runs first (dashboard loads before user starts a session).
 
 **Frontend Zod Validation:** `web-ui/src/lib/schemas.ts` -- Zod schemas validate API responses at runtime. Types derived from schemas via `z.infer`.
 
@@ -300,7 +316,7 @@ flowchart TD
 
 **Error propagation:** `listAccessApps()` and `listAccessGroups()` propagate errors through `withSetupRetry` rather than silently returning `[]`. Errors surface as `SetupError` with step details. The frontend `ApiError` carries a `steps` array from `SetupError` JSON responses.
 
-**Stale user removal during reconfiguration:** When `POST /configure` is re-run with a new `allowedUsers` list, users no longer in the list are removed via `cleanupUserData()` (`src/lib/user-cleanup.ts`), wrapped in `runStep('cleanup_stale_users')` for progress visibility. This performs full cleanup identical to `DELETE /api/users/:email`: destroys all active sessions/containers, deletes bucket-keyed KV entries (`storage-stats:`, `presets:`, `user-prefs:`), deletes the R2 scoped token, empties the R2 bucket (paginated `ListObjectsV2` + `DeleteObjects` via `emptyR2Bucket`), and deletes the bucket via CF API with retry logic (up to 3 attempts with exponential backoff for R2 eventual consistency).
+**Stale user removal during reconfiguration:** When `POST /configure` is re-run with a new `allowedUsers` list, users no longer in the list are removed via `cleanupUserData()` (`src/lib/user-cleanup.ts`), wrapped in `runStep('cleanup_stale_users')` for progress visibility. This performs full cleanup identical to `DELETE /api/users/:email`: destroys all active sessions/containers, deletes bucket-keyed KV entries (`storage-stats:`, `presets:`, `user-prefs:`), deletes the R2 scoped token, empties the R2 bucket (paginated `ListObjectsV2` + `DeleteObjects` via `emptyR2Bucket`), and deletes the bucket via CF API with retry logic (up to 3 attempts with exponential backoff for R2 eventual consistency). **SaaS mode:** only admin-role users removed from the admin list are cleaned up — JIT-provisioned regular users are preserved (managed via User Management, not setup). Each existing KV user is checked for `role: 'admin'` before deletion. Admin KV writes merge with existing entries (preserving `accessTier`) and always set `accessTier: 'advanced'`. **Self-removal prevention:** during reconfiguration, the backend rejects the request if the current authenticated user is not in the submitted admin list (`ValidationError: 'You cannot remove yourself from the admin list'`). The Zod schema enforces at least 1 admin user.
 
 ### Session Route Architecture
 
@@ -590,7 +606,7 @@ One Access application with five destinations: `/app`, `/app/*`, `/api/*`, `/set
 
 ### Access Group Model
 
-Per-worker groups: `<worker-name>-admins`, `<worker-name>-users`. Setup upserts both, stores IDs in KV. `/api/users` syncs group membership via `syncAccessPolicy()`. `GET /api/setup/prefill` reads existing membership for redeploy prefill. Admin-only deployments (0 regular users) are supported: the users group is skipped entirely and the Access policy references only the admin group.
+Per-worker groups: `<worker-name>-admins`, `<worker-name>-users`. Setup upserts both, stores IDs in KV. `/api/users` syncs group membership via `syncAccessPolicy()` after user mutations — **skipped in SaaS mode** because the Access policy uses `login_method` includes (set by setup); syncing would overwrite them with email/group includes, breaking the policy. `GET /api/setup/prefill` reads existing membership for redeploy prefill (skipped in SaaS mode — returns empty arrays, admin enters everything manually). Admin-only deployments (0 regular users) are supported: the users group is skipped entirely and the Access policy references only the admin group.
 
 ### Root Redirect
 
@@ -620,6 +636,268 @@ flowchart TD
 ### Bucket Auto-Creation
 
 **File:** `src/lib/r2-admin.ts` - `createBucketIfNotExists()` via Cloudflare API on first container start.
+
+---
+
+## SaaS Mode Authentication
+
+When `SAAS_MODE=active`, Codeflare replaces the Cloudflare Access interstitial with a branded login page. New users are auto-provisioned with `pending` access tier and require admin approval. This section documents the complete SaaS auth flow from initial setup through user approval to session management.
+
+### Deployment Modes
+
+| Mode | Auth provider | User provisioning | Access control |
+|------|--------------|-------------------|----------------|
+| **Default** (no `SAAS_MODE`) | Cloudflare Access (JWT) | Manual allowlist via setup wizard | CF Access policies + KV allowlist |
+| **SaaS** (`SAAS_MODE=active`) | Custom login page + CF Access IdP hints | Auto-provisioned on first login | Three-tier middleware + KV access tiers |
+
+### Complete SaaS Authentication Flow
+
+The diagram below shows the entire journey from first visitor to approved, active user:
+
+```mermaid
+flowchart TD
+    A["Visitor arrives at domain"] --> B["CF Access intercepts request<br/>(no JWT cookie)"]
+    B --> C{"Access policy<br/>login_method check"}
+    C -->|not authenticated| D["Redirect to GitHub OAuth<br/>(auto_redirect_to_identity=true)"]
+    D --> E["User completes GitHub login"]
+    E --> F["CF Access mints JWT<br/>(CF_Authorization cookie)"]
+    F --> G["Redirect to /app/<br/>with CF_Authorization cookie"]
+    G --> H["Request reaches Worker<br/>with CF Access JWT"]
+    H --> I["authenticateRequest verifies JWT<br/>from JWKS at auth_domain"]
+    I --> J["Extract user email<br/>from JWT claims"]
+    J --> K{"User in KV?<br/>user:{email} record"}
+    K -->|no| L["JIT Provision:<br/>new record with pending tier"]
+    K -->|yes| M["Load existing<br/>access tier"]
+    L --> N["requireActiveUser check"]
+    M --> N
+    N -->|tier=pending| O["Redirect to /app/subscribe"]
+    N -->|tier=standard| P["Allow IDE access"]
+    N -->|tier=advanced| P
+    N -->|tier=blocked| Q["Redirect: blocked message"]
+    O --> R["SubscribePage shows Turnstile"]
+    R --> S["User completes CAPTCHA"]
+    S --> T["POST /api/auth/request-access<br/>with turnstileToken"]
+    T --> U["Verify token with Turnstile API"]
+    U --> V["Set requestedAt timestamp<br/>in KV user record"]
+    V --> W["Send admin notification<br/>via Resend email"]
+    W --> X["SubscribePage polls /api/auth/status<br/>every 10 seconds"]
+    X --> Y{"Admin approves?<br/>sets tier to standard"}
+    Y -->|no| X
+    Y -->|yes| Z["Frontend detects tier change"]
+    Z --> AA["Show 'Access Granted' state"]
+    AA --> AB["User clicks Continue → /app/"]
+    AB --> P
+    P --> AC["Session created with tier"]
+    AC --> AD["Tier controls session mode<br/>standard=default only<br/>advanced=default+advanced"]
+```
+
+This flow highlights the key architectural choice: **CF Access handles authentication (identity), while the Worker handles authorization (access control)**. CF Access only knows "is this person GitHub-authenticated?" while the Worker enforces the business logic: "is this person an approved tier?"
+
+### Three-Tier Auth Middleware
+
+SaaS mode uses a layered middleware stack on every request to protected routes. See `src/middleware/auth.ts`:
+
+1. **`requireIdentity`** — Resolves the user from CF Access JWT (verified via JWKS at auth_domain). If the user is not in KV, auto-provisions them with `pending` tier via `resolveOrProvisionUser()`. Sets `c.get('user')` with email, role, and accessTier. Used for endpoints like `/api/auth/status` where pending users need to see Turnstile and request-access button.
+
+2. **`requireActiveUser`** — Authenticates (same as requireIdentity) then checks `accessTier` is `standard` or `advanced`. When SAAS_MODE is active:
+   - Pending users on API routes get 403 JSON: `{ error: 'Access denied', code: 'PENDING' }`
+   - Pending users on HTML requests get 403 but frontend catches it and redirects to `/app/subscribe`
+   - Blocked users get 403 JSON: `{ error: 'Access denied', code: 'BLOCKED' }`
+   - Standard/advanced users pass through
+
+   When SAAS_MODE is NOT active, requireActiveUser behaves identically to requireIdentity (no tier checking, backward compat).
+
+3. **`requireAdmin`** — Checks `role === 'admin'`. Must be used AFTER requireIdentity or requireActiveUser. Used for `/admin/*` and user management endpoints.
+
+### Access Tiers
+
+| Tier | Can log in | Can use IDE | Session modes | How assigned |
+|------|-----------|-------------|---------------|-------------|
+| `pending` | Yes | No | None | Auto-assigned on first login (JIT provisioning) |
+| `standard` | Yes | Yes | `default` only | Admin manually promotes from `pending` in User Management |
+| `advanced` | Yes | Yes | `default` + `advanced` | Admin manually grants full access (or users created via allowedUsers list at setup) |
+| `blocked` | Yes | No | None | Admin blocks user to revoke IDE access without deleting record |
+
+Tiers are stored in the KV record at `user:{email}` in the `accessTier` field (JSON value is `{ addedBy, addedAt, role, accessTier }`). Existing users without `accessTier` default to `advanced` (backward compatibility with setups created before tier support).
+
+The tier logic is defined in `src/lib/access-tier.ts`:
+- `isActiveUser(tier)` — returns true if tier is `standard`, `advanced`, or undefined
+- `allowedSessionModes(tier)` — returns array of modes user can select: `advanced` tier gets both `default` and `advanced`, `standard` gets only `default`
+- `canUseSessionMode(tier, mode)` — checks if a specific mode is allowed
+
+### CF Access Configuration Strategy
+
+The setup wizard (Step 5 in `src/routes/setup/index.ts`) calls `handleCreateAccessApp()` in `src/routes/setup/access.ts` to configure Cloudflare Access. The key architectural decision is **login_method vs. groups**.
+
+#### Why login_method in SaaS mode (not groups)
+
+- **Groups (default mode):** `include: { group: { id: adminGroupId } }, { group: { id: userGroupId } }` — CF Access only allows users in these specific allowlisted groups. Works for closed deployments with known user emails.
+
+- **login_method (SaaS mode):** `include: { login_method: { id: githubIdpId } }` — CF Access allows ANY GitHub-authenticated user. The Worker then enforces per-user access tiers (pending/standard/advanced/blocked) based on KV records. This enables open SaaS signup.
+
+The policy is created via `upsertAccessPolicy()` at line 384-465 of `src/routes/setup/access.ts`:
+- If `saasLoginMethods` array is provided, use `login_method` includes (SaaS mode)
+- Otherwise, use `group` includes (default mode)
+
+In SaaS mode, the admin group is NOT included in the policy because admin status is enforced by the Worker (via `requireAdmin` middleware), not CF Access. This allows admins to be demoted without Cloudflare API calls.
+
+#### Why syncAccessPolicy is skipped in SaaS mode
+
+Later deployments should NOT call `syncAccessPolicy()` if SaaS mode is active. If called, it would overwrite the `login_method` policy with `group` includes, breaking open signup. Currently there is no sync function, but this is documented for future maintainers.
+
+#### Access Application Configuration
+
+The setup wizard configures the Access app (created/updated via `upsertAccessApp()` at line 147-217) with these SaaS-specific settings:
+
+```typescript
+appBody = {
+  name: managedAppName,
+  domain: appDomain,
+  destinations: [...'/app/*', '/api/*', '/setup', ...],
+  type: 'self_hosted',
+  session_duration: '24h',
+  skip_interstitial: true,
+  auto_redirect_to_identity: saasIdpIds ? saasIdpIds.length === 1 : false,
+  allowed_idps: saasIdpIds,  // [githubIdpId] in SaaS mode
+}
+```
+
+Key points:
+- `allowed_idps: [githubIdpId]` — restricts the login UI to show only GitHub (if multiple IdPs exist in the account)
+- `auto_redirect_to_identity: true` (when exactly one IdP) — skips the CF Access login page and redirects directly to GitHub OAuth, creating a seamless branded experience
+- `skip_interstitial: true` — skips the "you are being redirected" page after OAuth completes
+- `session_duration: '24h'` — CF Access JWT is valid for 24 hours; user must re-authenticate when cookie expires
+
+The IdP list is fetched early and stored in KV (`setup:idp_list`) for frontend use. See line 533-538 of `src/routes/setup/access.ts`.
+
+### JIT User Provisioning
+
+When a GitHub-authenticated user (verified CF Access JWT) makes their first request to a protected endpoint:
+
+1. `authenticateRequest()` in `src/lib/access.ts` extracts the user's email from the JWT
+2. `resolveUserFromKV()` looks up `user:{email}` — not found (first login)
+3. If SAAS_MODE is active, `resolveOrProvisionUser()` creates a new KV record:
+   ```json
+   {
+     "addedBy": "jit",
+     "addedAt": "2025-03-15T12:00:00Z",
+     "role": "user",
+     "accessTier": "pending"
+   }
+   ```
+4. The user is returned with `accessTier: 'pending'`
+5. If the route uses `requireActiveUser`, it rejects with 403 → frontend redirects to `/app/subscribe`
+
+**Concurrency note:** KV has eventual consistency. If two requests for the same new user arrive simultaneously, both may reach the JIT provision step and write identical records. This is benign — both produce the same result. KV's per-key serialization prevents split-brain scenarios.
+
+**Stale user cleanup:** Admins can manually delete users via the User Management UI (`web-ui/src/components/admin/UserManagement.tsx`). There is no automatic cleanup of pending users who never request access. A future enhancement could archive records after 30 days of inactivity.
+
+### First-Time Onboarding Redirect
+
+When an active user logs in for the first time, the frontend (`web-ui/src/App.tsx` at line 52-54) checks:
+```typescript
+if (user.saasMode && !user.onboardingComplete) {
+  window.location.href = '/app/onboarding';
+  return;
+}
+```
+
+The `onboardingComplete` flag is set in KV when the user calls `POST /api/auth/onboarding-complete` (line 192-205 of `src/routes/auth.ts`). This allows the setup wizard or onboarding page to mark guided setup as finished, and the user won't be redirected again.
+
+### Access Request Flow (Pending → Approval)
+
+When a pending user submits an access request via `/app/subscribe`:
+
+1. **Turnstile verification:** The frontend renders a Cloudflare Turnstile CAPTCHA (data-sitekey from `/api/auth/status`). User completes the challenge, obtaining a token.
+
+2. **Rate limiting:** `POST /api/auth/request-access` is rate-limited to 3 requests per hour per user (see `src/routes/auth.ts` line 55-59). This prevents spam.
+
+3. **Idempotency:** If `requestedAt` is already set in the user's KV record, the endpoint returns success without re-notifying admins (line 113-116).
+
+4. **Admin notification:** If `RESEND_API_KEY` env var is set, the Worker sends an email to all admins with the user's email and request timestamp (line 154-186). Email is sent via Resend API.
+
+5. **Polling:** The frontend polls `/api/auth/status` every 10 seconds (line 36 of `src/components/SubscribePage.tsx`). When the admin approves the user (changing `accessTier` to `standard` or `advanced`), the poll detects the change and updates the UI to "Access Granted".
+
+6. **No auto-redirect:** Active users are NOT automatically redirected from `/app/subscribe`. They choose when to click "Continue". This allows them to always see their account status. (This was a key lesson learned: automatic redirects create confusion when the user wants to verify their account status.)
+
+### Session Mode Upgrade (Auto-Advanced)
+
+When the frontend detects a tier change to `advanced`, it can optionally upgrade the user's `sessionMode` preference from `default` to `advanced` (if stored in KV). See `src/lib/access-tier.ts` at line 7-10 for the tier-to-modes mapping. This allows users to immediately use advanced sessions after promotion.
+
+### Logout Flow
+
+`GET /auth/logout` in `src/routes/auth-redirects.ts`:
+
+1. Retrieves `setup:auth_domain` from KV (set during setup)
+2. Computes `returnTo` URL (custom domain root or fallback)
+3. Redirects to CF Access logout endpoint:
+   ```
+   https://{auth_domain}/cdn-cgi/access/logout?returnTo={encodeURIComponent(returnTo)}
+   ```
+4. CF Access clears the `CF_Authorization` cookie and redirects back to returnTo
+
+The frontend calls this via `window.location.href = '/cdn-cgi/access/logout?returnTo=...'` directly (see `web-ui/src/components/SubscribePage.tsx` line 298-300), which also works because `/cdn-cgi/access/logout` is a CF Access system endpoint.
+
+### Frontend Components
+
+#### LoginPage (`web-ui/src/components/LoginPage.tsx`)
+
+Shown at `/` when `SAAS_MODE=active` and providers are configured. Features:
+- Detects if the current user is already authenticated (pending, standard, advanced, or blocked)
+- If tier is pending/standard/advanced, redirects to `/app/`; if blocked, shows blocked message
+- If unauthenticated, fetches providers from `/public/auth/providers` and renders GitHub login button
+- Uses `window.location.href` to navigate (avoids SolidJS Router intercepting the navigation)
+- Animated logo (float + glow), ScrambleText title animation, feature highlights with MDI icons
+
+#### SubscribePage (`web-ui/src/components/SubscribePage.tsx`)
+
+Shown at `/app/subscribe` for pending and approved users. States:
+- **Loading:** Shows spinner while fetching `/api/auth/status`
+- **Pending (no request):** Renders Turnstile CAPTCHA + "Request Access" button. Turnstile script is dynamically loaded from `https://challenges.cloudflare.com/turnstile/v0/api.js`. Uses `MutationObserver` to detect when Turnstile token appears in the DOM (rather than polling a timer).
+- **Pending (requested):** Shows "Pending Approval" with pulsing indicator. Polls `/api/auth/status` every 10 seconds.
+- **Active (standard/advanced):** Shows green checkmark, "Your Access is Active", and "Continue" button.
+- **Blocked:** Shows red message + logout link.
+
+#### RootPage (`web-ui/src/App.tsx` lines 159-205)
+
+Determines deployment mode and renders appropriate landing:
+1. Calls `/public/auth/providers` (public, no auth required) — if it returns providers, show LoginPage (SaaS mode)
+2. Calls `/public/onboarding-config` (public) — if active, show OnboardingLanding
+3. Otherwise, redirect to `/app/` (default mode with CF Access)
+
+This avoids needing a client-side env variable. The frontend auto-detects the mode from the backend.
+
+### Environment Variables for SaaS Mode
+
+Set as GitHub Actions repository variables (not secrets, since they're non-sensitive).
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SAAS_MODE` | unset | Set to `active` to enable custom login, JIT provisioning, and admin approval |
+| `SAAS_EXTRA_IDPS` | unset | Comma-separated IdP UUIDs for future multi-IdP support (currently unused) |
+| `RESEND_API_KEY` | unset | Resend email API token for admin notifications on access requests |
+| `WAITLIST_FROM_EMAIL` | `Codeflare <onboarding@resend.dev>` | From address for admin notification emails |
+| `ONBOARDING_LANDING_PAGE` | unset | Set to `active` to show waitlist/onboarding page at `/` instead of login |
+
+Both `SAAS_MODE` and `ONBOARDING_LANDING_PAGE` are passed to the Worker via `--var` in `deploy.yml`.
+
+### Common Pitfalls and Lessons Learned
+
+These issues were discovered and fixed during SaaS mode implementation:
+
+1. **Auto-redirect loops:** Early versions auto-redirected pending users from `/app/subscribe` to themselves when admin approved (e.g., on page load after approval, redirect back to `/app/subscribe`). Fixed by removing auto-redirect; users now click "Continue" manually. This also allows users to verify their tier was actually updated.
+
+2. **Stale JWT cache:** The Worker cached auth config (auth_domain, access_aud) for 5 minutes. If setup changed during that window, old JWT would fail to verify. Fixed by adding auth config cache invalidation via `resetAuthConfigCache()` called after setup completes.
+
+3. **Policy overwrite on reconfigure:** If admin re-ran setup with the same SaaS mode config, the access policy would be re-synced (if a sync function existed). This would overwrite `login_method` with `group` includes if the function didn't check the mode. Fixed by not calling sync in SaaS mode (and documenting this constraint).
+
+4. **Concurrent first-login writes:** KV eventual consistency means two simultaneous first-logins could write the same user record twice. This is actually benign (idempotent), but the code includes a note about it for future maintainers.
+
+5. **CSRF on state-changing requests:** Early versions didn't check for `X-Requested-With` header on POST/PUT/DELETE. Added in `authenticateRequest()` at line 292-298 of `src/lib/access.ts`.
+
+6. **Email header spoofing post-setup:** If auth was configured (auth_domain set), the Worker would reject requests without a valid JWT, preventing header spoofing via `cf-access-authenticated-user-email`. This is intentional (line 154-158 of `src/lib/access.ts`).
+
+7. **Service token auth for e2e tests:** Added support for `X-Service-Auth` header with custom secret for CI/e2e tests that can't go through CF Access (line 112-139).
 
 ---
 
@@ -713,13 +991,14 @@ When the limit is exceeded: HTTP 429 with `{ code: "RATE_LIMIT_ERROR", message: 
 | `/api/sessions/:id/stop` | POST | 10/min | `session-stop` |
 | `/api/user/ensure-r2-token` | POST | 5/min | `ensure-r2-token` |
 | `/api/sessions` | POST | 10/min | `session-create` |
-| `/api/container/start` | POST | 10/min | `container-start` |
+| `/api/container/start` | POST | 5/min | `container-start` |
 | `/api/users/:email` | DELETE | 20/min | `user-mutation` |
 | `/api/setup/status` | GET | 30/min | `setup-status` |
-| `/api/setup/detect-token` | GET | 5/min | `setup-configure` |
-| `/api/setup/prefill` | GET | 5/min | `setup-configure` |
+| `/api/setup/detect-token` | GET | 10/min | `setup-detect-token` |
+| `/api/setup/prefill` | GET | 10/min | `setup-prefill` |
 | `/api/setup/configure` | POST | 5/min | `setup-configure` |
 | `PATCH /api/preferences` | PATCH | 20/min | `preferences-patch` |
+| `POST /api/auth/request-access` | POST | 3/hr | `request-access` |
 | `POST /public/waitlist` | POST | 5/min | `waitlist-submit` |
 
 **Adding a new rate limiter:**
@@ -832,7 +1111,8 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/user` | Authenticated user info (includes `onboardingActive`) |
+| GET | `/api/user` | Authenticated user info (includes `onboardingActive`, `onboardingComplete`) |
+| POST | `/api/user/onboarding-complete` | Mark guided setup as visited (sets KV flag) |
 | GET | `/api/user/r2-status` | R2 credential status for current user |
 | POST | `/api/user/ensure-r2-token` | Create scoped R2 token if missing (rate limited) |
 | GET | `/api/users` | List allowed users (admin only) |
@@ -840,22 +1120,292 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 ### Setup
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/setup/status` | Check setup status |
-| GET | `/api/setup/detect-token` | Auto-detect token from env |
-| GET | `/api/setup/prefill` | Prefill emails from existing Access groups |
-| POST | `/api/setup/configure` | Run configuration (NDJSON stream response) |
+The setup wizard configures a fresh Codeflare deployment. It provisions Cloudflare resources (R2 credentials, DNS records, Access applications) and stores the resulting configuration in Workers KV so the application can serve requests.
 
-**`POST /configure` streams NDJSON:** Returns `Content-Type: application/x-ndjson` with per-step progress lines as each CF API step executes. Each line is a JSON object:
-- **Step progress:** `{"step":"create_r2","status":"running"}` then `{"step":"create_r2","status":"success"}` (or `"error"` with optional `error` field)
-- **Final summary:** `{"done":true,"success":true,"steps":[...],"workersDevUrl":"...","customDomainUrl":"..."}` or `{"done":true,"success":false,"error":"...","steps":[...]}`
-- Always returns HTTP 200 -- errors are conveyed within the stream. Validation errors (missing fields) still return HTTP 400 before streaming begins.
-- Frontend reads via `response.body.getReader()` with buffer-based line parsing, updating `configureSteps` progressively so the UI shows real-time step status.
+#### When Setup Runs
 
-Public before setup; admin-only after. All `adminUsers` must also be in `allowedUsers`. Regular users (`allowedUsers` beyond admins) are optional -- admin-only deployments with 0 regular users are fully supported.
+| Scenario | Auth requirement | Entry point |
+|---|---|---|
+| **First-time setup** (`setup:complete` not set in KV) | Public -- no authentication required | `POST /api/setup/configure` |
+| **Reconfigure** (`setup:complete` is `"true"`) | Admin auth via Cloudflare Access | `POST /api/setup/configure` |
 
-See [docs/SETUP_WIZARD.md](docs/SETUP_WIZARD.md) for complete setup configuration details.
+The conditional auth middleware in `src/routes/setup/index.ts` checks `KV.get('setup:complete')` on every request. When the value is `"true"`, the request must pass through `authMiddleware` and `requireAdmin` before reaching the configure handler.
+
+#### Request Format
+
+```
+POST /api/setup/configure
+Content-Type: application/json
+
+{
+  "customDomain":   "claude.example.com",
+  "allowedUsers":   ["alice@example.com", "bob@example.com"],
+  "adminUsers":     ["alice@example.com"],
+  "allowedOrigins": [".example.com"]          // optional
+}
+```
+
+Validation rules (enforced by Zod before streaming starts):
+
+- `customDomain` -- non-empty string matching a valid domain pattern.
+- `allowedUsers` -- non-empty array of valid email addresses.
+- `adminUsers` -- non-empty array of valid emails; every admin must also appear in `allowedUsers`.
+- `allowedOrigins` -- optional array of domain suffix patterns (each must start with `.`).
+
+The Cloudflare API token is read from the `CLOUDFLARE_API_TOKEN` environment binding, not from the request body.
+
+#### Configuration Steps
+
+The configure endpoint runs steps sequentially, streaming progress over NDJSON.
+
+**Step 1 -- `get_account`**
+
+**Source:** `src/routes/setup/account.ts`
+
+Calls `GET /accounts` on the Cloudflare API to retrieve the account ID associated with the API token. The first account in the response is used.
+
+**Step 2 -- `derive_r2_credentials`**
+
+**Source:** `src/routes/setup/credentials.ts`
+
+Derives S3-compatible R2 credentials from the existing API token without needing extra permissions:
+
+- **Access Key ID** = the token's own ID (from `GET /user/tokens/verify`).
+- **Secret Access Key** = hex-encoded SHA-256 hash of the raw token value.
+
+**Step 3 -- `set_secrets`**
+
+**Source:** `src/routes/setup/secrets.ts`
+
+Sets `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY` as Worker secrets via `PUT /accounts/{id}/workers/scripts/{name}/secrets`.
+
+If the API returns error code `10215` (latest version not deployed -- common after `wrangler versions upload`), the handler deploys the latest Worker version at 100% traffic and retries the secret write.
+
+**Step 3a -- `cleanup_stale_users` (conditional)**
+
+Runs only when reconfiguring and the new `allowedUsers` list has removed previously allowed users. Performs full cleanup of each stale user's KV entries and associated data.
+
+**Step 4 -- `configure_custom_domain`**
+
+**Source:** `src/routes/setup/custom-domain.ts`
+
+1. **Zone resolution** -- looks up the Cloudflare zone ID by trying progressively shorter domain suffixes (supports ccTLDs like `.co.uk`).
+2. **DNS upsert** -- creates or updates a proxied CNAME record pointing the custom domain to `{workerName}.{accountSubdomain}.workers.dev`.
+3. **Worker route** -- creates the route pattern `{customDomain}/*` mapped to the worker script. Handles "already exists" errors by updating the existing route.
+
+**Step 5 -- `create_access_app`**
+
+**Source:** `src/routes/setup/access.ts`
+
+1. Upserts two Cloudflare Access groups scoped to the worker name:
+   - `{workerName}-admins` -- contains admin emails.
+   - `{workerName}-users` -- contains non-admin allowed emails (created only when there are non-admin users).
+2. Prunes legacy Access apps that used older domain patterns.
+3. Creates or updates a self-hosted Access application protecting `/app/*` (primary), `/app`, `/api/*`, `/setup`, and `/setup/*` via the `destinations` field.
+4. Upserts an "Allow users" policy referencing both groups.
+5. Stores Access configuration in KV (audience tag, group IDs, auth domain).
+
+**SaaS-specific behavior:**
+- The Access app is configured with `allowed_idps` restricted to GitHub IdP only (if available).
+- The policy uses `login_method` includes (any GitHub-authenticated user passes CF Access) instead of group includes.
+- The user group is skipped entirely — Worker enforces per-user access-tier authorization (pending/standard/advanced).
+- Admin users created via allowedUsers have `accessTier: 'advanced'` set automatically.
+
+**Step 6 -- `configure_turnstile` (conditional)**
+
+**Source:** `src/routes/setup/turnstile.ts`
+
+Runs only when the `ONBOARDING_LANDING_PAGE` env var is active OR SaaS mode is enabled. Creates or updates a Turnstile widget in `managed` mode for the custom domain (and the workers.dev hostname). Stores the site key and secret in KV.
+
+**Step 7 -- `finalize`**
+
+Writes final KV state and marks setup as complete.
+
+#### NDJSON Stream Contract
+
+The response uses content type `application/x-ndjson`. Each line is a self-contained JSON object terminated by `\n`.
+
+**Progress messages**
+
+```json
+{"step":"get_account","status":"running"}
+{"step":"get_account","status":"success"}
+{"step":"derive_r2_credentials","status":"running"}
+{"step":"derive_r2_credentials","status":"success"}
+```
+
+Status values for in-progress steps:
+
+| Value | Meaning |
+|---|---|
+| `running` | Step has started |
+| `success` | Step completed successfully |
+| `error` | Step failed; includes an `error` field with the message |
+
+**Completion message**
+
+Every stream ends with exactly one completion object containing `done: true`.
+
+**Success:**
+
+```json
+{
+  "done": true,
+  "success": true,
+  "steps": [
+    {"step":"get_account","status":"success"},
+    {"step":"derive_r2_credentials","status":"success"},
+    ...
+  ],
+  "workersDevUrl": "https://codeflare.account.workers.dev",
+  "customDomainUrl": "https://claude.example.com"
+}
+```
+
+**Failure:**
+
+```json
+{
+  "done": true,
+  "success": false,
+  "steps": [
+    {"step":"get_account","status":"success"},
+    {"step":"derive_r2_credentials","status":"error","error":"Token verification failed"}
+  ],
+  "error": "Token verification failed"
+}
+```
+
+**Detecting completion**
+
+Read lines from the stream until you parse an object where `done === true`. Then check `success` to determine the outcome. The `steps` array provides the cumulative status of every step attempted, including which step failed and the error message.
+
+**Detecting lock contention**
+
+If another configure run is already in progress, the stream immediately emits:
+
+```json
+{"done":true,"success":false,"error":"Setup configuration is already in progress. Please wait and try again."}
+```
+
+No step progress messages are sent in this case.
+
+#### Error Recovery
+
+**Per-step retry**
+
+Each Cloudflare API call is wrapped in `withSetupRetry` (exponential backoff, up to 3 total attempts with a 1 s base delay). `CircuitBreakerOpenError` is not retried because the circuit breaker is already open and retrying immediately would be wasteful.
+
+**Step failure**
+
+When any step throws, the error is caught by the top-level handler which:
+
+1. Sends a completion message with `success: false` and the error details.
+2. Releases the configure lock.
+3. Closes the writable stream.
+
+Partial progress from earlier successful steps remains in KV. Setup is **not** marked complete, so the next call to `/api/setup/configure` can retry from the beginning.
+
+**Lock mechanism**
+
+A KV-based lock prevents concurrent configure runs:
+
+| Key | Value | TTL |
+|---|---|---|
+| `setup:configuring` | Unix timestamp (ms) as string | 300 s |
+
+Before starting, the handler checks for an existing lock:
+
+- If the lock exists and is less than 60 seconds old, the request is rejected immediately.
+- If the lock exists but is older than 60 seconds, it is treated as stale and overridden (logged as a warning).
+- The lock is deleted in the `finally` block regardless of success or failure.
+- The KV TTL of 300 s acts as a safety net if the worker crashes before cleanup.
+
+**How to retry**
+
+The client can simply re-submit the same `POST /api/setup/configure` request. All steps are idempotent -- they create-or-update resources rather than assuming a clean slate. If a previous run partially completed, the retry will update existing resources and continue.
+
+#### KV State Management
+
+The following KV keys are written during setup. All keys use the `setup:` prefix.
+
+| KV Key | Written by | Value |
+|---|---|---|
+| `setup:complete` | finalize | `"true"` |
+| `setup:account_id` | finalize | Cloudflare account ID |
+| `setup:r2_endpoint` | finalize | `https://{accountId}.r2.cloudflarestorage.com` |
+| `setup:completed_at` | finalize | ISO 8601 timestamp |
+| `setup:custom_domain` | post-step-5 | Lowercased custom domain |
+| `setup:allowed_origins` | post-step-5 | JSON array of origin suffix patterns |
+| `setup:onboarding_landing_page` | post-step-5 | `"active"` or `"inactive"` |
+| `setup:configuring` | lock acquire | Unix timestamp (ms); deleted on completion |
+| `setup:access_aud` | step 5 | Primary Access audience tag |
+| `setup:access_aud_list` | step 5 | JSON array of audience tags |
+| `setup:access_app_id` | step 5 | Access application ID |
+| `setup:access_group_admin_id` | step 5 | Admin Access group ID |
+| `setup:access_group_user_id` | step 5 | User Access group ID |
+| `setup:access_group_admin_name` | step 5 | Admin group name (`{worker}-admins`) |
+| `setup:access_group_user_name` | step 5 | User group name (`{worker}-users`) |
+| `setup:auth_domain` | step 5 | Access organization auth domain |
+| `setup:turnstile_site_key` | step 6 | Turnstile widget site key |
+| `setup:turnstile_secret_key` | step 6 | Turnstile widget secret |
+| `setup:idp_list` | step 5 | JSON array of IdP objects (id, type, name) |
+
+User records are stored separately under the `user:{email}` key pattern with a JSON value containing `addedBy`, `addedAt`, `role` (`"admin"` or `"user"`), and `accessTier` (SaaS mode only).
+
+#### Authentication
+
+**First-time setup**
+
+When `setup:complete` is not set in KV, all setup endpoints are publicly accessible. This is necessary for bootstrapping -- no Access application exists yet to authenticate against.
+
+**Subsequent reconfiguration**
+
+Once `setup:complete` is `"true"`, the conditional auth middleware requires:
+
+1. A valid Cloudflare Access JWT (verified by `authMiddleware`).
+2. The authenticated user must have the `admin` role (enforced by `requireAdmin`).
+
+This applies to `POST /api/setup/configure`, `GET /api/setup/detect-token`, and `GET /api/setup/prefill`. The `GET /api/setup/status` endpoint is always public.
+
+#### Helper Endpoints
+
+**`GET /api/setup/status`**
+
+Always public. Returns whether setup is complete and the custom domain if configured.
+
+```json
+{"configured": true, "customDomain": "claude.example.com", "saasMode": false}
+```
+
+**`GET /api/setup/detect-token`**
+
+Checks whether `CLOUDFLARE_API_TOKEN` is present in the environment, verifies it against the Cloudflare API, and returns account info.
+
+```json
+{"detected": true, "valid": true, "account": {"id": "abc123", "name": "My Account"}}
+```
+
+**`GET /api/setup/prefill`**
+
+Best-effort prefill for the setup form. Reads existing admin and user lists from Cloudflare Access groups (scoped by worker name). Does not prefill the custom domain.
+
+In SaaS mode, returns empty arrays — admin enters everything manually.
+
+```json
+{"adminUsers": ["alice@example.com"], "allowedUsers": ["bob@example.com"]}
+```
+
+#### Rate Limiting
+
+| Endpoint | Window | Max requests | Key prefix |
+|---|---|---|---|
+| `/api/setup/configure` | 60 s | 5 | `setup-configure` |
+| `/api/setup/status` | 60 s | 30 | `setup-status` |
+| `/api/setup/detect-token` | 60 s | 10 | `setup-detect-token` |
+| `/api/setup/prefill` | 60 s | 10 | `setup-prefill` |
+
+Note: `/api/setup/detect-token` and `/api/setup/prefill` are also subject to the shared `setupRateLimiter` (5/min, key prefix `setup-configure`) applied as middleware. The effective limit is 5/min for these endpoints during the setup flow.
 
 ### Storage (R2 File Browser)
 
@@ -883,7 +1433,7 @@ GET `/api/presets`, POST `/api/presets`, PATCH `/api/presets/:id` (rename), DELE
 
 GET `/api/preferences`, PATCH `/api/preferences`
 
-`UserPreferences` fields: `lastAgentType` (AgentType, optional — last selected agent), `lastPresetId` (string, optional — last used preset), `workspaceSyncEnabled` (boolean, optional — workspace sync toggle), `fastStartEnabled` (boolean, default: `true` — fast CLI start toggle). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
+`UserPreferences` fields: `lastAgentType` (AgentType, optional — last selected agent), `lastPresetId` (string, optional — last used preset), `workspaceSyncEnabled` (boolean, default: `false` — workspace sync toggle, disabled by default), `fastStartEnabled` (boolean, default: `true` — fast CLI start toggle). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](#fast-start).
 
 ### LLM API Keys
 
@@ -891,7 +1441,7 @@ GET `/api/llm-keys` — returns masked keys (`****` + last 4 chars), never full 
 PUT `/api/llm-keys` — set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys.
 DELETE `/api/llm-keys` — removes all LLM keys from KV.
 
-Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`.
+Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`. The LLM Keys accordion in Settings is only visible when the user can use advanced mode (`canUseAdvanced()`) AND has selected advanced session mode (`currentSessionMode() === 'advanced'`). Admins always qualify for advanced mode but must still select it.
 
 ### Public (Onboarding)
 
@@ -919,13 +1469,15 @@ GET `/health`, GET `/api/health`
 | `LOG_LEVEL` | Min log level (default: "info") | wrangler.toml |
 | `ONBOARDING_LANDING_PAGE` | `"active"` enables public waitlist landing | wrangler.toml |
 | `TURNSTILE_SECRET_KEY` | Optional direct Turnstile secret override | Optional |
-| `RESEND_API_KEY` | Waitlist notification emails | Optional |
-| `WAITLIST_FROM_EMAIL` | Sender identity for waitlist | Optional |
+| `RESEND_API_KEY` | Notification emails (waitlist + access requests) | Optional |
+| `WAITLIST_FROM_EMAIL` | Sender identity for notification emails | Optional |
 | `CLOUDFLARE_WORKER_NAME` | Worker name override for forks (set at deploy time via `--var`, also used at runtime by worker code) | GitHub Actions variable / Worker runtime env |
 | `MAX_SESSIONS_USER` | Per-user session cap (default: 3) | wrangler.toml |
 | `MAX_SESSIONS_ADMIN` | Per-admin session cap (default: 10) | wrangler.toml |
 | `SERVICE_AUTH_SECRET` | Worker secret for E2E/CLI service auth (`X-Service-Auth` header) | Worker secret (optional) |
 | `STRESS_TEST_MODE` | `"active"` disables all rate limits (integration only) | Worker env var |
+| `SAAS_MODE` | `"active"` enables custom login page, auto-provisioning, admin approval | GitHub Actions variable → `--var` at deploy |
+| `SAAS_EXTRA_IDPS` | Comma-separated IdP UUIDs for custom OIDC providers on login page | GitHub Actions variable → `--var` at deploy |
 
 ### Container Environment
 
@@ -1134,7 +1686,7 @@ Eight workflows covering deploy, testing, fuzzing, penetration testing, stress t
 |--------|----------|---------|---------|
 | `CLOUDFLARE_API_TOKEN` | Yes | `deploy.yml`, `e2e.yml` | Wrangler CLI auth, KV operations, container push, worker deploy, secret management |
 | `CLOUDFLARE_ACCOUNT_ID` | Yes | `deploy.yml`, `e2e.yml` | Identifies the Cloudflare account for all API operations |
-| `RESEND_API_KEY` | Only if `ONBOARDING_LANDING_PAGE=active` | `deploy.yml` | Waitlist notification emails via Resend |
+| `RESEND_API_KEY` | If onboarding or SaaS mode active | `deploy.yml` | Notification emails via Resend (waitlist submissions + access requests) |
 | `CF_ACCESS_CLIENT_ID` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token ID for E2E auth |
 | `CF_ACCESS_CLIENT_SECRET` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token secret; also used as `SERVICE_AUTH_SECRET` worker secret and KV seeding |
 
@@ -1202,7 +1754,7 @@ Six parallel jobs, each running lightweight external probes against the producti
 ### Backend Tests
 
 **Config:** `vitest.config.ts` with `@cloudflare/vitest-pool-workers` - tests run in real Workers runtime (not Node.js).
-**Count:** 68 test files, ~996 tests.
+**Count:** 82 test files.
 **Run:** `npm test`
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
@@ -1210,7 +1762,7 @@ Six parallel jobs, each running lightweight external probes against the producti
 ### Frontend Tests
 
 **Config:** `web-ui/vitest.config.ts` with jsdom + `@solidjs/testing-library`.
-**Count:** 71 test files, ~1,324 tests.
+**Count:** 76 test files.
 **Run:** `cd web-ui && npm test`
 **Key patterns:** SolidJS stores use getter-based exports. Test by re-importing module after `vi.resetModules()`. Use `render()` from `@solidjs/testing-library` for component tests.
 
@@ -1468,7 +2020,7 @@ Zombie alarm loops are now prevented by two mechanisms: (1) `onStop()` calls `de
 
 `DELETE /api/users/:email` and `POST /configure` (stale user removal during reconfiguration) both call `cleanupUserData()` in `src/lib/user-cleanup.ts`, which: destroys all active containers, deletes the user KV entry and bucket-keyed KV entries (`storage-stats:`, `presets:`, `user-prefs:`), deletes the scoped R2 token, empties the R2 bucket via S3 `ListObjectsV2` + `DeleteObjects` loop (using worker-level R2 credentials via `createR2Client` + `emptyR2Bucket`), and deletes the empty bucket via Cloudflare API with retry logic (up to 3 attempts with exponential backoff for R2 eventual consistency when objects were deleted).
 
-If worker-level R2 credentials are not configured (e.g., setup was interrupted), the emptying step is skipped and bucket deletion may fail with `BucketNotEmpty`. This logs `logger.warn` server-side but does not block the overall cleanup. During reconfiguration, stale user cleanup is wrapped in a `runStep('cleanup_stale_users')` call for NDJSON progress visibility in the setup wizard frontend.
+If worker-level R2 credentials are not configured (e.g., setup was interrupted), the emptying step is skipped and bucket deletion may fail with `BucketNotEmpty`. This logs `logger.warn` server-side but does not block the overall cleanup. During reconfiguration, stale user cleanup is wrapped in a `runStep('cleanup_stale_users')` call for NDJSON progress visibility in the setup wizard frontend. **SaaS mode:** only admin-role users removed from the admin list are cleaned up — JIT-provisioned regular users are preserved. Each user's KV entry is checked for `role: 'admin'` before qualifying for removal.
 
 ### Chrome in CI (Ubuntu 22.04)
 
@@ -1877,6 +2429,40 @@ This caused visible oscillation (jump up, snap back down) during output with key
 
 The write callback's `scrollToBottom()` remains the single source of truth for bottom-anchoring during keyboard-open output.
 
+#### Programmatic Scroll Suppression (Fix 18)
+
+**Problem:** During rapid output with scrollback trimming at 400 lines, the terminal oscillated — jumping up, snapping down, producing visual artifacts. Root cause: `scrollToBottom()` and `scrollLines()` called by the post-write guard in `flushWriteBuffer()` fire synchronous `onScroll` events that the scroll-reset detector in `useTerminal.ts` misidentifies as browser focus resets.
+
+**xterm 6.0.0 internal mechanism:** `Viewport._sync()` calls `setScrollDimensions()` BEFORE `setScrollPosition()`. During the dimension update, `ScrollState` constructor clamps `scrollTop` to `max(0, scrollHeight - height)`. This clamped value can leak as an `onScroll` event with `ydisp = 0`, which matches the detector's `suspiciousReset` predicate.
+
+**Note:** Fix 17 (removing all custom corrections) was attempted and REVERTED — xterm does NOT handle viewport position natively during trim. The post-write guard and onScroll detector ARE needed.
+
+**Fix 18 changes:**
+
+1. **Suppression counter** (`scrollSuppressionCounts` map in `terminal.ts`) — tracks when programmatic scroll corrections are in progress. Uses a counter (not boolean) to handle nested/overlapping corrections.
+
+2. **Wrap post-write corrections** — `beginProgrammaticScroll(key)` before `scrollToBottom()` / `scrollLines()`, `endProgrammaticScroll(key)` via `queueMicrotask()` after. The microtask ensures the suppression covers the entire synchronous `onScroll` cascade.
+
+3. **Check suppression in onScroll detector** — early return when `isProgrammaticScrollSuppressed()` is true, but still update tracking baselines (`previousYdisp`, `previousDistFromBottom`, `wasFollowingOutput`) so the next unsuppressed event compares against correct state.
+
+This eliminates the feedback loop without weakening either protection mechanism. The onScroll detector remains active for genuine browser focus resets.
+
+#### Bottom-Following Re-Anchor in onScroll (Fix 19)
+
+**Problem:** Users at the bottom following output saw constant flashing/jitter during rapid output with scrollback trimming. The post-write callback correction (Fix 15) ran AFTER xterm rendered, causing a visible two-frame glitch: frame 1 shows wrong position, frame 2 shows corrected position.
+
+**Root cause:** `terminal.write(data, callback)` is async — the callback fires after xterm processes data AND renders via rAF. The correction arrives too late to prevent the bad frame from being painted.
+
+**Key insight (validated by GPT-5.4 + Gemini 3.1 Pro):** xterm's `onScroll` event fires synchronously during the parse loop, BEFORE the rAF render pass. Correcting viewport position in the `onScroll` handler means the fix is applied before the canvas paints — the bad frame is never visible.
+
+**Fix 19 changes:**
+
+1. **Bottom-following correction moved to `onScroll` handler** (`useTerminal.ts`) — when `wasFollowingOutput` is true and `ydisp < ybase`, call `scrollToBottom()` immediately. Uses `isCorrectingScroll` flag to prevent recursion. Checks recent user intent (wheel/pointerdown/keydown) to avoid trapping users at the bottom when they intentionally scroll up.
+
+2. **Write callback simplified** (`terminal.ts`) — bottom-followers skip the callback entirely (handled by `onScroll`). Callback only handles scrolled-up user distance correction, which is less timing-sensitive.
+
+3. **Fix 18 suppression counter preserved** — scrolled-up corrections in the write callback still use `beginProgrammaticScroll`/`endProgrammaticScroll` to prevent detector feedback.
+
 #### WS Retryable Close Codes (Fix 5)
 
 The WebSocket reconnection logic retries on a set of close codes (`WS_RETRYABLE_CLOSE_CODES`) rather than only on `1006` (Abnormal Closure). This covers server shutdown (1001), unexpected conditions (1011), service restart (1012), and try-again-later (1013). Normal closure (1000) does NOT trigger retry.
@@ -1946,7 +2532,7 @@ Users can choose between **Default** and **Advanced** session modes via Settings
 | Content | Default | Advanced |
 |---------|---------|----------|
 | Memory plugin & rule | No | Yes |
-| CI monitoring, environment, no-local-builds rules | Yes | Yes |
+| CI monitoring, environment, no-local-builds, deploy-credentials rules | Yes | Yes |
 | Cloudflare stack, ship, ship references skills | Yes | Yes |
 | `consult-llm` skill (CC only) | No | Yes |
 | `block-attributed-commits` hook (CC only) | No | Yes |
@@ -1958,9 +2544,9 @@ Users can choose between **Default** and **Advanced** session modes via Settings
 
 **Storage**: `sessionMode?: 'default' | 'advanced'` in `UserPreferences` (KV). Undefined = `'default'`.
 
-**Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and produces adapted versions for all 5 supported agents.
+**Manifest**: `preseed/agents/claude/manifest.json` — object-per-entry with `{ "modes": ["default", "advanced"] }` tags. The generator (`scripts/generate-agent-seed.mjs`) reads the manifest and produces adapted versions for all 6 supported agents.
 
-**Multi-agent generation**: The generator produces 123 seed documents from CC's preseed as the single source of truth. For each non-CC agent (Codex, Gemini CLI, Copilot, OpenCode), it: (1) concatenates applicable rules into a single instructions file per mode, (2) adapts skills with tool name remapping, (3) adapts agent definitions with tool name remapping and `model` field removal. Instructions files are variant-per-mode (same R2 key, different content for default vs advanced). See [Multi-Agent Preseed](#multi-agent-preseed) section below.
+**Multi-agent generation**: The generator produces 124 seed documents from CC's preseed as the single source of truth. For each non-CC agent (Codex, Gemini CLI, Copilot, OpenCode), it: (1) concatenates applicable rules into a single instructions file per mode, (2) adapts skills with tool name remapping, (3) adapts agent definitions with tool name remapping and `model` field removal. Instructions files are variant-per-mode (same R2 key, different content for default vs advanced). See [Multi-Agent Preseed](#multi-agent-preseed) section below.
 
 **Resolver**: `resolveSessionMode(prefs)` in `src/lib/session-mode.ts` — single source of truth for the `?? 'default'` fallback.
 
@@ -1980,7 +2566,7 @@ ECC-derived rules, agents, commands, and skills are preseeded directly to the ag
 
 **Skills (13 files, 11 unique skills)**: `cloudflare-stack`, `ship` (+ 2 reference files), `consult-llm`, `api-design`, `backend-patterns`, `content-hash-cache-pattern`, `database-migrations`, `deployment-patterns`, `frontend-patterns`, `iterative-retrieval`, `search-first`. Preseeded to `~/.claude/skills/<name>/SKILL.md` (and adapted equivalents for agents that support skills). `consult-llm` is CC-only (depends on MCP tool).
 
-**Rules (27 files, 3 default + 24 advanced-only)**: Core environment rules (`ci-monitoring`, `cloudflare-environment`, `no-local-builds`) in both modes. `memory` rule is advanced-only (depends on MCP memory server). ECC-derived language rules in `{common,typescript,python,golang,swift}/` subdirs (3 + 5*4 = 23 files, advanced only). Common rules cover security, coding style, and git workflow. Language-specific rules provide conventions for TypeScript, Python, Go, and Swift.
+**Rules (28 files, 4 in both modes + 24 advanced-only)**: Core environment rules (`ci-monitoring`, `cloudflare-environment`, `no-local-builds`, `deploy-credentials`) in both modes. `memory` rule is advanced-only (depends on MCP memory server). ECC-derived language rules in `{common,typescript,python,golang,swift}/` subdirs (3 + 5*4 = 23 files, advanced only). Common rules cover security, coding style, and git workflow. Language-specific rules provide conventions for TypeScript, Python, Go, and Swift.
 
 **Known marketplaces**: `plugins/known_marketplaces.json` preseeds the official Anthropic plugin marketplace URL for user discovery.
 
@@ -1992,13 +2578,13 @@ All preseed content is deployed via the manifest pipeline:
 
 1. Source files in `preseed/agents/claude/` organized by type: `rules/`, `agents/`, `commands/`, `skills/`, `plugins/`
 2. `preseed/agents/claude/manifest.json` maps each file to modes (`default`, `advanced`, or both)
-3. `scripts/generate-agent-seed.mjs` reads manifest + files (manifest-driven, ignores non-manifest files like `plugins/cache/`), generates `src/lib/agent-seed.generated.ts` with `AGENTS_SEEDED_CONFIGS` array (123 documents across all agents)
+3. `scripts/generate-agent-seed.mjs` reads manifest + files (manifest-driven, ignores non-manifest files like `plugins/cache/`), generates `src/lib/agent-seed.generated.ts` with `AGENTS_SEEDED_CONFIGS` array (124 documents across all agents)
 4. On first bucket creation: `reconcileAgentConfigs(mode, { overwrite: false, cleanup: false })` writes mode-appropriate files to R2
 5. On "Recreate skills & rules" button: `reconcileAgentConfigs(mode, { overwrite: true, cleanup: true })` overwrites in R2 and deletes files not in current mode
 6. Bisync pulls from R2 to container config directories (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`, `~/.config/opencode/`)
 
-**Manifest structure (58 CC source entries)**:
-- `rules/` (27): core (3 default+advanced + 1 advanced-only: memory), common (3), typescript (5), python (5), golang (5), swift (5)
+**Manifest structure (59 total entries)**:
+- `rules/` (28): core (4 default+advanced: ci-monitoring, cloudflare-environment, no-local-builds, deploy-credentials; + 1 advanced-only: memory), common (3), typescript (5), python (5), golang (5), swift (5)
 - `agents/` (7): architect, build-error-resolver, code-reviewer, doc-updater, refactor-cleaner, security-reviewer, tdd-guide (advanced only)
 - `commands/` (5): brainstorm, debug, deploy, plan, review (advanced only)
 - `skills/` (13): cloudflare-stack, ship (+2 refs), consult-llm, api-design, backend-patterns, content-hash-cache-pattern, database-migrations, deployment-patterns, frontend-patterns, iterative-retrieval, search-first
@@ -2006,7 +2592,7 @@ All preseed content is deployed via the manifest pipeline:
 
 ### Multi-Agent Preseed
 
-The generator produces adapted config files for 5 agents from CC's preseed as single source of truth. No duplicate preseed files exist on disk.
+The generator produces adapted config files for 6 agents from CC's preseed as single source of truth. No duplicate preseed files exist on disk.
 
 **Supported agents and their config locations:**
 

@@ -71,6 +71,12 @@ async function resolveManagedAccessApp(
   existingApps: AccessApp[],
   managedAppName: string
 ): Promise<AccessApp | null> {
+  // 4-tier fallback strategy to find existing Access app:
+  // 1. Exact domain match (highest specificity)
+  // 2. Stored app ID from prior setup
+  // 3. Name match + domain validation (prevent cross-env collision)
+  // 4. /app/* suffix + domain validation (prevent cross-env collision)
+
   const desiredDomain = getManagedAppDomain(customDomain);
   const byDesiredDomain = existingApps.find((app) => app.domain === desiredDomain) ?? null;
   if (byDesiredDomain) {
@@ -85,7 +91,8 @@ async function resolveManagedAccessApp(
     }
   }
 
-  // Fallback for fresh KV + pre-existing Access app: prefer a uniquely named managed app.
+  // Tier 3: Name match + domain validation
+  // Handles fresh KV + pre-existing Access app from prior setup
   const byManagedName = existingApps.filter((app) => app.name === managedAppName && app.domain.includes(customDomain));
   if (byManagedName.length === 1) {
     return byManagedName[0];
@@ -98,6 +105,7 @@ async function resolveManagedAccessApp(
     return byManagedName[0];
   }
 
+  // Tier 4: /app/* suffix + domain validation (legacy app format)
   const byAppSuffix = existingApps.filter((app) => app.domain.endsWith('/app/*') && app.domain.includes(customDomain));
   if (byAppSuffix.length === 1) {
     return byAppSuffix[0];
@@ -143,13 +151,32 @@ async function upsertAccessApp(
   existingAppId: string | null,
   managedAppName: string,
   steps: SetupStep[],
-  stepIndex: number
+  stepIndex: number,
+  saasIdpIds?: string[]
 ): Promise<AccessAppResult | null> {
   const appDomain = getManagedAppDomain(customDomain);
   const method = existingAppId ? 'PUT' : 'POST';
   const url = existingAppId
     ? `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingAppId}`
     : `${CF_API_BASE}/accounts/${accountId}/access/apps`;
+
+  // SaaS mode: configure app to restrict login methods to social IdPs.
+  // Note: This is the APPLICATION config (controls login UI), separate from the POLICY
+  // (controls who is allowed). In SaaS mode, the policy uses login_method includes,
+  // allowing any authenticated user. Worker enforces access-tier authorization.
+  const appBody: Record<string, unknown> = {
+    name: managedAppName,
+    domain: appDomain,
+    destinations: getManagedDestinations(customDomain),
+    type: 'self_hosted',
+    session_duration: '24h',
+    skip_interstitial: true,
+    auto_redirect_to_identity: saasIdpIds ? saasIdpIds.length === 1 : false,
+  };
+  // Restrict login to GitHub IdP in SaaS mode (social IdP)
+  if (saasIdpIds && saasIdpIds.length > 0) {
+    appBody.allowed_idps = saasIdpIds;
+  }
 
   const response = await withSetupRetry(
     () => cfApiCB.execute(() => fetch(url, {
@@ -158,15 +185,7 @@ async function upsertAccessApp(
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      name: managedAppName,
-      domain: appDomain,
-      destinations: getManagedDestinations(customDomain),
-      type: 'self_hosted',
-      session_duration: '24h',
-      auto_redirect_to_identity: false,
-      skip_interstitial: true,
-    }),
+    body: JSON.stringify(appBody),
     signal: AbortSignal.timeout(10000),
   })), 'upsertAccessApp');
 
@@ -347,17 +366,39 @@ async function pruneLegacyAccessApps(
   return existingApps.filter((app) => !staleIds.has(app.id));
 }
 
+async function listIdentityProviders(
+  token: string,
+  accountId: string
+): Promise<Array<{ id: string; type: string; name: string }>> {
+  const res = await cfApiCB.execute(() => fetch(
+    `${CF_API_BASE}/accounts/${accountId}/access/identity_providers`,
+    { headers: { 'Authorization': `Bearer ${token}` }, signal: AbortSignal.timeout(10000) }
+  ));
+  const data = await parseCfResponse<Array<{ id: string; type: string; name: string }>>(res);
+  if (data.success && Array.isArray(data.result)) {
+    return data.result.map(p => ({ id: p.id, type: p.type, name: p.name }));
+  }
+  return [];
+}
+
 async function upsertAccessPolicy(
   token: string,
   accountId: string,
   appId: string,
   adminGroupId: string,
-  userGroupId: string | null
+  userGroupId: string | null,
+  saasLoginMethods?: Array<{ id: string }>
 ): Promise<void> {
-  const include = [
-    { group: { id: adminGroupId } },
-    ...(userGroupId ? [{ group: { id: userGroupId } }] : []),
-  ];
+  // Policy include strategy (determines who passes CF Access):
+  // - SaaS mode: login_method includes (any user authenticating via GitHub).
+  //   Worker applies access-tier gating. Admin group NOT in policy (Worker checks role).
+  // - Default mode: group includes (admin + user groups with allowlisted emails).
+  const include = saasLoginMethods
+    ? saasLoginMethods.map(m => ({ login_method: { id: m.id } }))
+    : [
+        { group: { id: adminGroupId } },
+        ...(userGroupId ? [{ group: { id: userGroupId } }] : []),
+      ];
 
   let updated = false;
   try {
@@ -477,7 +518,8 @@ export async function handleCreateAccessApp(
   adminUsers: string[],
   steps: SetupStep[],
   kv: KVNamespace,
-  workerName?: string
+  workerName?: string,
+  saasMode?: boolean
 ): Promise<void> {
   const stepIndex = addStep(steps, 'create_access_app');
 
@@ -487,6 +529,13 @@ export async function handleCreateAccessApp(
     const adminSet = new Set(adminUsers.map((email) => email.trim().toLowerCase()));
     const dedupedAllowedUsers = Array.from(new Set(allowedUsers.map((email) => email.trim().toLowerCase())));
     const regularUsers = dedupedAllowedUsers.filter((email) => !adminSet.has(email));
+
+    // Fetch IdPs early — needed for SaaS mode policy AND stored in KV for login page
+    const idpList = await listIdentityProviders(token, accountId);
+    if (idpList.length > 0) {
+      await kv.put('setup:idp_list', JSON.stringify(idpList));
+      logger.info('Stored IdP list in KV', { count: idpList.length });
+    }
 
     const listedGroups = await listAccessGroups(token, accountId);
     const adminGroup = await upsertAccessGroup(
@@ -502,8 +551,11 @@ export async function handleCreateAccessApp(
       throw new Error(`Could not resolve Access group ${groupNames.admin}`);
     }
 
+    // In SaaS mode, skip user group creation because:
+    // - Access policy uses login_method includes (any authenticated GitHub user)
+    // - Worker enforces per-user access-tier authorization (pending/standard/advanced)
     let userGroup: AccessGroupResult | null = null;
-    if (regularUsers.length > 0) {
+    if (!saasMode && regularUsers.length > 0) {
       userGroup = await upsertAccessGroup(
         token,
         accountId,
@@ -522,6 +574,13 @@ export async function handleCreateAccessApp(
     const existingApps = await pruneLegacyAccessApps(token, accountId, customDomain, listedApps, managedAppName);
     const audienceTags: string[] = [];
     const existingManagedApp = await resolveManagedAccessApp(kv, customDomain, existingApps, managedAppName);
+
+    // In SaaS mode, restrict the Access app to GitHub IdP only.
+    // With exactly one IdP, auto_redirect_to_identity=true skips the CF Access login interstitial.
+    const saasIdpIds = saasMode
+      ? idpList.filter(p => p.type === 'github').map(p => p.id)
+      : undefined;
+
     const appResult = await upsertAccessApp(
       token,
       accountId,
@@ -529,7 +588,8 @@ export async function handleCreateAccessApp(
       existingManagedApp?.id ?? null,
       managedAppName,
       steps,
-      stepIndex
+      stepIndex,
+      saasIdpIds
     );
     if (!appResult) {
       throw new SetupError('Failed to create or update Access application', steps);
@@ -538,12 +598,21 @@ export async function handleCreateAccessApp(
     if (appResult.aud) {
       audienceTags.push(appResult.aud);
     }
-    await upsertAccessPolicy(token, accountId, appResult.id, adminGroup.id, userGroup?.id ?? null);
+
+    // Access policy includes strategy:
+    // - SaaS mode: login_method include (any GitHub-authenticated user passes CF Access).
+    //   Worker enforces per-user access-tier authorization (pending/standard/advanced).
+    // - Default mode: group-based includes (only allowlisted email addresses).
+    const saasLoginMethods = saasMode && saasIdpIds
+      ? saasIdpIds.map(id => ({ id }))
+      : undefined;
+    await upsertAccessPolicy(token, accountId, appResult.id, adminGroup.id, userGroup?.id ?? null, saasLoginMethods);
 
     await storeAccessConfig(token, accountId, kv, audienceTags, groupNames, {
       admin: adminGroup.id,
       user: userGroup?.id ?? '',
     }, appResult.id);
+
     steps[stepIndex].status = 'success';
   } catch (error) {
     steps[stepIndex].status = 'error';

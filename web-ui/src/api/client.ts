@@ -1,4 +1,4 @@
-import type { Session, UserInfo, InitProgress, StartupStatusResponse, AgentType, TabConfig, TabPreset, UserPreferences } from '../types';
+import type { Session, UserInfo, InitProgress, StartupStatusResponse, AgentType, TabConfig, TabPreset, UserPreferences, AuthStatus, AuthProvider } from '../types';
 import { logger } from '../lib/logger';
 import { STARTUP_POLL_INTERVAL_MS, SESSION_ID_DISPLAY_LENGTH, MAX_STARTUP_POLL_ERRORS, MAX_TERMINALS_PER_SESSION } from '../lib/constants';
 import { z } from 'zod';
@@ -20,6 +20,9 @@ import {
   LlmKeysResponseSchema,
   DeployKeysResponseSchema,
   OnboardingConfigResponseSchema,
+  AuthStatusResponseSchema,
+  AuthProvidersResponseSchema,
+  AccessTierSchema,
 } from '../lib/schemas';
 import { mapStartupDetailsToProgress } from '../lib/status-mapper';
 import { ApiError, baseFetch } from './fetch-helper';
@@ -333,6 +336,12 @@ export async function getOnboardingConfig(): Promise<OnboardingConfigResponse> {
   });
 }
 
+// Mark onboarding as complete for the current user
+export async function markOnboardingComplete(): Promise<{ success: boolean }> {
+  const data = await fetchApi<{ success: boolean }>('/user/onboarding-complete', { method: 'POST' });
+  return data ?? { success: false };
+}
+
 // R2 scoped token readiness
 export async function getR2Status(): Promise<{ ready: boolean }> {
   const data = await fetchApi<{ ready: boolean }>('/user/r2-status', {});
@@ -342,6 +351,48 @@ export async function getR2Status(): Promise<{ ready: boolean }> {
 export async function ensureR2Token(): Promise<{ ready: boolean }> {
   const data = await fetchApi<{ ready: boolean }>('/user/ensure-r2-token', { method: 'POST' });
   return data ?? { ready: false };
+}
+
+// Auth API — providers endpoint uses /public/ prefix to bypass CF Access
+export async function getAuthProviders(): Promise<{ providers: AuthProvider[] }> {
+  return baseFetch<{ providers: AuthProvider[] }>('/auth/providers', {}, {
+    basePath: '/public',
+    schema: AuthProvidersResponseSchema,
+  });
+}
+
+export async function getAuthStatus(): Promise<AuthStatus> {
+  return fetchApi('/auth/status', {}, AuthStatusResponseSchema);
+}
+
+export async function requestAccess(turnstileToken: string): Promise<{ success: boolean }> {
+  return fetchApi('/auth/request-access', {
+    method: 'POST',
+    body: JSON.stringify({ turnstileToken }),
+  }, z.object({ success: z.boolean() }));
+}
+
+
+const UpdateUserTierResponseSchema = z.object({
+  success: z.boolean(),
+  email: z.string(),
+  accessTier: AccessTierSchema,
+});
+
+export async function updateUserAccessTier(
+  email: string,
+  accessTier: string
+): Promise<z.infer<typeof UpdateUserTierResponseSchema>> {
+  return fetchApi(`/users/${encodeURIComponent(email)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ accessTier }),
+  }, UpdateUserTierResponseSchema);
+}
+
+export async function deleteUser(email: string): Promise<{ success: boolean; email: string }> {
+  return fetchApi(`/users/${encodeURIComponent(email)}`, {
+    method: 'DELETE',
+  }, z.object({ success: z.boolean(), email: z.string() }));
 }
 
 // Session ID format: 8-24 lowercase alphanumeric characters (matches backend SESSION_ID_PATTERN)

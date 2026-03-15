@@ -4,6 +4,31 @@ import { logger } from './logger';
 import { getXtermCore, setIframeInput, setRemoveFocusGuard } from './xterm-internals';
 
 // ---------------------------------------------------------------------------
+// Sticky CTRL modifier for mobile floating button
+// ---------------------------------------------------------------------------
+
+let _ctrlStickyActive = false;
+let _ctrlDeactivateCallback: (() => void) | null = null;
+
+/** Activate sticky Ctrl — next keypress will include Ctrl modifier, then auto-deactivate. */
+export function activateStickyCtrl(onDeactivate?: () => void): void {
+  _ctrlStickyActive = true;
+  _ctrlDeactivateCallback = onDeactivate ?? null;
+}
+
+/** Deactivate sticky Ctrl. */
+export function deactivateStickyCtrl(): void {
+  _ctrlStickyActive = false;
+  if (_ctrlDeactivateCallback) {
+    _ctrlDeactivateCallback();
+    _ctrlDeactivateCallback = null;
+  }
+}
+
+/** Check if sticky Ctrl is active. */
+export function isStickyCtrlActive(): boolean { return _ctrlStickyActive; }
+
+// ---------------------------------------------------------------------------
 // Extracted key-mapping constants and pure dispatch logic (CF-020)
 // ---------------------------------------------------------------------------
 
@@ -220,9 +245,16 @@ export function setupMobileInput(
       if (!terminal) return;
       sentViaKeydown = false;
 
+      // Sticky CTRL: if the floating button activated it, treat this keypress as Ctrl+key.
+      // On mobile virtual keyboards, keydown often fires with key='Unidentified' or 'Process'.
+      // In that case, don't consume sticky CTRL here — let the 'input' event handler use it.
+      const useCtrl = e.ctrlKey || _ctrlStickyActive;
+      const keyIdentified = e.key !== 'Unidentified' && e.key !== 'Process';
+      if (_ctrlStickyActive && keyIdentified) deactivateStickyCtrl();
+
       const action = resolveKeyAction(
         e.key,
-        e.ctrlKey,
+        useCtrl,
         !!terminal.getSelection(),
       );
 
@@ -262,6 +294,16 @@ export function setupMobileInput(
       if (!terminal) return;
       const val = input.value;
       if (val) {
+        // Sticky CTRL not consumed by keydown (key was 'Unidentified') — apply here
+        if (_ctrlStickyActive && val.length === 1) {
+          deactivateStickyCtrl();
+          const code = val.toLowerCase().charCodeAt(0);
+          if (code >= 97 && code <= 122) {
+            terminal.input(String.fromCharCode(code - 96), false);
+            input.value = '';
+            return;
+          }
+        }
         terminal.input(val, false);
         input.value = '';
       }

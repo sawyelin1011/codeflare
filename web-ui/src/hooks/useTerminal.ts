@@ -153,9 +153,16 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       textarea.setAttribute('data-enable-grammarly', 'false');
     }
 
-    // Ctrl+C/V key handler
+    // Custom key handler: Shift+Enter (CSI u for Claude Code), Ctrl+C (copy), Ctrl+V (paste)
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
+      // Shift+Enter → send CSI u encoded sequence so Claude Code can distinguish
+      // it from plain Enter and insert a newline instead of submitting.
+      // Without this, xterm.js sends \r for both Enter and Shift+Enter.
+      if (event.shiftKey && event.key === 'Enter') {
+        term!.input('\x1b[13;2u', false);
+        return false;
+      }
       if (event.ctrlKey && event.key === 'c') {
         const selection = term!.getSelection();
         if (selection) {
@@ -271,8 +278,43 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
           return;
         }
 
+        // Fix 18: Skip detection for scroll events caused by our own post-write
+        // corrections in flushWriteBuffer. These are tagged with a suppression
+        // counter to prevent cross-triggering feedback loops during trim.
+        // Still update baselines so the next unsuppressed event compares correctly.
+        if (terminalStore.isProgrammaticScrollSuppressed(props.sessionId, props.terminalId)) {
+          wasFollowingOutput = ydisp >= ybase;
+          previousYdisp = ydisp;
+          previousDistFromBottom = distFromBottom;
+          return;
+        }
+
         const wasFollowing = wasFollowingOutput;
         wasFollowingOutput = ydisp >= ybase;
+
+        // Fix 19: Bottom-following re-anchor in onScroll (before render).
+        // xterm's onScroll fires synchronously during the parse loop, BEFORE
+        // the rAF render pass. If the user was following output and got displaced
+        // during scrollback trimming, correct immediately — this prevents the
+        // visible one-frame jitter that occurred with the write callback approach.
+        // User intent (wheel/pointerdown/keydown) is checked to avoid trapping
+        // the user at the bottom when they intentionally scroll up.
+        if (wasFollowing && ydisp < ybase) {
+          const recentIntent = Date.now() - lastUserScrollIntentAt < USER_SCROLL_GRACE_MS
+            || hasRecentScrollIntent(props.sessionId, props.terminalId, USER_SCROLL_GRACE_MS);
+          if (!recentIntent) {
+            isCorrectingScroll = true;
+            try {
+              t.scrollToBottom();
+            } finally {
+              isCorrectingScroll = false;
+            }
+            wasFollowingOutput = true;
+            previousYdisp = t.buffer.active.viewportY;
+            previousDistFromBottom = t.buffer.active.baseY - t.buffer.active.viewportY;
+            return;
+          }
+        }
 
         // Fix 16: When virtual keyboard is open, skip all scroll correction.
         // The terminal is in bottom-anchored mode — the write callback handles

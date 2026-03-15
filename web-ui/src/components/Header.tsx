@@ -3,6 +3,9 @@ import {
   mdiXml,
   mdiCogOutline,
   mdiAccountCircle,
+  mdiAccountOutline,
+  mdiRocketLaunchOutline,
+  mdiLogout,
   mdiViewDashboardOutline,
   mdiBookOutline,
   mdiDelete,
@@ -38,6 +41,7 @@ interface HeaderProps {
   onStopSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
   onCreateSession: (name: string, agentType?: AgentType, tabConfig?: TabConfig[]) => void;
+  // Note: logout is handled via CF Access at /cdn-cgi/access/logout
 }
 
 /**
@@ -49,12 +53,14 @@ interface HeaderProps {
  * +-----------------------------------------------------------------------------------+
  */
 const Header: Component<HeaderProps> = (props) => {
+  const [showUserMenu, setShowUserMenu] = createSignal(false);
   const [showBookmarksMenu, setShowBookmarksMenu] = createSignal(false);
   const [showCreateBookmark, setShowCreateBookmark] = createSignal(false);
   const [bookmarkName, setBookmarkName] = createSignal('');
   const [bookmarkError, setBookmarkError] = createSignal<string | null>(null);
   const [editingPresetId, setEditingPresetId] = createSignal<string | null>(null);
   const [editingPresetName, setEditingPresetName] = createSignal('');
+  let userMenuRef: HTMLDivElement | undefined;
   let bookmarksMenuRef: HTMLDivElement | undefined;
   let bookmarkInputRef: HTMLInputElement | undefined;
   let renameInputRef: HTMLInputElement | undefined;
@@ -77,6 +83,9 @@ const Header: Component<HeaderProps> = (props) => {
   };
 
   const handleClickOutside = (e: MouseEvent) => {
+    if (showUserMenu() && userMenuRef && !userMenuRef.contains(e.target as Node)) {
+      setShowUserMenu(false);
+    }
     if (!showBookmarksMenu()) return;
     if (bookmarksMenuRef && !bookmarksMenuRef.contains(e.target as Node)) {
       closeBookmarksMenu();
@@ -225,15 +234,55 @@ const Header: Component<HeaderProps> = (props) => {
           </button>
         </Show>
 
-        {/* User menu */}
-        <button type="button" class="header-user-menu" data-testid="header-user-menu" title="User menu">
-          <Show when={props.userName} fallback={<Icon path={mdiAccountCircle} size={24} class="header-user-avatar" />}>
-            <img src={getGravatarUrl(props.userName!, 48)} alt="Avatar" class="header-user-avatar-img" width={24} height={24} />
+        {/* User menu with dropdown */}
+        <div class="header-user-wrapper" ref={userMenuRef}>
+          <button
+            type="button"
+            class="header-user-menu"
+            data-testid="header-user-menu"
+            title="User menu"
+            onClick={() => setShowUserMenu(!showUserMenu())}
+          >
+            <Show when={props.userName} fallback={<Icon path={mdiAccountCircle} size={24} class="header-user-avatar" />}>
+              <img src={getGravatarUrl(props.userName!, 48)} alt="Avatar" class="header-user-avatar-img" width={24} height={24} />
+            </Show>
+            <Show when={props.userName}>
+              <span class="header-user-name">{props.userName}</span>
+            </Show>
+          </button>
+          {/* Profile and Guided Setup use plain <a> tags — SolidJS Router's
+              top-level DOM listener intercepts clicks for client-side navigation.
+              No onClick handlers = no touch event race conditions on mobile. */}
+          <Show when={showUserMenu()}>
+            <div class="header-user-dropdown" data-testid="header-user-dropdown">
+              <a
+                href="/app/subscribe"
+                class="header-user-dropdown-item"
+                data-testid="header-user-dropdown-profile"
+              >
+                <Icon path={mdiAccountOutline} size={16} />
+                <span>Profile</span>
+              </a>
+              <a
+                href="/app/onboarding"
+                class="header-user-dropdown-item"
+                data-testid="header-user-dropdown-onboarding"
+              >
+                <Icon path={mdiRocketLaunchOutline} size={16} />
+                <span>Guided Setup</span>
+              </a>
+              <button
+                type="button"
+                class="header-user-dropdown-item header-user-dropdown-item--danger"
+                data-testid="header-user-dropdown-logout"
+                onClick={() => { window.location.href = `/cdn-cgi/access/logout?returnTo=${encodeURIComponent(window.location.origin + '/')}`; }}
+              >
+                <Icon path={mdiLogout} size={16} />
+                <span>Logout</span>
+              </button>
+            </div>
           </Show>
-          <Show when={props.userName}>
-            <span class="header-user-name">{props.userName}</span>
-          </Show>
-        </button>
+        </div>
 
         {/* Bookmarks button */}
         <div class="header-bookmarks-wrapper" ref={bookmarksMenuRef}>

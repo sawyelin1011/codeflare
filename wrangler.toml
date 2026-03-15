@@ -18,6 +18,12 @@ ALLOWED_ORIGINS = ".workers.dev"
 LOG_LEVEL = "info"
 MAX_SESSIONS_USER = "3"
 MAX_SESSIONS_ADMIN = "10"
+# SaaS mode: custom login page, auto-provisioning, admin approval gate
+# Set to "active" via GitHub Actions variable to enable
+# SAAS_MODE = "inactive"
+# Extra IdP UUIDs for custom OIDC providers on login page (comma-separated)
+# Set via GitHub Actions variable; only relevant when SAAS_MODE = "active"
+# SAAS_EXTRA_IDPS = ""
 
 # KV namespace for session metadata
 # The id "placeholder" is for local dev/tests (vitest-pool-workers creates in-memory KV).
@@ -60,4 +66,4 @@ not_found_handling = "single-page-application"
 # Ensure control-plane routes pass through Worker logic first.
 # - "/" is needed for mode-aware redirect/landing logic
 # - "/api/*" and "/health" must never be swallowed by SPA asset fallback
-run_worker_first = ["/", "/api/*", "/public/*", "/health"]
+run_worker_first = ["/", "/auth/*", "/api/*", "/public/*", "/health"]

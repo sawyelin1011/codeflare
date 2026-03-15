@@ -1,8 +1,10 @@
 import { Component, onMount, onCleanup, createSignal, Show, lazy, type JSX } from 'solid-js';
+import type { AccessTier } from './types';
 import { Router, Route, Navigate, useNavigate } from '@solidjs/router';
 import Layout from './components/Layout';
 import SetupWizard from './components/setup/SetupWizard';
-import { getUser, getSetupStatus } from './api/client';
+import { getUser, getSetupStatus, getAuthProviders, getOnboardingConfig } from './api/client';
+import { ApiError } from './api/fetch-helper';
 import { sessionStore } from './stores/session';
 import { storageStore } from './stores/storage';
 import { terminalStore } from './stores/terminal';
@@ -11,6 +13,10 @@ import './styles/app.css';
 
 // Lazy-load the onboarding landing page (only needed when onboarding mode is active)
 const OnboardingLanding = lazy(() => import('./components/OnboardingLanding'));
+const LoginPage = lazy(() => import('./components/LoginPage'));
+const SubscribePage = lazy(() => import('./components/SubscribePage'));
+const UserManagement = lazy(() => import('./components/admin/UserManagement'));
+const OnboardingPage = lazy(() => import('./components/OnboardingPage'));
 
 // Check setup status from API.
 // Returns null when status cannot be determined (e.g. Access redirect/network error).
@@ -29,6 +35,7 @@ async function checkSetupStatus(): Promise<boolean | null> {
 const AppContent: Component = () => {
   const [userName, setUserName] = createSignal<string | undefined>();
   const [userRole, setUserRole] = createSignal<'admin' | 'user' | undefined>();
+  const [userAccessTier, setUserAccessTier] = createSignal<AccessTier | undefined>();
   const [onboardingActive, setOnboardingActive] = createSignal<boolean | undefined>();
   const [loading, setLoading] = createSignal(true);
   const [authError, setAuthError] = createSignal<string | null>(null);
@@ -38,10 +45,29 @@ const AppContent: Component = () => {
       const user = await getUser();
       setUserName(user.email);
       setUserRole(user.role);
+      setUserAccessTier(user.accessTier);
       setOnboardingActive(user.onboardingActive);
       if (user.workerName) storageStore.setWorkerName(user.workerName);
+      // First-time user: redirect to guided setup
+      if (user.saasMode && !user.onboardingComplete) {
+        window.location.href = '/app/onboarding';
+        return;
+      }
     } catch (err) {
       logger.warn('Failed to get user info:', err);
+      // SaaS mode: pending/blocked users get 403 from requireActiveUser
+      if (err instanceof ApiError && err.status === 403) {
+        try {
+          const parsed = typeof err.body === 'string' ? JSON.parse(err.body) : err.body;
+          const code = parsed && typeof parsed === 'object' && 'code' in parsed ? (parsed as { code: string }).code : null;
+          if (code === 'PENDING' || code === 'BLOCKED') {
+            window.location.href = '/app/subscribe';
+            return;
+          }
+        } catch {
+          // Failed to parse body — fall through to generic error
+        }
+      }
       if (import.meta.env.DEV) {
         setUserName('dev@localhost');
         setUserRole('admin');
@@ -78,7 +104,7 @@ const AppContent: Component = () => {
           </div>
         }
       >
-        <Layout userName={userName()} userRole={userRole()} onboardingActive={onboardingActive()} />
+        <Layout userName={userName()} userRole={userRole()} userAccessTier={userAccessTier()} onboardingActive={onboardingActive()} />
       </Show>
     </Show>
   );
@@ -124,11 +150,73 @@ const SetupGuard: Component<{ children: JSX.Element }> = (props) => {
   );
 };
 
+/**
+ * Root page component — decides which landing to show based on deployment mode.
+ * SaaS mode (providers configured) → LoginPage
+ * Onboarding mode (onboarding active) → OnboardingLanding
+ * Default → redirect to /app/
+ */
+const RootPage: Component = () => {
+  const [mode, setMode] = createSignal<'loading' | 'login' | 'onboarding' | 'redirect'>('loading');
+
+  onMount(async () => {
+    // Check if SaaS mode is active (providers endpoint is public)
+    try {
+      const { providers } = await getAuthProviders();
+      if (providers.length > 0) {
+        setMode('login');
+        return;
+      }
+    } catch {
+      // providers endpoint failed — not in SaaS mode or backend issue
+    }
+
+    // Check if onboarding mode is active
+    try {
+      const config = await getOnboardingConfig();
+      if (config.active) {
+        setMode('onboarding');
+        return;
+      }
+    } catch {
+      // onboarding config failed — default mode
+    }
+
+    // Default mode — redirect to /app/
+    setMode('redirect');
+    window.location.href = '/app/';
+  });
+
+  return (
+    <Show when={mode() !== 'loading'} fallback={
+      <div class="app-loading">
+        <div class="app-loading-spinner" />
+        <span>Loading...</span>
+      </div>
+    }>
+      <Show when={mode() === 'login'}>
+        <LoginPage />
+      </Show>
+      <Show when={mode() === 'onboarding'}>
+        <OnboardingLanding />
+      </Show>
+    </Show>
+  );
+};
+
 const App: Component = () => {
   return (
     <Router>
       <Route path="/setup" component={SetupWizard} />
-      <Route path="/" component={OnboardingLanding} />
+      <Route path="/" component={RootPage} />
+      <Route path="/login" component={LoginPage} />
+      <Route path="/app/subscribe" component={SubscribePage} />
+      <Route path="/app/onboarding" component={OnboardingPage} />
+      <Route path="/admin/users" component={() => (
+        <SetupGuard>
+          <UserManagement onBack={() => { window.location.href = '/app/'; }} />
+        </SetupGuard>
+      )} />
       <Route
         path="/*"
         component={() => (

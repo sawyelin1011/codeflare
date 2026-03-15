@@ -24,6 +24,18 @@ Chat history is summarized automatically by the memory-capture UserPromptSubmit 
 
 When the user says "check memory", "update memory", "optimize memory", "compact memory", "search memory", "load memory", or similar — they mean the **MCP memory server** (server-memory). Use the MCP tools (`search_nodes`, `read_graph`, `create_entities`, `add_observations`, `delete_entities`, `delete_observations`). Do NOT confuse this with the file-based memory system at `~/.claude/projects/*/memory/`.
 
-## Hook-Triggered Summarization
+## Hook-Triggered Summarization (MANDATORY)
 
-When a `UserPromptSubmit hook additional context` system-reminder appears, you MUST follow its instructions immediately. It runs in the background and does not block your response.
+The memory-capture hook fires periodically and injects `UserPromptSubmit hook additional context: Spawn a background haiku Task agent...` into the system-reminder.
+
+**Execution protocol — do this FIRST, before responding to the user:**
+
+1. Extract the lock file path from the hook message
+2. Check if lock exists: `ls <lock_file> 2>/dev/null`
+3. If lock exists → skip (agent already running)
+4. If no lock → create lock (`touch <lock_file>`) → spawn background haiku agent with the instructions from the hook message
+5. Then respond to the user's actual message
+
+**DO NOT ignore this hook.** It is a system-level directive, not optional context.
+
+**DO NOT re-trigger** when no fresh `additionalContext` arrived in the current turn. The message can persist in context from prior turns — only act on it when it appears as part of the CURRENT user message's system-reminders.

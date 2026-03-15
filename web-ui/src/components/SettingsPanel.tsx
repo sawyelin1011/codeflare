@@ -7,6 +7,10 @@ import {
   mdiFastForward,
   mdiContentPaste,
   mdiChevronDown,
+  mdiWrenchOutline,
+  mdiAccountGroupOutline,
+  mdiFileDocumentRefreshOutline,
+  mdiRobotOutline,
 } from '@mdi/js';
 import Icon from './Icon';
 import Button from './ui/Button';
@@ -15,6 +19,8 @@ import type { Settings } from '../lib/settings';
 import { sessionStore } from '../stores/session';
 import { isTouchDevice, isSamsungBrowser } from '../lib/mobile';
 import { recreateGettingStartedDocs, recreateAgentConfigs } from '../api/storage';
+import { getUser } from '../api/client';
+import type { AccessTier } from '../types';
 import DeployKeysSection from './settings/DeployKeysSection';
 import LlmKeysSection from './settings/LlmKeysSection';
 import '../styles/settings-panel.css';
@@ -24,6 +30,7 @@ interface SettingsPanelProps {
   onClose: () => void;
   currentUserEmail?: string;
   currentUserRole?: 'admin' | 'user';
+  currentUserAccessTier?: import('../types').AccessTier;
 }
 
 type AccordionGroup = 'appearance' | 'session' | 'deploy' | 'llm' | 'admin';
@@ -116,12 +123,20 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
   const [recreateAgentError, setRecreateAgentError] = createSignal<string | null>(null);
   const [openGroup, setOpenGroup] = createSignal<AccordionGroup>('appearance');
 
+  // Live access tier — refreshed from API each time panel opens so tier
+  // upgrades take effect without a full page reload.
+  const [liveAccessTier, setLiveAccessTier] = createSignal<AccessTier | undefined>(props.currentUserAccessTier);
+
   // Reset accordion to Appearance when panel is closed then reopened (false → true)
   createEffect(on(
     () => props.isOpen,
     (isOpen, prevIsOpen) => {
       if (isOpen && prevIsOpen === false) {
         setOpenGroup('appearance');
+        // Re-fetch access tier on panel open
+        getUser().then((user) => {
+          if (user.accessTier) setLiveAccessTier(user.accessTier);
+        }).catch(() => {});
       }
     }
   ));
@@ -131,7 +146,14 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
   };
 
   const isAdmin = () => props.currentUserRole === 'admin';
-  const workspaceSyncEnabled = () => sessionStore.preferences.workspaceSyncEnabled !== false;
+  const canUseAdvanced = () => {
+    // Admins always have advanced access regardless of stored tier
+    if (isAdmin()) return true;
+    const tier = liveAccessTier();
+    // advanced tier or no tier set (backward compat: non-SaaS defaults to full access)
+    return !tier || tier === 'advanced';
+  };
+  const workspaceSyncEnabled = () => sessionStore.preferences.workspaceSyncEnabled === true;
   const fastStartEnabled = () => sessionStore.preferences.fastStartEnabled !== false;
   const currentSessionMode = () => sessionStore.preferences.sessionMode ?? 'default';
 
@@ -447,7 +469,7 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                   Default
                 </label>
                 <label
-                  class={`session-mode-option ${currentSessionMode() === 'advanced' ? 'session-mode-option--selected' : ''}`}
+                  class={`session-mode-option ${currentSessionMode() === 'advanced' ? 'session-mode-option--selected' : ''} ${!canUseAdvanced() ? 'session-mode-option--disabled' : ''}`}
                 >
                   <input
                     type="radio"
@@ -455,6 +477,7 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                     value="advanced"
                     checked={currentSessionMode() === 'advanced'}
                     onChange={() => handleSessionModeChange('advanced')}
+                    disabled={!canUseAdvanced()}
                     role="radio"
                     aria-checked={currentSessionMode() === 'advanced'}
                     data-testid="session-mode-advanced"
@@ -526,25 +549,18 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                   Restart the session after changing this switch for it to take effect.
                 </span>
               </div>
-              <div class="setting-row setting-row--column-gap">
-                <div class="setting-row setting-row--split" data-testid="settings-recreate-docs-row">
-                  <span class="settings-hint settings-hint--primary" data-testid="settings-recreate-docs-label">
-                    Recreate getting-started documentation
-                  </span>
-                  <div class="settings-recreate-docs-action">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      loading={recreateDocsLoading()}
-                      onClick={() => { void handleRecreateDocs(); }}
-                    >
-                      Recreate
-                    </Button>
-                  </div>
-                </div>
-                <span class="settings-hint" data-testid="settings-recreate-docs-hint">
-                  Writes files from the repository `preseed/tutorials/` folder into your R2 root.
-                </span>
+              <div class="settings-admin-actions">
+                <button
+                  type="button"
+                  class="provider-row-connect-btn"
+                  style={{ background: '#0891b2' }}
+                  disabled={recreateDocsLoading()}
+                  onClick={() => { void handleRecreateDocs(); }}
+                  data-testid="settings-recreate-docs-label"
+                >
+                  <Icon path={mdiFileDocumentRefreshOutline} size={24} style={{ color: 'white' }} />
+                  <span>{recreateDocsLoading() ? 'Recreating...' : 'Recreate Docs & Examples'}</span>
+                </button>
                 <Show when={recreateDocsMessage()}>
                   {(message) => (
                     <span class="settings-hint" data-testid="settings-recreate-docs-success">{message()}</span>
@@ -555,26 +571,17 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
                     <span class="settings-error" data-testid="settings-recreate-docs-error">{error()}</span>
                   )}
                 </Show>
-              </div>
-              <div class="setting-row setting-row--column-gap">
-                <div class="setting-row setting-row--split" data-testid="settings-recreate-agent-row">
-                  <span class="settings-hint settings-hint--primary" data-testid="settings-recreate-agent-label">
-                    Recreate AI agent skills & rules
-                  </span>
-                  <div class="settings-recreate-docs-action">
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      loading={recreateAgentLoading()}
-                      onClick={() => { void handleRecreateAgentConfigs(); }}
-                    >
-                      Recreate
-                    </Button>
-                  </div>
-                </div>
-                <span class="settings-hint" data-testid="settings-recreate-agent-hint">
-                  Writes AI agent configuration files (skills, rules) into your R2 storage.
-                </span>
+                <button
+                  type="button"
+                  class="provider-row-connect-btn"
+                  style={{ background: '#e11d48' }}
+                  disabled={recreateAgentLoading()}
+                  onClick={() => { void handleRecreateAgentConfigs(); }}
+                  data-testid="settings-recreate-agent-label"
+                >
+                  <Icon path={mdiRobotOutline} size={24} style={{ color: 'white' }} />
+                  <span>{recreateAgentLoading() ? 'Recreating...' : 'Recreate Agent Skills & Rules'}</span>
+                </button>
                 <Show when={recreateAgentMessage()}>
                   {(message) => (
                     <span class="settings-hint" data-testid="settings-recreate-agent-success">{message()}</span>
@@ -631,8 +638,8 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
             <DeployKeysSection />
           </AccordionSection>
 
-          {/* ── LLM API Keys (advanced mode only) ── */}
-          <Show when={currentSessionMode() === 'advanced'}>
+          {/* ── LLM API Keys (advanced session mode only) ── */}
+          <Show when={canUseAdvanced() && currentSessionMode() === 'advanced'}>
             <AccordionSection
               group="llm"
               title="LLM API Keys"
@@ -656,25 +663,35 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
               <section class="settings-section">
                 <div class="settings-section-header">
                   <Icon path={mdiCogOutline} size={16} />
-                  <h3 class="settings-section-title">Setup</h3>
+                  <h3 class="settings-section-title">Setup & Users</h3>
                 </div>
-                <div class="setting-row setting-row--column-gap">
-                  <span class="settings-hint">
-                    Re-run the setup wizard to reconfigure domain, users, or secrets
-                  </span>
-                  <div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => { window.location.href = '/setup'; }}
-                    >
-                      Open Setup & User Management
-                    </Button>
-                  </div>
-                  <span class="settings-hint" data-testid="settings-r2-warning">
-                    Changing your Cloudflare API token requires re-running setup. R2 credentials and per-user storage tokens depend on the API token — without re-running, file sync and new sessions will break.
-                  </span>
+                <p class="settings-hint" style={{ "margin-bottom": "var(--space-2)" }}>
+                  Configure custom domain and admin users in the Setup Wizard.
+                  Manage user roles and access tiers in User Management.
+                </p>
+                <div class="settings-admin-actions">
+                  <button
+                    type="button"
+                    class="provider-row-connect-btn"
+                    style={{ background: '#2563eb' }}
+                    onClick={() => { window.location.href = '/setup'; }}
+                  >
+                    <Icon path={mdiWrenchOutline} size={24} style={{ color: 'white' }} />
+                    <span>Setup Wizard</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="provider-row-connect-btn"
+                    style={{ background: '#7c3aed' }}
+                    onClick={() => { window.location.href = '/admin/users'; }}
+                  >
+                    <Icon path={mdiAccountGroupOutline} size={24} style={{ color: 'white' }} />
+                    <span>Manage Users</span>
+                  </button>
                 </div>
+                <span class="settings-hint" data-testid="settings-r2-warning">
+                  If you rotate your Cloudflare API token, redeploy with the new token and re-run the Setup Wizard.
+                </span>
               </section>
             </AccordionSection>
           </Show>

@@ -18,6 +18,7 @@ type ViewState = 'dashboard' | 'expanding' | 'terminal' | 'collapsing';
 interface LayoutProps {
   userName?: string;
   userRole?: 'admin' | 'user';
+  userAccessTier?: import('../types').AccessTier;
   onboardingActive?: boolean;
 }
 
@@ -307,12 +308,11 @@ const Layout: Component<LayoutProps> = (props) => {
           viewState={viewState()}
           userName={props.userName}
           onSettingsClick={handleSettingsClick}
-          onLogout={() => { window.location.href = '/cdn-cgi/access/logout'; }}
         />
       </div>
 
       {/* Settings Panel - slides in from right */}
-      <SettingsPanel isOpen={isSettingsOpen()} onClose={handleSettingsClose} currentUserEmail={props.userName} currentUserRole={props.userRole} />
+      <SettingsPanel isOpen={isSettingsOpen()} onClose={handleSettingsClose} currentUserEmail={props.userName} currentUserRole={props.userRole} currentUserAccessTier={props.userAccessTier} />
 
       {/* Storage Panel - slides in from right */}
       <StoragePanel isOpen={isStoragePanelOpen()} onClose={handleStoragePanelClose} />

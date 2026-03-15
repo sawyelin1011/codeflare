@@ -28,6 +28,8 @@ interface SetupState {
   // Result URLs
   customDomainUrl: string | null;
   accountId: string | null;
+  // SaaS mode
+  saasMode: boolean;
 }
 
 const initialState: SetupState = {
@@ -46,6 +48,7 @@ const initialState: SetupState = {
   setupComplete: false,
   customDomainUrl: null,
   accountId: null,
+  saasMode: false,
 };
 
 const [state, setState] = createStore<SetupState>({ ...initialState });
@@ -155,7 +158,12 @@ async function loadExistingConfig(): Promise<void> {
   try {
     const statusRes = await api.getSetupStatus();
 
+    if (statusRes.saasMode) {
+      setState('saasMode', true);
+    }
+
     if (statusRes.configured) {
+      // Reconfiguration: load existing config so admin can see what's set
       const usersRes = await api.getUsers();
       setState(
         produce((s) => {
@@ -165,11 +173,18 @@ async function loadExistingConfig(): Promise<void> {
           s.adminUsers = usersRes
             .filter((u) => u.role === 'admin')
             .map((u) => u.email);
-          s.allowedUsers = usersRes
-            .filter((u) => u.role !== 'admin')
-            .map((u) => u.email);
+          if (!statusRes.saasMode) {
+            s.allowedUsers = usersRes
+              .filter((u) => u.role !== 'admin')
+              .map((u) => u.email);
+          }
         })
       );
+      return;
+    }
+
+    // Initial setup: in SaaS mode, admin enters everything manually (no prefill)
+    if (statusRes.saasMode) {
       return;
     }
 
@@ -356,6 +371,9 @@ export const setupStore = {
   },
   get accountId() {
     return state.accountId;
+  },
+  get saasMode() {
+    return state.saasMode;
   },
 
   // Actions

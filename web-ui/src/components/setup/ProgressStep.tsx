@@ -49,10 +49,13 @@ const ProgressStep: Component = () => {
   };
 
   const handleLaunch = () => {
+    // Navigate to custom domain root (login page).
+    // CF Access protects /app/* not / — going to /app directly on the custom domain
+    // can fail if the browser has no CF Access cookie yet (setup runs on workers.dev).
     if (setupStore.customDomainUrl) {
-      window.location.href = `${setupStore.customDomainUrl}/app`;
+      window.location.href = setupStore.customDomainUrl;
     } else {
-      window.location.href = '/app/';
+      window.location.href = '/';
     }
   };
 

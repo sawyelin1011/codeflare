@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import type { Env } from '../types';
 import { authMiddleware, AuthVariables } from '../middleware/auth';
 import { createRateLimiter } from '../middleware/rate-limit';
-import { isOnboardingLandingPageActive } from '../lib/onboarding';
+import { isOnboardingLandingPageActive, isSaasModeActive } from '../lib/onboarding';
 import { getOrCreateScopedR2Token } from '../lib/r2-admin';
 
 /**
@@ -23,23 +23,43 @@ app.use('*', authMiddleware);
 
 /**
  * GET /api/user
- * Returns authenticated user info
+ * Returns authenticated user info including access tier, onboarding status, and configuration
  *
- * Note: Bucket creation is handled by POST /api/container/start,
- * so we don't create it here to avoid unnecessary latency.
+ * Note: Bucket creation is handled by POST /api/container/start.
+ * This endpoint does NOT create buckets — it only reads user metadata.
  */
 app.get('/', async (c) => {
   const user = c.get('user');
   const bucketName = c.get('bucketName');
 
+  // Read onboardingComplete from user's KV entry
+  const kvRaw = await c.env.KV.get(`user:${user.email}`, 'json') as { onboardingComplete?: boolean } | null;
+  const onboardingComplete = kvRaw?.onboardingComplete === true;
+
   return c.json({
     email: user.email,
     authenticated: user.authenticated,
     role: user.role,
+    accessTier: user.accessTier,
     bucketName,
     workerName: c.env.CLOUDFLARE_WORKER_NAME || 'codeflare',
     onboardingActive: isOnboardingLandingPageActive(c.env.ONBOARDING_LANDING_PAGE),
+    saasMode: isSaasModeActive(c.env.SAAS_MODE),
+    onboardingComplete,
   });
+});
+
+/**
+ * POST /api/user/onboarding-complete
+ * Marks the current user's onboarding as complete so they go to dashboard next time.
+ */
+app.post('/onboarding-complete', async (c) => {
+  const user = c.get('user');
+  const kvRaw = await c.env.KV.get(`user:${user.email}`, 'json') as Record<string, unknown> | null;
+  if (kvRaw) {
+    await c.env.KV.put(`user:${user.email}`, JSON.stringify({ ...kvRaw, onboardingComplete: true }));
+  }
+  return c.json({ success: true });
 });
 
 /**

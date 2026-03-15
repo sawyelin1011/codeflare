@@ -535,6 +535,12 @@
   background: var(--color-bg-muted);
 }
 
+.session-mode-option--disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
 /* LLM Key Input */
 .llm-key-input {
   width: 100%;
@@ -593,6 +599,12 @@
 
 .provider-row-connect-btn:active {
   transform: scale(0.98);
+}
+
+.provider-row-connect-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  filter: none;
 }
 
 /* Connected state row */
@@ -775,7 +787,7 @@
   margin: 0 0 var(--space-3) 0;
   padding-left: var(--space-6);
   color: var(--color-text-muted);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   line-height: 1.8;
 }
 
@@ -838,4 +850,16 @@
   .accordion-body-inner {
     transition: none;
   }
+}
+
+/* Full-width admin action buttons */
+.settings-admin-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 0.5rem);
+  width: 100%;
+}
+
+.settings-admin-actions .button {
+  width: 100%;
 }

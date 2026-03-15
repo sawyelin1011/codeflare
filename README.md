@@ -1,11 +1,14 @@
 # <img src="docs/images/logo-icon.svg" width="28" align="absmiddle" alt="Codeflare logo"> Codeflare
 
-You're not sure which AI coding agent is the best. Neither is anyone else. So Codeflare gives you all of them - at the same time. Five agents, six tabs, one browser. No guardrails, no permission prompts, no risk. Every session runs in an isolated container that deletes itself when you're done. Your files persist. Your bad decisions don't.
+![Login](docs/images/login.png)
+*One click to sign in. No account creation, no passwords — GitHub OAuth handles it.*
+
+You're not sure which AI coding agent is the best. Neither is anyone else. So Codeflare gives you all of them - at the same time. Six agents, six tabs, one browser. No guardrails, no permission prompts, no risk. Every session runs in an isolated container that deletes itself when you're done. Your files persist. Your bad decisions don't.
 
 It runs wherever you happen to find yourself - on the Cloudflare edge that spans the planet, accessible from anything with a browser. Your phone, your tablet, your partner's laptop while they're not looking. Because the best commits in history were made from places without desks.
 
 ![Codeflare on a foldable tablet](docs/images/mobile-foldable.jpg)
-*Ideas don't care where you are. Five coding agents, any screen with a browser, zero setup. No installs, no configuration, no asking for permission. Open the link and start building.*
+*Ideas don't care where you are. Six coding agents, any screen with a browser, zero setup. No installs, no configuration, no asking for permission. Open the link and start building.*
 
 Every session comes pre-loaded with your choice of AI coding agent:
 
@@ -33,10 +36,21 @@ Codeflare is an ephemeral cloud IDE that runs entirely in your browser. Every se
 
 It's strongly optimized for mobile - because the best ideas hit while rewatching your favorite show for the 15th time, and your PC is just too far away.
 
-**Try it:** [codeflare.graymatter.ch](https://codeflare.graymatter.ch) (gated behind a waitlist - I'm not an animal)
+**Try it:** [codeflare.ch](https://codeflare.ch)
 
-![Onboarding](docs/images/onboarding.png)
-*Join the waitlist, get approved, log in. No account creation, no password - Cloudflare Access handles it.*
+## From idea to live in minutes
+
+Codeflare is built for Cloudflare. Not adapted, not ported - built on it, for it.
+
+- **Native GitHub integration** - connect your GitHub account once. Every session gets automatic `git push`, `gh` CLI, and CI/CD access. No SSH keys, no token juggling, no manual auth per session.
+- **Native Cloudflare integration** - connect your Cloudflare account once. Deploy Workers, manage D1 databases, R2 storage, KV namespaces, and DNS - all from the terminal, already authenticated.
+- **Specialized skills for build, push, and deploy** - pre-loaded agent skills know how to create Cloudflare Workers projects, configure `wrangler.toml`, push to GitHub, set up CI workflows, and deploy to production. Tell the agent what you want. It builds, pushes, and deploys.
+- **Guided onboarding** - new users get walked through connecting GitHub, Cloudflare, and choosing a coding agent. No prior Cloudflare knowledge required.
+
+![Guided Setup](docs/images/guided-setup.png)
+*Connect your accounts and pick a coding agent. No prior Cloudflare or GitHub knowledge required.*
+
+- **Go from idea to live on Cloudflare in minutes** - describe what you want, the agent builds it, pushes to GitHub, deploys to Cloudflare Workers. You get a live URL. The whole loop happens in one terminal session on your phone or anywhere else.
 
 ## What you get
 
@@ -47,11 +61,11 @@ It's strongly optimized for mobile - because the best ideas hit while rewatching
 - One isolated container per session - agents can't escape their sandbox (I checked)
 - Persistent R2 storage with bisync every 60s - even if a session dies before you `git push`, R2 has got your back. Sync conflicts? Cleaned up automatically next cycle.
 - Pre-warmed terminals - the agent is already loaded when you open the tab, not staring at a blank screen wondering if something broke
-- Fast Start - auto-updates disabled by default across all 5 tools for instant agent startup. Toggle it in Settings if you prefer bleeding edge over fast boot.
+- Fast Start - auto-updates disabled by default across all 6 tools for instant agent startup. Toggle it in Settings if you prefer bleeding edge over fast boot.
 - Set your API key once. It syncs across sessions forever. (It's rclone, but magic sounds better.)
 - Push & Deploy - connect your GitHub and Cloudflare accounts once in Settings. Every session gets automatic auth. No more pasting tokens into terminals like it's 2019.
 - Dashboard for managing sessions, browsing files, and inviting users (or revoking them when they get too creative). Live CPU/memory/disk metrics per session. Three-color status: green (active), yellow (idle but alive), gray (stopped).
-- Scales to zero when idle. You pay for what you use. Nothing when you don't.
+- CPU cost scales to zero when idle. You pay for what you use. Nothing when you don't.
 
 ## Architecture
 
@@ -73,7 +87,7 @@ flowchart LR
     zero cost"]
 ```
 
-Containers scale to zero when idle (no sessions = no bill). Storage persists. Auth is handled by Cloudflare Access - no custom login pages, no token management, no OAuth dance.
+Containers scale to zero when idle (no sessions = no bill). Storage persists. Auth is handled by Cloudflare Access with a branded login page - one-click GitHub OAuth, automatic user provisioning, and admin approval workflow.
 
 ## Setup
 
@@ -92,10 +106,6 @@ In your fork: `Settings` > `Secrets and variables` > `Actions` > `New repository
 - `CLOUDFLARE_ACCOUNT_ID` - find it on any zone's overview page in the Cloudflare dashboard
 
 Add each as a separate secret. Name goes in the **Name** field, value in **Secret**. Click **Add secret** after each one.
-
-**Secrets** (optional - for E2E testing):
-- `CF_ACCESS_CLIENT_ID` - CF Access service token client ID
-- `CF_ACCESS_CLIENT_SECRET` - CF Access service token client secret
 
 ### 3. Deploy
 
@@ -159,6 +169,19 @@ All optional. The defaults work out of the box. I respect your time.
 | `MAX_SESSIONS_USER` | `3` | Max concurrent running sessions per regular user |
 | `MAX_SESSIONS_ADMIN` | `10` | Max concurrent running sessions per admin user |
 | `E2E_BASE_URL` | unset | Custom domain URL for E2E tests (e.g., `https://codeflare.example.com`) |
+| `SAAS_MODE` | `inactive` | Set to `active` for custom login page with social IdPs, guided onboarding, user management, and admin approval gate. See [TECHNICAL.md](TECHNICAL.md) Section 8 for full auth architecture. |
+| `SAAS_EXTRA_IDPS` | unset | Comma-separated IdP UUIDs for custom OIDC providers on the login page (SaaS mode only) |
+| `CF_ACCESS_CLIENT_ID` | unset | CF Access service token client ID (secret — for E2E testing) |
+| `CF_ACCESS_CLIENT_SECRET` | unset | CF Access service token client secret (secret — for E2E testing) |
+| `RESEND_API_KEY` | unset | Resend API key (secret — for sending admin approval/rejection emails in SaaS or onboarding mode) |
+| `TURNSTILE_SITE_KEY` | unset | Cloudflare Turnstile site key (for CAPTCHA on public waitlist, required when `ONBOARDING_LANDING_PAGE=active`) |
+| `TURNSTILE_SECRET_KEY` | unset | Cloudflare Turnstile secret key (secret — for CAPTCHA verification, required when `ONBOARDING_LANDING_PAGE=active`) |
+
+### SaaS Mode (Custom Login)
+
+Set `SAAS_MODE=active` to replace the Cloudflare Access interstitial with a branded login page, guided onboarding, user management, and admin approval workflow. New users authenticate via GitHub OAuth, get auto-provisioned with `pending` status, and require admin approval before accessing the IDE. Leave `SAAS_MODE` unset for the default Cloudflare Access login.
+
+See [TECHNICAL.md](TECHNICAL.md) Section 8 for detailed setup instructions, auth flow diagrams, and common pitfalls.
 
 </details>
 
@@ -167,7 +190,7 @@ All optional. The defaults work out of the box. I respect your time.
 - Every session runs in its own container. No shared shells, no cross-session access. Your agent can `rm -rf /` and the only victim is itself.
 - AI agents run with full terminal access *inside* the container - and can't get out. I gave them root and a sandbox. They got root in a sandbox.
 - Cloudflare Access gates all authenticated surfaces (`/app`, `/api`, `/setup`) with JWT verification.
-- API tokens never enter the container. Secrets stay in GitHub and Cloudflare. The agent doesn't know your passwords, and frankly, it doesn't want to.
+- API tokens stay in GitHub and Cloudflare by default. If you connect GitHub and Cloudflare in Push & Deploy (optional), those tokens are injected into your container so the agent can push code and deploy for you. They're stored encrypted in KV, scoped per user, and never shared across sessions.
 - Security headers: HSTS, CSP, X-Frame-Options, Referrer-Policy on every response.
 - Rate limiting: KV-backed, per-user limits on session creation, container starts, and WebSocket connections. Returns 429 with `Retry-After` header when exceeded.
 - Input validation: Zod schemas, 64 KiB body limit.
@@ -178,7 +201,7 @@ All optional. The defaults work out of the box. I respect your time.
 
 ## Testing
 
-See `TECHNICAL.md` Section 17 for test suite details, counts, and configuration.
+See `TECHNICAL.md` Section 18 for test suite details, counts, and configuration.
 
 ```bash
 npm test                           # Backend tests
@@ -190,7 +213,7 @@ npm run test:e2e:ui-desktop        # E2E UI desktop (alias)
 npm run test:e2e:ui-mobile         # E2E UI mobile
 ```
 
-E2E tests require a deployed worker and CF Access service tokens. See `TECHNICAL.md` Section 17 for setup details.
+E2E tests require a deployed worker and CF Access service tokens. See `TECHNICAL.md` Section 18 for setup details.
 
 ## CI/CD
 
@@ -207,13 +230,13 @@ Eight GitHub Actions workflows:
 | `pentest.yml` | Weekly (Monday 5am UTC), manual | Automated external penetration testing |
 | `stress-test.yml` | Manual | k6 load testing against integration worker |
 
-See `TECHNICAL.md` Section 16 for full CI/CD documentation.
+See `TECHNICAL.md` Section 17 for full CI/CD documentation.
 
 ## Docs
 
 - `TECHNICAL.md` - deep dive into architecture, container lifecycle, and sync model
-- `tutorials/Getting Started.md` - what you can do and why you should want to. Tabs, tiling, file persistence, and three paths forward depending on how much hand-holding you need.
-- `tutorials/Examples/` - spec-driven project examples from Hello World to full blog platform. Hand one to your agent and go do something more interesting.
+- `preseed/tutorials/Getting Started.md` - what you can do and why you should want to. Tabs, tiling, file persistence, and three paths forward depending on how much hand-holding you need.
+- `preseed/tutorials/Examples/` - spec-driven project examples from Hello World to full blog platform. Hand one to your agent and go do something more interesting.
 
 <details>
 <summary><strong>Local development</strong></summary>
