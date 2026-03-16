@@ -118,6 +118,7 @@ export class container extends Container<Env> {
   private _sessionMode: string = 'default';
   private _containerAuthToken: string | null = null;
   private _sessionId: string | null = null;
+  private containerStartedAt = 0;
 
   // Map-based dispatch for internal routes
   private readonly internalRoutes: Map<string, (request: Request) => Promise<Response> | Response>;
@@ -506,6 +507,7 @@ export class container extends Container<Env> {
    * Called when the container starts successfully.
    */
   override async onStart(): Promise<void> {
+    this.containerStartedAt = Date.now();
     this.updateEnvVars();
     await this.updateKvStatus('running', 'lastStartedAt');
     this.logger.info('Container started');
@@ -522,7 +524,10 @@ export class container extends Container<Env> {
       return;
     }
 
-    // Keep-alive: renew sleepAfter timer while WebSocket clients are connected.
+    // Keep-alive: renew sleepAfter timer based on frontend visibility heartbeat
+    // AND recent user input. Both signals must be present to renew:
+    // - Heartbeat (tab visible) ensures the user is looking at the terminal
+    // - Input (typed within 30 min) ensures the user is actively engaged
     // The SDK only resets sleepAfterMs via containerFetch() — WebSocket frames
     // flow through raw TCP and never call renewActivityTimeout(). Without this,
     // the container dies after sleepAfter even during active terminal use.
@@ -530,36 +535,66 @@ export class container extends Container<Env> {
       const activityPort = this.ctx.container.getTcpPort(TERMINAL_SERVER_PORT);
       const activityRes = await activityPort.fetch('http://localhost/activity');
       if (!activityRes.ok) {
-        this.logger.warn('collectMetrics: /activity returned non-OK, renewing as safety net', { status: activityRes.status });
-        this.renewActivityTimeout();
-        // Don't return — still need to push metrics and re-arm schedule below
+        // Don't renew on non-OK — broken activity endpoint shouldn't keep containers alive
+        this.logger.warn('collectMetrics: /activity returned non-OK, NOT renewing', { status: activityRes.status });
       } else {
-        const activity = await activityRes.json() as { hasActiveConnections: boolean; connectedClients: number; lastInputAt: number | null };
+        const activity = await activityRes.json() as {
+          hasActiveConnections: boolean;
+          connectedClients: number;
+          lastInputAt: number | null;
+          lastHeartbeatAt?: number | null;  // undefined = old host, null = new host no heartbeat, number = timestamp
+        };
 
-        // Container stays alive only if BOTH conditions are true:
-        // 1. WebSocket clients are connected (browser tab open)
-        // 2. User typed something within the last 30 minutes, OR hasn't typed yet
-        //    (lastInputAt === null means container just started — give them time)
-        // Once the user types for the first time, the 30-min idle clock starts.
-        // If either condition fails after that, don't renew — sleepAfter expires.
+        const HEARTBEAT_STALE_MS = 5 * 60 * 1000; // 5 minutes
         const INPUT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+        const GRACE_PERIOD_MS = 5 * 60 * 1000; // 5 minutes from container start
         const now = Date.now();
         const lastInput = activity.lastInputAt;
         const inputIdleMs = lastInput !== null ? now - lastInput : null;
-        const inputRecent = lastInput === null || inputIdleMs! <= INPUT_IDLE_TIMEOUT_MS;
 
-        if (activity.hasActiveConnections && inputRecent) {
-          this.renewActivityTimeout();
-          this.logger.debug('collectMetrics: renewed sleepAfter (active WS + recent input)', {
-            connectedClients: activity.connectedClients,
-            lastInputAgoMs: inputIdleMs,
-          });
+        let renewed = false;
+
+        // Input check shared by both new and legacy paths
+        const inGracePeriod = (now - this.containerStartedAt) <= GRACE_PERIOD_MS;
+        const inputRecent = (lastInput === null && inGracePeriod) ||
+                            (lastInput !== null && inputIdleMs! <= INPUT_IDLE_TIMEOUT_MS);
+
+        if (activity.hasActiveConnections) {
+          if (activity.lastHeartbeatAt !== undefined && activity.lastHeartbeatAt !== null) {
+            // New host: require BOTH heartbeat recent AND input recent
+            const heartbeatAgeMs = now - activity.lastHeartbeatAt;
+            const heartbeatRecent = heartbeatAgeMs <= HEARTBEAT_STALE_MS;
+            if (heartbeatRecent && inputRecent) {
+              this.renewActivityTimeout();
+              renewed = true;
+            }
+            this.logger.info('collectMetrics: heartbeat+input check', {
+              renewed,
+              heartbeatAgeMs,
+              inputRecent,
+              lastInputAgoMs: inputIdleMs,
+              connectedClients: activity.connectedClients,
+            });
+          } else if (activity.lastHeartbeatAt === undefined) {
+            // Old host without heartbeat support: legacy input-based fallback
+            if (inputRecent) {
+              this.renewActivityTimeout();
+              renewed = true;
+            }
+            this.logger.info('collectMetrics: legacy input-based check', {
+              renewed,
+              lastInputAgoMs: inputIdleMs,
+              inGracePeriod,
+              connectedClients: activity.connectedClients,
+            });
+          } else {
+            // New host, lastHeartbeatAt === null: no heartbeat ever received, don't renew
+            this.logger.info('collectMetrics: new host, no heartbeat received, not renewing', {
+              connectedClients: activity.connectedClients,
+            });
+          }
         } else {
-          this.logger.debug('collectMetrics: not renewing sleepAfter', {
-            hasActiveConnections: activity.hasActiveConnections,
-            inputRecent,
-            lastInputAgoMs: inputIdleMs,
-          });
+          this.logger.info('collectMetrics: no active connections, not renewing');
         }
       }
     } catch (err) {
@@ -685,8 +720,9 @@ export class container extends Container<Env> {
   }
 
   /**
-   * Called when sleepAfter expires. Check if there are active WebSocket
-   * clients — if so, renew the timeout instead of letting the container die.
+   * Called when sleepAfter expires. Check frontend visibility heartbeat AND
+   * recent user input (or WS connections on legacy hosts) — if both recent,
+   * renew. Otherwise stop.
    */
   override async onActivityExpired(): Promise<void> {
     if (!this.ctx.container?.running) {
@@ -699,28 +735,62 @@ export class container extends Container<Env> {
       const tcpPort = this.ctx.container.getTcpPort(TERMINAL_SERVER_PORT);
       const res = await tcpPort.fetch('http://localhost/activity');
       if (!res.ok) {
-        this.logger.warn('onActivityExpired: /activity returned non-OK after 30m idle, stopping', { status: res.status });
+        this.logger.warn('onActivityExpired: /activity returned non-OK, stopping', { status: res.status });
         await this.stop('SIGTERM');
         return;
       }
-      const activity = await res.json() as { hasActiveConnections: boolean; connectedClients: number };
+      const activity = await res.json() as {
+        hasActiveConnections: boolean;
+        connectedClients: number;
+        lastHeartbeatAt?: number | null;
+        lastInputAt: number | null;
+      };
 
+      const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
+      const INPUT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+      const GRACE_PERIOD_MS = 5 * 60 * 1000;
+      const now = Date.now();
+      const lastInput = activity.lastInputAt;
+      const inputIdleMs = lastInput !== null ? now - lastInput : null;
+      const inGracePeriod = (now - this.containerStartedAt) <= GRACE_PERIOD_MS;
+      const inputRecent = (lastInput === null && inGracePeriod) ||
+                          (lastInput !== null && inputIdleMs! <= INPUT_IDLE_TIMEOUT_MS);
+
+      // Check heartbeat + input (new host), or WS + input (old host)
       if (activity.hasActiveConnections) {
-        this.logger.info('onActivityExpired: active WS clients, renewing timeout', {
-          connectedClients: activity.connectedClients,
-        });
-        this.renewActivityTimeout();
-        return;
+        if (activity.lastHeartbeatAt !== undefined && activity.lastHeartbeatAt !== null) {
+          const heartbeatRecent = (now - activity.lastHeartbeatAt) <= HEARTBEAT_STALE_MS;
+          if (heartbeatRecent && inputRecent) {
+            this.logger.info('onActivityExpired: active WS + recent heartbeat + recent input, renewing', {
+              connectedClients: activity.connectedClients,
+              heartbeatAgeMs: now - activity.lastHeartbeatAt,
+              lastInputAgoMs: inputIdleMs,
+            });
+            this.renewActivityTimeout();
+            return;
+          }
+        } else if (activity.lastHeartbeatAt === undefined) {
+          // Old host: fall back to WS + input check (legacy behavior)
+          if (inputRecent) {
+            this.logger.info('onActivityExpired: legacy host, active WS + recent input, renewing', {
+              connectedClients: activity.connectedClients,
+              lastInputAgoMs: inputIdleMs,
+            });
+            this.renewActivityTimeout();
+            return;
+          }
+        }
+        // Not renewing: stale heartbeat, stale input, or no heartbeat received
       }
     } catch (err) {
-      this.logger.warn('onActivityExpired: failed to check activity after 30m idle, stopping', {
+      this.logger.warn('onActivityExpired: failed to check activity, stopping', {
         error: err instanceof Error ? err.message : String(err),
       });
       await this.stop('SIGTERM');
       return;
     }
 
-    this.logger.info('onActivityExpired: no active clients, stopping container');
+    this.logger.info('onActivityExpired: no recent activity, stopping container');
     await this.stop('SIGTERM');
   }
 
