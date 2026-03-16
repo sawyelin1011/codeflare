@@ -114,6 +114,7 @@ export class container extends Container<Env> {
   private _githubToken: string | null = null;
   private _cloudflareApiToken: string | null = null;
   private _cloudflareAccountId: string | null = null;
+  private _encryptionKey: string | null = null;
   private _sessionMode: string = 'default';
   private _containerAuthToken: string | null = null;
   private _sessionId: string | null = null;
@@ -178,6 +179,7 @@ export class container extends Container<Env> {
     githubToken?: string;
     cloudflareApiToken?: string;
     cloudflareAccountId?: string;
+    encryptionKey?: string;
     sessionMode?: string;
   }): Promise<void> {
     this._bucketName = name;
@@ -205,6 +207,9 @@ export class container extends Container<Env> {
     if (r2Creds?.githubToken) this._githubToken = r2Creds.githubToken;
     if (r2Creds?.cloudflareApiToken) this._cloudflareApiToken = r2Creds.cloudflareApiToken;
     if (r2Creds?.cloudflareAccountId) this._cloudflareAccountId = r2Creds.cloudflareAccountId;
+
+    // Store encryption key in instance memory
+    if (r2Creds?.encryptionKey) this._encryptionKey = r2Creds.encryptionKey;
 
     // Store session mode in instance memory only (not persisted to DO storage; re-sent on each container start)
     if (r2Creds?.sessionMode) this._sessionMode = r2Creds.sessionMode;
@@ -287,6 +292,8 @@ export class container extends Container<Env> {
       // LLM API keys (injected for consult-llm-mcp MCP server)
       ...(this._openaiApiKey && { OPENAI_API_KEY: this._openaiApiKey }),
       ...(this._geminiApiKey && { GEMINI_API_KEY: this._geminiApiKey }),
+      // Encryption key for rclone SSE-C
+      ...(this._encryptionKey && { ENCRYPTION_KEY: this._encryptionKey }),
       // Deploy credentials (GitHub + Cloudflare for push & deploy)
       ...(this._githubToken && { GH_TOKEN: this._githubToken }),
       ...(this._cloudflareApiToken && { CLOUDFLARE_API_TOKEN: this._cloudflareApiToken }),
@@ -321,7 +328,7 @@ export class container extends Container<Env> {
    */
   private async handleSetBucketName(request: Request): Promise<Response> {
     try {
-      const { bucketName, sessionId, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey, githubToken, cloudflareApiToken, cloudflareAccountId, sessionMode } =
+      const { bucketName, sessionId, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey, githubToken, cloudflareApiToken, cloudflareAccountId, encryptionKey, sessionMode } =
         await request.json() as {
           bucketName: string;
           sessionId?: string;
@@ -337,6 +344,7 @@ export class container extends Container<Env> {
           githubToken?: string;
           cloudflareApiToken?: string;
           cloudflareAccountId?: string;
+          encryptionKey?: string;
           sessionMode?: string;
         };
 
@@ -394,6 +402,10 @@ export class container extends Container<Env> {
           this._cloudflareAccountId = cloudflareAccountId || null;
           prefsChanged = true;
         }
+        if (encryptionKey !== undefined) {
+          this._encryptionKey = encryptionKey || null;
+          prefsChanged = true;
+        }
         if (sessionMode) {
           this._sessionMode = sessionMode;
           prefsChanged = true;
@@ -441,6 +453,7 @@ export class container extends Container<Env> {
         githubToken,
         cloudflareApiToken,
         cloudflareAccountId,
+        encryptionKey,
         sessionMode,
       });
 
@@ -521,14 +534,32 @@ export class container extends Container<Env> {
         this.renewActivityTimeout();
         // Don't return — still need to push metrics and re-arm schedule below
       } else {
-        const activity = await activityRes.json() as { hasActiveConnections: boolean; connectedClients: number };
-        if (activity.hasActiveConnections) {
+        const activity = await activityRes.json() as { hasActiveConnections: boolean; connectedClients: number; lastInputAt: number | null };
+
+        // Container stays alive only if BOTH conditions are true:
+        // 1. WebSocket clients are connected (browser tab open)
+        // 2. User typed something within the last 30 minutes, OR hasn't typed yet
+        //    (lastInputAt === null means container just started — give them time)
+        // Once the user types for the first time, the 30-min idle clock starts.
+        // If either condition fails after that, don't renew — sleepAfter expires.
+        const INPUT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+        const now = Date.now();
+        const lastInput = activity.lastInputAt;
+        const inputIdleMs = lastInput !== null ? now - lastInput : null;
+        const inputRecent = lastInput === null || inputIdleMs! <= INPUT_IDLE_TIMEOUT_MS;
+
+        if (activity.hasActiveConnections && inputRecent) {
           this.renewActivityTimeout();
-          this.logger.debug('collectMetrics: renewed sleepAfter (active WS clients)', {
+          this.logger.debug('collectMetrics: renewed sleepAfter (active WS + recent input)', {
             connectedClients: activity.connectedClients,
+            lastInputAgoMs: inputIdleMs,
           });
         } else {
-          this.logger.debug('collectMetrics: no active WS clients, skipping renewal');
+          this.logger.debug('collectMetrics: not renewing sleepAfter', {
+            hasActiveConnections: activity.hasActiveConnections,
+            inputRecent,
+            lastInputAgoMs: inputIdleMs,
+          });
         }
       }
     } catch (err) {
@@ -644,6 +675,7 @@ export class container extends Container<Env> {
       this._githubToken = null;
       this._cloudflareApiToken = null;
       this._cloudflareAccountId = null;
+      this._encryptionKey = null;
       this._sessionMode = 'default';
       this.logger.info('Operational storage cleared');
     } catch (err) {

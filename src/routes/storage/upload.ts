@@ -12,6 +12,7 @@ import { getR2Config } from '../../lib/r2-config';
 import { ValidationError, ContainerError } from '../../lib/error-types';
 import { escapeXml } from '../../lib/xml-utils';
 import { validateKey, MAX_KEY_LENGTH } from './validation';
+import { getSseHeaders } from '../../lib/r2-sse';
 
 const storageUploadRateLimiter = createRateLimiter({
   windowMs: 60_000,
@@ -80,7 +81,7 @@ app.post('/', async (c) => {
   const response = await r2Client.fetch(url, {
     method: 'PUT',
     body: binaryContent,
-    headers: { 'Content-Type': 'application/octet-stream' },
+    headers: { 'Content-Type': 'application/octet-stream', ...getSseHeaders(c.env) },
   });
 
   if (!response.ok) {
@@ -111,7 +112,7 @@ app.post('/initiate', async (c) => {
   const { endpoint } = await getR2Config(c.env);
 
   const url = `${getR2Url(endpoint, bucketName, sanitizedKey)}?uploads`;
-  const response = await r2Client.fetch(url, { method: 'POST' });
+  const response = await r2Client.fetch(url, { method: 'POST', headers: getSseHeaders(c.env) });
 
   if (!response.ok) {
     throw new ContainerError('upload', `R2 InitiateMultipartUpload failed: ${response.status}`);
@@ -151,6 +152,7 @@ app.post('/part', async (c) => {
   const response = await r2Client.fetch(url, {
     method: 'PUT',
     body: binaryContent,
+    headers: getSseHeaders(c.env),
   });
 
   if (!response.ok) {

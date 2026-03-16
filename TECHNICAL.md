@@ -113,7 +113,7 @@ With SPA fallback (`not_found_handling = "single-page-application"`), control-pl
 
 **`collectMetrics()` Heartbeat (every 5s):**
 1. Checks `this.ctx.container?.running` - returns early (no re-arm) if container is dead
-2. Fetches `/activity` via `getTcpPort()` - if active WS clients, calls `renewActivityTimeout()` (keepalive). If `/activity` fails, renews as safety net (don't kill container on transient errors). Activity/keepalive logs are at `debug` level to reduce noise (was `info` - downgraded once keepalive was confirmed stable).
+2. Fetches `/activity` via `getTcpPort()` - if active WS clients, checks `lastInputAt`: if user hasn't typed for 30 minutes, calls `this.stop('SIGTERM')` (idle kill despite open WS). Otherwise calls `renewActivityTimeout()` (keepalive). If `/activity` fails, renews as safety net (don't kill container on transient errors). Activity/keepalive logs are at `debug` level to reduce noise.
 3. Fetches `/health` via `getTcpPort()` - reads cpu/mem/hdd/syncStatus
 4. Writes metrics to KV session record (`session.metrics`)
 5. Re-arms schedule if container still running
@@ -129,7 +129,9 @@ flowchart TD
     IDs -->|No| Exit2["Early return, no re-arm<br/>(zombie DO detected)"]
     IDs -->|Yes| FetchAct["Fetch /activity<br/>from container"]
     FetchAct --> WSClients{"Active WS clients?"}
-    WSClients -->|Yes| Renew["renewActivityTimeout()<br/>(keepalive)"]
+    WSClients -->|Yes| InputCheck{"lastInputAt > 30min ago?"}
+    InputCheck -->|Yes| IdleKill["this.stop('SIGTERM')<br/>(idle kill — no user input)"]
+    InputCheck -->|No| Renew["renewActivityTimeout()<br/>(keepalive)"]
     WSClients -->|No| NoRenew["Don't renew<br/>(let container idle to sleepAfter)"]
     Renew --> FetchHealth["Fetch /health<br/>from container"]
     NoRenew --> FetchHealth
@@ -173,11 +175,13 @@ sequenceDiagram
 
 **File:** `host/src/server.ts` - Node.js/TypeScript server inside the container. Single port 8080 for WebSocket + REST + health/metrics.
 
-Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads sync status from `/tmp/sync-status.json` and exposes via `/health`. Activity tracking (WebSocket connection state: `hasActiveConnections`, `connectedClients`, `activeSessions`, `disconnectedForMs`) for hibernation decisions via `GET /activity`.
+Sync handled entirely by `entrypoint.sh` (60s daemon). Terminal server reads sync status from `/tmp/sync-status.json` and exposes via `/health`. Activity tracking (WebSocket connection state + user input timestamps: `hasActiveConnections`, `connectedClients`, `activeSessions`, `disconnectedForMs`, `lastInputAt`) for hibernation decisions via `GET /activity`.
 
 **Auth-Exempt Paths:** The terminal server validates `Authorization: Bearer <token>` on all HTTP requests. Paths called via `getTcpPort().fetch()` (which bypasses the DO's `fetch()` override that injects the auth header) must be in the `authExemptPaths` Set at `host/src/server.ts`: `['/health', '/activity']`. The `/activity` endpoint is also exempted from auth in the DO-level `fetch()` override so internal health checks don't require token injection.
 
-**`GET /activity` Endpoint:** Returns `{ hasActiveConnections: boolean, connectedClients: number, activeSessions: number, disconnectedForMs: number | null }`. Used by both `collectMetrics()` (keepalive heartbeat) and `onActivityExpired()` (idle detection). Active connections = WebSocket clients that are currently connected. `disconnectedForMs` tracks time since all clients disconnected (null if clients are currently connected).
+**`GET /activity` Endpoint:** Returns `{ hasActiveConnections: boolean, connectedClients: number, activeSessions: number, disconnectedForMs: number | null, lastInputAt: number | null }`. Used by both `collectMetrics()` (keepalive heartbeat + idle input detection) and `onActivityExpired()` (idle detection). Active connections = WebSocket clients that are currently connected. `disconnectedForMs` tracks time since all clients disconnected (null if clients are currently connected). `lastInputAt` is the Unix timestamp (ms) of the last real user keyboard input — any keystroke that reaches `ptyProcess.write()` after stripping terminal response sequences (CPR, OSC, DA). Includes typing commands, Enter, Ctrl+C, arrow keys, tab completion. Does NOT include mouse events, browser-side UI interactions, or terminal output from agents.
+
+**Idle Input Detection:** `collectMetrics()` (every 5s) reads `lastInputAt` from `/activity`. The container's `sleepAfter` timer is only renewed when BOTH conditions are true: (1) WebSocket clients are connected, AND (2) user input is recent (within 30 minutes) or `null` (user just arrived, hasn't typed yet). Once the user types for the first time, the 30-minute idle clock starts. If either condition fails, `renewActivityTimeout()` is not called and the SDK's `sleepAfter` (30 minutes) counts down naturally. Worst case: a user gets ~60 minutes total (30 min since last keystroke + 30 min sleepAfter countdown). This prevents browser tabs left open from keeping containers alive indefinitely.
 
 **WebSocket Protocol:** Raw terminal data (NOT JSON-wrapped). Control messages (resize, process-name) as JSON. No application-level ping/pong -- Cloudflare handles protocol-level WebSocket keepalive for DO/Container connections. Headless terminal (xterm SerializeAddon) captures full state for reconnection.
 
@@ -961,6 +965,111 @@ HSTS is also applied to all redirect responses via `secureRedirect()` helper, in
 
 64 KiB on all `/api/*` routes (storage routes exempt for file uploads).
 
+### Credential Encryption at Rest
+
+Optional encryption for all user secrets and workspace files, enabled by setting `ENCRYPTION_KEY` (base64-encoded 256-bit key). Generate with `openssl rand -base64 32`. Set as a GitHub Actions repository secret named `ENCRYPTION_KEY` — the deploy workflow passes it to the Worker via `wrangler secret put`.
+
+#### Key generation and setup
+
+```bash
+# Generate a cryptographically secure 32-byte key
+openssl rand -base64 32
+# Output example: oBmGaRVT1W84oLgeTGif09kBlXxJkMs9uaoiqnCTJC0=
+
+# Add as GitHub Actions secret (Settings > Secrets and variables > Actions)
+# Secret name: ENCRYPTION_KEY
+# Secret value: <paste the base64 string>
+```
+
+The key must decode to exactly 32 bytes. Arbitrary strings, passwords, or non-base64 values are rejected at import time with a clear error.
+
+#### What gets encrypted
+
+| Storage | KV key pattern | Data | Encryption |
+|---------|---------------|------|------------|
+| KV | `llm-keys:{bucket}` | OpenAI, Gemini API keys | AES-256-GCM |
+| KV | `deploy-keys:{bucket}` | GitHub PAT, Cloudflare API token, account ID | AES-256-GCM |
+| KV | `r2token:{email}` | Scoped R2 access key, secret key, token ID | AES-256-GCM |
+| R2 | All objects in user buckets | Workspace files, agent configs, credentials | SSE-C (AES-256) |
+
+Everything else (`user-prefs:*`, `session:*`, `user:*`, `setup:*`, `storage-stats:*`) stays plaintext — no secrets in those entries.
+
+#### KV encryption (AES-256-GCM via Web Crypto API)
+
+Implementation: `src/lib/kv-crypto.ts`
+
+**Ciphertext format:** `v1:` + base64(12-byte random IV + AES-256-GCM ciphertext + 16-byte auth tag). The `v1:` prefix distinguishes encrypted values from plaintext JSON, enabling format evolution without breaking existing data.
+
+**AAD (Additional Authenticated Data):** The KV key name (e.g., `llm-keys:codeflare-user-example-com`) is bound to the ciphertext as AAD. This prevents ciphertext from being copied between KV keys — decryption fails if the key name doesn't match.
+
+**Key caching:** The CryptoKey is imported once per Worker isolate lifetime and cached in module-level state. Subsequent requests reuse the cached key without re-importing.
+
+**API responses** always return masked values (`****` + last 4 chars), never plaintext keys — regardless of whether encryption is enabled.
+
+#### Transparent KV migration
+
+When `ENCRYPTION_KEY` is enabled on an existing deployment with plaintext KV entries:
+
+1. `getAndDecrypt()` reads the raw value as text
+2. If value starts with `v1:` → decrypt with AES-256-GCM → return parsed JSON (fast path)
+3. If value is valid JSON without `v1:` prefix → plaintext legacy entry → parse and return
+4. Fire-and-forget: re-encrypt the plaintext value and write back to KV (`kv.put` runs asynchronously, never blocks the response)
+5. Subsequent reads hit the fast decrypt path (step 2)
+
+The write-back is fire-and-forget — if the KV write fails (transient error, rate limit), the caller still gets the correct data. Migration retries automatically on the next read. No data loss, no downtime.
+
+**Race condition safety:** Two concurrent requests can both read the same plaintext entry and both write encrypted copies. This is safe because both workers encrypt the same plaintext — whichever write wins is equally valid. Real updates go through `encryptAndStore()` which always encrypts directly.
+
+#### R2 SSE-C encryption
+
+Implementation: `src/lib/r2-sse.ts`
+
+When `ENCRYPTION_KEY` is set, all R2 object operations include SSE-C headers:
+
+| S3 operation | Route | Headers |
+|-------------|-------|---------|
+| PutObject | `upload.ts` (simple + multipart part) | `getSseHeaders()` |
+| InitiateMultipartUpload | `upload.ts` | `getSseHeaders()` |
+| GetObject | `download.ts`, `preview.ts` | `getSseHeaders()` |
+| HeadObject | `preview.ts`, `r2-seed.ts` | `getSseHeaders()` |
+| CopyObject | `move.ts` | `getSseHeaders()` + `getSseCopyHeaders()` |
+| PutObject (seed) | `r2-seed.ts` | `getSseHeaders()` |
+
+SSE-C headers: `x-amz-server-side-encryption-customer-algorithm: AES256`, `x-amz-server-side-encryption-customer-key: <base64 key>`, `x-amz-server-side-encryption-customer-key-MD5: <base64 MD5 of raw key bytes>`. The MD5 is computed via `node:crypto createHash('md5')`.
+
+**Rclone integration:** `ENCRYPTION_KEY` is passed from Worker → Durable Object → container env var. In `entrypoint.sh`, when present, `sse_customer_key_base64` and `sse_customer_algorithm = AES256` are appended to `rclone.conf`. Rclone auto-computes the MD5 from the base64 key. All bisync operations (initial restore, periodic sync, shutdown sync) transparently encrypt/decrypt.
+
+**Cloudflare dashboard impact:** With SSE-C enabled, files are visible in the R2 dashboard (names, sizes, metadata) but contents are unreadable — the dashboard doesn't have the encryption key. Downloads through the app work normally (Worker decrypts transparently).
+
+#### R2 bucket migration
+
+Enabling SSE-C on an existing deployment requires re-uploading all R2 objects with SSE-C headers. Existing unencrypted objects remain readable without headers, but new objects written with SSE-C can only be read with SSE-C. For a clean encrypted state:
+
+1. Enable `ENCRYPTION_KEY` in GitHub secrets and deploy
+2. For each existing user bucket: download all objects (unencrypted GET), re-upload with SSE-C headers (PUT with `getSseHeaders()`)
+3. Verify by starting a session — rclone bisync should complete without errors
+
+New deployments that set `ENCRYPTION_KEY` from the start require no migration — all seeded files are encrypted at creation.
+
+#### Key pipeline
+
+```mermaid
+flowchart TD
+    GH["GitHub Actions Secret<br/>ENCRYPTION_KEY"] -->|wrangler secret put| WS["Worker Secret<br/>Env.ENCRYPTION_KEY"]
+    WS -->|getOrImportKey| CK["CryptoKey<br/>AES-256-GCM"]
+    WS -->|getSseHeaders| SSE["SSE-C Headers<br/>x-amz-server-side-encryption-*"]
+    WS -->|setBucketName body| DO["Durable Object<br/>_encryptionKey"]
+    CK -->|getAndDecrypt / encryptAndStore| KV["KV Encryption<br/>llm-keys, deploy-keys, r2token"]
+    SSE -->|fetch with headers| R2W["R2 Worker Calls<br/>upload, download, preview, move, seed"]
+    DO -->|container env var| CE["Container ENV<br/>ENCRYPTION_KEY"]
+    CE -->|entrypoint.sh| RC["rclone.conf<br/>sse_customer_key_base64"]
+    RC -->|bisync| R2C["R2 Container Sync<br/>restore, periodic, shutdown"]
+```
+
+#### Backward compatibility
+
+When `ENCRYPTION_KEY` is not set: KV values are stored and read as plaintext JSON (existing behavior). R2 operations proceed without SSE-C headers. No code paths change — `getOrImportKey()` returns `null`, `getSseHeaders()` returns `{}`, and all encryption wrappers fall through to direct KV/R2 calls.
+
 ## Rate Limiting
 
 Per-user rate limiting via `createRateLimiter()` factory in `src/middleware/rate-limit.ts`. Keyed by `bucketName` (user identifier set by auth middleware), falls back to `CF-Connecting-IP` for unauthenticated requests.
@@ -1416,7 +1525,7 @@ Note: `/api/setup/detect-token` and `/api/setup/prefill` are also subject to the
 | GET | `/api/storage/download` | Download file |
 | POST | `/api/storage/delete` | Delete objects by key and/or prefix (server-side bulk delete) |
 | POST | `/api/storage/move` | Move/rename object |
-| GET | `/api/storage/preview` | Preview file content |
+| GET | `/api/storage/preview` | Preview file content (text files inline, others return metadata only) |
 | GET | `/api/storage/stats` | File/folder counts (60s KV cache, refreshes from R2 on miss/stale) |
 | POST | `/api/storage/seed/getting-started` | Seed tutorial docs |
 | POST | `/api/storage/seed/agent-configs` | Recreate AI agent skills & rules (overwrites, respects session mode) |
@@ -1438,7 +1547,7 @@ GET `/api/preferences`, PATCH `/api/preferences`
 ### LLM API Keys
 
 GET `/api/llm-keys` — returns masked keys (`****` + last 4 chars), never full keys.
-PUT `/api/llm-keys` — set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys.
+PUT `/api/llm-keys` — set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys. When `ENCRYPTION_KEY` is set, values are encrypted with AES-256-GCM before KV storage.
 DELETE `/api/llm-keys` — removes all LLM keys from KV.
 
 Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`. The LLM Keys accordion in Settings is only visible when the user can use advanced mode (`canUseAdvanced()`) AND has selected advanced session mode (`currentSessionMode() === 'advanced'`). Admins always qualify for advanced mode but must still select it.
@@ -1478,6 +1587,7 @@ GET `/health`, GET `/api/health`
 | `STRESS_TEST_MODE` | `"active"` disables all rate limits (integration only) | Worker env var |
 | `SAAS_MODE` | `"active"` enables custom login page, auto-provisioning, admin approval | GitHub Actions variable → `--var` at deploy |
 | `SAAS_EXTRA_IDPS` | Comma-separated IdP UUIDs for custom OIDC providers on login page | GitHub Actions variable → `--var` at deploy |
+| `ENCRYPTION_KEY` | AES-256-GCM encryption key for `llm-keys:*`, `deploy-keys:*`, and `r2token:*` KV entries, also used as R2 SSE-C key | Wrangler secret (optional) |
 
 ### Container Environment
 
@@ -1497,6 +1607,7 @@ GET `/health`, GET `/api/health`
 | `FAST_CLI_START` | Disables auto-update for all 5 AI tools when `'true'` (default) | Worker -> DO |
 | `OPENAI_API_KEY` | OpenAI API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
 | `GEMINI_API_KEY` | Gemini API key for consult-llm-mcp MCP server (optional) | Worker -> DO (from KV `llm-keys:{bucket}`) |
+| `ENCRYPTION_KEY` | AES-256 key (base64) for rclone SSE-C. Appended to `rclone.conf` as `sse_customer_key_base64`. | Worker -> DO (from `env.ENCRYPTION_KEY`) |
 | `SESSION_MODE` | Session mode (`'default'` or `'advanced'`) — controls memory persistence and rclone filters | Worker -> DO via `setBucketName` |
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | Dockerfile ENV (`/root/.cache/node-compile-cache`) |
 | `BROWSER` | Points to `open-url` shim that exits 1 | Dockerfile ENV (`/usr/local/bin/open-url`) |
@@ -1758,6 +1869,7 @@ Six parallel jobs, each running lightweight external probes against the producti
 **Run:** `npm test`
 **Coverage:** v8 provider, thresholds: 50% statement/function/line, 40% branch.
 **Key patterns:** `vi.mock()` must be at module level BEFORE imports. Use `vi.hoisted()` for shared mutable state referenced by mock factories. `LOG_LEVEL: 'silent'` in miniflare bindings suppresses log noise.
+**Notable test files:** `kv-crypto.test.ts` (KV AES-256-GCM encryption + migration), `r2-sse.test.ts` (R2 SSE-C encryption).
 
 ### Frontend Tests
 
@@ -1936,7 +2048,7 @@ codeflare/
 │   │   ├── session.ts        # Session class — PTY management, tab lifecycle
 │   │   ├── session-manager.ts # SessionManager class, PREWARM_SESSION_ID constant
 │   │   ├── metrics.ts        # System metrics collection (disk usage, sync status)
-│   │   ├── activity-tracker.ts # WebSocket disconnect tracking for idle detection
+│   │   ├── activity-tracker.ts # WS connection + user input tracking for idle detection
 │   │   ├── prewarm-config.ts # PTY pre-warm configuration (first-output readiness)
 │   │   └── types.ts          # Shared TypeScript types
 │   ├── __tests__/            # Host unit tests (12 files: prewarm, activity tracker, WS input, server prewarm integration, entrypoint sync filter, server security, host fixes, fuzz, memory merge/cleanup)
@@ -2167,7 +2279,7 @@ Architectural principles and design rationale.
 1. **rclone bisync > s3fs FUSE** - FUSE mounts are fragile and slow. Periodic bisync with local disk is faster and more reliable.
 2. **Newest file wins** - Simple conflict resolution for single-user scenarios.
 3. **Resilient bisync over auto-resync** - `--resilient` + `--recover` handle transient failures without losing deletion tracking. `--resync` is only used for initial baseline establishment (see AD14).
-4. **SDK-managed lifecycle with heartbeat** - `sleepAfter` with `collectMetrics` heartbeat keeps containers alive during active WS use. The heartbeat compensates for WS frames bypassing `renewActivityTimeout()`.
+4. **SDK-managed lifecycle with heartbeat** - `sleepAfter` with `collectMetrics` heartbeat keeps containers alive during active use. Renewal requires BOTH active WS clients AND recent user input (within 30 min). The heartbeat compensates for WS frames bypassing `renewActivityTimeout()`. Idle browser tabs (connected but no typing) cause the container to stop after ~60 min max.
 5. **`onStop()` must set KV status and clear schedules** - SDK hibernation fires `onStop()` which must write `status: 'stopped'` to KV (otherwise other devices see stale 'running' status) and call `deleteSchedules('collectMetrics')` to kill the alarm loop (otherwise zombie alarms fire on a dead container indefinitely).
 6. **`destroy()` must clear identifiers before `super.destroy()`** - `onStop()` fires asynchronously after `super.destroy()`. Without clearing identifiers first, `onStop()` resuscitates deleted sessions in KV via read-modify-write.
 7. **Secrets persist with worker state** - `wrangler delete` destroys all secrets.

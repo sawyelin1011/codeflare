@@ -7,6 +7,7 @@ import { ValidationError, ContainerError } from '../../lib/error-types';
 import { createRateLimiter } from '../../middleware/rate-limit';
 import { createLogger } from '../../lib/logger';
 import { validateKey } from './validation';
+import { getSseHeaders } from '../../lib/r2-sse';
 
 const logger = createLogger('storage-preview');
 
@@ -17,7 +18,6 @@ const storagePreviewRateLimiter = createRateLimiter({
 });
 
 const MAX_TEXT_SIZE = 1_048_576; // 1MB
-const PRESIGN_EXPIRY_SECONDS = 900; // 15 minutes
 
 function isTextContentType(contentType: string): boolean {
   if (contentType.startsWith('text/')) return true;
@@ -29,10 +29,6 @@ function isTextContentType(contentType: string): boolean {
   if (contentType === 'application/toml') return true;
   if (contentType === 'application/x-sh') return true;
   return false;
-}
-
-function isImageContentType(contentType: string): boolean {
-  return contentType.startsWith('image/');
 }
 
 const app = new Hono<{ Bindings: Env; Variables: AuthVariables }>();
@@ -53,7 +49,7 @@ app.get('/', async (c) => {
   const objectUrl = getR2Url(endpoint, bucketName, key);
 
   // HEAD request to get metadata without downloading the full object
-  const headResponse = await r2Client.fetch(objectUrl, { method: 'HEAD' });
+  const headResponse = await r2Client.fetch(objectUrl, { method: 'HEAD', headers: getSseHeaders(c.env) });
 
   if (!headResponse.ok) {
     logger.error('R2 HEAD failed', undefined, { status: headResponse.status, bucketName, key });
@@ -66,7 +62,7 @@ app.get('/', async (c) => {
 
   // Text files under 1MB: return content inline
   if (isTextContentType(contentType) && size <= MAX_TEXT_SIZE) {
-    const getResponse = await r2Client.fetch(objectUrl, { method: 'GET' });
+    const getResponse = await r2Client.fetch(objectUrl, { method: 'GET', headers: getSseHeaders(c.env) });
     const content = await getResponse.text();
 
     return c.json({
@@ -77,25 +73,7 @@ app.get('/', async (c) => {
     });
   }
 
-  // Images: return presigned URL
-  if (isImageContentType(contentType)) {
-    const presignUrl = new URL(objectUrl);
-    presignUrl.searchParams.set('X-Amz-Expires', String(PRESIGN_EXPIRY_SECONDS));
-
-    const signedRequest = await r2Client.sign(presignUrl.toString(), {
-      method: 'GET',
-      aws: { signQuery: true },
-    });
-
-    return c.json({
-      type: 'image',
-      url: signedRequest.url,
-      size,
-      lastModified,
-    });
-  }
-
-  // Binary or large text files: return metadata only
+  // Non-text files: return metadata only
   return c.json({
     type: 'binary',
     size,
