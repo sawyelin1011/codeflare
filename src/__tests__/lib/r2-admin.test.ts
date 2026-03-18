@@ -356,7 +356,7 @@ describe('r2-admin', () => {
       };
     });
 
-    it('should return cached token from KV r2token:{email} if exists', async () => {
+    it('should return cached token from KV r2token:{email} if exists and token is valid', async () => {
       const cached = {
         accessKeyId: 'cached-ak',
         secretAccessKey: 'cached-sk',
@@ -366,16 +366,22 @@ describe('r2-admin', () => {
       };
       mockKV._value = JSON.stringify(cached);
 
+      // verifyTokenExists calls GET /accounts/{id}/tokens/{tokenId} — return 200 (valid)
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+
       const result = await getOrCreateScopedR2Token(
         'user@example.com', 'account-123', 'api-token', 'my-bucket',
         mockKV as unknown as KVNamespace,
       );
 
-      expect(mockKV.get).toHaveBeenCalledWith('r2token:user@example.com', 'json');
       expect(result.accessKeyId).toBe('cached-ak');
       expect(result.secretAccessKey).toBe('cached-sk');
-      // Should NOT have called fetch (no token creation)
-      expect(mockFetch).not.toHaveBeenCalled();
+      // Should have called fetch ONCE for token verification, NOT for token creation
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.cloudflare.com/client/v4/accounts/account-123/tokens/cached-tok',
+        expect.objectContaining({ method: 'GET' }),
+      );
     });
 
     it('should create new token if KV returns null, write to KV, return creds', async () => {
@@ -458,6 +464,97 @@ describe('r2-admin', () => {
       expect(result1.accessKeyId).toBe(result2.accessKeyId);
       // Token creation should only happen once
       expect(createCount).toBe(1);
+    });
+
+    it('should delete and recreate when verify returns 404', async () => {
+      const cached = {
+        accessKeyId: 'stale-ak',
+        secretAccessKey: 'stale-sk',
+        tokenId: 'stale-tok',
+        bucketName: 'my-bucket',
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+      mockKV._value = JSON.stringify(cached);
+
+      // First fetch: verifyTokenExists GET returns 404 (token deleted externally)
+      mockFetch.mockResolvedValueOnce(new Response('Not Found', { status: 404 }));
+      // Second fetch: createScopedR2Token POST creates new token
+      mockFetch.mockResolvedValueOnce(
+        new Response(JSON.stringify({
+          success: true,
+          result: { id: 'fresh-tok', value: 'fresh-raw-value' },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      );
+
+      const result = await getOrCreateScopedR2Token(
+        'user@example.com', 'account-123', 'api-token', 'my-bucket',
+        mockKV as unknown as KVNamespace,
+      );
+
+      // Stale KV entry should be deleted
+      expect(mockKV.delete).toHaveBeenCalledWith('r2token:user@example.com');
+      // New token should be returned
+      expect(result.accessKeyId).toBe('fresh-tok');
+      expect(result.secretAccessKey).toMatch(/^[0-9a-f]{64}$/);
+      // New token should be written to KV
+      expect(mockKV.put).toHaveBeenCalledWith(
+        'r2token:user@example.com',
+        expect.stringContaining('fresh-tok'),
+      );
+    });
+
+    it('should keep cached token when verify returns 500 (transient error)', async () => {
+      const cached = {
+        accessKeyId: 'cached-ak',
+        secretAccessKey: 'cached-sk',
+        tokenId: 'cached-tok',
+        bucketName: 'my-bucket',
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+      mockKV._value = JSON.stringify(cached);
+
+      // verifyTokenExists GET returns 500 — transient error, token may still be valid
+      mockFetch.mockResolvedValueOnce(new Response('Server Error', { status: 500 }));
+
+      const result = await getOrCreateScopedR2Token(
+        'user@example.com', 'account-123', 'api-token', 'my-bucket',
+        mockKV as unknown as KVNamespace,
+      );
+
+      // Should return cached token (500 is NOT proof the token is gone)
+      expect(result.accessKeyId).toBe('cached-ak');
+      expect(result.secretAccessKey).toBe('cached-sk');
+      // Should NOT have deleted the KV entry
+      expect(mockKV.delete).not.toHaveBeenCalled();
+      // Should NOT have created a new token (only 1 fetch call for verify)
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('should keep cached token when verify throws (network error)', async () => {
+      const cached = {
+        accessKeyId: 'cached-ak',
+        secretAccessKey: 'cached-sk',
+        tokenId: 'cached-tok',
+        bucketName: 'my-bucket',
+        createdAt: '2024-01-01T00:00:00Z',
+      };
+      mockKV._value = JSON.stringify(cached);
+
+      // verifyTokenExists throws a network error — circuit breaker or fetch failure
+      mockFetch.mockRejectedValueOnce(new Error('Network timeout'));
+
+      const result = await getOrCreateScopedR2Token(
+        'user@example.com', 'account-123', 'api-token', 'my-bucket',
+        mockKV as unknown as KVNamespace,
+      );
+
+      // Should return cached token (network error is NOT proof the token is gone)
+      expect(result.accessKeyId).toBe('cached-ak');
+      expect(result.secretAccessKey).toBe('cached-sk');
+      // Should NOT have deleted the KV entry
+      expect(mockKV.delete).not.toHaveBeenCalled();
+      // Should NOT have created a new token (only 1 fetch call for verify)
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it('should self-heal: forceFresh=true deletes stale KV entry and creates fresh token', async () => {
