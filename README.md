@@ -7,7 +7,7 @@ An ephemeral IDE where AI coding agents reach their full potential. Fully autono
 It runs wherever you happen to find yourself - on the Cloudflare edge that spans the planet, accessible from anything with a browser. Your phone, your tablet, your partner's laptop while they're not looking. Because the best commits in history were made from places without desks.
 
 ![Codeflare on a foldable tablet](docs/images/mobile-foldable.jpg)
-*Ideas don't care where you are. Six coding agents, any screen with a browser, zero setup. No installs, no configuration, no asking for permission. Open the link and start building.*
+*Ideas don't care where you are. Any screen with a browser, zero setup. No installs, no configuration, no asking for permission. Open the link and start building.*
 
 Every session comes pre-loaded with your choice of AI coding agent:
 
@@ -280,7 +280,7 @@ Create one OAuth App per environment (integration vs production) with the matchi
 
 ## Testing
 
-See `TECHNICAL.md` Section 18 for test suite details, counts, and configuration.
+See [TECHNICAL.md — Testing](TECHNICAL.md#testing) for test suite details, counts, and configuration.
 
 ```bash
 npm test                           # Backend tests
@@ -292,7 +292,7 @@ npm run test:e2e:ui-desktop        # E2E UI desktop (alias)
 npm run test:e2e:ui-mobile         # E2E UI mobile
 ```
 
-E2E tests require a deployed worker and CF Access service tokens. See `TECHNICAL.md` Section 18 for setup details.
+E2E tests require a deployed worker and CF Access service tokens. See [TECHNICAL.md — Testing](TECHNICAL.md#testing) for setup details.
 
 ## CI/CD
 
@@ -309,7 +309,7 @@ Eight GitHub Actions workflows:
 | `pentest.yml` | Weekly (Monday 5am UTC), manual | Automated external penetration testing |
 | `stress-test.yml` | Manual | k6 load testing against integration worker |
 
-See `TECHNICAL.md` Section 17 for full CI/CD documentation.
+See [TECHNICAL.md — CI/CD](TECHNICAL.md#cicd-github-actions) for full CI/CD documentation.
 
 ## Docs
 
