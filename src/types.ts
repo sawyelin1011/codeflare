@@ -46,11 +46,11 @@ export interface Env {
   // Turnstile secret used to verify waitlist submissions (optional).
   TURNSTILE_SECRET_KEY?: string;
 
-  // Resend API key used for waitlist notification emails (optional).
+  // Resend API key for transactional emails: welcome, subscription, tier change, access requests (optional).
   RESEND_API_KEY?: string;
 
-  // Optional sender identity for waitlist emails.
-  WAITLIST_FROM_EMAIL?: string;
+  // Optional sender identity for outgoing emails (e.g. "Codeflare <noreply@example.com>").
+  RESEND_EMAIL?: string;
 
   // Optional worker name override for forks (set via wrangler.toml [vars] or GitHub Actions)
   CLOUDFLARE_WORKER_NAME?: string;
@@ -69,9 +69,27 @@ export interface Env {
   // Use for custom OIDC/SAML providers (e.g., Authentik, Okta).
   SAAS_EXTRA_IDPS?: string;
 
+  // Stripe secret key for payment processing (optional, SaaS mode only).
+  // Set via wrangler secret. When absent, all plans are free (no billing).
+  STRIPE_SECRET_KEY?: string;
+
+  // Stripe webhook signing secret for verifying webhook payloads (optional, SaaS mode only).
+  // Set via wrangler secret. Required when STRIPE_SECRET_KEY is set.
+  STRIPE_WEBHOOK_SECRET?: string;
+
   // Optional AES-256 key (base64) for encrypting KV values at rest.
   // Set via wrangler secret. When absent, credentials stored as plaintext.
   ENCRYPTION_KEY?: string;
+
+  // GitHub OAuth (SaaS mode only — replaces CF Access for authentication)
+  // Create an OAuth App at github.com/settings/applications/new
+  OAUTH_CLIENT_ID?: string;      // OAuth App client ID (wrangler.toml var, public)
+  OAUTH_CLIENT_SECRET?: string;   // OAuth App client secret (wrangler secret)
+  OAUTH_JWT_SECRET?: string;             // HMAC-SHA256 signing key for session JWTs (wrangler secret)
+
+  // Timekeeper Durable Object for per-user usage tracking
+  TIMEKEEPER?: DurableObjectNamespace;
+
 }
 
 /**
@@ -87,6 +105,10 @@ export interface AccessUser {
   authenticated: boolean;
   role?: UserRole;
   accessTier?: AccessTier;
+  subscriptionTier?: SubscriptionTier;
+  subscribedMode?: 'default' | 'advanced';
+  billingStatus?: BillingStatus;
+  billingPeriodEnd?: string;
 }
 
 /**
@@ -125,6 +147,62 @@ export type SessionMode = z.infer<typeof SessionModeSchema>;
 export const AccessTierSchema = z.enum(['pending', 'standard', 'advanced', 'blocked']);
 export type AccessTier = z.infer<typeof AccessTierSchema>;
 
+const BillingStatusSchema = z.enum(['active', 'trialing', 'past_due', 'canceled']);
+export type BillingStatus = z.infer<typeof BillingStatusSchema>;
+
+export const BILLING_STATUS = {
+  ACTIVE: 'active',
+  TRIALING: 'trialing',
+  PAST_DUE: 'past_due',
+  CANCELED: 'canceled',
+} as const satisfies Record<string, BillingStatus>;
+
+export function isBillingStatus(value: unknown): value is BillingStatus {
+  return typeof value === 'string' && BillingStatusSchema.safeParse(value).success;
+}
+
+export const SubscriptionTierSchema = z.enum([
+  'blocked', 'pending', 'free', 'trial', 'standard', 'advanced', 'max', 'unlimited',
+]);
+export type SubscriptionTier = z.infer<typeof SubscriptionTierSchema>;
+
+/**
+ * Configuration for a single subscription tier.
+ * Stored as part of the tiers:config KV value.
+ */
+export interface SubscriptionTierConfig {
+  id: SubscriptionTier | string;
+  displayName: string;
+  monthlySeconds: number | null; // null = unlimited
+  maxSessions: number;
+  sessionModes: SessionMode[];
+  canLogin: boolean;
+  order: number;
+  isDefault: boolean;
+  priceMonthly: number | null; // cents, null = not purchasable
+  trialQuotaHours: number; // hours of free usage before billing, 0 = no trial
+  maxStorageBytes?: number | null; // null/undefined = unlimited
+  description: string;
+  advancedPriceMonthly?: number | null; // cents, higher price for advanced mode
+  stripePriceId?: string | null; // Stripe price ID for standard mode
+  stripeAdvancedPriceId?: string | null; // Stripe price ID for advanced/pro mode
+}
+
+/**
+ * Usage record stored at timekeeper:{bucketName} in KV.
+ * Written by Timekeeper DO alarm handler.
+ */
+export const UsageRecordSchema = z.object({
+  today: z.object({ date: z.string(), seconds: z.number().min(0) }),
+  thisWeek: z.object({ weekStart: z.string(), seconds: z.number().min(0) }),
+  thisMonth: z.object({ month: z.string(), seconds: z.number().min(0) }),
+  thisYear: z.object({ year: z.string(), seconds: z.number().min(0) }),
+  allTime: z.object({ seconds: z.number().min(0) }),
+  lastUpdatedAt: z.string(),
+});
+export type UsageRecord = z.infer<typeof UsageRecordSchema>;
+
+
 /**
  * Configuration for a single terminal tab
  */
@@ -147,12 +225,16 @@ export interface Preset {
 /**
  * User preferences persisted across sessions
  */
+export type SleepAfterOption = '5m' | '15m' | '30m' | '1h' | '2h';
+export const SleepAfterOptions: SleepAfterOption[] = ['5m', '15m', '30m', '1h', '2h'];
+
 export interface UserPreferences {
   lastAgentType?: AgentType;
   lastPresetId?: string;
   workspaceSyncEnabled?: boolean;
   fastStartEnabled?: boolean;
   sessionMode?: SessionMode;
+  sleepAfter?: SleepAfterOption;
 }
 
 /**
@@ -170,6 +252,25 @@ export interface DeployKeys {
   githubToken?: string;
   cloudflareApiToken?: string;
   cloudflareAccountId?: string;
+}
+
+/**
+ * Grouped parameters for container DO initialization (buildSetBucketNameBody + configureContainerDO).
+ */
+export interface ContainerConfigPayload {
+  bucketName: string;
+  sessionId: string;
+  userEmail: string;
+  scopedCreds: { accessKeyId: string; secretAccessKey: string };
+  r2Config: { accountId: string; endpoint: string };
+  tabConfig: TabConfig[];
+  workspaceSyncEnabled: boolean;
+  fastStartEnabled: boolean;
+  sessionMode: string;
+  sleepAfter?: string;
+  encryptionKey?: string;
+  llmKeys?: LlmKeys;
+  deployKeys?: DeployKeys;
 }
 
 export interface StorageObject {

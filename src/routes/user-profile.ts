@@ -6,6 +6,7 @@ import { createRateLimiter } from '../middleware/rate-limit';
 import { isOnboardingLandingPageActive, isSaasModeActive } from '../lib/onboarding';
 import { getOrCreateScopedR2Token } from '../lib/r2-admin';
 import { getOrImportKey } from '../lib/kv-crypto';
+import { SETUP_KEYS } from '../lib/kv-keys';
 
 /**
  * Rate limiter for ensure-r2-token
@@ -33,20 +34,27 @@ app.get('/', async (c) => {
   const user = c.get('user');
   const bucketName = c.get('bucketName');
 
-  // Read onboardingComplete from user's KV entry
-  const kvRaw = await c.env.KV.get(`user:${user.email}`, 'json') as { onboardingComplete?: boolean } | null;
+  // Read onboardingComplete and subscribedMode from user's KV entry
+  const kvRaw = await c.env.KV.get(`user:${user.email}`, 'json') as { onboardingComplete?: boolean; subscribedMode?: string } | null;
   const onboardingComplete = kvRaw?.onboardingComplete === true;
+  const subscribedMode = kvRaw?.subscribedMode === 'advanced' ? 'advanced' : 'default';
+
+  const subscriptionTier = user.subscriptionTier ?? user.accessTier;
+  const hasSubscribed = subscriptionTier !== 'pending' && subscriptionTier !== 'blocked';
 
   return c.json({
     email: user.email,
     authenticated: user.authenticated,
     role: user.role,
     accessTier: user.accessTier,
+    subscriptionTier,
     bucketName,
     workerName: c.env.CLOUDFLARE_WORKER_NAME || 'codeflare',
     onboardingActive: isOnboardingLandingPageActive(c.env.ONBOARDING_LANDING_PAGE),
     saasMode: isSaasModeActive(c.env.SAAS_MODE),
     onboardingComplete,
+    hasSubscribed,
+    subscribedMode,
   });
 });
 
@@ -80,7 +88,7 @@ app.get('/r2-status', async (c) => {
 app.post('/ensure-r2-token', ensureR2TokenRateLimiter, async (c) => {
   const user = c.get('user');
   const bucketName = c.get('bucketName');
-  const accountId = await c.env.KV.get('setup:account_id');
+  const accountId = await c.env.KV.get(SETUP_KEYS.ACCOUNT_ID);
 
   if (!accountId || !c.env.CLOUDFLARE_API_TOKEN) {
     return c.json({ ready: false, error: 'Setup incomplete' }, 503);

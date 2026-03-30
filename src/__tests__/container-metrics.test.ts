@@ -162,7 +162,7 @@ describe('Container Metrics', () => {
 
       await containerInstance.collectMetrics();
 
-      // Verify KV was written with metrics
+      // Verify metrics written to session key (with metadata for batch-status)
       expect(mockKV.put).toHaveBeenCalled();
       const putCall = mockKV.put.mock.calls.find(
         (call: unknown[]) => typeof call[0] === 'string' && (call[0] as string).includes('testsession123456')

@@ -25,6 +25,7 @@ interface StorageStats {
   totalFolders: number;
   totalSizeBytes: number;
   bucketName?: string;
+  maxStorageBytes?: number | null;
 }
 
 interface PreviewFile {
@@ -338,9 +339,13 @@ export const storageStore = {
   },
 };
 
-/** Update stats from batch-status polling (avoids separate /storage/stats request) */
+/** Update stats from batch-status polling. Preserves maxStorageBytes and bucketName
+ *  from the last fetchStats() call — batch-status doesn't include quota info. */
 export function updateStatsFromBatch(stats: { totalFiles: number; totalFolders: number; totalSizeBytes: number }): void {
-  setState('stats', stats);
+  setState('stats', (prev) => ({
+    ...prev,
+    ...stats,
+  }));
 }
 
 /** @internal test-only */

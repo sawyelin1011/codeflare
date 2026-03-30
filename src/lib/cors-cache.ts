@@ -8,6 +8,7 @@ import type { Env } from '../types';
 import { DEFAULT_ALLOWED_ORIGINS } from './constants';
 import { toErrorMessage } from './error-types';
 import { createLogger } from './logger';
+import { SETUP_KEYS } from './kv-keys';
 
 const logger = createLogger('cors-cache');
 
@@ -56,17 +57,18 @@ async function getKvOrigins(env: Env): Promise<string[]> {
 
   const origins: string[] = [];
 
+  // CF-022: Separate try/catch for each KV read to prevent partial-list caching
   try {
-    // Read custom domain — stored as bare domain (e.g., "claude.example.com").
-    // matchesPattern() handles both exact match and subdomain match with
-    // dot-boundary enforcement, so no duplicate patterns needed.
-    const customDomain = await env.KV.get('setup:custom_domain');
+    const customDomain = await env.KV.get(SETUP_KEYS.CUSTOM_DOMAIN);
     if (customDomain) {
       origins.push(customDomain);
     }
+  } catch (err) {
+    logger.warn('Failed to load custom domain from KV', { error: toErrorMessage(err) });
+  }
 
-    // Read allowed origins list
-    const originsJson = await env.KV.get('setup:allowed_origins');
+  try {
+    const originsJson = await env.KV.get(SETUP_KEYS.ALLOWED_ORIGINS);
     if (originsJson) {
       const parsed = JSON.parse(originsJson) as string[];
       if (Array.isArray(parsed)) {
@@ -78,9 +80,7 @@ async function getKvOrigins(env: Env): Promise<string[]> {
       }
     }
   } catch (err) {
-    logger.warn('Failed to load KV origins, falling back to env/defaults', {
-      error: toErrorMessage(err),
-    });
+    logger.warn('Failed to load allowed_origins from KV', { error: toErrorMessage(err) });
   }
 
   setCachedKvOrigins(origins);

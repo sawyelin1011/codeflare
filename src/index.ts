@@ -13,8 +13,12 @@ import preferenceRoutes from './routes/preferences';
 import llmKeysRoutes from './routes/llm-keys';
 import deployKeysRoutes from './routes/deploy-keys';
 import publicRoutes from './routes/public/index';
+import usageRoutes from './routes/usage';
+import adminTiersRoutes from './routes/admin/tiers';
+import billingRoutes from './routes/billing';
+import stripeWebhookRoute from './routes/stripe-webhook';
 import { REQUEST_ID_LENGTH, REQUEST_ID_PATTERN, CORS_MAX_AGE_SECONDS } from './lib/constants';
-import { AppError } from './lib/error-types';
+import { AppError, toError } from './lib/error-types';
 import { isAllowedOrigin } from './lib/cors-cache';
 import {
   resetSetupCache as resetSetupCacheShared,
@@ -24,10 +28,15 @@ import {
 import { createLogger, setLogLevel } from './lib/logger';
 import type { LogLevel } from './lib/logger';
 import { authenticateRequest } from './lib/access';
+import { SETUP_KEYS } from './lib/kv-keys';
+import { verifySessionJWT, shouldRefreshJWT, signSessionJWT } from './lib/session-jwt';
+import { warnIfNoEncryptionKey } from './lib/kv-crypto';
 import { isOnboardingLandingPageActive, isSaasModeActive } from './lib/onboarding';
 import { isActiveUser } from './lib/access-tier';
+import { getEffectiveTier } from './lib/subscription';
 import authApiRoutes from './routes/auth';
 import authRedirectRoutes from './routes/auth-redirects';
+import githubAuthRoutes from './routes/github-auth';
 
 // Type for app context with request ID
 type AppVariables = {
@@ -65,6 +74,15 @@ const logger = createLogger('index');
 // Request Tracing Middleware
 // ============================================================================
 app.use('*', async (c, next) => {
+  // CF-001: Hard enforcement — STRESS_TEST_MODE must never bypass rate limits in SaaS production.
+  if (c.env.SAAS_MODE === 'active' && c.env.STRESS_TEST_MODE === 'active') {
+    logger.error('BLOCKED: STRESS_TEST_MODE active in SaaS production', undefined, { path: c.req.path });
+    return c.json({ error: 'Misconfiguration: stress test mode cannot be active in SaaS production' }, 503);
+  }
+
+  // CF-017: Warn on first request if credentials will be stored as plaintext
+  warnIfNoEncryptionKey(c.env.ENCRYPTION_KEY);
+
   const clientId = c.req.header('X-Request-ID');
   const requestId = (clientId && REQUEST_ID_PATTERN.test(clientId))
     ? clientId
@@ -87,6 +105,27 @@ app.use('*', async (c, next) => {
     status: c.res.status,
     durationMs: duration,
   });
+});
+
+// SaaS mode: cookie refresh middleware — extends session when < 15 min remaining
+app.use('*', async (c, next) => {
+  await next();
+  // Only refresh for SaaS OIDC mode
+  if (!isSaasModeActive(c.env.SAAS_MODE) || !c.env.OAUTH_CLIENT_ID || !c.env.OAUTH_JWT_SECRET) return;
+  const cookieHeader = c.req.header('Cookie');
+  if (!cookieHeader) return;
+  const match = cookieHeader.match(/codeflare_session=([^;]+)/);
+  if (!match) return;
+  try {
+    const payload = await verifySessionJWT(match[1], c.env.OAUTH_JWT_SECRET);
+    if (payload && shouldRefreshJWT(payload)) {
+      const refreshed = await signSessionJWT(
+        { email: payload.email, sub: payload.sub, ghLogin: payload.ghLogin },
+        c.env.OAUTH_JWT_SECRET,
+      );
+      c.header('Set-Cookie', `codeflare_session=${refreshed}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=3600`);
+    }
+  } catch { /* non-fatal — don't break the response */ }
 });
 
 // CORS middleware - restrict to trusted origins (configurable via ALLOWED_ORIGINS env var)
@@ -145,6 +184,7 @@ app.get('/api/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISO
 
 // Auth routes (mounted before setup routes)
 app.route('/api/auth', authApiRoutes);
+app.route('/auth/github', githubAuthRoutes);
 app.route('/auth', authRedirectRoutes);
 
 // Public auth providers endpoint (outside /api/* to bypass CF Access).
@@ -152,11 +192,20 @@ app.route('/auth', authRedirectRoutes);
 // Non-SaaS: show all social IdPs + extra IdPs.
 const SOCIAL_IDP_TYPES = new Set(['google', 'github', 'facebook', 'linkedin']);
 app.get('/public/auth/providers', async (c) => {
-  const idpList = await c.env.KV.get<Array<{ id: string; type: string; name: string }>>('setup:idp_list', 'json');
+  const saas = isSaasModeActive(c.env.SAAS_MODE);
+
+  // SaaS mode with GitHub OIDC: return hardcoded provider with direct login URL
+  if (saas && c.env.OAUTH_CLIENT_ID) {
+    return c.json({
+      providers: [{ id: 'github', type: 'github', name: 'GitHub', loginUrl: '/auth/github/login' }],
+    });
+  }
+
+  // CF Access mode: fetch IdP list from KV
+  const idpList = await c.env.KV.get<Array<{ id: string; type: string; name: string }>>(SETUP_KEYS.IDP_LIST, 'json');
   const extraIds = new Set(
     (c.env.SAAS_EXTRA_IDPS || '').split(',').map(s => s.trim()).filter(Boolean)
   );
-  const saas = isSaasModeActive(c.env.SAAS_MODE);
   const filtered = (idpList || []).filter(p => {
     if (extraIds.has(p.id)) return true;
     return saas ? p.type === 'github' : SOCIAL_IDP_TYPES.has(p.type);
@@ -166,6 +215,7 @@ app.get('/public/auth/providers', async (c) => {
 
 // Setup routes (public - no auth required)
 app.route('/api/setup', setupRoutes);
+app.route('/public/stripe', stripeWebhookRoute);  // Must be before /public catch-all
 app.route('/public', publicRoutes);
 
 // API routes
@@ -179,6 +229,9 @@ app.route('/api/presets', presetRoutes);
 app.route('/api/preferences', preferenceRoutes);
 app.route('/api/llm-keys', llmKeysRoutes);
 app.route('/api/deploy-keys', deployKeysRoutes);
+app.route('/api/usage', usageRoutes);
+app.route('/api/admin/tiers', adminTiersRoutes);
+app.route('/api/billing', billingRoutes);
 
 // 404 fallback - only for API routes
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
@@ -200,7 +253,7 @@ export function resetSetupCache() {
 // Convention: Routes should throw AppError subclasses for error handling.
 // Exception: Routes with domain-specific error response shapes (e.g., startup-status)
 // may catch and return directly when the shape differs from AppError.toJSON().
-type AppStatusCode = 400 | 401 | 403 | 404 | 409 | 429 | 500 | 503;
+type AppStatusCode = 400 | 401 | 402 | 403 | 404 | 409 | 429 | 500 | 503;
 
 app.onError((err, c) => {
   const requestId = c.get('requestId') || 'unknown';
@@ -214,7 +267,7 @@ app.onError((err, c) => {
     return c.json(err.toJSON(), err.statusCode as AppStatusCode);
   }
 
-  logger.error('Unexpected error', err instanceof Error ? err : new Error(String(err)), { requestId });
+  logger.error('Unexpected error', toError(err), { requestId });
   return c.json({ error: 'An unexpected error occurred' }, 500);
 });
 
@@ -257,7 +310,7 @@ export default {
     if (path !== '/setup' && !path.startsWith('/setup/')) {
       // Check setup status (with in-memory cache)
       if (getSetupCompleteCache() === null) {
-        const status = await env.KV.get('setup:complete');
+        const status = await env.KV.get(SETUP_KEYS.COMPLETE);
         setSetupCompleteCache(status === 'true');
       }
       if (!getSetupCompleteCache()) {
@@ -274,7 +327,9 @@ export default {
       if (saasActive) {
         try {
           const { user } = await authenticateRequest(request, env);
-          if (isActiveUser(user.accessTier)) {
+          // HIGH-1: Use billing-aware tier resolution, not raw tier field
+          const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd);
+          if (isActiveUser(effectiveTier)) {
             return redirectWithHeaders('/app/');
           }
           // Authenticated but pending/blocked — redirect to subscribe page
@@ -313,3 +368,4 @@ export default {
 // Export Durable Objects
 // Export container class for Durable Objects
 export { container } from './container';
+export { Timekeeper as timekeeper } from './timekeeper/index';

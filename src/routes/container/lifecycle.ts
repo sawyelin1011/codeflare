@@ -4,7 +4,7 @@
  */
 import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
-import type { Env, Session, SessionMode, UserPreferences, LlmKeys, DeployKeys, TabConfig } from '../../types';
+import type { Env, Session, SessionMode, UserPreferences, LlmKeys, DeployKeys, ContainerConfigPayload } from '../../types';
 import { createBucketIfNotExists, getOrCreateScopedR2Token } from '../../lib/r2-admin';
 import { seedGettingStartedDocs, reconcileAgentConfigs } from '../../lib/r2-seed';
 import { resolveSessionMode } from '../../lib/session-mode';
@@ -12,42 +12,31 @@ import { getR2Config } from '../../lib/r2-config';
 import { getContainerContext, getSessionIdFromQuery, getContainerId } from '../../lib/container-helpers';
 import { AuthVariables } from '../../middleware/auth';
 import { createRateLimiter } from '../../middleware/rate-limit';
-import { AppError, ContainerError, NotFoundError, RateLimitError, toError, toErrorMessage } from '../../lib/error-types';
+import { AppError, ContainerError, NotFoundError, RateLimitError, QuotaExceededError, toError, toErrorMessage } from '../../lib/error-types';
+import { getTierConfig, getUserTier, getEffectiveTier, getAllowedSessionModes } from '../../lib/subscription';
+import { isSaasModeActive } from '../../lib/onboarding';
 import { BUCKET_NAME_SETTLE_DELAY_MS, CONTAINER_ID_DISPLAY_LENGTH, getMaxSessions } from '../../lib/constants';
-import { getSessionKey, getPreferencesKey, getLlmKeysKey, getDeployKeysKey, listAllKvKeys, getSessionPrefix } from '../../lib/kv-keys';
+import { getSessionKey, getPreferencesKey, getLlmKeysKey, getDeployKeysKey, listAllKvKeys, getSessionPrefix, getTimekeeperKey, getUtcMonthString, putSessionWithMetadata, type SessionListMetadata } from '../../lib/kv-keys';
 import { getDefaultTabConfig } from '../../lib/agent-config';
+import { SetBucketNameBodySchema } from '../../lib/container-config-schema';
 import { containerLogger, getStoredBucketName } from './shared';
 import { getContainerInternalCB } from '../../lib/circuit-breakers';
 import type { Logger } from '../../lib/logger';
 import { getAndDecrypt, getOrImportKey } from '../../lib/kv-crypto';
 
 // ---------------------------------------------------------------------------
-// Extracted helpers (FIX-8)
+// Extracted helpers
 // ---------------------------------------------------------------------------
 
 /**
  * Build the JSON body for /_internal/setBucketName requests.
  * Extracted to avoid duplication between initial set and post-destroy re-set.
  */
-function buildSetBucketNameBody(params: {
-  bucketName: string;
-  sessionId: string;
-  scopedCreds: { accessKeyId: string; secretAccessKey: string };
-  r2Config: { accountId: string; endpoint: string };
-  tabConfig: TabConfig[];
-  workspaceSyncEnabled: boolean;
-  fastStartEnabled: boolean;
-  openaiApiKey?: string;
-  geminiApiKey?: string;
-  githubToken?: string;
-  cloudflareApiToken?: string;
-  cloudflareAccountId?: string;
-  encryptionKey?: string;
-  sessionMode: string;
-}): string {
-  return JSON.stringify({
+function buildSetBucketNameBody(params: ContainerConfigPayload): string {
+  const body = SetBucketNameBodySchema.parse({
     bucketName: params.bucketName,
     sessionId: params.sessionId,
+    userEmail: params.userEmail,
     r2AccessKeyId: params.scopedCreds.accessKeyId,
     r2SecretAccessKey: params.scopedCreds.secretAccessKey,
     r2AccountId: params.r2Config.accountId,
@@ -55,14 +44,16 @@ function buildSetBucketNameBody(params: {
     tabConfig: params.tabConfig,
     workspaceSyncEnabled: params.workspaceSyncEnabled,
     fastStartEnabled: params.fastStartEnabled,
-    ...(params.openaiApiKey && { openaiApiKey: params.openaiApiKey }),
-    ...(params.geminiApiKey && { geminiApiKey: params.geminiApiKey }),
-    githubToken: params.githubToken ?? null,
-    cloudflareApiToken: params.cloudflareApiToken ?? null,
-    cloudflareAccountId: params.cloudflareAccountId ?? null,
+    ...(params.llmKeys?.openaiApiKey && { openaiApiKey: params.llmKeys.openaiApiKey }),
+    ...(params.llmKeys?.geminiApiKey && { geminiApiKey: params.llmKeys.geminiApiKey }),
+    ...(params.deployKeys?.githubToken && { githubToken: params.deployKeys.githubToken }),
+    ...(params.deployKeys?.cloudflareApiToken && { cloudflareApiToken: params.deployKeys.cloudflareApiToken }),
+    ...(params.deployKeys?.cloudflareAccountId && { cloudflareAccountId: params.deployKeys.cloudflareAccountId }),
     ...(params.encryptionKey && { encryptionKey: params.encryptionKey }),
     sessionMode: params.sessionMode,
+    sleepAfter: params.sleepAfter ?? '30m',
   });
+  return JSON.stringify(body);
 }
 
 /**
@@ -104,8 +95,12 @@ export async function validateSessionAndCheckLimits(params: {
   bucketName: string;
   sessionId: string;
   maxSessions: number;
+  subscriptionTier?: string;
+  accessTier?: string;
+  billingStatus?: string;
+  billingPeriodEnd?: string;
 }): Promise<Session> {
-  const { env, bucketName, sessionId, maxSessions } = params;
+  const { env, bucketName, sessionId, maxSessions, subscriptionTier, accessTier, billingStatus, billingPeriodEnd } = params;
 
   const sessionKey = getSessionKey(bucketName, sessionId);
   const sessionData = await env.KV.get<Session>(sessionKey, 'json');
@@ -113,24 +108,61 @@ export async function validateSessionAndCheckLimits(params: {
     throw new NotFoundError('Session', sessionId);
   }
 
-  // Session limit check: enforce max concurrent running sessions per role.
-  // Bypass when stress testing so E2E suites can start unlimited containers.
+  // Session limit + quota checks. Bypass when stress testing.
   if (env.STRESS_TEST_MODE !== 'active') {
-    const sessionKeys = await listAllKvKeys(env.KV, getSessionPrefix(bucketName));
-    const sessionSettled = await Promise.allSettled(
-      sessionKeys.map(key => env.KV.get<Session>(key.name, 'json'))
-    );
-    const sessionResults = sessionSettled
-      .filter((r): r is PromiseFulfilledResult<Session | null> => r.status === 'fulfilled')
-      .map(r => r.value);
-    const runningCount = sessionResults.filter(
-      (s): s is Session => s !== null && s.status === 'running' && s.id !== sessionId
-    ).length;
+    // Resolve tier once for both session limit and quota checks (cached 60s)
+    const isSaas = isSaasModeActive(env.SAAS_MODE);
+    let resolvedTier: ReturnType<typeof getUserTier> | null = null;
+    if (isSaas) {
+      try {
+        const tiers = await getTierConfig(env.KV);
+        resolvedTier = getUserTier(getEffectiveTier(subscriptionTier, accessTier, billingStatus, billingPeriodEnd), tiers);
+      } catch { /* fall back to role-based */ }
+    }
 
-    if (runningCount >= maxSessions) {
+    // Session limit: tier-based in SaaS mode, role-based otherwise.
+    // Uses list metadata to count running sessions (zero individual KV.get calls).
+    const effectiveMaxSessions = resolvedTier?.maxSessions ?? maxSessions;
+    const sessionKeys = await listAllKvKeys(env.KV, getSessionPrefix(bucketName));
+    let runningCount = 0;
+    for (const key of sessionKeys) {
+      const meta = key.metadata as SessionListMetadata | null;
+      if (meta && meta.s) {
+        // Fast path: read status from list metadata
+        const keySessionId = key.name.split(':').pop();
+        if (meta.s === 'r' && keySessionId !== sessionId) runningCount++;
+      } else {
+        // Fallback: pre-migration key without metadata
+        const s = await env.KV.get<Session>(key.name, 'json');
+        if (s && s.status === 'running' && s.id !== sessionId) runningCount++;
+      }
+    }
+
+    if (runningCount >= effectiveMaxSessions) {
       throw new RateLimitError(
-        `Session limit reached (${runningCount}/${maxSessions}). Stop an existing session to start a new one.`
+        `Session limit reached (${runningCount}/${effectiveMaxSessions}). Stop an existing session to start a new one.`
       );
+    }
+
+    // Usage quota check (SaaS mode only)
+    if (isSaas && resolvedTier && resolvedTier.monthlySeconds !== null) {
+      try {
+        const usageRecord = await env.KV.get(getTimekeeperKey(bucketName), 'json') as { thisMonth?: { month: string; seconds: number } } | null;
+        const now = new Date();
+        const currentMonth = getUtcMonthString(now);
+        const monthlySeconds = (usageRecord?.thisMonth?.month === currentMonth)
+          ? usageRecord.thisMonth.seconds : 0;
+
+        if (monthlySeconds >= resolvedTier.monthlySeconds) {
+          const usedHours = Math.round(monthlySeconds / 3600);
+          const quotaHours = Math.round(resolvedTier.monthlySeconds / 3600);
+          throw new QuotaExceededError(
+            `Monthly compute quota reached (${usedHours}h / ${quotaHours}h). Upgrade your plan.`
+          );
+        }
+      } catch (err) {
+        if (err instanceof QuotaExceededError) throw err;
+      }
     }
   }
 
@@ -208,45 +240,16 @@ export async function ensureBucketAndSeed(params: {
  *
  * @throws ContainerError if setBucketName fails on a needed update
  */
-export async function configureContainerDO(params: {
+export async function configureContainerDO(params: ContainerConfigPayload & {
   container: { fetch: (req: Request) => Promise<Response> };
-  bucketName: string;
-  sessionId: string;
   containerId: string;
-  scopedCreds: { accessKeyId: string; secretAccessKey: string };
-  r2Config: { accountId: string; endpoint: string };
-  tabConfig: TabConfig[];
-  workspaceSyncEnabled: boolean;
-  fastStartEnabled: boolean;
-  openaiApiKey?: string;
-  geminiApiKey?: string;
-  githubToken?: string;
-  cloudflareApiToken?: string;
-  cloudflareAccountId?: string;
-  encryptionKey?: string;
-  sessionMode: string;
   logger: Logger;
 }): Promise<{ needsBucketUpdate: boolean; setBucketBody: string }> {
   const { container, bucketName, containerId, logger } = params;
 
   const storedBucketName = await getStoredBucketName(container, logger, containerId);
 
-  const setBucketBody = buildSetBucketNameBody({
-    bucketName: params.bucketName,
-    sessionId: params.sessionId,
-    scopedCreds: params.scopedCreds,
-    r2Config: params.r2Config,
-    tabConfig: params.tabConfig,
-    workspaceSyncEnabled: params.workspaceSyncEnabled,
-    fastStartEnabled: params.fastStartEnabled,
-    openaiApiKey: params.openaiApiKey,
-    geminiApiKey: params.geminiApiKey,
-    githubToken: params.githubToken,
-    cloudflareApiToken: params.cloudflareApiToken,
-    cloudflareAccountId: params.cloudflareAccountId,
-    encryptionKey: params.encryptionKey,
-    sessionMode: params.sessionMode,
-  });
+  const setBucketBody = buildSetBucketNameBody(params);
 
   const needsBucketUpdate = storedBucketName !== bucketName;
 
@@ -332,7 +335,7 @@ export async function startOrRestartContainer(params: {
   // Mark session as running in KV
   if (sessionData.status !== 'running') {
     const updated = { ...sessionData, status: 'running' as const };
-    await env.KV.put(sessionKey, JSON.stringify(updated));
+    await putSessionWithMetadata(env.KV, sessionKey, updated);
   }
 
   // If container is already running/healthy with correct bucket, return immediately
@@ -355,7 +358,7 @@ export async function startOrRestartContainer(params: {
           const freshSession = await env.KV.get<Session>(sessionKey, 'json');
           if (freshSession) {
             const rolledBack = { ...freshSession, status: 'stopped' as const };
-            await env.KV.put(sessionKey, JSON.stringify(rolledBack));
+            await putSessionWithMetadata(env.KV, sessionKey, rolledBack);
           }
         } catch (err) {
           logger.error('KV rollback to stopped failed', toError(err));
@@ -396,12 +399,16 @@ app.post('/start', containerStartRateLimiter, async (c) => {
     const user = c.get('user');
     const maxSessions = getMaxSessions(user.role, c.env);
 
-    // Step 1: Validate session and check limits
+    // Step 1: Validate session and check limits (including usage quota)
     const sessionData = await validateSessionAndCheckLimits({
       env: c.env,
       bucketName,
       sessionId,
       maxSessions,
+      subscriptionTier: user.subscriptionTier,
+      accessTier: user.accessTier,
+      billingStatus: user.billingStatus,
+      billingPeriodEnd: user.billingPeriodEnd,
     });
 
     const containerId = getContainerId(bucketName, sessionId);
@@ -410,14 +417,26 @@ app.post('/start', containerStartRateLimiter, async (c) => {
     const preferences = await c.env.KV.get<UserPreferences>(preferencesKey, 'json') || {};
     const workspaceSyncEnabled = preferences.workspaceSyncEnabled === true;
     const fastStartEnabled = preferences.fastStartEnabled !== false;
-    const sessionMode = resolveSessionMode(preferences);
+    let sessionMode = resolveSessionMode(preferences);
+    // Free tier: locked to 5m idle timeout. All other tiers: user preference or 30m default.
+    const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd);
+    // Clamp session mode against effective tier — canceled users can't use advanced (SaaS only)
+    if (isSaasModeActive(c.env.SAAS_MODE) && sessionMode === 'advanced') {
+      try {
+        const tiers = await getTierConfig(c.env.KV);
+        if (!getAllowedSessionModes(effectiveTier, tiers).includes('advanced')) {
+          sessionMode = 'default';
+        }
+      } catch { /* non-SaaS or KV unavailable — allow the stored mode */ }
+    }
+    const sleepAfter = effectiveTier === 'free' ? '5m' : (preferences.sleepAfter || '30m');
 
     // Read LLM API keys and deploy credentials (if any) to inject into container env vars
     const cryptoKey = await getOrImportKey(c.env);
-    const llmKeysKey = getLlmKeysKey(bucketName);
-    const llmKeys = await getAndDecrypt<LlmKeys>(c.env.KV, llmKeysKey, cryptoKey);
-    const deployKeysKey = getDeployKeysKey(bucketName);
-    const deployKeys = await getAndDecrypt<DeployKeys>(c.env.KV, deployKeysKey, cryptoKey);
+    const [llmKeys, deployKeys] = await Promise.all([
+      getAndDecrypt<LlmKeys>(c.env.KV, getLlmKeysKey(bucketName), cryptoKey),
+      getAndDecrypt<DeployKeys>(c.env.KV, getDeployKeysKey(bucketName), cryptoKey),
+    ]);
 
     // Step 2: Ensure R2 bucket exists and seed if new
     const { r2Config } = await ensureBucketAndSeed({
@@ -440,21 +459,20 @@ app.post('/start', containerStartRateLimiter, async (c) => {
     // Step 4: Configure the container DO
     const { needsBucketUpdate, setBucketBody } = await configureContainerDO({
       container,
+      containerId,
       bucketName,
       sessionId,
-      containerId,
+      userEmail: user.email,
       scopedCreds,
       r2Config,
       tabConfig,
       workspaceSyncEnabled,
       fastStartEnabled,
-      openaiApiKey: llmKeys?.openaiApiKey,
-      geminiApiKey: llmKeys?.geminiApiKey,
-      githubToken: deployKeys?.githubToken,
-      cloudflareApiToken: deployKeys?.cloudflareApiToken,
-      cloudflareAccountId: deployKeys?.cloudflareAccountId,
-      encryptionKey: c.env.ENCRYPTION_KEY,
       sessionMode,
+      sleepAfter,
+      encryptionKey: c.env.ENCRYPTION_KEY,
+      llmKeys: llmKeys ?? undefined,
+      deployKeys: deployKeys ?? undefined,
       logger: reqLogger,
     });
 

@@ -5,9 +5,12 @@ import { createRateLimiter } from '../../middleware/rate-limit';
 import { AppError, ValidationError } from '../../lib/error-types';
 import { getAllUsers } from '../../lib/access-policy';
 import { isOnboardingLandingPageActive } from '../../lib/onboarding';
+import { getTierConfig, SUBSCRIBABLE_TIER_IDS } from '../../lib/subscription';
 import { escapeXml } from '../../lib/xml-utils';
 import { createLogger } from '../../lib/logger';
+import { parseJsonBody, firstZodError } from '../../lib/request-helpers';
 import { verifyTurnstileToken } from '../../lib/turnstile';
+import { SETUP_KEYS } from '../../lib/kv-keys';
 
 const logger = createLogger('public-routes');
 
@@ -69,7 +72,7 @@ async function sendWaitlistEmail(params: {
 }
 
 app.get('/onboarding-config', async (c) => {
-  const siteKey = await c.env.KV.get('setup:turnstile_site_key');
+  const siteKey = await c.env.KV.get(SETUP_KEYS.TURNSTILE_SITE_KEY);
   return c.json({
     active: true,
     turnstileSiteKey: siteKey,
@@ -77,14 +80,14 @@ app.get('/onboarding-config', async (c) => {
 });
 
 app.post('/waitlist', waitlistRateLimiter, async (c) => {
-  const body = await c.req.json();
+  const body = await parseJsonBody(c);
   const parsed = WaitlistRequestSchema.safeParse(body);
   if (!parsed.success) {
-    throw new ValidationError(parsed.error.issues[0].message);
+    throw new ValidationError(firstZodError(parsed.error));
   }
 
   const turnstileSecret = c.env.TURNSTILE_SECRET_KEY
-    || await c.env.KV.get('setup:turnstile_secret_key');
+    || await c.env.KV.get(SETUP_KEYS.TURNSTILE_SECRET_KEY);
   const resendApiKey = c.env.RESEND_API_KEY;
 
   if (!turnstileSecret || !resendApiKey) {
@@ -125,7 +128,7 @@ app.post('/waitlist', waitlistRateLimiter, async (c) => {
   const submittedAtIso = new Date().toISOString();
   await sendWaitlistEmail({
     resendApiKey,
-    from: c.env.WAITLIST_FROM_EMAIL || 'Codeflare Waitlist <onboarding@resend.dev>',
+    from: c.env.RESEND_EMAIL || 'Codeflare Waitlist <onboarding@resend.dev>',
     to: adminRecipients,
     submittedEmail: parsed.data.email,
     submittedAtIso,
@@ -134,6 +137,13 @@ app.post('/waitlist', waitlistRateLimiter, async (c) => {
 
   logger.info('Waitlist submission accepted', { email: parsed.data.email });
   return c.json({ success: true });
+});
+
+// GET /public/tiers — subscribable tier config (no auth required)
+app.get('/tiers', async (c) => {
+  const allTiers = await getTierConfig(c.env.KV);
+  const subscribable = allTiers.filter((t) => SUBSCRIBABLE_TIER_IDS.has(t.id as string));
+  return c.json({ tiers: subscribable });
 });
 
 export default app;

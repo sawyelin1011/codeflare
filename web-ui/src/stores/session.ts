@@ -2,10 +2,9 @@ import { createStore, produce } from 'solid-js/store';
 import { createSignal } from 'solid-js';
 import type { SessionWithStatus, SessionStatus, InitProgress, SessionTerminals, AgentType, TabConfig, TabPreset, UserPreferences } from '../types';
 import * as api from '../api/client';
-import { ApiError } from '../api/fetch-helper';
 import { terminalStore } from './terminal';
 import { logger } from '../lib/logger';
-import { MAX_STOP_POLL_ATTEMPTS, STOP_POLL_INTERVAL_MS, MAX_STOP_POLL_ERRORS, SESSION_LIST_POLL_INTERVAL_MS, CONTEXT_EXPIRY_MS } from '../lib/constants';
+import { MAX_STOP_POLL_ATTEMPTS, STOP_POLL_INTERVAL_MS, MAX_STOP_POLL_ERRORS, CONTEXT_EXPIRY_MS } from '../lib/constants';
 import {
   setTilingLayout,
   getTilingForSession,
@@ -47,26 +46,34 @@ import {
   loadPreferences,
   updateUserPreferences,
 } from './preferences';
+import {
+  registerPollingDeps,
+  sessionMissCounters,
+  refreshSessionStatuses,
+  startSessionListPolling,
+  stopSessionListPolling,
+  markSessionStarted,
+  clearSessionStartedGuard,
+} from './session-polling';
+
+// Re-export usage functions so existing consumers keep working
+export {
+  setUsageState,
+  getUsageState,
+  isAtUsageQuota,
+  getUsageWarningLevel,
+} from './session-usage';
+export type { UsageWarningLevel, UsageState } from './session-usage';
 
 /**
  * Session Store — central facade for session lifecycle management.
  *
- * Responsibilities:
- *  - CRUD operations for sessions (list, create, rename, delete)
- *  - Session start/stop with startup-status polling
- *  - Active session selection and view-state tracking
- *  - Per-session metrics display (CPU, mem, sync status from KV)
- *  - User preferences persistence
- *
- * Delegates to:
- *  - `session-tabs.ts` for terminal tab management
- *  - `session-presets.ts` for tab preset CRUD
- *  - `tiling.ts` for tiling layout logic
+ * Delegates to: session-tabs, session-presets, session-polling,
+ * session-usage, tiling, r2-readiness, preferences.
  */
 
-// ============================================================================
-// Session Metrics Type
-// ============================================================================
+// ── Session Metrics ─────────────────────────────────────────────────────────
+
 interface SessionMetrics {
   bucketName: string;
   syncStatus: 'pending' | 'syncing' | 'success' | 'failed' | 'skipped';
@@ -75,7 +82,7 @@ interface SessionMetrics {
   hdd?: string;
 }
 
-/** Batch status entry shape from the backend (L9: named type for inline type) */
+/** Batch status entry shape from the backend */
 type BatchStatusEntry = {
   status: 'running' | 'stopped';
   ptyActive: boolean;
@@ -86,7 +93,7 @@ type BatchStatusEntry = {
 };
 
 /**
- * Populate sessionMetrics from KV-pushed metrics (M5: extracted helper).
+ * Populate sessionMetrics from batch-status metrics.
  * Mutates the `sessionMetrics` record in place — designed for use inside `produce()` or direct object mutation.
  */
 export function applyMetricsUpdate(
@@ -103,7 +110,7 @@ export function applyMetricsUpdate(
   };
 }
 
-interface SessionState {
+export interface SessionState {
   sessions: SessionWithStatus[];
   activeSessionId: string | null;
   loading: boolean;
@@ -135,7 +142,8 @@ const [state, setState] = createStore<SessionState>({
 // Exposed as a reactive signal so Layout can show a re-auth banner.
 const [authExpired, setAuthExpired] = createSignal(false);
 
-// Register dependencies for extracted modules
+// ── Dependency registration for extracted modules ───────────────────────────
+
 registerTabsDeps(
   () => state,
   (fn) => setState(produce(fn)),
@@ -168,7 +176,34 @@ registerR2ReadinessDeps({
   ensureR2Token: api.ensureR2Token,
 });
 
-// Get active session
+// ── Core session helpers ────────────────────────────────────────────────────
+
+function updateSessionStatus(id: string, status: SessionStatus): void {
+  const index = state.sessions.findIndex((sess) => sess.id === id);
+  if (index !== -1) {
+    setState('sessions', index, 'status', status);
+    if (status === 'running') markSessionStarted(id);
+    if (status === 'stopped' || status === 'stopping') clearSessionStartedGuard(id);
+  }
+}
+
+function isSessionInitializing(sessionId: string): boolean {
+  return state.initializingSessionIds[sessionId] === true;
+}
+
+// Register polling dependencies (extracted to session-polling.ts)
+registerPollingDeps({
+  getState: () => state,
+  setStateProduce: (fn) => setState(produce(fn)),
+  setStateRaw: (...args: any[]) => (setState as any)(...args),
+  updateSessionStatus,
+  isSessionInitializing,
+  setAuthExpired,
+  applyMetricsUpdate,
+});
+
+// ── Session CRUD & lifecycle ────────────────────────────────────────────────
+
 function getActiveSession(): SessionWithStatus | undefined {
   return state.sessions.find((s) => s.id === state.activeSessionId);
 }
@@ -235,7 +270,7 @@ async function loadSessions(): Promise<void> {
         }
       }
 
-      // Populate sessionMetrics from KV-pushed metrics (M5: use extracted helper)
+      // Populate sessionMetrics from batch-status metrics
       if (batchStatus.metrics) {
         setState(produce(s => {
           applyMetricsUpdate(s.sessionMetrics, session.id, batchStatus.metrics!);
@@ -421,7 +456,7 @@ async function stopSession(id: string): Promise<void> {
           }
         }, STOP_POLL_INTERVAL_MS);
 
-        // Track stop-polling interval for cleanup (FIX-17)
+        // Track stop-polling interval for cleanup
         startupCleanups.set(id, () => {
           clearInterval(interval);
         });
@@ -431,13 +466,6 @@ async function stopSession(id: string): Promise<void> {
     await pollForStopped();
   } catch (err) {
     setState('error', err instanceof Error ? err.message : 'Failed to stop session');
-  }
-}
-
-function updateSessionStatus(id: string, status: SessionStatus): void {
-  const index = state.sessions.findIndex((sess) => sess.id === id);
-  if (index !== -1) {
-    setState('sessions', index, 'status', status);
   }
 }
 
@@ -465,112 +493,8 @@ function dismissInitProgressForSession(sessionId: string): void {
   );
 }
 
-function isSessionInitializing(sessionId: string): boolean {
-  return state.initializingSessionIds[sessionId] === true;
-}
-
 function getInitProgressForSession(sessionId: string): InitProgress | null {
   return state.initProgressBySession[sessionId] || null;
-}
-
-// ============================================================================
-// Session List Polling
-// ============================================================================
-
-const sessionMissCounters = new Map<string, number>();
-const REMOVAL_THRESHOLD = 3;
-
-let sessionListPollInterval: ReturnType<typeof setInterval> | null = null;
-
-/**
- * Lightweight status refresh — only fetches batch-status and updates
- * existing session statuses in-place. Does NOT replace the sessions
- * array or set loading state, so the dashboard doesn't flicker.
- * Also updates storage stats when storageStats is present in the batch response.
- */
-async function refreshSessionStatuses(): Promise<void> {
-  try {
-    const batchResponse = await api.getBatchSessionStatus();
-    const batchStatuses = batchResponse.statuses;
-    if (batchResponse.maxSessions !== undefined) setState('maxSessions', batchResponse.maxSessions);
-    if (batchResponse.storageStats) updateStatsFromBatch(batchResponse.storageStats);
-
-    // Consecutive-miss tracking: only remove sessions after REMOVAL_THRESHOLD misses.
-    // Skip initializing sessions — they may not appear in batch status yet.
-    const removedIds: string[] = [];
-    for (const session of state.sessions) {
-      if (!batchStatuses[session.id]) {
-        if (session.status === 'initializing' || session.id === state.activeSessionId) continue;
-        const count = (sessionMissCounters.get(session.id) || 0) + 1;
-        sessionMissCounters.set(session.id, count);
-        if (count >= REMOVAL_THRESHOLD) {
-          removedIds.push(session.id);
-        }
-      } else {
-        sessionMissCounters.delete(session.id);
-      }
-    }
-    if (removedIds.length > 0) {
-      for (const id of removedIds) {
-        sessionMissCounters.delete(id);
-      }
-      setState('sessions', (prev) => prev.filter((s) => !removedIds.includes(s.id)));
-    }
-    for (const session of state.sessions) {
-      const remote = batchStatuses[session.id];
-      if (!remote) continue;
-
-      // Store timestamp fields
-      const idx = state.sessions.findIndex(s => s.id === session.id);
-      if (idx !== -1) {
-        if (remote.lastActiveAt) setState('sessions', idx, 'lastActiveAt', remote.lastActiveAt);
-        if (remote.lastStartedAt) setState('sessions', idx, 'lastStartedAt', remote.lastStartedAt);
-      }
-
-      // Populate sessionMetrics from KV-pushed metrics (M5: use extracted helper)
-      if (remote.metrics) {
-        setState(produce(s => {
-          applyMetricsUpdate(s.sessionMetrics, session.id, remote.metrics!);
-        }));
-      }
-
-      // Guard: skip status transitions for the active session (L5: use named function)
-      if (shouldSkipStatusTransition(session.id, state.activeSessionId)) continue;
-
-      // Guard: skip status transitions for initializing sessions to avoid
-      // clobbering the init progress UI with stale KV data. The container
-      // may report 'running' in batch-status before the init flow completes.
-      if (remote.status === 'running' && session.status !== 'running' && session.status !== 'initializing') {
-        updateSessionStatus(session.id, 'running');
-        initializeTerminalsForSession(session.id);
-      } else if (remote.status === 'stopped' && session.status !== 'stopped' && session.status !== 'stopping' && session.status !== 'initializing') {
-        updateSessionStatus(session.id, 'stopped');
-      }
-    }
-  } catch (err) {
-    // Detect auth expiry: stop polling and surface to UI instead of thrashing
-    if (err instanceof ApiError && err.status === 401) {
-      logger.warn('[SessionStore] Auth expired — stopping background polling');
-      setAuthExpired(true);
-      stopSessionListPolling();
-      return;
-    }
-    // Silently ignore other errors — this is background polling
-  }
-}
-
-function startSessionListPolling(): void {
-  if (sessionListPollInterval !== null) return;
-  sessionListPollInterval = setInterval(() => {
-    refreshSessionStatuses();
-  }, SESSION_LIST_POLL_INTERVAL_MS);
-}
-
-function stopSessionListPolling(): void {
-  if (sessionListPollInterval !== null) {
-    clearInterval(sessionListPollInterval);
-    sessionListPollInterval = null;
-  }
 }
 
 function stopAllPolling(): void {
@@ -593,13 +517,7 @@ registerPreferencesDeps({
   getPreferences: () => state.preferences,
 });
 
-/**
- * Check if user has reached the maximum number of concurrent running sessions.
- * Counts both 'running' and 'initializing' sessions (conservative — prevents
- * clicking "+ New Session" while a session is still starting up).
- * Note: backend only counts status === 'running', so this may be stricter
- * than the backend check. This is intentional — better UX than hitting a 429.
- */
+/** Check if user has reached max concurrent running sessions (counts running + initializing). */
 function isAtSessionLimit(): boolean {
   const runningCount = state.sessions.filter(s => s.status === 'running' || s.status === 'initializing').length;
   return runningCount >= state.maxSessions;
@@ -611,47 +529,18 @@ function hasRecentContext(session: SessionWithStatus): boolean {
   return Date.now() - new Date(session.lastActiveAt).getTime() < CONTEXT_EXPIRY_MS;
 }
 
-// Export store and actions
-/**
- * Whether KV polling should skip status transitions for this session.
- * The active session's lifecycle is managed by WebSocket/startup-status
- * (which talk to the DO directly), not by eventually-consistent KV.
- */
-export function shouldSkipStatusTransition(sessionId: string, activeSessionId: string | null): boolean {
-  return sessionId === activeSessionId && activeSessionId !== null;
-}
-
 export const sessionStore = {
-  // State (readonly)
-  get sessions() {
-    return state.sessions;
-  },
-  get activeSessionId() {
-    return state.activeSessionId;
-  },
-  get loading() {
-    return state.loading;
-  },
-  get error() {
-    return state.error;
-  },
-
-  // Derived
+  get sessions() { return state.sessions; },
+  get activeSessionId() { return state.activeSessionId; },
+  get loading() { return state.loading; },
+  get error() { return state.error; },
   getActiveSession,
-
-  // Per-session initialization state accessors
   isSessionInitializing,
   getInitProgressForSession,
-
-  // Session metrics
   getMetricsForSession,
   stopAllPolling,
-
-  // Session list polling
   startSessionListPolling,
   stopSessionListPolling,
-
-  // Actions
   loadSessions,
   createSession,
   renameSession,
@@ -661,25 +550,17 @@ export const sessionStore = {
   setActiveSession,
   clearError,
   dismissInitProgressForSession,
-
-  // Nested terminals management (re-exported from session-tabs)
   getTerminalsForSession,
   initializeTerminalsForSession,
   addTerminalTab,
   removeTerminalTab,
   setActiveTerminalTab,
   cleanupTerminalsForSession,
-
-  // Tiling management
   reorderTerminalTabs,
   setTilingLayout,
   getTilingForSession,
   getTabOrder,
-
-  // Dynamic terminal labels
   updateTerminalLabel,
-
-  // Presets (re-exported from session-presets)
   get presets() { return state.presets; },
   loadPresets,
   savePreset,
@@ -687,27 +568,16 @@ export const sessionStore = {
   renamePreset,
   saveBookmarkForSession,
   applyPresetToSession,
-
-  // Preferences (delegated to preferences.ts)
   get preferences() { return state.preferences; },
   loadPreferences,
   updatePreferences: updateUserPreferences,
-
-  // Session limits
   get maxSessions() { return state.maxSessions; },
   isAtSessionLimit,
-
-  // Context lifecycle
   hasRecentContext,
-
-  // R2 scoped token readiness (delegated to r2-readiness.ts)
   get r2Ready() { return isR2Ready(); },
   startR2Polling,
   stopR2Polling,
-
-  // Auth expiry
   get authExpired() { return authExpired(); },
-
   // @internal -- exposed for tests (AD23)
   updateSessionStatus,
   refreshSessionStatuses,

@@ -1,8 +1,12 @@
-import type { AccessTier, AccessUser, Env, UserRole } from '../types';
+import type { AccessTier, AccessUser, BillingStatus, Env, SubscriptionTier, UserRole } from '../types';
 import { verifyAccessJWT } from './jwt';
+import { verifySessionJWT } from './session-jwt';
 import { AuthError, ForbiddenError } from './error-types';
 import { createLogger } from './logger';
 import { isSaasModeActive } from './onboarding';
+import { sendWelcomeEmail } from './email';
+import { parseUserRecord } from './user-record';
+import { SETUP_KEYS } from './kv-keys';
 
 const logger = createLogger('access');
 
@@ -12,12 +16,19 @@ let cachedAuthDomain: string | null | undefined = undefined;
 let cachedAccessAud: string | null | undefined = undefined;
 let cachedAccessAudList: string[] | null | undefined = undefined;
 let authConfigCachedAt = 0;
+// CF-005: Tracks whether KV auth config has been fetched at least once.
+let authConfigFetched = false;
+// CF-002: Promise dedup — prevents concurrent cold requests from issuing redundant KV reads.
+let pendingAuthConfigFetch: Promise<void> | null = null;
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 
 const VALID_ACCESS_TIERS = new Set<string>(['pending', 'standard', 'advanced', 'blocked']);
+const VALID_SUBSCRIPTION_TIERS = new Set<string>([
+  'blocked', 'pending', 'free', 'trial', 'standard', 'advanced', 'max', 'unlimited',
+]);
 
 /**
  * Reset cached auth config. Call when setup completes or config changes.
@@ -27,9 +38,11 @@ export function resetAuthConfigCache(): void {
   cachedAccessAud = undefined;
   cachedAccessAudList = undefined;
   authConfigCachedAt = 0;
+  authConfigFetched = false;
+  pendingAuthConfigFetch = null;
 }
 
-function getCookieValue(cookieHeader: string | null, key: string): string | null {
+export function getCookieValue(cookieHeader: string | null, key: string): string | null {
   if (!cookieHeader) return null;
   const pairs = cookieHeader.split(';');
   for (const pair of pairs) {
@@ -42,23 +55,43 @@ function getCookieValue(cookieHeader: string | null, key: string): string | null
 }
 
 /**
- * Extract user info from Cloudflare Access.
+ * Extract user identity from the request.
  *
- * Supports three authentication methods:
+ * **Return value**: Returns `{ email, authenticated }` — the minimal identity
+ * established by the auth provider (CF Access JWT, SaaS OIDC session, or
+ * service token). The only exception is service-token auth, which also sets
+ * `role: 'admin'` because the caller proved possession of the worker secret.
  *
- * 1. Browser/JWT authentication (via CF Access login):
- *    - cf-access-jwt-assertion: full JWT (verified via JWKS when auth_domain/access_aud are configured)
- *    - cf-access-authenticated-user-email: user's email (fallback when JWT config not yet stored)
+ * For OIDC/SaaS and CF Access paths, the returned object does **not** include
+ * `role`, `accessTier`, `subscriptionTier`, or billing fields. Those are
+ * populated later by {@link authenticateRequest}, which calls
+ * {@link resolveOrProvisionUser} (SaaS) or {@link resolveUserFromKV} (non-SaaS)
+ * to hydrate the full {@link AccessUser} profile from KV.
  *
- * 2. Service token authentication (for API/CLI clients):
- *    - CF-Access-Client-Id: service token ID
- *    - CF-Access-Client-Secret: service token secret
- *    When CF Access validates a service token, it sets cf-access-client-id header.
- *    Service tokens are mapped to SERVICE_TOKEN_EMAIL env var or default email.
+ * This partial return is intentional — it separates identity verification
+ * (proving who the caller is) from authorization (determining what the caller
+ * can do). Callers that only need to know "is there a valid session?" can use
+ * this function directly; callers that need role/tier information must go
+ * through `authenticateRequest`.
+ *
+ * Authentication methods (checked in order):
+ *
+ * 1. Service token (X-Service-Auth header) — for API/CLI/E2E clients.
+ *    Constant-time comparison against SERVICE_AUTH_SECRET. Returns admin role.
+ *
+ * 2. SaaS mode + GitHub OIDC (codeflare_session cookie) — when SAAS_MODE=active
+ *    and OAUTH_CLIENT_ID is set. HMAC-SHA256 JWT signed by OAUTH_JWT_SECRET.
+ *    Replaces CF Access for SaaS deployments.
+ *
+ * 3. CF Access JWT (cf-access-jwt-assertion header or CF_Authorization cookie) —
+ *    default/non-SaaS mode. Verified via JWKS from the CF Access auth domain.
+ *
+ * 4. Pre-setup fallback (cf-access-authenticated-user-email header) —
+ *    trusted only before setup is complete (auth_domain not yet configured).
  *
  */
 export async function getUserFromRequest(request: Request, env?: Env): Promise<AccessUser> {
-  // Check for JWT assertion header first (primary auth method)
+  // Extract CF Access JWT early — evaluated after service token and SaaS OIDC checks
   const jwtAssertionHeader = request.headers.get('cf-access-jwt-assertion');
   const jwtCookie = getCookieValue(request.headers.get('Cookie'), 'CF_Authorization');
   const jwtToken = jwtAssertionHeader || jwtCookie;
@@ -70,33 +103,38 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     cachedAuthDomain = undefined;
     cachedAccessAud = undefined;
     cachedAccessAudList = undefined;
+    pendingAuthConfigFetch = null; // HIGH-4: ensure stale promise doesn't block re-fetch
   }
-  if (env?.KV) {
-    if (cachedAuthDomain === undefined) {
-      cachedAuthDomain = await env.KV.get('setup:auth_domain');
-    }
-    if (cachedAccessAudList === undefined) {
-      const audListRaw = await env.KV.get('setup:access_aud_list');
-      if (audListRaw) {
-        try {
-          const parsed = JSON.parse(audListRaw);
-          if (Array.isArray(parsed) && parsed.every((value) => typeof value === 'string')) {
-            cachedAccessAudList = parsed;
-          } else {
+  // CF-002: Deduplicate concurrent cold-start KV reads via Promise sentinel.
+  // Pattern mirrors pendingJWKSFetch in jwt.ts.
+  if (env?.KV && cachedAuthDomain === undefined) {
+    if (!pendingAuthConfigFetch) {
+      pendingAuthConfigFetch = (async () => {
+        cachedAuthDomain = await env.KV.get(SETUP_KEYS.AUTH_DOMAIN);
+        const audListRaw = await env.KV.get(SETUP_KEYS.ACCESS_AUD_LIST);
+        if (audListRaw) {
+          try {
+            const parsed = JSON.parse(audListRaw);
+            if (Array.isArray(parsed) && parsed.every((value: unknown) => typeof value === 'string')) {
+              cachedAccessAudList = parsed;
+            } else {
+              cachedAccessAudList = null;
+            }
+          } catch {
+            logger.warn('Failed to parse access_aud_list', { raw: audListRaw });
             cachedAccessAudList = null;
           }
-        } catch {
-          logger.warn('Failed to parse access_aud_list', { raw: audListRaw });
+        } else {
           cachedAccessAudList = null;
         }
-      } else {
-        cachedAccessAudList = null;
-      }
+        cachedAccessAud = await env.KV.get(SETUP_KEYS.ACCESS_AUD);
+        authConfigCachedAt = Date.now();
+        if (cachedAuthDomain && (cachedAccessAud || (cachedAccessAudList && cachedAccessAudList.length > 0))) {
+          authConfigFetched = true;
+        }
+      })().finally(() => { pendingAuthConfigFetch = null; });
     }
-    if (cachedAccessAud === undefined) {
-      cachedAccessAud = await env.KV.get('setup:access_aud');
-    }
-    authConfigCachedAt = Date.now();
+    await pendingAuthConfigFetch;
   }
 
   const accessAudList = cachedAccessAudList && cachedAccessAudList.length > 0
@@ -138,7 +176,24 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     // SERVICE_AUTH_SECRET not in env — note for diagnostics but continue to other auth methods
   }
 
-  // JWT verification: if token present and auth is configured, verify it
+  // SaaS mode + GitHub OIDC: verify codeflare_session cookie (HMAC JWT)
+  // This replaces CF Access JWT verification when OAUTH_CLIENT_ID is configured.
+  if (env && isSaasModeActive(env.SAAS_MODE) && env.OAUTH_CLIENT_ID) {
+    if (!env.OAUTH_JWT_SECRET) {
+      throw new AuthError('SaaS mode active but OAUTH_JWT_SECRET not configured');
+    }
+    const sessionToken = getCookieValue(request.headers.get('Cookie'), 'codeflare_session');
+    if (!sessionToken) {
+      return { email: '', authenticated: false };
+    }
+    const payload = await verifySessionJWT(sessionToken, env.OAUTH_JWT_SECRET);
+    if (!payload) {
+      return { email: '', authenticated: false };
+    }
+    return { email: normalizeEmail(payload.email), authenticated: true };
+  }
+
+  // CF Access JWT verification (non-SaaS mode or SaaS without GitHub OIDC)
   if (jwtToken && authConfigured && cachedAuthDomain) {
     for (const expectedAud of accessAudList) {
       const verifiedEmail = await verifyAccessJWT(jwtToken, cachedAuthDomain, expectedAud);
@@ -157,17 +212,24 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
     return { email: '', authenticated: false };
   }
 
-  // Pre-setup fallback: trust email header (allows setup wizard to work)
-  const email = request.headers.get('cf-access-authenticated-user-email');
-
-  if (email) {
-    return { email: normalizeEmail(email), authenticated: true };
+  // Pre-setup fallback: trust email header (allows setup wizard to work).
+  // CF-005: Only activate when auth is genuinely not configured (no domain + aud in KV).
+  // Once auth HAS been configured and fetched, this path is permanently disabled for
+  // the isolate's lifetime. Prevents KV transient errors from degrading to header trust.
+  if (!authConfigured && !authConfigFetched) {
+    const email = request.headers.get('cf-access-authenticated-user-email');
+    if (email) {
+      logger.warn('Pre-setup auth fallback activated — trusting header', { email: normalizeEmail(email), path: request.url });
+      return { email: normalizeEmail(email), authenticated: true };
+    }
   }
 
-  // Service token authentication (fallback)
+  // Service token authentication (fallback — non-SaaS only)
   // When CF Access validates a service token, it passes through cf-access-client-id header.
-  // Only used if no JWT was available (JWT takes precedence).
-  const serviceTokenClientId = request.headers.get('cf-access-client-id');
+  // In SaaS mode there is no CF Access edge, so this header is attacker-controlled.
+  const serviceTokenClientId = !isSaasModeActive(env?.SAAS_MODE)
+    ? request.headers.get('cf-access-client-id')
+    : null;
 
   if (serviceTokenClientId) {
     // Service token was validated by CF Access
@@ -223,30 +285,32 @@ export function getBucketName(email: string, workerName?: string): string {
 export async function resolveUserFromKV(
   kv: KVNamespace,
   email: string
-): Promise<{ addedBy: string; addedAt: string; role: UserRole; accessTier?: AccessTier } | null> {
+): Promise<{ addedBy: string; addedAt: string; role: UserRole; accessTier?: AccessTier; subscriptionTier?: SubscriptionTier; subscribedMode?: 'default' | 'advanced'; billingStatus?: BillingStatus; billingPeriodEnd?: string } | null> {
   const normalizedEmail = normalizeEmail(email);
-  const raw = await kv.get(`user:${normalizedEmail}`);
-  if (!raw) return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== 'object' || parsed === null) return null;
-  const obj = parsed as { addedBy?: unknown; addedAt?: unknown; role?: unknown; accessTier?: unknown };
-  const rawTier = typeof obj.accessTier === 'string' ? obj.accessTier : undefined;
+  const raw = await kv.get(`user:${normalizedEmail}`, 'json');
+  // CF-010/CF-017: Use parseUserRecord for validated, typed parsing
+  const record = parseUserRecord(raw);
+  if (!record) return null;
+  const rawTier = record.accessTier;
+  const rawSubTier = record.subscriptionTier;
+  const subscriptionTier = rawSubTier && VALID_SUBSCRIPTION_TIERS.has(rawSubTier)
+    ? (rawSubTier as SubscriptionTier)
+    : undefined;
   return {
-    addedBy: typeof obj.addedBy === 'string' ? obj.addedBy : 'unknown',
-    addedAt: typeof obj.addedAt === 'string' ? obj.addedAt : '',
-    role: obj.role === 'admin' ? 'admin' : 'user',
+    addedBy: record.addedBy,
+    addedAt: record.addedAt,
+    role: record.role === 'admin' ? 'admin' : 'user',
     accessTier: rawTier && VALID_ACCESS_TIERS.has(rawTier) ? (rawTier as AccessTier) : undefined,
+    subscriptionTier,
+    subscribedMode: record.subscribedMode === 'advanced' ? 'advanced' : 'default',
+    billingStatus: record.billingStatus,
+    billingPeriodEnd: record.billingPeriodEnd,
   };
 }
 
 /**
  * Resolve an existing user from KV, or auto-provision a new one in SaaS mode.
- * New users are always created with 'pending' tier (requires admin approval).
+ * New users are created with 'pending' tier and can self-subscribe via /api/auth/subscribe.
  *
  * Throws ForbiddenError when the user is not in KV and SaaS mode is off.
  */
@@ -254,26 +318,46 @@ export async function resolveOrProvisionUser(
   kv: KVNamespace,
   email: string,
   env: Env
-): Promise<{ role: UserRole; accessTier: AccessTier }> {
+): Promise<{ role: UserRole; accessTier: AccessTier; subscriptionTier?: SubscriptionTier; subscribedMode?: 'default' | 'advanced'; billingStatus?: BillingStatus; billingPeriodEnd?: string }> {
   const normalizedEmail = normalizeEmail(email);
   const kvEntry = await resolveUserFromKV(kv, normalizedEmail);
 
   if (kvEntry) {
-    return { role: kvEntry.role, accessTier: kvEntry.accessTier ?? 'advanced' };
+    return {
+      role: kvEntry.role,
+      accessTier: kvEntry.accessTier ?? 'advanced',
+      subscriptionTier: kvEntry.subscriptionTier,
+      subscribedMode: kvEntry.subscribedMode,
+      billingStatus: kvEntry.billingStatus,
+      billingPeriodEnd: kvEntry.billingPeriodEnd,
+    };
   }
 
   if (isSaasModeActive(env.SAAS_MODE)) {
     // Note: concurrent first-login requests may both reach this point and write
     // identical records. This is benign — both produce the same {role:'user',
-    // accessTier:'pending'} entry. KV eventual consistency prevents true atomicity.
+    // accessTier:'pending', subscriptionTier:'pending'} entry.
     await kv.put(`user:${normalizedEmail}`, JSON.stringify({
       addedBy: 'jit',
       addedAt: new Date().toISOString(),
       role: 'user',
       accessTier: 'pending',
+      subscriptionTier: 'pending',
     }));
 
-    return { role: 'user', accessTier: 'pending' };
+    // Fire-and-forget welcome email with dedup flag.
+    // Concurrent first-login requests can race past the check, but the flag
+    // narrows the window from "always doubles" to milliseconds of KV propagation.
+    const welcomeFlag = `welcome-sent:${normalizedEmail}`;
+    const alreadySent = await kv.get(welcomeFlag);
+    if (!alreadySent) {
+      await kv.put(welcomeFlag, '1', { expirationTtl: 86400 });
+      const customDomain = await kv.get(SETUP_KEYS.CUSTOM_DOMAIN);
+      const instanceUrl = customDomain ? `https://${customDomain}` : undefined;
+      void sendWelcomeEmail({ userEmail: normalizedEmail, instanceUrl, env });
+    }
+
+    return { role: 'user', accessTier: 'pending', subscriptionTier: 'pending', subscribedMode: 'default' };
   }
 
   throw new ForbiddenError('User not in allowlist');
@@ -313,9 +397,9 @@ export async function authenticateRequest(
 
   // SaaS mode: use resolveOrProvisionUser for JIT provisioning + accessTier
   if (isSaasModeActive(env.SAAS_MODE)) {
-    const { role, accessTier } = await resolveOrProvisionUser(env.KV, normalizedEmail, env);
+    const { role, accessTier, subscriptionTier, subscribedMode, billingStatus, billingPeriodEnd } = await resolveOrProvisionUser(env.KV, normalizedEmail, env);
     const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
-    return { user: { ...rawUser, email: normalizedEmail, role, accessTier }, bucketName };
+    return { user: { ...rawUser, email: normalizedEmail, role, accessTier, subscriptionTier, subscribedMode, billingStatus, billingPeriodEnd }, bucketName };
   }
 
   // Non-SaaS mode: existing allowlist behavior
@@ -323,7 +407,7 @@ export async function authenticateRequest(
   if (!kvEntry) {
     throw new ForbiddenError('User not in allowlist');
   }
-  const { role, accessTier } = kvEntry;
+  const { role, accessTier, subscriptionTier, subscribedMode, billingStatus, billingPeriodEnd } = kvEntry;
   const bucketName = getBucketName(normalizedEmail, env.CLOUDFLARE_WORKER_NAME);
-  return { user: { ...rawUser, email: normalizedEmail, role, accessTier }, bucketName };
+  return { user: { ...rawUser, email: normalizedEmail, role, accessTier, subscriptionTier, subscribedMode, billingStatus, billingPeriodEnd }, bucketName };
 }

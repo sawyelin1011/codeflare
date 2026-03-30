@@ -4,12 +4,12 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { AgentTypeSchema, SessionModeSchema, type Env, type UserPreferences } from '../types';
+import { AgentTypeSchema, SessionModeSchema, SleepAfterOptions, type Env, type UserPreferences } from '../types';
 import { getPreferencesKey } from '../lib/kv-keys';
 import { authMiddleware, AuthVariables } from '../middleware/auth';
 import { ValidationError } from '../lib/error-types';
+import { parseJsonBody, firstZodError } from '../lib/request-helpers';
 import { createRateLimiter } from '../middleware/rate-limit';
-import { canUseSessionMode } from '../lib/access-tier';
 import { isSaasModeActive } from '../lib/onboarding';
 
 const UpdatePreferencesBody = z.object({
@@ -18,6 +18,7 @@ const UpdatePreferencesBody = z.object({
   workspaceSyncEnabled: z.boolean().optional(),
   fastStartEnabled: z.boolean().optional(),
   sessionMode: SessionModeSchema.optional(),
+  sleepAfter: z.enum(SleepAfterOptions as unknown as [string, ...string[]]).optional(),
 }).strict();
 
 const preferencesPatchRateLimiter = createRateLimiter({
@@ -48,28 +49,26 @@ app.get('/', async (c) => {
 app.patch('/', preferencesPatchRateLimiter, async (c) => {
   const bucketName = c.get('bucketName');
 
-  let raw: unknown;
-  try {
-    raw = await c.req.json();
-  } catch {
-    throw new ValidationError('Invalid JSON body');
-  }
+  const raw = await parseJsonBody(c);
 
   const parsed = UpdatePreferencesBody.safeParse(raw);
   if (!parsed.success) {
-    throw new ValidationError(parsed.error.issues[0].message);
+    throw new ValidationError(firstZodError(parsed.error));
   }
 
   if (parsed.data.sessionMode && isSaasModeActive(c.env.SAAS_MODE)) {
     const user = c.get('user');
-    if (!canUseSessionMode(user.accessTier, parsed.data.sessionMode)) {
-      throw new ValidationError(`Session mode '${parsed.data.sessionMode}' not available for your access tier`);
+    // subscribedMode is the source of truth from Stripe — if the user paid for
+    // Pro (subscribedMode: 'advanced'), allow it regardless of tier config.
+    const subscribedToPro = user.subscribedMode === 'advanced';
+    if (parsed.data.sessionMode === 'advanced' && !subscribedToPro && user.role !== 'admin') {
+      throw new ValidationError(`Session mode '${parsed.data.sessionMode}' not available for your subscription`);
     }
   }
 
   const key = getPreferencesKey(bucketName);
   const existing = await c.env.KV.get<UserPreferences>(key, 'json') || {};
-  const updated: UserPreferences = { ...existing, ...parsed.data };
+  const updated: UserPreferences = { ...existing, ...parsed.data } as UserPreferences;
 
   await c.env.KV.put(key, JSON.stringify(updated));
 

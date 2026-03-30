@@ -13,7 +13,14 @@ vi.mock('../../lib/logger', () => ({
   })),
 }));
 
-import { resolveUserFromKV, getBucketName, authenticateRequest, getUserFromRequest, resetAuthConfigCache } from '../../lib/access';
+const { mockSendWelcomeEmail } = vi.hoisted(() => ({
+  mockSendWelcomeEmail: vi.fn(async () => true),
+}));
+vi.mock('../../lib/email', () => ({
+  sendWelcomeEmail: mockSendWelcomeEmail,
+}));
+
+import { resolveUserFromKV, getBucketName, authenticateRequest, getUserFromRequest, resetAuthConfigCache, resolveOrProvisionUser } from '../../lib/access';
 import { AuthError, ForbiddenError } from '../../lib/error-types';
 import type { Env } from '../../types';
 import { createMockKV } from '../helpers/mock-kv';
@@ -79,10 +86,8 @@ describe('access.ts', () => {
       mockKV._store.set('user:arr@example.com', '[1, 2, 3]');
 
       const result = await resolveUserFromKV(mockKV as unknown as KVNamespace, 'arr@example.com');
-      // Arrays are typeof 'object' and not null, so they pass the check
-      // but the result will have defaults for missing fields
-      expect(result).not.toBeNull();
-      expect(result!.role).toBe('user'); // no .role on array → defaults
+      // CF-010: parseUserRecord rejects non-object values (arrays fail Zod z.object schema)
+      expect(result).toBeNull();
     });
 
     it('defaults role to user when role field is missing', async () => {
@@ -393,5 +398,29 @@ describe('access.ts', () => {
       );
     });
 
+  });
+
+  describe('resolveOrProvisionUser — welcome email dedup', () => {
+    beforeEach(() => {
+      mockSendWelcomeEmail.mockClear();
+    });
+
+    it('sends welcome email on first-time SaaS user and sets flag', async () => {
+      const env = { SAAS_MODE: 'active', KV: mockKV } as unknown as Env;
+      await resolveOrProvisionUser(mockKV as unknown as KVNamespace, 'new@example.com', env);
+
+      expect(mockSendWelcomeEmail).toHaveBeenCalledTimes(1);
+      // Flag should be set in KV
+      const flag = mockKV._store.get('welcome-sent:new@example.com');
+      expect(flag).toBe('1');
+    });
+
+    it('does NOT send welcome email when flag already exists', async () => {
+      mockKV._store.set('welcome-sent:existing@example.com', '1');
+      const env = { SAAS_MODE: 'active', KV: mockKV } as unknown as Env;
+      await resolveOrProvisionUser(mockKV as unknown as KVNamespace, 'existing@example.com', env);
+
+      expect(mockSendWelcomeEmail).not.toHaveBeenCalled();
+    });
   });
 });

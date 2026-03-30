@@ -239,12 +239,26 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .claude/stats-cache.json"    # regenerated usage stats
     --filter "- .claude.json.backup.*"       # auto-generated backups, accumulate endlessly
 
+    # Claude Code — subagent transcripts (results captured in main transcript, never re-read)
+    --filter "- .claude/projects/**/subagents/**"
+
+    # Claude Code — tool result artifacts (ephemeral, never re-read, 26MB+ per long session)
+    --filter "- .claude/projects/**/tool-results/**"
+
+    # Claude Code — ephemeral session state (regenerated per session)
+    --filter "- .claude/usage-data/**"       # insights reports (regenerated on /insights)
+    --filter "- .claude/backups/**"          # settings backups (settings.json itself is synced)
+    --filter "- .claude/tasks/**"            # task state (ephemeral per session)
+    --filter "- .claude/sessions/**"         # session metadata
+    --filter "- .claude/history.jsonl"       # command history (nice-to-have, not critical)
+
     # Codex — ephemeral session data and caches
     --filter "- .codex/log/**"               # TUI session logs
     --filter "- .codex/models_cache.json"    # regenerated model list
     --filter "- .codex/.personality_migration" # one-time migration marker
     --filter "- .codex/shell_snapshots/**"   # session shell snapshots
     --filter "- .codex/tmp/**"               # temp lock files
+    --filter "- .codex/.tmp/**"              # plugin clones + sync temp files (17MB+, regenerated)
     --filter "- .codex/version.json"         # version check cache
 
     # Memory capture — exclude all counter files (ephemeral per-session)
@@ -260,6 +274,12 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .local/share/opencode/log/**"
     --filter "- .local/share/opencode/opencode.db-shm"
     --filter "- .local/share/opencode/opencode.db-wal"
+
+    # MCP server state — logs and thread history, ephemeral
+    --filter "- .local/state/**"
+
+    # Wrangler — deploy logs, regenerated
+    --filter "- .config/.wrangler/**"
 )
 
 # In default mode, exclude entire .memory/ directory (no persistent memory)
@@ -302,6 +322,7 @@ initial_sync_from_r2() {
         "${RCLONE_FILTERS[@]}" \
         --fast-list \
         --size-only \
+        --min-size 1B \
         --multi-thread-streams 4 \
         --transfers 32 \
         --checkers 32 \
@@ -338,6 +359,7 @@ establish_bisync_baseline() {
         "${RCLONE_FILTERS[@]}" \
         --resync \
         --fast-list \
+        --min-size 1B \
         --conflict-resolve newer \
         --resilient \
         --recover \
@@ -401,6 +423,7 @@ bisync_with_r2() {
         --config "$RCLONE_CONFIG" \
         "${RCLONE_FILTERS[@]}" \
         --fast-list \
+        --min-size 1B \
         --conflict-resolve newer \
         --resilient \
         --recover \
@@ -427,6 +450,41 @@ bisync_with_r2() {
 }
 
 # ============================================================================
+# Cleanup old Claude Code session transcripts — keep only the 5 most recent
+# ============================================================================
+cleanup_old_transcripts() {
+    local PROJECTS_DIR="$USER_HOME/.claude/projects"
+    local KEEP_COUNT=5
+
+    # Find all session transcript JSONL files across all project dirs
+    local ALL_TRANSCRIPTS
+    ALL_TRANSCRIPTS=$(find "$PROJECTS_DIR" -maxdepth 2 -name "*.jsonl" -not -path "*/subagents/*" 2>/dev/null | sort -t/ -k6) || true
+    local COUNT
+    COUNT=$(echo "$ALL_TRANSCRIPTS" | grep -c . 2>/dev/null) || COUNT=0
+
+    if [ "$COUNT" -le "$KEEP_COUNT" ]; then
+        return 0
+    fi
+
+    # Sort by modification time (newest first), delete all but the newest KEEP_COUNT
+    local TO_DELETE
+    TO_DELETE=$(echo "$ALL_TRANSCRIPTS" | xargs ls -t 2>/dev/null | tail -n +$((KEEP_COUNT + 1))) || true
+
+    [ -z "$TO_DELETE" ] && return 0
+
+    local DELETED=0
+    for transcript in $TO_DELETE; do
+        [ -f "$transcript" ] || continue
+        rm -f "$transcript"
+        DELETED=$((DELETED + 1))
+    done
+
+    if [ "$DELETED" -gt 0 ]; then
+        echo "[sync-daemon] Cleaned up $DELETED old session transcript(s), kept newest $KEEP_COUNT" | tee -a /tmp/sync.log
+    fi
+}
+
+# ============================================================================
 # Background sync daemon - bisync every 60 seconds
 # ============================================================================
 start_sync_daemon() {
@@ -441,6 +499,10 @@ start_sync_daemon() {
             tail -c 262144 /tmp/sync.log > /tmp/sync.log.tmp && mv /tmp/sync.log.tmp /tmp/sync.log
             echo "[sync-daemon] Log rotated (exceeded 512KB)" | tee -a /tmp/sync.log
         fi
+
+        # Cleanup old session transcripts before sync (sequential — no race with bisync).
+        # Run in subshell to prevent set -e from killing the daemon on cleanup failure.
+        (cleanup_old_transcripts) || true
 
         echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Running periodic bisync..." | tee -a /tmp/sync.log
 
@@ -782,7 +844,7 @@ merge_memory_files() {
 
 cleanup_old_memory_files() {
     local MEMORY_DIR="$USER_HOME/.memory"
-    local KEEP=3
+    local KEEP=5
     local count=0
 
     # Keep the 3 newest session files (by mtime), delete the rest.
@@ -985,10 +1047,9 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
     (
         echo "[entrypoint] Establishing bisync baseline in background..."
         if establish_bisync_baseline; then
-            # Cleanup old memory files AFTER baseline — bisync will propagate deletions to R2
-            if [ -n "${SESSION_ID:-}" ] && [ "${SESSION_MODE:-default}" = "advanced" ]; then
-                cleanup_old_memory_files
-            fi
+            # Cleanup old memory files AFTER baseline — bisync will propagate deletions to R2.
+            # Run in subshell to prevent set -e from killing the daemon on cleanup failure.
+            (cleanup_old_memory_files) || true
             echo "[entrypoint] Bisync baseline established, starting daemon..."
             start_sync_daemon
         else

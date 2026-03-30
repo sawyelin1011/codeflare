@@ -41,6 +41,12 @@ const sessionStoreState = vi.hoisted(() => ({
   renamePreset: vi.fn(async () => ({ id: 'preset-1', name: 'Renamed', tabs: [], createdAt: new Date().toISOString() })),
 }));
 
+// Mock getUsageState - returns usage data for the header dropdown display
+// Real getUsageState() always returns an object (never null) — see session.ts line 734
+const usageStateMock = vi.hoisted(() => ({
+  value: { monthlySeconds: 0, monthlyQuotaSeconds: null } as { monthlySeconds: number; monthlyQuotaSeconds: number | null },
+}));
+
 vi.mock('../../stores/session', () => ({
   sessionStore: {
     get activeSessionId() {
@@ -63,6 +69,7 @@ vi.mock('../../stores/session', () => ({
     renamePreset: (...args: Parameters<typeof sessionStoreState.renamePreset>) =>
       sessionStoreState.renamePreset(...args),
   },
+  getUsageState: () => usageStateMock.value,
 }));
 
 const defaultSessionProps = {
@@ -82,6 +89,7 @@ describe('Header Component', () => {
     sessionStoreState.error = null;
     isMobileMock.value = false;
     terminalStoreMock.authUrl = null;
+    usageStateMock.value = { monthlySeconds: 0, monthlyQuotaSeconds: null };
   });
 
   afterEach(() => {
@@ -478,6 +486,65 @@ describe('Header Component', () => {
       const logo = screen.getByTestId('header-logo');
       const svgPath = logo.querySelector('svg path');
       expect(svgPath?.getAttribute('d')).toBe(mdiXml);
+    });
+  });
+
+  describe('Usage Dropdown Item', () => {
+    it('should show formatted spent time when usage data is available', () => {
+      // 2h 15m = 8100 seconds, quota = 10h = 36000 seconds
+      usageStateMock.value = { monthlySeconds: 8100, monthlyQuotaSeconds: 36000 };
+      render(() => <Header {...defaultSessionProps} />);
+
+      // Open user menu
+      fireEvent.click(screen.getByTestId('header-user-menu'));
+
+      const usageItem = screen.getByTestId('header-user-dropdown-usage');
+      expect(usageItem).toBeInTheDocument();
+      // Should show compact duration format: "2h 15m / 10h"
+      expect(usageItem.textContent).toMatch(/2h 15m/);
+      expect(usageItem.textContent).toMatch(/10h/);
+    });
+
+    it('should show "Usage" without time when no usage data is available', () => {
+      // Default state: 0 seconds used, no quota — matches real getUsageState() initial state
+      usageStateMock.value = { monthlySeconds: 0, monthlyQuotaSeconds: null };
+      render(() => <Header {...defaultSessionProps} />);
+
+      // Open user menu
+      fireEvent.click(screen.getByTestId('header-user-menu'));
+
+      const usageItem = screen.getByTestId('header-user-dropdown-usage');
+      expect(usageItem).toBeInTheDocument();
+      expect(usageItem.textContent).toContain('Usage');
+      // Should NOT contain time formatting (monthlySeconds is 0 and quota is null)
+      expect(usageItem.textContent).not.toMatch(/\d+h\s*\d+m/);
+    });
+
+    it('should show usage with unlimited quota (no denominator)', () => {
+      // 5h = 18000 seconds, unlimited quota = null
+      usageStateMock.value = { monthlySeconds: 18000, monthlyQuotaSeconds: null };
+      render(() => <Header {...defaultSessionProps} />);
+
+      // Open user menu
+      fireEvent.click(screen.getByTestId('header-user-menu'));
+
+      const usageItem = screen.getByTestId('header-user-dropdown-usage');
+      expect(usageItem).toBeInTheDocument();
+      // Should show "5h"
+      expect(usageItem.textContent).toMatch(/5h/);
+    });
+
+    it('should show zero usage correctly', () => {
+      usageStateMock.value = { monthlySeconds: 0, monthlyQuotaSeconds: 3600 };
+      render(() => <Header {...defaultSessionProps} />);
+
+      // Open user menu
+      fireEvent.click(screen.getByTestId('header-user-menu'));
+
+      const usageItem = screen.getByTestId('header-user-dropdown-usage');
+      expect(usageItem).toBeInTheDocument();
+      // Should show "0s / 1h"
+      expect(usageItem.textContent).toMatch(/0s/);
     });
   });
 

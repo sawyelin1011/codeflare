@@ -650,11 +650,10 @@ describe('Terminal Store', () => {
   });
 
   describe('WebSocket reconnection behavior', () => {
-    it('retries with flat 1s delay on abnormal close (never gives up)', async () => {
+    it('stops retrying on 4503 (container stopped) and sets disconnected', async () => {
       const terminal = createMockTerminal();
-
       const OriginalWebSocket = globalThis.WebSocket;
-      const connectTimestamps: number[] = [];
+      let connectCount = 0;
 
       vi.stubGlobal('WebSocket', class {
         static CONNECTING = 0;
@@ -672,11 +671,12 @@ describe('Terminal Store', () => {
 
         constructor(url: string) {
           this.url = url;
-          connectTimestamps.push(Date.now());
+          connectCount++;
           setTimeout(() => {
             this.readyState = 3;
             if (this.onclose) {
-              this.onclose(new CloseEvent('close', { code: 1006 }));
+              // Server-authoritative: container is not running
+              this.onclose(new CloseEvent('close', { code: 4503, reason: 'container-stopped' }));
             }
           }, 0);
         }
@@ -688,31 +688,20 @@ describe('Terminal Store', () => {
       } as unknown as typeof WebSocket);
 
       terminalStore.connect(sessionId, terminalId, terminal);
-
-      expect(connectTimestamps.length).toBe(1);
-
-      // Let first attempt fail
       await vi.advanceTimersByTimeAsync(0);
 
-      // Each retry cycle: WS_RETRY_DELAY_MS (100ms mocked) + 1ms close timer
-      // Advance through 3 retry cycles
-      await vi.advanceTimersByTimeAsync(303);
+      // Should NOT retry — 4503 is authoritative
+      await vi.advanceTimersByTimeAsync(200);
+      expect(connectCount).toBe(1);
 
-      // Should have 4 total attempts (1 initial + 3 retries)
-      expect(connectTimestamps.length).toBe(4);
-
-      // Verify intervals are constant (flat delay)
-      for (let i = 2; i < connectTimestamps.length; i++) {
-        const interval = connectTimestamps[i] - connectTimestamps[i - 1];
-        expect(interval).toBeLessThanOrEqual(150);
-      }
+      expect(terminalStore.getConnectionState(sessionId, terminalId)).toBe('disconnected');
+      expect(terminalStore.getRetryMessage(sessionId, terminalId)).toBe('Session stopped');
 
       vi.stubGlobal('WebSocket', OriginalWebSocket);
     });
 
-    it('never gives up retrying on retryable close codes', async () => {
+    it('retries indefinitely on 1006 (network error) without dead-container inference', async () => {
       const terminal = createMockTerminal();
-
       const OriginalWebSocket = globalThis.WebSocket;
       let connectCount = 0;
 
@@ -749,18 +738,15 @@ describe('Terminal Store', () => {
 
       terminalStore.connect(sessionId, terminalId, terminal);
 
-      // Run 15 retry cycles — should NOT give up
-      for (let i = 0; i < 15; i++) {
-        await vi.advanceTimersByTimeAsync(0);   // WS closes
-        await vi.advanceTimersByTimeAsync(100);  // WS_RETRY_DELAY_MS (mocked)
-      }
+      // Let initial attempt fail + 4 retries
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(101);
+      await vi.advanceTimersByTimeAsync(101);
+      await vi.advanceTimersByTimeAsync(101);
+      await vi.advanceTimersByTimeAsync(101);
 
-      // Should still be retrying — NOT in error state
-      const state = terminalStore.getConnectionState(sessionId, terminalId);
-      expect(state).toBe('connecting');
-
-      // Should have made more than 10 attempts (proves no limit)
-      expect(connectCount).toBeGreaterThan(10);
+      // Should keep retrying — no dead-container cutoff at attemptNumber > 1
+      expect(connectCount).toBeGreaterThanOrEqual(5);
 
       vi.stubGlobal('WebSocket', OriginalWebSocket);
     });

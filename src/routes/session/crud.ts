@@ -6,13 +6,16 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { getContainer } from '@cloudflare/containers';
 import { AgentTypeSchema, type Env, type Session } from '../../types';
-import { getSessionKey, getSessionPrefix, generateSessionId, getSessionOrThrow, listAllKvKeys, sanitizeSessionName } from '../../lib/kv-keys';
+import { getSessionKey, getSessionPrefix, generateSessionId, getSessionOrThrow, listAllKvKeys, sanitizeSessionName, putSessionWithMetadata } from '../../lib/kv-keys';
 import { AuthVariables } from '../../middleware/auth';
 import { createRateLimiter } from '../../middleware/rate-limit';
-import { MAX_SESSION_NAME_LENGTH, MAX_TABS, SESSION_ID_PATTERN } from '../../lib/constants';
+import { MAX_SESSION_NAME_LENGTH, MAX_TABS } from '../../lib/constants';
 import { getContainerId } from '../../lib/container-helpers';
 import { createLogger } from '../../lib/logger';
 import { ValidationError } from '../../lib/error-types';
+import { getTierConfig, getUserTier, getEffectiveTier } from '../../lib/subscription';
+import { isSaasModeActive } from '../../lib/onboarding';
+import { parseJsonBody, firstZodError, validateSessionId } from '../../lib/request-helpers';
 import { toApiSession } from '../../lib/session-helpers';
 import { TabConfigSchema } from '../../lib/schemas';
 
@@ -87,10 +90,28 @@ app.get('/', async (c) => {
  */
 app.post('/', sessionCreateRateLimiter, async (c) => {
   const bucketName = c.get('bucketName');
-  const raw = await c.req.json();
+  const raw = await parseJsonBody(c);
   const parsed = CreateSessionBody.safeParse(raw);
   if (!parsed.success) {
-    throw new ValidationError(parsed.error.issues[0].message);
+    throw new ValidationError(firstZodError(parsed.error));
+  }
+
+  // Storage quota check — block session start if over quota
+  if (isSaasModeActive(c.env.SAAS_MODE)) {
+    const user = c.get('user');
+    const tiers = await getTierConfig(c.env.KV);
+    const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd);
+    const tier = getUserTier(effectiveTier, tiers);
+    if (tier.maxStorageBytes !== null && tier.maxStorageBytes !== undefined) {
+      const statsCached = await c.env.KV.get(`storage-stats:${bucketName}`, 'json') as { totalSizeBytes: number } | null;
+      if (statsCached && statsCached.totalSizeBytes > tier.maxStorageBytes) {
+        const usedMB = Math.round(statsCached.totalSizeBytes / 1048576);
+        const limitMB = Math.round(tier.maxStorageBytes / 1048576);
+        throw new ValidationError(
+          `Storage quota exceeded (${usedMB} MB / ${limitMB} MB). Delete files from your storage to free up space, then try again.`
+        );
+      }
+    }
   }
 
   let sessionName = parsed.data.name?.trim() || 'Terminal';
@@ -111,7 +132,7 @@ app.post('/', sessionCreateRateLimiter, async (c) => {
 
   // Store session in KV
   const key = getSessionKey(bucketName, sessionId);
-  await c.env.KV.put(key, JSON.stringify(session));
+  await putSessionWithMetadata(c.env.KV, key, session);
 
   // Omit userId from API response
   return c.json({ session: toApiSession(session) }, 201);
@@ -124,9 +145,7 @@ app.post('/', sessionCreateRateLimiter, async (c) => {
 app.get('/:id', async (c) => {
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
-  if (!SESSION_ID_PATTERN.test(sessionId)) {
-    return c.json({ error: 'Invalid session ID format' }, 400);
-  }
+  validateSessionId(sessionId);
   const key = getSessionKey(bucketName, sessionId);
 
   const session = await getSessionOrThrow(c.env.KV, key);
@@ -142,17 +161,15 @@ app.get('/:id', async (c) => {
 app.patch('/:id', async (c) => {
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
-  if (!SESSION_ID_PATTERN.test(sessionId)) {
-    return c.json({ error: 'Invalid session ID format' }, 400);
-  }
+  validateSessionId(sessionId);
   const key = getSessionKey(bucketName, sessionId);
 
   const session = await getSessionOrThrow(c.env.KV, key);
 
-  const raw = await c.req.json();
+  const raw = await parseJsonBody(c);
   const parsed = UpdateSessionBody.safeParse(raw);
   if (!parsed.success) {
-    throw new ValidationError(parsed.error.issues[0].message);
+    throw new ValidationError(firstZodError(parsed.error));
   }
 
   // Update fields (immutable)
@@ -164,7 +181,7 @@ app.patch('/:id', async (c) => {
   };
 
   // Save updated session
-  await c.env.KV.put(key, JSON.stringify(updated));
+  await putSessionWithMetadata(c.env.KV, key, updated);
 
   // Omit userId from API response
   return c.json({ session: toApiSession(updated) });
@@ -178,9 +195,7 @@ app.delete('/:id', sessionDeleteRateLimiter, async (c) => {
   const reqLogger = logger.child({ requestId: c.get('requestId') });
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
-  if (!SESSION_ID_PATTERN.test(sessionId)) {
-    return c.json({ error: 'Invalid session ID format' }, 400);
-  }
+  validateSessionId(sessionId);
   const key = getSessionKey(bucketName, sessionId);
 
   // Check if session exists
@@ -213,15 +228,13 @@ app.delete('/:id', sessionDeleteRateLimiter, async (c) => {
 app.post('/:id/touch', async (c) => {
   const bucketName = c.get('bucketName');
   const sessionId = c.req.param('id');
-  if (!SESSION_ID_PATTERN.test(sessionId)) {
-    return c.json({ error: 'Invalid session ID format' }, 400);
-  }
+  validateSessionId(sessionId);
   const key = getSessionKey(bucketName, sessionId);
 
   const session = await getSessionOrThrow(c.env.KV, key);
 
   const updated = { ...session, lastAccessedAt: new Date().toISOString() };
-  await c.env.KV.put(key, JSON.stringify(updated));
+  await putSessionWithMetadata(c.env.KV, key, updated);
 
   return c.json({ session: toApiSession(updated) });
 });

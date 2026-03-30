@@ -61,6 +61,8 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     p7zip-full \
     bat \
     unzip \
+    # Sandbox for OpenAI Codex
+    bubblewrap \
     # GPG for GitHub CLI repo key
     gpg \
     && rm -rf /var/lib/apt/lists/* \
@@ -119,7 +121,7 @@ COPY .cache-bust /tmp/.cache-bust
 RUN apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g github:nikolanovoselec/claude-unleashed#860c5d2e946681c238e1ef33447a99942bb349dd && \
+RUN npm install -g github:nikolanovoselec/claude-unleashed#999d553c6c395acff8210a252e5a2f39ec10344c && \
     rm -f /tmp/.cache-bust && \
     npm cache clean --force && \
     rm -rf /root/.npm

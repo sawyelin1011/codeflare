@@ -1,16 +1,9 @@
-import { Component, onMount, createSignal, Show, For, type JSX } from 'solid-js';
-import {
-  mdiRocketLaunchOutline,
-  mdiCellphoneLink,
-  mdiCloudLockOutline,
-  mdiCellphoneScreenshot,
-  mdiSourceBranch,
-  mdiLightningBolt,
-} from '@mdi/js';
+import { Component, onMount, createSignal, Show, For } from 'solid-js';
 import { getAuthProviders, getAuthStatus } from '../api/client';
 import type { AuthProvider } from '../types';
 import ScrambleText from './ScrambleText';
 import Icon from './Icon';
+import { FEATURES } from '../lib/marketing-content';
 import { logger } from '../lib/logger';
 import '../styles/login-page.css';
 
@@ -47,14 +40,6 @@ function getProviderIcon(provider: AuthProvider) {
   return null;
 }
 
-const FEATURES: Array<{ icon: string; content: () => JSX.Element }> = [
-  { icon: mdiRocketLaunchOutline, content: () => <>Ready to code in seconds</> },
-  { icon: mdiCellphoneLink, content: () => <>Runs on any device with a browser</> },
-  { icon: mdiSourceBranch, content: () => <><span style={{ color: '#3b82f6' }}>GitHub</span> & <span style={{ color: '#f38020' }}>Cloudflare</span> integration</> },
-  { icon: mdiCloudLockOutline, content: () => <>Data persisted & encrypted at rest</> },
-  { icon: mdiCellphoneScreenshot, content: () => <>Optimized for mobiles & foldables</> },
-  { icon: mdiLightningBolt, content: () => <>From idea to deployment in minutes</> },
-];
 
 const LoginPage: Component = () => {
   const [loading, setLoading] = createSignal(true);
@@ -65,15 +50,17 @@ const LoginPage: Component = () => {
   onMount(async () => {
     try {
       const status = await getAuthStatus();
-      if (status.accessTier === 'standard' || status.accessTier === 'advanced') {
+      const tier = status.subscriptionTier ?? status.accessTier;
+      // Active tiers: free, trial, standard, advanced, max, unlimited
+      if (tier !== 'pending' && tier !== 'blocked') {
         window.location.href = '/app/';
         return;
       }
-      if (status.accessTier === 'pending') {
+      if (tier === 'pending') {
         window.location.href = '/app/subscribe';
         return;
       }
-      if (status.accessTier === 'blocked') {
+      if (tier === 'blocked') {
         setBlocked(true);
         setLoading(false);
         return;
@@ -116,8 +103,8 @@ const LoginPage: Component = () => {
         </h1>
 
         <p class="login-subtitle">
-          Five coding agents in the palm of your hand.
-          Ready when you are, wherever you are.
+          An ephemeral IDE where AI coding agents reach their full potential.
+          Fully autonomous. No boundaries. Zero risk.
         </p>
 
         {/* Feature highlights */}
@@ -155,10 +142,10 @@ const LoginPage: Component = () => {
             <For each={providers()}>
               {(provider) => (
                 <a
-                  href="/app/"
+                  href={provider.loginUrl ?? '/app/'}
                   class="login-provider-button"
                   data-provider={provider.type}
-                  onClick={(e) => { e.preventDefault(); window.location.href = '/app/'; }}
+                  onClick={(e) => { e.preventDefault(); window.location.href = provider.loginUrl ?? '/app/'; }}
                 >
                   <span class="login-provider-icon">
                     {getProviderIcon(provider)}
@@ -171,6 +158,7 @@ const LoginPage: Component = () => {
         </Show>
 
         <p class="login-footer">From Switzerland <span class="login-footer-flag" aria-label="Swiss flag">&#127464;&#127469;</span> for <span style={{ color: '#f38020' }}>Region: Earth</span></p>
+        <p class="login-footer login-footer-legal"><a href="https://graymatter.ch" target="_blank" rel="noopener noreferrer" style={{ color: 'inherit', 'text-decoration': 'none' }}>&copy; 2026 Gray Matter GmbH</a></p>
       </div>
     </div>
   );

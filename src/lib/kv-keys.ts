@@ -5,6 +5,91 @@ import type { Session } from '../types';
 import { NotFoundError } from './error-types';
 
 /**
+ * Compressed metadata embedded in KV list keys for session status.
+ * batch-status reads this instead of N individual KV.get calls.
+ * Must fit within Cloudflare KV's 1024-byte metadata limit (~195 bytes worst case).
+ */
+export interface SessionListMetadata {
+  /** status: 'r' = running, 's' = stopped */
+  s?: 'r' | 's';
+  /** lastActiveAt ISO string */
+  la?: string;
+  /** lastStartedAt ISO string */
+  sa?: string;
+  /** metrics */
+  m?: {
+    /** cpu */
+    c?: string;
+    /** mem */
+    e?: string;
+    /** hdd */
+    h?: string;
+    /** syncStatus */
+    y?: string;
+    /** updatedAt */
+    u?: string;
+  };
+}
+
+/** Build compressed list metadata from a Session object. */
+export function buildSessionMetadata(session: Session): SessionListMetadata {
+  const meta: SessionListMetadata = {
+    s: session.status === 'running' ? 'r' : 's',
+    la: session.lastActiveAt,
+    sa: session.lastStartedAt,
+  };
+  if (session.metrics) {
+    meta.m = {
+      ...(session.metrics.cpu && { c: session.metrics.cpu }),
+      ...(session.metrics.mem && { e: session.metrics.mem }),
+      ...(session.metrics.hdd && { h: session.metrics.hdd }),
+      ...(session.metrics.syncStatus && { y: session.metrics.syncStatus }),
+      ...(session.metrics.updatedAt && { u: session.metrics.updatedAt }),
+    };
+  }
+  return meta;
+}
+
+/** Expand compressed metadata to the shape batch-status returns. */
+export function expandSessionMetadata(meta: SessionListMetadata): {
+  status: string;
+  ptyActive: boolean;
+  lastActiveAt: string | null;
+  lastStartedAt: string | null;
+  metrics?: Session['metrics'];
+} {
+  const isRunning = meta.s === 'r';
+  return {
+    status: isRunning ? 'running' : 'stopped',
+    ptyActive: isRunning,
+    lastActiveAt: meta.la || null,
+    lastStartedAt: meta.sa || null,
+    ...(meta.m && {
+      metrics: {
+        ...(meta.m.c && { cpu: meta.m.c }),
+        ...(meta.m.e && { mem: meta.m.e }),
+        ...(meta.m.h && { hdd: meta.m.h }),
+        ...(meta.m.y && { syncStatus: meta.m.y }),
+        ...(meta.m.u && { updatedAt: meta.m.u }),
+      },
+    }),
+  };
+}
+
+/**
+ * Write a session to KV with synchronized list metadata.
+ * All session KV.put calls MUST use this to keep metadata in sync.
+ */
+export async function putSessionWithMetadata(
+  kv: KVNamespace,
+  key: string,
+  session: Session,
+): Promise<void> {
+  const metadata = buildSessionMetadata(session);
+  await kv.put(key, JSON.stringify(session), { metadata });
+}
+
+/**
  * Extract the email address from a KV key like "user:alice@example.com"
  */
 export function emailFromKvKey(keyName: string): string {
@@ -93,6 +178,86 @@ export function getLlmKeysKey(bucketName: string): string {
  */
 export function getDeployKeysKey(bucketName: string): string {
   return `deploy-keys:${bucketName}`;
+}
+
+/**
+ * Get KV key for subscription tier configuration
+ */
+export function getTiersConfigKey(): string {
+  return 'tiers:config';
+}
+
+/**
+ * Get KV key for a user's Timekeeper usage record
+ */
+export function getTimekeeperKey(bucketName: string): string {
+  return `timekeeper:${bucketName}`;
+}
+
+/**
+ * Get UTC date string in YYYY-MM-DD format
+ */
+export function getUtcDateString(date: Date): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Get UTC month string in YYYY-MM format
+ */
+export function getUtcMonthString(date: Date): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+}
+
+/**
+ * Get the ISO week start (Monday) date string for a given date.
+ * ISO weeks start on Monday. Returns YYYY-MM-DD of the Monday.
+ */
+export function getIsoWeekStart(date: Date): string {
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  // getUTCDay() returns 0=Sun, 1=Mon, ..., 6=Sat
+  // Convert to Mon=0, Tue=1, ..., Sun=6
+  const dayOfWeek = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dayOfWeek);
+  return getUtcDateString(d);
+}
+
+/**
+ * Centralized setup KV key constants. Eliminates raw 'setup:*' strings across 17+ files.
+ */
+export const SETUP_KEYS = {
+  COMPLETE: 'setup:complete',
+  COMPLETED_AT: 'setup:completed_at',
+  CONFIGURING: 'setup:configuring',
+  ACCOUNT_ID: 'setup:account_id',
+  R2_ENDPOINT: 'setup:r2_endpoint',
+  CUSTOM_DOMAIN: 'setup:custom_domain',
+  ALLOWED_ORIGINS: 'setup:allowed_origins',
+  ONBOARDING_LANDING_PAGE: 'setup:onboarding_landing_page',
+  AUTH_DOMAIN: 'setup:auth_domain',
+  ACCESS_AUD: 'setup:access_aud',
+  ACCESS_AUD_LIST: 'setup:access_aud_list',
+  ACCESS_APP_ID: 'setup:access_app_id',
+  ACCESS_GROUP_ADMIN_ID: 'setup:access_group_admin_id',
+  ACCESS_GROUP_USER_ID: 'setup:access_group_user_id',
+  ACCESS_GROUP_ADMIN_NAME: 'setup:access_group_admin_name',
+  ACCESS_GROUP_USER_NAME: 'setup:access_group_user_name',
+  IDP_LIST: 'setup:idp_list',
+  MAX_USERS: 'setup:max_users',
+  TURNSTILE_SITE_KEY: 'setup:turnstile_site_key',
+  TURNSTILE_SECRET_KEY: 'setup:turnstile_secret_key',
+} as const;
+
+/**
+ * Resolve the base URL for redirects using custom domain from KV or the request origin.
+ */
+export async function getBaseUrl(kv: KVNamespace, requestUrl: string): Promise<string> {
+  const customDomain = await kv.get(SETUP_KEYS.CUSTOM_DOMAIN);
+  return customDomain ? `https://${customDomain}` : new URL(requestUrl).origin;
 }
 
 /**

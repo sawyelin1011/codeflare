@@ -8,6 +8,7 @@ import { logger } from '../lib/logger';
 import { isTouchDevice, isVirtualKeyboardOpen, getKeyboardHeight, enableVirtualKeyboardOverlay, disableVirtualKeyboardOverlay, resetKeyboardStateIfStale, forceResetKeyboardState, isSamsungBrowser } from '../lib/mobile';
 import { attachSwipeGestures } from '../lib/touch-gestures';
 import { registerMultiLineLinkProvider } from '../lib/terminal-link-provider';
+import { isSpeechSupported, isListening, startListening, stopListening } from '../lib/speech-input';
 import { setupMobileInput } from '../lib/terminal-mobile-input';
 import { loadSettings } from '../lib/settings';
 import { getIframeInput } from '../lib/xterm-internals';
@@ -77,16 +78,16 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     const termBrightBlack = rootStyle.getPropertyValue('--color-terminal-theme-bright-black').trim() || '#627088';
 
     term = new Terminal({
-      cursorBlink: false,
-      cursorStyle: 'block',
+      cursorBlink: true,
+      cursorStyle: 'bar',
       fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', Menlo, Monaco, 'Courier New', 'Noto Color Emoji', 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Sans Symbols 2', 'Segoe UI Symbol', 'Apple Symbols', monospace",
       fontSize: 14,
       lineHeight: 1.2,
       theme: {
         background: termBg,
         foreground: '#e4e4f0',
-        cursor: 'transparent',
-        cursorAccent: 'transparent',
+        cursor: '#e4e4f0',
+        cursorAccent: '#1a2332',
         selectionBackground: '#d9770644',
         selectionForeground: '#e4e4f0',
         black: termBlack,
@@ -115,7 +116,9 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     term.loadAddon(fitAddon);
     registerMultiLineLinkProvider(term);
 
-    // Open terminal - on mobile, swap xterm's textarea for a password input to disable IME
+    // Open terminal - on mobile, swap xterm's textarea for a password input
+    // to suppress autocorrect at OS level. Voice input uses Web Speech API
+    // (speech-input.ts), completely decoupled from the keyboard input.
     if (isTouchDevice()) {
       const origCreateElement = document.createElement;
       document.createElement = function(tagName: string, options?: ElementCreationOptions) {
@@ -136,7 +139,8 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       term.open(container);
     }
 
-    // Disable mobile IME composition
+    // Suppress autocorrect/autocapitalize/spellcheck on the input element.
+    // Uses attributes instead of type="password" to preserve voice input.
     const textarea = term.textarea;
     if (textarea) {
       textarea.setAttribute('autocomplete', 'off');
@@ -145,6 +149,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
       textarea.setAttribute('spellcheck', 'false');
       textarea.setAttribute('inputmode', 'text');
       textarea.setAttribute('enterkeyhint', 'enter');
+      textarea.setAttribute('aria-autocomplete', 'none');
       textarea.style.setProperty('-webkit-user-modify', 'read-write-plaintext-only');
       textarea.setAttribute('data-gramm', 'false');
       textarea.setAttribute('data-gramm_editor', 'false');
@@ -171,6 +176,15 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
         return true;
       }
       if (event.ctrlKey && event.key === 'v') {
+        return false;
+      }
+      // Ctrl+Space → toggle voice input via Web Speech API
+      if (event.ctrlKey && event.key === ' ' && isSpeechSupported()) {
+        if (isListening()) {
+          stopListening();
+        } else {
+          startListening((text) => term!.input(text, false));
+        }
         return false;
       }
       return true;
@@ -236,14 +250,25 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     terminalStore.registerFitAddon(props.sessionId, props.terminalId, fa);
     setTerminalInstance(t);
 
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        if (!fitAddon || !containerEl || !term) return;
-        if (containerEl.clientHeight === 0) return;
-        fitAddon.fit();
-        setDimensions({ cols: term.cols, rows: term.rows });
-      });
-    });
+    // Fit xterm to container once layout is stable. On mobile (especially
+    // Samsung Internet), the container may report clientHeight === 0 during
+    // initial mount if the flex layout hasn't resolved yet. Retry with rAF
+    // polling instead of giving up — the ResizeObserver backup may not fire
+    // if props.active is false during the initializing phase.
+    let fitRetries = 0;
+    const MAX_FIT_RETRIES = 20; // ~330ms at 60fps
+    function tryFit() {
+      if (!fitAddon || !containerEl || !term) return;
+      if (containerEl.clientHeight === 0) {
+        if (fitRetries++ < MAX_FIT_RETRIES) {
+          requestAnimationFrame(tryFit);
+        }
+        return;
+      }
+      fitAddon.fit();
+      setDimensions({ cols: term.cols, rows: term.rows });
+    }
+    requestAnimationFrame(() => requestAnimationFrame(tryFit));
 
     // Resize observer
     resizeObserver = new ResizeObserver(() => {
@@ -276,20 +301,21 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
 
     // Cursor visibility tracking
     const origCursorColor = '#d97706';
-    let isAlternateBuffer = false;
     let isCursorHidden = false;
 
     const applyCursorVisibility = () => {
       if (!term) return;
-      if (isAlternateBuffer || isCursorHidden) {
+      // Always keep cursor visible — CLI apps (Copilot, Claude Code, Codex)
+      // in alternate buffer mode need xterm's cursor layer. Hiding it caused
+      // invisible cursors in newer CLI versions that rely on it.
+      if (isCursorHidden) {
         term.options.theme = { ...term.options.theme, cursor: 'transparent', cursorAccent: 'transparent' };
       } else {
         term.options.theme = { ...term.options.theme, cursor: origCursorColor, cursorAccent: termBg };
       }
     };
 
-    bufferChangeDisposable = t.buffer.onBufferChange((buf) => {
-      isAlternateBuffer = buf.type === 'alternate';
+    bufferChangeDisposable = t.buffer.onBufferChange(() => {
       applyCursorVisibility();
     });
 

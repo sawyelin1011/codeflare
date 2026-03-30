@@ -16,6 +16,10 @@ vi.mock('../../components/SessionStatCard', () => ({
   )
 }));
 
+vi.mock('../../components/ScrambleText', () => ({
+  default: (props: any) => <span class={props.class}>{props.text}</span>
+}));
+
 vi.mock('../../components/StorageBrowser', () => ({
   default: () => <div data-testid="storage-browser" />
 }));
@@ -67,6 +71,8 @@ vi.mock('../../stores/session', () => {
       },
       _setR2Ready: (ready: boolean) => { _r2Ready = ready; },
     },
+    isAtUsageQuota: () => false,
+    getUsageState: () => ({ monthlySeconds: 0, monthlyQuotaSeconds: null }),
   };
 });
 
@@ -326,7 +332,7 @@ describe('Dashboard', () => {
     expect(icon?.getAttribute('data-path')).toBe(mdiXml);
   });
 
-  it('logout dropdown item redirects to /cdn-cgi/access/logout with returnTo', () => {
+  it('logout dropdown item redirects to /auth/logout', () => {
     const originalLocation = window.location;
     const mockLocation = { ...originalLocation, href: '', origin: 'https://codeflare.example.com' };
     Object.defineProperty(window, 'location', { value: mockLocation, writable: true });
@@ -335,7 +341,7 @@ describe('Dashboard', () => {
     fireEvent.click(screen.getByTestId('header-user-menu'));
     fireEvent.click(screen.getByTestId('header-user-dropdown-logout'));
 
-    expect(mockLocation.href).toContain('/cdn-cgi/access/logout?returnTo=');
+    expect(mockLocation.href).toBe('/auth/logout');
 
     Object.defineProperty(window, 'location', { value: originalLocation, writable: true });
   });

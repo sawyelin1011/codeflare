@@ -18,7 +18,7 @@
 import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
 import type { Env, Session } from '../types';
-import { getSessionKey } from '../lib/kv-keys';
+import { getSessionKey, putSessionWithMetadata } from '../lib/kv-keys';
 import { SESSION_ID_PATTERN, REQUEST_ID_LENGTH, REQUEST_ID_PATTERN, WS_RATE_LIMIT_WINDOW_MS, WS_RATE_LIMIT_MAX_CONNECTIONS, WS_RATE_LIMIT_TTL_SECONDS } from '../lib/constants';
 import { checkRateLimit } from '../lib/rate-limit-core';
 import { authMiddleware, AuthVariables } from '../middleware/auth';
@@ -26,6 +26,7 @@ import { getContainerId, safeCheckContainerHealth } from '../lib/container-helpe
 import { authenticateRequest } from '../lib/access';
 import { isSaasModeActive } from '../lib/onboarding';
 import { isActiveUser } from '../lib/access-tier';
+import { getEffectiveTier } from '../lib/subscription';
 import { createLogger } from '../lib/logger';
 import { getContainerSessionsCB } from '../lib/circuit-breakers';
 import { isAllowedOrigin } from '../lib/cors-cache';
@@ -170,8 +171,10 @@ export async function handleWebSocketUpgrade(
     }
 
     // SaaS mode: enforce access tier on WebSocket connections (mirrors requireActiveUser)
-    if (isSaasModeActive(env.SAAS_MODE) && !isActiveUser(user.accessTier)) {
-      const code = user.accessTier === 'blocked' ? 'BLOCKED' : 'PENDING';
+    // CF-006: Use getEffectiveTier with all args instead of raw field read
+    const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd);
+    if (isSaasModeActive(env.SAAS_MODE) && !isActiveUser(effectiveTier)) {
+      const code = effectiveTier === 'blocked' ? 'BLOCKED' : 'PENDING';
       return new Response(JSON.stringify({ error: 'Access denied', code }), { status: 403, headers: jsonHeaders });
     }
 
@@ -217,13 +220,13 @@ export async function handleWebSocketUpgrade(
     }
 
     // Reject WebSocket connections to stopped/hibernated sessions.
-    // Without this, the browser's auto-reconnect logic wakes the container
-    // immediately after it sleeps, creating an infinite stop/start cycle.
+    // Uses custom close code 4503 so the client can distinguish
+    // "container stopped" from network errors (1006).
     if (session.status === 'stopped') {
-      return new Response(JSON.stringify({ error: 'Session is stopped', code: 'SESSION_STOPPED' }), {
-        status: 503,
-        headers: jsonHeaders,
-      });
+      const pair = new WebSocketPair();
+      pair[1].accept();
+      pair[1].close(4503, 'container-stopped');
+      return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
     // Update last accessed timestamp (don't await)
@@ -232,7 +235,7 @@ export async function handleWebSocketUpgrade(
       const fresh = await env.KV.get<Session>(sessionKey, 'json');
       if (fresh) {
         const touched = { ...fresh, lastAccessedAt: new Date().toISOString() };
-        await env.KV.put(sessionKey, JSON.stringify(touched));
+        await putSessionWithMetadata(env.KV, sessionKey, touched);
       }
     })().catch(err => logger.warn('Failed to update lastAccessedAt', { error: toErrorMessage(err) })));
 

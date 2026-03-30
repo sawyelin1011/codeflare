@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
 import type { DurableObjectStub } from '@cloudflare/workers-types';
 import type { Env, Session } from '../../types';
-import { getSessionKey, getSessionPrefix, listAllKvKeys, getSessionOrThrow } from '../../lib/kv-keys';
+import { getSessionKey, getSessionPrefix, listAllKvKeys, getSessionOrThrow, getTimekeeperKey, getUtcMonthString, getUtcDateString, putSessionWithMetadata, expandSessionMetadata, type SessionListMetadata } from '../../lib/kv-keys';
 import { getMaxSessions, SESSION_ID_PATTERN } from '../../lib/constants';
 import { AuthVariables } from '../../middleware/auth';
 import { createRateLimiter } from '../../middleware/rate-limit';
@@ -14,6 +14,9 @@ import { getContainerId, safeCheckContainerHealth } from '../../lib/container-he
 import { getContainerSessionsCB } from '../../lib/circuit-breakers';
 import { toApiSession } from '../../lib/session-helpers';
 import { ValidationError } from '../../lib/error-types';
+import { isSaasModeActive } from '../../lib/onboarding';
+import { getTierConfig, getUserTier } from '../../lib/subscription';
+import type { UsageRecord } from '../../types';
 
 /**
  * Check container health and PTY status for a session.
@@ -83,22 +86,42 @@ app.get('/batch-status', async (c) => {
   const bucketName = c.get('bucketName');
   const prefix = getSessionPrefix(bucketName);
 
+  // Read session status/metrics from KV list metadata (zero individual KV.get calls).
+  // Keys written via putSessionWithMetadata() include compressed metadata.
+  // Fallback to KV.get for pre-migration keys without metadata.
   const keys = await listAllKvKeys(c.env.KV, prefix);
-  const sessionPromises = keys.map(key => c.env.KV.get<Session>(key.name, 'json'));
-  const sessionResults = await Promise.all(sessionPromises);
-  const sessions: Session[] = sessionResults.filter((s): s is Session => s !== null);
 
   const statuses: Record<string, { status: string; ptyActive: boolean; lastActiveAt: string | null; lastStartedAt: string | null; metrics?: Session['metrics'] }> = {};
+  const fallbackKeys: Array<{ name: string }> = [];
 
-  for (const session of sessions) {
-    const isRunning = session.status === 'running';
-    statuses[session.id] = {
-      status: isRunning ? 'running' : 'stopped',
-      ptyActive: isRunning,
-      lastActiveAt: session.lastActiveAt || null,
-      lastStartedAt: session.lastStartedAt || null,
-      metrics: session.metrics || undefined,
-    };
+  for (const key of keys) {
+    const meta = key.metadata as SessionListMetadata | null;
+    if (meta && meta.s) {
+      // Fast path: read from list metadata (zero KV.get)
+      const sessionId = key.name.split(':').pop()!;
+      statuses[sessionId] = expandSessionMetadata(meta);
+    } else {
+      // Pre-migration key without metadata — queue for fallback KV.get
+      fallbackKeys.push(key);
+    }
+  }
+
+  // Fallback: fetch full session for keys without metadata (graceful migration)
+  if (fallbackKeys.length > 0) {
+    const fallbackResults = await Promise.all(
+      fallbackKeys.map(key => c.env.KV.get<Session>(key.name, 'json'))
+    );
+    for (const session of fallbackResults) {
+      if (!session) continue;
+      const isRunning = session.status === 'running';
+      statuses[session.id] = {
+        status: isRunning ? 'running' : 'stopped',
+        ptyActive: isRunning,
+        lastActiveAt: session.lastActiveAt || null,
+        lastStartedAt: session.lastStartedAt || null,
+        metrics: session.metrics || undefined,
+      };
+    }
   }
 
   const user = c.get('user');
@@ -108,7 +131,31 @@ app.get('/batch-status', async (c) => {
   const storageStatsCached = await c.env.KV.get(`storage-stats:${bucketName}`, 'json') as { totalFiles: number; totalFolders: number; totalSizeBytes: number } | null;
   const storageStats = storageStatsCached || undefined;
 
-  return c.json({ statuses, maxSessions, storageStats });
+  // Include usage data when SaaS mode is active
+  let usage: { dailySeconds: number; monthlySeconds: number; monthlyQuotaSeconds: number | null; tier: string } | undefined;
+  if (isSaasModeActive(c.env.SAAS_MODE)) {
+    try {
+      const [record, tiers] = await Promise.all([
+        c.env.KV.get<UsageRecord>(getTimekeeperKey(bucketName), 'json'),
+        getTierConfig(c.env.KV),
+      ]);
+      const tierValue = user.subscriptionTier ?? user.accessTier;
+      const tier = getUserTier(tierValue, tiers);
+      const now = new Date();
+      const currentMonth = getUtcMonthString(now);
+      const currentDate = getUtcDateString(now);
+      usage = {
+        dailySeconds: (record && record.today.date === currentDate) ? record.today.seconds : 0,
+        monthlySeconds: (record && record.thisMonth.month === currentMonth) ? record.thisMonth.seconds : 0,
+        monthlyQuotaSeconds: tier.monthlySeconds,
+        tier: tier.id,
+      };
+    } catch {
+      // Non-fatal — usage display is best-effort
+    }
+  }
+
+  return c.json({ statuses, maxSessions, storageStats, usage });
 });
 
 /**
@@ -128,7 +175,7 @@ app.post('/:id/stop', sessionStopRateLimiter, async (c) => {
 
   // Persist stopped status in KV so batch-status can skip container probes
   const updated = { ...session, status: 'stopped' as const, lastStatusCheck: Date.now() };
-  await c.env.KV.put(key, JSON.stringify(updated));
+  await putSessionWithMetadata(c.env.KV, key, updated);
 
   // Best-effort container destroy — container may already be stopped
   try {

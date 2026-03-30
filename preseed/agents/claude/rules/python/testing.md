@@ -5,13 +5,13 @@ paths:
 ---
 # Python Testing
 
-> This file extends [common/testing.md](../common/testing.md) with Python specific content.
+**Important:** Tests run via CI only (GitHub Actions). Do not run test suites locally — the container has 1 vCPU. Write tests, push, and verify via `gh run view`.
 
 ## Framework
 
 Use **pytest** as the testing framework.
 
-## Coverage
+## Coverage (CI only)
 
 ```bash
 pytest --cov=src --cov-report=term-missing
@@ -32,7 +32,3 @@ def test_calculate_total():
 def test_database_connection():
     ...
 ```
-
-## Reference
-
-See skill: `python-testing` for detailed pytest patterns and fixtures.

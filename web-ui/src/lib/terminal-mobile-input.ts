@@ -127,7 +127,9 @@ export function setupMobileInput(
   iframe.className = 'terminal-input-iframe';
   iframe.setAttribute('tabindex', '-1');
   iframe.setAttribute('aria-hidden', 'true');
-  // srcdoc: minimal HTML with a password input. Same-origin, no network request.
+  // srcdoc: minimal HTML with a password input. Password type suppresses
+  // autocorrect at OS level. Voice input uses Web Speech API (speech-input.ts),
+  // completely decoupled from the keyboard. Same-origin, no network request.
   iframe.srcdoc = `<!DOCTYPE html>
 <html><head><style>
   html, body { margin: 0; padding: 0; overflow: hidden; background: transparent; }
@@ -238,6 +240,14 @@ export function setupMobileInput(
     input.addEventListener('compositionstart', () => { composing = true; });
     input.addEventListener('compositionend', () => {
       composing = false;
+      // Flush composed text (voice dictation, swipe typing) now that
+      // the IME has committed its result.
+      if (!terminal) return;
+      const val = input.value;
+      if (val) {
+        terminal.input(val, false);
+        input.value = '';
+      }
     });
 
     input.addEventListener('keydown', (e: KeyboardEvent) => {
@@ -285,13 +295,15 @@ export function setupMobileInput(
     });
 
     // 'input' event fires for character input (including IME results).
+    // During composition (voice dictation, swipe typing), don't flush —
+    // wait for compositionend to send the committed text.
     input.addEventListener('input', () => {
       if (sentViaKeydown) {
         sentViaKeydown = false;
-        input.value = '';
+        if (!composing) input.value = '';
         return;
       }
-      if (!terminal) return;
+      if (!terminal || composing) return;
       const val = input.value;
       if (val) {
         // Sticky CTRL not consumed by keydown (key was 'Unidentified') — apply here

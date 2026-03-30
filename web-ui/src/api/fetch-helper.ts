@@ -2,6 +2,8 @@ import { ZodType } from 'zod';
 
 export class ApiError extends Error {
   public steps?: Array<{ step: string; status: string; error?: string }>;
+  /** Error code from backend (e.g., QUOTA_EXCEEDED, PENDING, BLOCKED) */
+  public code?: string;
 
   constructor(
     message: string,
@@ -65,11 +67,26 @@ export async function baseFetch<T>(
       );
     }
 
+    // Auto-redirect to login on 401 (expired session cookie).
+    // Only redirect from authenticated pages (/app/*, /admin/*).
+    // Login page (/, /login) and public pages handle 401 in their own error flow.
+    // Return a never-resolving promise to prevent error propagation to the UI
+    // (avoids flash of "unauthorized" error before redirect completes).
+    if (response.status === 401) {
+      const path = window.location.pathname;
+      if (path.startsWith('/app/') || path.startsWith('/admin/')) {
+        window.location.href = '/';
+        return new Promise<never>(() => {});
+      }
+    }
+
+    let code: string | undefined;
     try {
       if (body) {
         const parsed = JSON.parse(body);
         if (parsed.error) errorMessage = parsed.error;
         if (Array.isArray(parsed.steps)) steps = parsed.steps;
+        if (typeof parsed.code === 'string') code = parsed.code;
       }
     } catch {
       // Not JSON, use raw text
@@ -81,6 +98,7 @@ export async function baseFetch<T>(
       body
     );
     if (steps) apiError.steps = steps;
+    if (code) apiError.code = code;
     throw apiError;
   }
 

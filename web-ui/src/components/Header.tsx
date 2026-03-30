@@ -2,9 +2,10 @@ import { Component, Show, For, createMemo, createSignal, createEffect, onMount, 
 import {
   mdiXml,
   mdiCogOutline,
-  mdiAccountCircle,
+  mdiShieldAccount,
   mdiAccountOutline,
   mdiRocketLaunchOutline,
+  mdiChartBar,
   mdiLogout,
   mdiViewDashboardOutline,
   mdiBookOutline,
@@ -15,20 +16,19 @@ import {
   mdiClose,
   mdiFileCabinet,
   mdiOpenInNew,
+  mdiClockTimeEightOutline,
 } from '@mdi/js';
 import Icon from './Icon';
 import SessionSwitcher from './SessionSwitcher';
 import { sessionStore } from '../stores/session';
+import { getSleepTimerInfo } from '../lib/sleep-timer';
+import UsageInlineBadge from './UsageInlineBadge';
+
 import { terminalStore } from '../stores/terminal';
-import { md5 } from '../lib/md5';
+import { getGravatarUrl } from '../lib/gravatar';
 import { isTouchDevice, getKeyboardHeight } from '../lib/mobile';
 import type { SessionWithStatus, AgentType, TabConfig } from '../types';
 import '../styles/header.css';
-
-function getGravatarUrl(email: string, size = 32): string {
-  const hash = md5(email.trim().toLowerCase());
-  return `https://www.gravatar.com/avatar/${hash}?s=${size}&d=mp`;
-}
 
 interface HeaderProps {
   userName?: string;
@@ -41,7 +41,7 @@ interface HeaderProps {
   onStopSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
   onCreateSession: (name: string, agentType?: AgentType, tabConfig?: TabConfig[]) => void;
-  // Note: logout is handled via CF Access at /cdn-cgi/access/logout
+  // Note: logout goes through /auth/logout which routes to OIDC or CF Access as appropriate
 }
 
 /**
@@ -54,14 +54,32 @@ interface HeaderProps {
  */
 const Header: Component<HeaderProps> = (props) => {
   const [showUserMenu, setShowUserMenu] = createSignal(false);
+  const [gravatarFailed, setGravatarFailed] = createSignal(false);
   const [showBookmarksMenu, setShowBookmarksMenu] = createSignal(false);
   const [showCreateBookmark, setShowCreateBookmark] = createSignal(false);
+  const [showTimerDropdown, setShowTimerDropdown] = createSignal(false);
   const [bookmarkName, setBookmarkName] = createSignal('');
   const [bookmarkError, setBookmarkError] = createSignal<string | null>(null);
   const [editingPresetId, setEditingPresetId] = createSignal<string | null>(null);
   const [editingPresetName, setEditingPresetName] = createSignal('');
   let userMenuRef: HTMLDivElement | undefined;
   let bookmarksMenuRef: HTMLDivElement | undefined;
+  let timerMenuRef: HTMLDivElement | undefined;
+
+  const activeSession = createMemo(() =>
+    props.sessions.find(s => s.id === props.activeSessionId)
+  );
+  // Tick signal forces timer recomputation every 15s (Date.now() isn't reactive)
+  const [timerTick, setTimerTick] = createSignal(0);
+  const timerInterval = setInterval(() => setTimerTick(t => t + 1), 15_000);
+  onCleanup(() => clearInterval(timerInterval));
+
+  const timerInfo = createMemo(() => {
+    timerTick(); // subscribe to tick for periodic recomputation
+    const session = activeSession();
+    if (!session || session.status !== 'running') return null;
+    return getSleepTimerInfo(session.lastActiveAt, sessionStore.preferences.sleepAfter);
+  });
   let bookmarkInputRef: HTMLInputElement | undefined;
   let renameInputRef: HTMLInputElement | undefined;
 
@@ -85,6 +103,9 @@ const Header: Component<HeaderProps> = (props) => {
   const handleClickOutside = (e: MouseEvent) => {
     if (showUserMenu() && userMenuRef && !userMenuRef.contains(e.target as Node)) {
       setShowUserMenu(false);
+    }
+    if (showTimerDropdown() && timerMenuRef && !timerMenuRef.contains(e.target as Node)) {
+      setShowTimerDropdown(false);
     }
     if (!showBookmarksMenu()) return;
     if (bookmarksMenuRef && !bookmarksMenuRef.contains(e.target as Node)) {
@@ -243,8 +264,14 @@ const Header: Component<HeaderProps> = (props) => {
             title="User menu"
             onClick={() => setShowUserMenu(!showUserMenu())}
           >
-            <Show when={props.userName} fallback={<Icon path={mdiAccountCircle} size={24} class="header-user-avatar" />}>
-              <img src={getGravatarUrl(props.userName!, 48)} alt="Avatar" class="header-user-avatar-img" width={24} height={24} />
+            <Show when={props.userName && !gravatarFailed()} fallback={<Icon path={mdiShieldAccount} size={24} class="header-user-avatar" />}>
+              <img
+                src={getGravatarUrl(props.userName!, 48)}
+                alt="Avatar"
+                class="header-user-avatar-img"
+                width={24} height={24}
+                onError={() => setGravatarFailed(true)}
+              />
             </Show>
             <Show when={props.userName}>
               <span class="header-user-name">{props.userName}</span>
@@ -261,7 +288,16 @@ const Header: Component<HeaderProps> = (props) => {
                 data-testid="header-user-dropdown-profile"
               >
                 <Icon path={mdiAccountOutline} size={16} />
-                <span>Profile</span>
+                <span>Subscription</span>
+              </a>
+              <a
+                href="/app/usage"
+                class="header-user-dropdown-item"
+                data-testid="header-user-dropdown-usage"
+              >
+                <Icon path={mdiChartBar} size={16} />
+                <span>Usage</span>
+                <UsageInlineBadge />
               </a>
               <a
                 href="/app/onboarding"
@@ -275,7 +311,7 @@ const Header: Component<HeaderProps> = (props) => {
                 type="button"
                 class="header-user-dropdown-item header-user-dropdown-item--danger"
                 data-testid="header-user-dropdown-logout"
-                onClick={() => { window.location.href = `/cdn-cgi/access/logout?returnTo=${encodeURIComponent(window.location.origin + '/')}`; }}
+                onClick={() => { window.location.href = '/auth/logout'; }}
               >
                 <Icon path={mdiLogout} size={16} />
                 <span>Logout</span>
@@ -283,6 +319,31 @@ const Header: Component<HeaderProps> = (props) => {
             </div>
           </Show>
         </div>
+
+        {/* Sleep timer dropdown */}
+        <Show when={timerInfo()}>
+          {(info) => (
+            <div class="header-timer-wrapper" ref={timerMenuRef}>
+              <button
+                type="button"
+                class={`header-timer-button header-timer-button--${info().severity}`}
+                data-testid="header-timer-button"
+                title={info().bucket}
+                onClick={() => setShowTimerDropdown(!showTimerDropdown())}
+              >
+                <Icon path={mdiClockTimeEightOutline} size={20} />
+              </button>
+              <Show when={showTimerDropdown()}>
+                <div class="header-timer-dropdown" data-testid="header-timer-dropdown">
+                  <div class="header-timer-bucket">{info().bucket}</div>
+                  <p class="header-timer-explanation">
+                    When this timer expires, your session will stop. Tracks time since last terminal input and the session idle timeout. Configurable in settings.
+                  </p>
+                </div>
+              </Show>
+            </div>
+          )}
+        </Show>
 
         {/* Bookmarks button */}
         <div class="header-bookmarks-wrapper" ref={bookmarksMenuRef}>

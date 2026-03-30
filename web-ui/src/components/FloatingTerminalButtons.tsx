@@ -1,5 +1,5 @@
 import { Component, Show, createSignal, createEffect, onCleanup } from 'solid-js';
-import { mdiCancel, mdiKeyboardTab, mdiContentPaste, mdiContentCopy, mdiArrowExpandDown, mdiArrowExpandUp, mdiSecurity, mdiCodeBrackets } from '@mdi/js';
+import { mdiCancel, mdiKeyboardTab, mdiContentPaste, mdiContentCopy, mdiArrowExpandDown, mdiArrowExpandUp, mdiSecurity, mdiCodeBrackets, mdiMicrophonePlus } from '@mdi/js';
 import Icon from './Icon';
 import { isTouchDevice, isVirtualKeyboardOpen, getKeyboardHeight } from '../lib/mobile';
 import { sendTerminalKey } from '../lib/touch-gestures';
@@ -10,6 +10,7 @@ import { markScrollIntent } from '../lib/terminal-scroll-intent';
 import { loadSettings } from '../lib/settings';
 import { BUTTON_LABEL_VISIBLE_DURATION_MS } from '../lib/constants';
 import { getIframeInput } from '../lib/xterm-internals';
+import { isSpeechSupported, isListening, startListening, stopListening, getMicPermissionState } from '../lib/speech-input';
 import '../styles/floating-terminal-buttons.css';
 
 interface FloatingTerminalButtonsProps {
@@ -20,6 +21,7 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
   const [labelsVisible, setLabelsVisible] = createSignal(false);
   const [showLabels, setShowLabels] = createSignal(loadSettings().showButtonLabels !== false);
   const [ctrlActive, setCtrlActive] = createSignal(false);
+  const [voiceActive, setVoiceActive] = createSignal(false);
 
   // Show labels for 3 seconds each time the floating buttons appear
   createEffect(() => {
@@ -42,6 +44,9 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
     const terminalId = terminals?.activeTabId || '1';
     return terminalStore.getTerminal(sessionId, terminalId);
   };
+
+  // Stop speech recognition on component unmount
+  onCleanup(() => { if (isListening()) stopListening(); });
 
   // Prevent button from stealing focus from xterm textarea (which would dismiss keyboard)
   const preventFocusSteal = (e: MouseEvent | PointerEvent) => e.preventDefault();
@@ -68,6 +73,15 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
   const pasteFromClipboard = async () => {
     const term = getActiveTerm();
     if (!term) return;
+    // On first use, browser shows clipboard permission prompt. On mobile it
+    // appears behind the keyboard. Dismiss keyboard so user sees it.
+    try {
+      const perm = await navigator.permissions.query({ name: 'clipboard-read' as PermissionName });
+      if (perm.state === 'prompt') {
+        const iframeInput = getIframeInput(term);
+        if (iframeInput) iframeInput.blur();
+      }
+    } catch { /* permissions API may not support clipboard-read query */ }
     try {
       const text = await navigator.clipboard.readText();
       if (text) term.paste(text);
@@ -95,8 +109,9 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
   };
 
   return (
+    <>
     <Show when={isTouchDevice() && props.showTerminal && isVirtualKeyboardOpen()}>
-      <div class="floating-terminal-buttons" style={{ bottom: `calc(env(safe-area-inset-bottom, 0px) + ${getKeyboardHeight()}px + 10px)` }}>
+      <div class="floating-terminal-buttons" style={{ bottom: `calc(env(safe-area-inset-bottom, 0px) + ${getKeyboardHeight()}px + 10px)`, "max-height": `calc(100vh - env(safe-area-inset-bottom, 0px) - ${getKeyboardHeight()}px - 60px)` }}>
         <Show when={terminalStore.authUrl}>
           <div class="floating-btn-row">
             <span class={`floating-btn-label ${labelsVisible() ? 'visible' : ''}`}>OPEN AUTH URL</span>
@@ -140,6 +155,42 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
             <Icon path={mdiContentPaste} size={18} />
           </button>
         </div>
+        <Show when={isSpeechSupported()}>
+          <div class="floating-btn-row">
+            <span class={`floating-btn-label ${labelsVisible() ? 'visible' : ''}`}>VOICE INPUT</span>
+            <button
+              type="button"
+              class={`floating-terminal-btn ${voiceActive() ? 'floating-terminal-btn--active' : ''}`}
+              tabIndex={-1}
+              onPointerDown={preventFocusSteal}
+              onClick={async () => {
+                const term = getActiveTerm();
+                if (!term) return;
+                if (isListening()) {
+                  stopListening();
+                  setVoiceActive(false);
+                  refocusTerminal();
+                  return;
+                }
+                // On first use, browser shows a permission prompt. On mobile it
+                // appears behind the keyboard. Dismiss keyboard so user sees it.
+                const permState = await getMicPermissionState();
+                if (permState === 'prompt') {
+                  const iframeInput = getIframeInput(term);
+                  if (iframeInput) iframeInput.blur();
+                }
+                const started = startListening(
+                  (text) => term.input(text, false),
+                  () => setVoiceActive(false),
+                );
+                setVoiceActive(started);
+              }}
+              title="Voice Input"
+            >
+              <Icon path={mdiMicrophonePlus} size={18} />
+            </button>
+          </div>
+        </Show>
         <div class="floating-btn-row">
           <span class={`floating-btn-label ${labelsVisible() ? 'visible' : ''}`}>TAB</span>
           <button
@@ -246,6 +297,34 @@ const FloatingTerminalButtons: Component<FloatingTerminalButtonsProps> = (props)
         </div>
       </div>
     </Show>
+
+    {/* Desktop mic button — bottom-right corner, same style as mobile buttons */}
+    <Show when={!isTouchDevice() && props.showTerminal && isSpeechSupported()}>
+      <div class="floating-mic-desktop">
+        <button
+          type="button"
+          class={`floating-terminal-btn ${voiceActive() ? 'floating-terminal-btn--active' : ''}`}
+          onClick={() => {
+            const term = getActiveTerm();
+            if (!term) return;
+            if (isListening()) {
+              stopListening();
+              setVoiceActive(false);
+            } else {
+              const started = startListening(
+                (text) => term.input(text, false),
+                () => setVoiceActive(false),
+              );
+              setVoiceActive(started);
+            }
+          }}
+          title="Voice Input (Ctrl+Space)"
+        >
+          <Icon path={mdiMicrophonePlus} size={18} />
+        </button>
+      </div>
+    </Show>
+    </>
   );
 };
 

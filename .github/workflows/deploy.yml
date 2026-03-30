@@ -123,28 +123,37 @@ jobs:
           grep 'name = "CONTAINER"' wrangler.toml || { echo "FATAL: DO binding name corrupted!"; exit 1; }
 
       - name: Apply container resource tier
+        env:
+          TIER: ${{ vars.RESSOURCE_TIER || 'default' }}
+          MAX_INSTANCES_OVERRIDE: ${{ vars.MAX_INSTANCES }}
         run: |
-          TIER="${{ vars.RESSOURCE_TIER || 'default' }}"
+          MAX_INSTANCES=10
 
           case "$TIER" in
             low)
               # 0.25 vCPU / 1 GiB RAM / 4 GB disk (Cloudflare basic preset)
               INSTANCE_BLOCK='instance_type = "basic"'
-              MAX_INSTANCES=10
               ;;
             high)
               INSTANCE_BLOCK=$'[containers.instance_type]\nvcpu = 2\nmemory_mib = 6144\ndisk_mb = 8000'
-              MAX_INSTANCES=10
               ;;
-            default)
+            saas|default)
               INSTANCE_BLOCK=$'[containers.instance_type]\nvcpu = 1\nmemory_mib = 3072\ndisk_mb = 6000'
-              MAX_INSTANCES=10
               ;;
             *)
-              echo "::error::Invalid RESSOURCE_TIER=\"$TIER\". Allowed values: low, high. Leave unset for default."
+              echo "::error::Invalid RESSOURCE_TIER=\"$TIER\". Allowed values: low, high, saas. Leave unset for default."
               exit 1
               ;;
           esac
+
+          # Override max_instances if MAX_INSTANCES variable is set
+          if [ -n "$MAX_INSTANCES_OVERRIDE" ]; then
+            if ! echo "$MAX_INSTANCES_OVERRIDE" | grep -qE '^[1-9][0-9]*$'; then
+              echo "::error::MAX_INSTANCES must be a positive integer, got: $MAX_INSTANCES_OVERRIDE"
+              exit 1
+            fi
+            MAX_INSTANCES="$MAX_INSTANCES_OVERRIDE"
+          fi
 
           awk -v block="$INSTANCE_BLOCK" -v max_instances="$MAX_INSTANCES" '
             BEGIN {
@@ -253,6 +262,7 @@ jobs:
           ${{ vars.STRESS_TEST_MODE && format('--var STRESS_TEST_MODE:{0}', vars.STRESS_TEST_MODE) || '' }}
           ${{ vars.SAAS_MODE && format('--var SAAS_MODE:{0}', vars.SAAS_MODE) || '' }}
           ${{ vars.SAAS_EXTRA_IDPS && format('--var SAAS_EXTRA_IDPS:{0}', vars.SAAS_EXTRA_IDPS) || '' }}
+          ${{ vars.SAAS_MODE == 'active' && secrets.OAUTH_CLIENT_ID && format('--var OAUTH_CLIENT_ID:{0}', secrets.OAUTH_CLIENT_ID) || '' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -265,12 +275,14 @@ jobs:
 
       - name: Set service auth secret for E2E testing (optional)
         run: |
-          if [ -z "${CF_ACCESS_CLIENT_SECRET}" ]; then
-            echo "No CF_ACCESS_CLIENT_SECRET — skipping service auth setup"
+          # Use CF_ACCESS_CLIENT_SECRET (CF Access mode) or OAUTH_E2E_TEST_SECRET (GitHub OIDC mode)
+          AUTH_SECRET="${CF_ACCESS_CLIENT_SECRET:-${OAUTH_E2E_TEST_SECRET}}"
+          if [ -z "${AUTH_SECRET}" ]; then
+            echo "No CF_ACCESS_CLIENT_SECRET or OAUTH_E2E_TEST_SECRET — skipping service auth setup"
             exit 0
           fi
 
-          printf '%s' "${CF_ACCESS_CLIENT_SECRET}" | npx wrangler secret put SERVICE_AUTH_SECRET --name "${WORKER_NAME}" 2>/dev/null
+          printf '%s' "${AUTH_SECRET}" | npx wrangler secret put SERVICE_AUTH_SECRET --name "${WORKER_NAME}" 2>/dev/null
 
           # Seed E2E service user in KV allowlist (fixed email matching worker's X-Service-Auth identity)
           SERVICE_EMAIL="e2e-service@codeflare.local"
@@ -280,20 +292,55 @@ jobs:
           echo "::warning::Could not seed E2E user in KV (non-fatal)"
         env:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          OAUTH_E2E_TEST_SECRET: ${{ secrets.OAUTH_E2E_TEST_SECRET }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Set Resend API key as worker secret (onboarding or SaaS mode)
+      - name: Set Resend secrets (onboarding or SaaS mode)
         if: ${{ vars.ONBOARDING_LANDING_PAGE == 'active' || vars.SAAS_MODE == 'active' }}
         run: |
           if [ -z "${RESEND_API_KEY}" ]; then
-            echo "::warning::RESEND_API_KEY not set — access request notification emails will be skipped"
+            echo "::warning::RESEND_API_KEY not set — email notifications will be skipped"
             exit 0
           fi
           printf '%s' "${RESEND_API_KEY}" | npx wrangler secret put RESEND_API_KEY --name "${WORKER_NAME}" 2>/dev/null
+          if [ -n "${RESEND_EMAIL}" ]; then
+            printf '%s' "${RESEND_EMAIL}" | npx wrangler secret put RESEND_EMAIL --name "${WORKER_NAME}" 2>/dev/null
+          fi
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_EMAIL: ${{ secrets.RESEND_EMAIL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Set Stripe secrets (SaaS mode, optional)
+        if: ${{ vars.SAAS_MODE == 'active' }}
+        run: |
+          if [ -n "${STRIPE_SECRET_KEY}" ]; then
+            printf '%s' "${STRIPE_SECRET_KEY}" | npx wrangler secret put STRIPE_SECRET_KEY --name "${WORKER_NAME}" 2>/dev/null
+          fi
+          if [ -n "${STRIPE_WEBHOOK_SECRET}" ]; then
+            printf '%s' "${STRIPE_WEBHOOK_SECRET}" | npx wrangler secret put STRIPE_WEBHOOK_SECRET --name "${WORKER_NAME}" 2>/dev/null
+          fi
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Set GitHub OIDC secrets (SaaS mode, optional)
+        if: ${{ vars.SAAS_MODE == 'active' }}
+        run: |
+          if [ -n "${OAUTH_CLIENT_SECRET}" ]; then
+            printf '%s' "${OAUTH_CLIENT_SECRET}" | npx wrangler secret put OAUTH_CLIENT_SECRET --name "${WORKER_NAME}" 2>/dev/null
+          fi
+          if [ -n "${OAUTH_JWT_SECRET}" ]; then
+            printf '%s' "${OAUTH_JWT_SECRET}" | npx wrangler secret put OAUTH_JWT_SECRET --name "${WORKER_NAME}" 2>/dev/null
+          fi
+        env:
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_JWT_SECRET: ${{ secrets.OAUTH_JWT_SECRET }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 

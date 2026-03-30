@@ -80,6 +80,9 @@ vi.mock('../../lib/kv-keys', () => ({
   getPreferencesKey: vi.fn((bucket: string) => `preferences:${bucket}`),
   listAllKvKeys: mockListAllKvKeys,
   getSessionPrefix: vi.fn((bucket: string) => `session:${bucket}:`),
+  putSessionWithMetadata: vi.fn(async (kv: unknown, key: string, session: unknown) => {
+    await (kv as { put: (k: string, v: string) => Promise<void> }).put(key, JSON.stringify(session));
+  }),
 }));
 
 vi.mock('../../lib/container-helpers', () => ({
@@ -253,6 +256,7 @@ describe('Container lifecycle extracted helpers', () => {
       container: mockContainer,
       bucketName: 'test-bucket',
       sessionId: 'session1234',
+      userEmail: 'test@example.com',
       containerId: 'test-bucket-session1234',
       scopedCreds: { accessKeyId: 'ak', secretAccessKey: 'sk' },
       r2Config: { accountId: 'acct', endpoint: 'https://r2.example.com' },
@@ -309,8 +313,7 @@ describe('Container lifecycle extracted helpers', () => {
 
       const paramsWithLlm = {
         ...baseParams,
-        openaiApiKey: 'sk-test123',
-        geminiApiKey: 'AIzaSy-test456',
+        llmKeys: { openaiApiKey: 'sk-test123', geminiApiKey: 'AIzaSy-test456' },
       };
 
       await configureContainerDO(paramsWithLlm);

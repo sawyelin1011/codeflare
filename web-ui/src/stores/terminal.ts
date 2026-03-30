@@ -7,6 +7,7 @@ import { logger } from '../lib/logger';
 import {
   WS_RETRY_DELAY_MS,
   WS_RETRYABLE_CLOSE_CODES,
+  WS_CONTAINER_STOPPED_CODE,
 } from '../lib/constants';
 import {
   registerUrlDetectionDeps,
@@ -25,6 +26,8 @@ import {
   cleanupFitAddonsByPrefix,
   refitAllTerminalsExported as _refitAllTerminals,
 } from './terminal-layout';
+
+const textDecoder = new TextDecoder();
 
 // Callback for process-name messages (avoids circular import with session store)
 let onProcessName: ((sessionId: string, terminalId: string, processName: string) => void) | null = null;
@@ -272,6 +275,8 @@ function connect(
   const signal = controller.signal;
   abortControllers.set(key, controller);
 
+  // Whether this terminal has ever successfully connected (for dead container detection).
+
   // Attempt connection with retries
   function attemptConnection(attemptNumber: number): void {
     if (signal.aborted) return;
@@ -343,7 +348,7 @@ function connect(
       // Server sends RAW terminal data - write directly to xterm
       let messageData: string;
       if (event.data instanceof ArrayBuffer) {
-        messageData = new TextDecoder().decode(event.data);
+        messageData = textDecoder.decode(event.data);
       } else if (typeof event.data === 'string') {
         messageData = event.data;
       } else {
@@ -390,7 +395,17 @@ function connect(
         return;
       }
 
-      // Retry on retryable close codes (forever, flat delay)
+      // Server-authoritative: container is definitively not running (4503 from DO).
+      // Don't retry — session status will be updated by KV polling or is already stopped.
+      if (event.code === WS_CONTAINER_STOPPED_CODE) {
+        logger.info(`[Terminal ${key}] Container stopped (4503)`);
+        setConnectionState(sessionId, terminalId, 'disconnected');
+        setRetryMessage(sessionId, terminalId, 'Session stopped');
+        return;
+      }
+
+      // Retry on retryable close codes (flat delay, no limit).
+      // Network errors (1006) just retry — KV polling handles session status.
       if (WS_RETRYABLE_CLOSE_CODES.has(event.code) && !signal.aborted) {
         logger.warn(`[Terminal ${key}] Retrying connection, attempt ${attemptNumber + 1}, code=${event.code}`);
         const timeout = setTimeout(() => {

@@ -24,6 +24,11 @@
       "advanced"
     ]
   },
+  "plugins/codeflare-memory/scripts/memory-compact-prompt.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "rules/ci-monitoring.md": {
     "modes": [
       "default",
@@ -73,11 +78,6 @@
       "advanced"
     ]
   },
-  "rules/typescript/hooks.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
   "rules/typescript/patterns.md": {
     "modes": [
       "advanced"
@@ -94,11 +94,6 @@
     ]
   },
   "rules/python/coding-style.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
-  "rules/python/hooks.md": {
     "modes": [
       "advanced"
     ]
@@ -123,11 +118,6 @@
       "advanced"
     ]
   },
-  "rules/golang/hooks.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
   "rules/golang/patterns.md": {
     "modes": [
       "advanced"
@@ -144,11 +134,6 @@
     ]
   },
   "rules/swift/coding-style.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
-  "rules/swift/hooks.md": {
     "modes": [
       "advanced"
     ]

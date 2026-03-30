@@ -1,11 +1,11 @@
 import { Component, Show, For, onMount, createSignal, createMemo, createEffect } from 'solid-js';
 import { Portal } from 'solid-js/web';
-import { mdiXml, mdiCogOutline, mdiAccountCircle, mdiAccountOutline, mdiRocketLaunchOutline, mdiLogout } from '@mdi/js';
+import { mdiXml, mdiCogOutline, mdiShieldAccount, mdiAccountOutline, mdiRocketLaunchOutline, mdiChartBar, mdiLogout } from '@mdi/js';
 import Icon from './Icon';
 import type { SessionWithStatus, AgentType, TabConfig } from '../types';
 import { storageStore } from '../stores/storage';
 import { getDownloadUrl } from '../api/storage';
-import { md5 } from '../lib/md5';
+import { getGravatarUrl } from '../lib/gravatar';
 import SessionStatCard from './SessionStatCard';
 import SessionContextMenu from './SessionContextMenu';
 import StatCards from './StatCards';
@@ -16,13 +16,9 @@ import SessionLimitPopup from './SessionLimitPopup';
 import ScrambleText from './ScrambleText';
 import KittScanner from './KittScanner';
 import DashboardCard from './TipsRotator';
-import { sessionStore } from '../stores/session';
+import { sessionStore, isAtUsageQuota } from '../stores/session';
+import UsageInlineBadge from './UsageInlineBadge';
 import '../styles/dashboard.css';
-
-function getGravatarUrl(email: string, size = 32): string {
-  const hash = md5(email.trim().toLowerCase());
-  return `https://www.gravatar.com/avatar/${hash}?s=${size}&d=mp`;
-}
 
 interface DashboardProps {
   sessions: SessionWithStatus[];
@@ -41,6 +37,7 @@ const Dashboard: Component<DashboardProps> = (props) => {
   const [showCreateDialog, setShowCreateDialog] = createSignal(false);
   const [showLimitPopup, setShowLimitPopup] = createSignal(false);
   const [showUserMenu, setShowUserMenu] = createSignal(false);
+  const [gravatarFailed, setGravatarFailed] = createSignal(false);
   const [userMenuPos, setUserMenuPos] = createSignal<{ top: number; right: number }>({ top: 0, right: 0 });
   let userBtnRef: HTMLButtonElement | undefined;
   const [newSessionBtnRef, setNewSessionBtnRef] = createSignal<HTMLButtonElement>();
@@ -134,8 +131,8 @@ const Dashboard: Component<DashboardProps> = (props) => {
                   setShowUserMenu(!showUserMenu());
                 }}
               >
-                <Show when={props.userName} fallback={<Icon path={mdiAccountCircle} size={24} class="header-user-avatar" />}>
-                  <img src={getGravatarUrl(props.userName!, 48)} alt="Avatar" class="header-user-avatar-img" width={24} height={24} />
+                <Show when={props.userName && !gravatarFailed()} fallback={<Icon path={mdiShieldAccount} size={24} class="header-user-avatar" />}>
+                  <img src={getGravatarUrl(props.userName!, 48)} alt="Avatar" class="header-user-avatar-img" width={24} height={24} onError={() => setGravatarFailed(true)} />
                 </Show>
                 <Show when={props.userName}>
                   <span class="header-user-name">{props.userName}</span>
@@ -162,7 +159,16 @@ const Dashboard: Component<DashboardProps> = (props) => {
                       data-testid="header-user-dropdown-profile"
                     >
                       <Icon path={mdiAccountOutline} size={16} />
-                      <span>Profile</span>
+                      <span>Subscription</span>
+                    </a>
+                    <a
+                      href="/app/usage"
+                      class="header-user-dropdown-item"
+                      data-testid="header-user-dropdown-usage"
+                    >
+                      <Icon path={mdiChartBar} size={16} />
+                      <span>Usage</span>
+                      <UsageInlineBadge />
                     </a>
                     <a
                       href="/app/onboarding"
@@ -176,7 +182,7 @@ const Dashboard: Component<DashboardProps> = (props) => {
                       type="button"
                       class="header-user-dropdown-item header-user-dropdown-item--danger"
                       data-testid="header-user-dropdown-logout"
-                      onClick={() => { window.location.href = `/cdn-cgi/access/logout?returnTo=${encodeURIComponent(window.location.origin + '/')}`; }}
+                      onClick={() => { window.location.href = '/auth/logout'; }}
                     >
                       <Icon path={mdiLogout} size={16} />
                       <span>Logout</span>
@@ -223,8 +229,8 @@ const Dashboard: Component<DashboardProps> = (props) => {
                   ref={setNewSessionBtnRef}
                   class={`dashboard-new-session-btn ${sessionStore.isAtSessionLimit() ? 'dashboard-new-session-btn--limited' : ''}`}
                   data-testid="dashboard-new-session"
-                  disabled={!sessionStore.r2Ready}
-                  aria-label={!sessionStore.r2Ready ? 'Waiting for storage setup' : sessionStore.isAtSessionLimit() ? 'Session limit reached' : 'Create new session'}
+                  disabled={!sessionStore.r2Ready || isAtUsageQuota()}
+                  aria-label={!sessionStore.r2Ready ? 'Waiting for storage setup' : isAtUsageQuota() ? 'Monthly compute quota exceeded' : sessionStore.isAtSessionLimit() ? 'Session limit reached' : 'Create new session'}
                   onClick={() => {
                     if (sessionStore.isAtSessionLimit()) {
                       setShowLimitPopup(!showLimitPopup());

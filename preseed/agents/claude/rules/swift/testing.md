@@ -5,7 +5,7 @@ paths:
 ---
 # Swift Testing
 
-> This file extends [common/testing.md](../common/testing.md) with Swift specific content.
+**Important:** Tests run via CI only (GitHub Actions). Do not run test suites locally — the container has 1 vCPU. Write tests, push, and verify via `gh run view`.
 
 ## Framework
 
@@ -39,7 +39,3 @@ func validatesFormat(format: String) throws {
 ```bash
 swift test --enable-code-coverage
 ```
-
-## Reference
-
-See skill: `swift-protocol-di-testing` for protocol-based dependency injection and mock patterns with Swift Testing.
