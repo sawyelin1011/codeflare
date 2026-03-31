@@ -14,12 +14,12 @@
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "node-pty": "^1.1.0",
-    "ws": "^8.19.0"
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
     "@types/ws": "^8.18.1",
     "fast-check": "^4.6.0",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.2"
   }
 }
