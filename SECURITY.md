@@ -132,12 +132,12 @@ Enabled at the repository level (Settings > Code security and analysis):
 - **Static origins:** Configured via `ALLOWED_ORIGINS` worker variable (comma-separated patterns).
 - **Dynamic origins:** Additional origins loaded from KV (`cors-cache.ts`), refreshed on cache miss.
 - **Pattern matching:** Dot-prefixed patterns enable suffix matching (e.g., `.workers.dev`). Non-prefixed patterns require exact match.
-- **`.workers.dev` wildcard:** The app allows any `*.workers.dev` origin by design. This is required because the initial setup flow runs on a `*.workers.dev` URL before a custom domain is configured, and the setup wizard persists `.workers.dev` to KV as an allowed origin. `matchesPattern()` enforces domain boundaries so `evil-workers.dev` does not match. The CF Access JWT cookie defaults to `SameSite=Lax`, which blocks cross-origin credentialed `fetch()` requests. This is an accepted design tradeoff documented in Architecture Decisions (AD11).
+- **`.workers.dev` wildcard:** The app allows any `*.workers.dev` origin by design. This is required because the initial setup flow runs on a `*.workers.dev` URL before a custom domain is configured, and the setup wizard persists `.workers.dev` to KV as an allowed origin. `matchesPattern()` enforces domain boundaries so `evil-workers.dev` does not match. Auth cookies default to `SameSite=Lax` (both CF Access `CF_Authorization` and GitHub OIDC `codeflare_session`), which blocks cross-origin credentialed `fetch()` requests. This is an accepted design tradeoff documented in Architecture Decisions (AD11).
 
 ### WebSocket Security
 
 - **Route validation:** WebSocket upgrade requests are validated against allowed routes before Hono routing (workerd bug workaround).
-- **Auth on connect:** WebSocket connections go through the same CF Access auth middleware as HTTP requests.
+- **Auth on connect:** WebSocket connections go through the same authentication as HTTP requests (CF Access JWT or OIDC session cookie depending on mode).
 - **Container-scoped tokens:** WebSocket traffic proxied to containers includes the DO-scoped `Authorization: Bearer` token.
 
 ### Push & Deploy Credentials
@@ -162,9 +162,10 @@ Users can connect their GitHub and Cloudflare accounts via Settings > Push & Dep
 
 ### Automated Penetration Testing
 
-A weekly CI workflow (`pentest.yml`) runs external black-box security tests against the production deployment, validating security headers, TLS, auth gates, info disclosure, injection resistance, and HTTP methods. Run manually via `Actions` > `Pentest` > `Run workflow`. See [PENTEST.md](PENTEST.md) for the complete report covering all 13 test categories.
+A weekly CI workflow (`pentest.yml`) runs external black-box security tests against the production deployment, validating security headers, TLS, auth gates, info disclosure, injection resistance, and HTTP methods. Run manually via `Actions` > `Pentest` > `Run workflow`. See [PENTEST.md](documentation/PENTEST.md) for the complete report covering all 13 test categories.
 
 **Related Documentation:**
-- [TECHNICAL.md](TECHNICAL.md) - Full technical reference including Security Model, Rate Limiting, and Architecture Decisions
-- [STRESS_TEST.md](STRESS_TEST.md) - Load testing methodology and rate limit validation
+- [Security Reference](documentation/security.md) - Security model, rate limiting, and encryption
+- [Architecture Decisions](documentation/decisions/README.md) - Design trade-offs and rationale
+- [STRESS_TEST.md](documentation/STRESS_TEST.md) - Load testing methodology and rate limit validation
 - [CONTRIBUTING.md](CONTRIBUTING.md) - Development workflow and guidelines
