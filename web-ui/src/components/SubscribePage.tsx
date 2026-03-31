@@ -36,6 +36,7 @@ import {
   mdiTrendingUp,
   mdiClockFast,
   mdiMicrophonePlus,
+  mdiAutorenew,
 } from '@mdi/js';
 import { getAuthStatus, getPublicTiers, subscribe, createCheckoutSession, createPortalSession, createSwitchSession, getBillingStatus } from '../api/client';
 import { formatDuration } from '../lib/format';
@@ -136,9 +137,10 @@ const STANDARD_MODE_FEATURES: Array<{ icon: string; text: string | (() => JSX.El
 const PRO_MODE_FEATURES: Array<{ icon: string; text: string }> = [
   { icon: mdiHeadCogOutline, text: 'Agent builds a knowledge graph' },
   { icon: mdiTrendingUp, text: 'Gets smarter every session' },
+  { icon: mdiClockFast, text: 'Auto-prunes context over time' },
   { icon: mdiWrenchOutline, text: 'Curated skills, rules & agents' },
   { icon: mdiBookOpenPageVariantOutline, text: 'Advanced commands & workflows' },
-  { icon: mdiClockFast, text: 'Auto-prunes context over time' },
+  { icon: mdiAutorenew, text: 'Continuous skillset improvement' },
   { icon: mdiCallSplit, text: 'Built-in second opinion from other LLMs' },
   { icon: mdiRocketLaunchOutline, text: 'Never start from scratch again' },
 ];
@@ -704,10 +706,10 @@ const SubscribePage: Component = () => {
                       )}
                     </For>
                   </ul>
-                  <p class="subscribe-mode-card-feature" style={{ "margin-top": "1rem", opacity: 0.6 }}>
+                  <p class="subscribe-mode-card-feature" style={{ "margin-top": "1rem", color: "rgba(113, 113, 122, 0.6)", display: "block" }}>
                     Voice input requires a compatible browser like Chrome or Samsung Internet.
                   </p>
-                  <p style={{ "margin-top": "0.5rem", opacity: 0.6, "font-size": "0.8125rem", color: "#71717a", "font-family": "'JetBrains Mono', 'Fira Code', monospace", "letter-spacing": "0.02em", "line-height": "1.5" }}>
+                  <p class="subscribe-mode-card-feature" style={{ "margin-top": "0.5rem", color: "rgba(113, 113, 122, 0.6)", display: "block" }}>
                     Coding agent subscription is <span style={{ color: '#22c55e', "font-weight": "700" }}>NOT INCLUDED</span>, bring your own.
                   </p>
 
@@ -726,7 +728,7 @@ const SubscribePage: Component = () => {
                           )}
                         </For>
                       </ul>
-                      <p class="subscribe-mode-card-feature" style={{ "margin-top": "1rem", opacity: 0.6 }}>
+                      <p class="subscribe-mode-card-feature" style={{ "margin-top": "1rem", color: "rgba(113, 113, 122, 0.6)", display: "block" }}>
                         Pro features are designed for Claude Code. Other agents receive rules and agent definitions but may not support all capabilities.
                       </p>
                     </div>

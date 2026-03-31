@@ -9,6 +9,11 @@
       "advanced"
     ]
   },
+  "plugins/codeflare-hooks/scripts/git-push-review-reminder.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "plugins/codeflare-memory/.claude-plugin/plugin.json": {
     "modes": [
       "advanced"
@@ -217,6 +222,11 @@
       "advanced"
     ]
   },
+  "agents/spec-reviewer.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "commands/brainstorm.md": {
     "modes": [
       "advanced"
@@ -285,6 +295,16 @@
   "plugins/known_marketplaces.json": {
     "modes": [
       "default",
+      "advanced"
+    ]
+  },
+  "skills/spec-driven-development/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "commands/sdd.md": {
+    "modes": [
       "advanced"
     ]
   }

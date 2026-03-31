@@ -8,7 +8,7 @@ Multi-agent support, preseed system, and session modes.
 |---------|-----------|
 | Agent | One of six supported AI coding tools (`claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
 | Preseed | A set of configuration files (rules, skills, agents, commands, plugins) generated from a single Claude Code source of truth and deployed to each user's R2 bucket |
-| Session Mode | Either Standard (`default`, 25 preseed files) or Pro (`advanced`, 117 preseed files) controlling the scope of agent enhancements seeded to a user's storage |
+| Session Mode | Either Standard (`default`, 25 preseed files) or Pro (`advanced`, 127 preseed files) controlling the scope of agent enhancements seeded to a user's storage |
 | Manifest | The declarative `manifest.json` file that maps each preseed source file to its applicable modes and drives the code generation pipeline |
 
 ### Out of Scope
@@ -138,16 +138,17 @@ Multi-agent support, preseed system, and session modes.
 | Cloudflare stack, ship, ship references skills | Yes | Yes |
 | consult-llm skill (Claude Code only) | No | Yes |
 | block-attributed-commits hook (Claude Code only) | No | Yes |
+| git-push-review-reminder hook (Claude Code only) | No | Yes |
 | Language rules (23 files: common, TS, Python, Go, Swift) | No | Yes |
-| Agent definitions (7: architect, code-reviewer, etc.) | No | Yes |
-| Commands (5: /brainstorm, /debug, /deploy, /plan, /review) | No | Yes |
-| Cherry-picked skills (8: api-design, backend-patterns, etc.) | No | Yes |
+| Agent definitions (8: architect, code-reviewer, spec-reviewer, etc.) | No | Yes |
+| Commands (6: /brainstorm, /debug, /deploy, /plan, /review, /sdd) | No | Yes |
+| Cherry-picked skills (14: api-design, backend-patterns, spec-driven-development, etc.) | No | Yes |
 | Known marketplaces plugin config | Yes | Yes |
 
 1. Default mode seeds 25 files to R2.
-2. Advanced mode seeds 117 files to R2.
+2. Advanced mode seeds 127 files to R2.
 3. Pro mode enables memory persistence (`.memory/` directory synced via rclone); Standard mode excludes the entire `.memory/**` directory from sync.
-4. Pro mode registers hooks in `settings.json` (PreToolUse for commit attribution blocking, UserPromptSubmit for memory capture); Standard mode merges only `skipDangerousModePermissionPrompt`.
+4. Pro mode registers hooks in `settings.json` (PreToolUse for commit attribution blocking, PreToolUse for git-push review reminders, UserPromptSubmit for memory capture); Standard mode merges only `skipDangerousModePermissionPrompt`.
 
 **Constraints:**
 - Cleanup on mode switch is scoped strictly to preseed-managed keys; user-created files are never deleted.
@@ -171,7 +172,7 @@ Multi-agent support, preseed system, and session modes.
 3. `scripts/generate-agent-seed.mjs` reads the manifest and source files, generating `src/lib/agent-seed.generated.ts` with an `AGENTS_SEEDED_CONFIGS` array.
 4. The generator is manifest-driven; files not in the manifest are ignored.
 5. No duplicate preseed source files exist on disk.
-6. Total generated output is 121 documents across all 5 agents.
+6. Total generated output is 131 documents across all 5 agents.
 
 **Constraints:**
 - The generator must be re-run when preseed source files or the manifest change.
@@ -206,11 +207,11 @@ Multi-agent support, preseed system, and session modes.
 
 | Agent | Instructions | Skills | Agents | Total Documents |
 |-------|-------------|--------|--------|-----------------|
-| Claude Code | 0 (individual rules) | 13 | 7 | 59 |
-| Codex | 2 (default+advanced) | 12 | 0 | 14 |
-| Gemini | 2 | 12 | 7 | 21 |
-| Copilot | 2 | 0 | 7 | 9 |
-| OpenCode | 2 | 12 | 7 | 21 |
+| Claude Code | 0 (individual rules) | 14 | 8 | 60 |
+| Codex | 2 (default+advanced) | 13 | 0 | 15 |
+| Gemini | 2 | 13 | 8 | 23 |
+| Copilot | 2 | 0 | 8 | 10 |
+| OpenCode | 2 | 13 | 8 | 23 |
 
 **Applies To:** User
 **Priority:** P1
@@ -388,7 +389,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 1. `preseed/agents/claude/manifest.json` is the single declaration of all preseed files and their mode assignments.
-2. The manifest contains 56 total entries across: rules (24), agents (7), commands (5), skills (13), plugins (7).
+2. The manifest contains 60 total entries across: rules (24), agents (8), commands (6), skills (14), plugins (8).
 3. Each entry specifies `"modes"` as an array of `"default"`, `"advanced"`, or both.
 4. The generator script (`scripts/generate-agent-seed.mjs`) is manifest-driven and ignores files not in the manifest.
 5. The generated output (`src/lib/agent-seed.generated.ts`) contains the `AGENTS_SEEDED_CONFIGS` array used at runtime.

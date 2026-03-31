@@ -11,9 +11,9 @@ Types: feat, fix, refactor, docs, test, chore, perf, ci
 
 Note: Attribution disabled globally via ~/.claude/settings.json.
 
-## Pre-Push: Code Review + Doc Review
+## Pre-Push: Code Review + Doc Review + Spec Review
 
-Before every `git push`, run both agents in the background (parallel).
+Before every `git push`, run review agents in the background (parallel).
 Push immediately — do not wait for reviews to complete. When they
 return, fix any HIGH or CRITICAL findings in a follow-up commit.
 
@@ -23,6 +23,13 @@ return, fix any HIGH or CRITICAL findings in a follow-up commit.
    auth flows, configuration, or architecture change without a
    corresponding doc update. See `documentation/README.md` for the
    structure and `doc-updater` agent definition for what goes where.
+3. **spec-reviewer** (conditional) — only if `sdd/` exists. Responsible
+   for keeping the spec valid as the single source of truth. When code
+   changes introduce new features, modify behavior, or change APIs
+   without a corresponding spec update, this agent updates `sdd/` to
+   match: adds new REQ-* entries for unspec'd features, updates
+   acceptance criteria for changed behavior, marks deprecated
+   requirements, and adds changelog entries to `sdd/changes.md`.
 
 ## Post-Push: CI Monitoring
 
@@ -42,6 +49,7 @@ Never report CI as passing unless you have confirmed it.
 When creating PRs:
 1. Analyze full commit history (not just latest commit)
 2. Use `git diff [base-branch]...HEAD` to see all changes
-3. Draft comprehensive PR summary
+3. If `sdd/` exists, reference implemented REQ-* IDs in the PR summary
+4. Draft comprehensive PR summary
 4. Include test plan with TODOs
 5. Push with `-u` flag if new branch
