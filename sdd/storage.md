@@ -79,7 +79,8 @@ R2 persistence, rclone bisync, quotas, and file browser.
 1. After bisync baseline is established, a periodic rclone bisync runs every 60 seconds.
 2. Conflict resolution uses newest-file-wins (`--conflict-resolve newer`).
 3. The daemon retries on transient failure and continues the 60-second cycle.
-4. After 3 consecutive failures (each with 3 internal retries), the daemon falls back to a `--resync` baseline to re-establish clean state.
+4. On bisync failure, the daemon attempts vanishing-file recovery (parse error output, exclude transient files, clear locks, retry) before counting the failure.
+5. After 3 consecutive unrecoverable failures (each with 3 internal retries), the daemon falls back to a `--resync` baseline to re-establish clean state.
 
 **Constraints:**
 - All bisync commands must use `--ignore-checksum` to prevent false hash-mismatch aborts from files changing mid-transfer.
@@ -105,7 +106,9 @@ R2 persistence, rclone bisync, quotas, and file browser.
 2. The sync completes or times out within 120 seconds (`SYNC_TIMEOUT`).
 3. All file modifications (`.claude.json`, `.gemini/settings.json`, `.codex/version.json`, tab autostart) complete after the initial sync but before bisync baseline, to avoid hash mismatches.
 4. A bisync baseline (`--resync`) is established after file modifications complete.
-5. If the initial baseline fails, the self-healing mechanism (`nuke_corrupted_r2_files`) runs and retries.
+5. If the initial baseline fails due to a vanishing file (file listed but deleted before copy), the system parses the error output, adds the file to a session-scoped recovery filter (`/tmp/rclone-recovery-filters.txt`), and retries (max 3 attempts). Only non-workspace files are auto-excluded; workspace files trigger a plain retry.
+6. Known ephemeral files (`.claude/mcp-*.json`) are statically excluded from all sync operations.
+7. The bisync daemon starts unconditionally after baseline — even if all baseline attempts fail. A dead daemon means zero sync for the entire session; the daemon has its own recovery (vanishing-file recovery + consecutive failure → resync fallback).
 
 **Constraints:**
 - Container must not serve terminal connections until the initial sync either succeeds or times out.
@@ -334,7 +337,7 @@ R2 persistence, rclone bisync, quotas, and file browser.
 **Dependencies:** REQ-STOR-003, REQ-STOR-004
 **Verification:** Integration test
 
-**Status:** Implemented
+**Status:** Deprecated -- The `nuke_corrupted_r2_files` function was never implemented. Self-healing for transient file errors is now handled by the vanishing-file recovery mechanism (REQ-STOR-004 AC5, REQ-STOR-003 AC4). Corruption from encryption mismatches is handled by `--resilient` + `--recover` flags and the resync fallback in the daemon.
 
 ---
 

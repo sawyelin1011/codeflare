@@ -90,6 +90,20 @@ Newest file wins (`--conflict-resolve newer`). `--resilient` + `--recover` handl
 
 **Bisync-initialized flag on timeout:** The bisync-initialized flag (`/tmp/.bisync-initialized`) is now touched on the sync timeout path as well. Previously, if initial sync timed out, the flag was never set, causing the shutdown trap to skip the final bisync — losing any files created during the session.
 
+### Vanishing-file recovery
+
+When bisync/resync fails because a transient file was listed but deleted before rclone could copy it (error: `failed to open source object: lstat ... no such file or directory`), the system automatically:
+1. Parses the rclone error output for the failing file path
+2. Adds it to a session-scoped recovery filter at `/tmp/rclone-recovery-filters.txt`
+3. Clears stale bisync locks
+4. Retries the same operation (up to 3 recovery attempts)
+
+Only non-workspace files are auto-excluded. If the vanishing file is under `workspace/` (user code), the system retries without excluding — the file likely reappeared after a save operation completed. Known ephemeral files (`.claude/mcp-*.json` — MCP auth cache that exists for milliseconds) are statically excluded to prevent the race condition entirely.
+
+The recovery filter file starts empty on every container start and is never synced to R2. All rclone bisync/resync invocations include `--filter-from /tmp/rclone-recovery-filters.txt` in addition to the static filters.
+
+**Daemon always starts:** The bisync daemon starts unconditionally after the baseline attempt — even if all baseline recovery attempts fail. A dead daemon means zero sync for the entire session. The daemon has its own recovery loop (vanishing-file recovery on each cycle + consecutive failure → resync fallback after 3 failures). This ensures sync can recover mid-session even if startup sync was disrupted.
+
 ---
 
 ## Related Documentation

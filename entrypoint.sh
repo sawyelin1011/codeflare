@@ -237,6 +237,7 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .claude/session-env/**"      # session environment variables
     --filter "- .claude/shell-snapshots/**"  # session shell state snapshots
     --filter "- .claude/stats-cache.json"    # regenerated usage stats
+    --filter "- .claude/mcp-*.json"            # MCP auth cache (transient, created/deleted in ms — causes bisync fatal error if listed then deleted before copy)
     --filter "- .claude.json.backup.*"       # auto-generated backups, accumulate endlessly
 
     # Claude Code — subagent transcripts (results captured in main transcript, never re-read)
@@ -309,6 +310,51 @@ else
     )
 fi
 
+# ============================================================================
+# Recovery filter for vanishing files
+# ============================================================================
+RECOVERY_FILTER_FILE="/tmp/rclone-recovery-filters.txt"
+
+# Initialize empty recovery filter file (populated on bisync failure)
+init_recovery_filters() {
+    : > "$RECOVERY_FILTER_FILE"
+    echo "[entrypoint] Recovery filter initialized: $RECOVERY_FILTER_FILE"
+}
+
+# Parse rclone output for vanishing file errors and add to recovery filter.
+# Returns 0 if recoverable files found (caller should retry), 1 if not.
+recover_vanished_files() {
+    local output="$1"
+    local recovered=0
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local file_path
+        file_path=$(echo "$line" | grep -oP '(?<=lstat /home/user/)\S+(?=: no such file)' || true)
+        [ -z "$file_path" ] && continue
+
+        # Workspace files are user code — don't exclude, but still flag as recoverable (triggers retry)
+        if [[ "$file_path" == workspace/* ]]; then
+            echo "[sync-recovery] Workspace file vanished: $file_path (will retry without excluding)" | tee -a /tmp/sync.log
+            recovered=1
+            continue
+        fi
+
+        # Check if already excluded
+        if grep -qF "- $file_path" "$RECOVERY_FILTER_FILE" 2>/dev/null; then
+            continue
+        fi
+
+        echo "- $file_path" >> "$RECOVERY_FILTER_FILE"
+        echo "[sync-recovery] Excluded vanished file: $file_path" | tee -a /tmp/sync.log
+        recovered=1
+    done <<< "$(echo "$output" | grep 'failed to open source object.*no such file')"
+
+    return $((1 - recovered))  # 0 = recoverable, 1 = nothing to recover
+}
+
+init_recovery_filters
+
 # Step 1: One-way sync FROM R2 TO local (restore user data)
 # This ensures existing credentials, plugins, etc. are restored BEFORE anything else runs
 # Workspace sync controlled by SYNC_MODE (none, full, or metadata-only)
@@ -349,49 +395,69 @@ initial_sync_from_r2() {
 
 # Step 2: Establish bisync baseline (after data is restored)
 # IMPORTANT: Uses timeout to prevent infinite hangs
+# Recovery: if a vanishing file causes failure, excludes it and retries (max 3 attempts)
 establish_bisync_baseline() {
     local BISYNC_TIMEOUT=600  # 10 minutes max for baseline (large buckets with many files)
-    echo "[entrypoint] Step 2: Establishing bisync baseline (max ${BISYNC_TIMEOUT}s)..." | tee -a /tmp/sync.log
+    local MAX_RECOVERY=3
 
-    BASELINE_OUTPUT=$(mktemp)
-    if timeout $BISYNC_TIMEOUT rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
-        --config "$RCLONE_CONFIG" \
-        "${RCLONE_FILTERS[@]}" \
-        --resync \
-        --fast-list \
-        --min-size 1B \
-        --conflict-resolve newer \
-        --resilient \
-        --recover \
-        --check-sync=false \
-        --ignore-checksum \
-        --s3-upload-cutoff 0 \
-        --max-delete 100 \
-        --retries 3 --retries-sleep 10s \
-        --transfers 32 --checkers 32 -v > "$BASELINE_OUTPUT" 2>&1; then
-        SYNC_RESULT=0
-    else
-        SYNC_RESULT=$?
-    fi
-    cat "$BASELINE_OUTPUT" >> /tmp/sync.log
-    cat "$BASELINE_OUTPUT" >&2
-    rm -f "$BASELINE_OUTPUT"
-    if [ $SYNC_RESULT -eq 0 ]; then
-        echo "[entrypoint] Step 2 complete: Bisync baseline established" | tee -a /tmp/sync.log
-        touch /tmp/.bisync-initialized
-        SYNC_STATUS="success"
-        return 0
-    elif [ $SYNC_RESULT -eq 124 ]; then
-        echo "[entrypoint] WARNING: Bisync baseline timed out after ${BISYNC_TIMEOUT}s" | tee -a /tmp/sync.log >&2
-        touch /tmp/.bisync-initialized
-        SYNC_STATUS="timeout"
-        return 0  # Don't fail, just skip daemon
-    else
-        SYNC_ERROR="rclone bisync --resync failed with code $SYNC_RESULT"
-        SYNC_STATUS="failed"
-        echo "[entrypoint] ERROR: $SYNC_ERROR" | tee -a /tmp/sync.log >&2
-        return 1
-    fi
+    for recovery_attempt in $(seq 1 $MAX_RECOVERY); do
+        echo "[entrypoint] Step 2: Establishing bisync baseline (max ${BISYNC_TIMEOUT}s, attempt $recovery_attempt/$MAX_RECOVERY)..." | tee -a /tmp/sync.log
+
+        BASELINE_OUTPUT=$(mktemp)
+        if timeout $BISYNC_TIMEOUT rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
+            --config "$RCLONE_CONFIG" \
+            "${RCLONE_FILTERS[@]}" \
+            --filter-from "$RECOVERY_FILTER_FILE" \
+            --resync \
+            --fast-list \
+            --min-size 1B \
+            --conflict-resolve newer \
+            --resilient \
+            --recover \
+            --check-sync=false \
+            --ignore-checksum \
+            --s3-upload-cutoff 0 \
+            --max-delete 100 \
+            --retries 3 --retries-sleep 10s \
+            --transfers 32 --checkers 32 -v > "$BASELINE_OUTPUT" 2>&1; then
+            SYNC_RESULT=0
+        else
+            SYNC_RESULT=$?
+        fi
+        cat "$BASELINE_OUTPUT" >> /tmp/sync.log
+        cat "$BASELINE_OUTPUT" >&2
+
+        if [ $SYNC_RESULT -eq 0 ]; then
+            rm -f "$BASELINE_OUTPUT"
+            echo "[entrypoint] Step 2 complete: Bisync baseline established" | tee -a /tmp/sync.log
+            touch /tmp/.bisync-initialized
+            SYNC_STATUS="success"
+            return 0
+        elif [ $SYNC_RESULT -eq 124 ]; then
+            rm -f "$BASELINE_OUTPUT"
+            echo "[entrypoint] WARNING: Bisync baseline timed out after ${BISYNC_TIMEOUT}s" | tee -a /tmp/sync.log >&2
+            touch /tmp/.bisync-initialized
+            SYNC_STATUS="timeout"
+            return 0  # Don't fail, just skip daemon
+        fi
+
+        # Check if vanishing file caused the failure — recover and retry
+        if recover_vanished_files "$(cat "$BASELINE_OUTPUT")"; then
+            rm -f "$BASELINE_OUTPUT"
+            echo "[sync-recovery] Baseline attempt $recovery_attempt: excluded vanished file(s), retrying..." | tee -a /tmp/sync.log
+            rm -f "$HOME/.cache/rclone/bisync"/*.lck 2>/dev/null
+            continue
+        fi
+
+        # Non-recoverable error
+        rm -f "$BASELINE_OUTPUT"
+        break
+    done
+
+    SYNC_ERROR="rclone bisync --resync failed with code $SYNC_RESULT"
+    SYNC_STATUS="failed"
+    echo "[entrypoint] ERROR: $SYNC_ERROR" | tee -a /tmp/sync.log >&2
+    return 1
 }
 
 # Regular bisync (after baseline is established)
@@ -415,13 +481,14 @@ bisync_with_r2() {
         rclone deletefile "$LOCK_FILE" 2>/dev/null || rm -f "$LOCK_FILE"
     fi
 
-    # Write output to temp file so we can capture exit code AND log it
-    SYNC_OUTPUT=$(mktemp)
+    # Write output to known location so daemon can read it for recovery
+    SYNC_OUTPUT="/tmp/last-bisync-output.txt"
 
-    # Run bisync
+    # Run bisync (includes recovery filter for dynamically excluded vanished files)
     if rclone bisync "$USER_HOME/" "r2:$R2_BUCKET_NAME/" \
         --config "$RCLONE_CONFIG" \
         "${RCLONE_FILTERS[@]}" \
+        --filter-from "$RECOVERY_FILTER_FILE" \
         --fast-list \
         --min-size 1B \
         --conflict-resolve newer \
@@ -440,7 +507,8 @@ bisync_with_r2() {
     cat "$SYNC_OUTPUT" >> /tmp/sync.log
     cat "$SYNC_OUTPUT"
 
-    rm -f "$SYNC_OUTPUT"
+    # Note: SYNC_OUTPUT (/tmp/last-bisync-output.txt) is NOT deleted here.
+    # The daemon reads it for vanishing-file recovery. It's overwritten each invocation.
 
     # Auto-clean conflict artifacts after successful bisync
     if [ $RESULT -eq 0 ]; then
@@ -518,6 +586,18 @@ start_sync_daemon() {
             echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Bisync completed successfully" | tee -a /tmp/sync.log
             update_sync_status "success" "null"
         else
+            # Try vanishing-file recovery before counting as failure
+            if recover_vanished_files "$(cat /tmp/last-bisync-output.txt 2>/dev/null)"; then
+                echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Vanished file recovered, retrying immediately..." | tee -a /tmp/sync.log
+                rm -f "$HOME/.cache/rclone/bisync"/*.lck 2>/dev/null
+                if bisync_with_r2 ""; then
+                    CONSECUTIVE_FAILURES=0
+                    echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Recovery bisync succeeded" | tee -a /tmp/sync.log
+                    update_sync_status "success" "null"
+                    continue
+                fi
+            fi
+
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Bisync failed with exit code $SYNC_RESULT (failure $CONSECUTIVE_FAILURES/3)" | tee -a /tmp/sync.log
             update_sync_status "failed" "Bisync exit code $SYNC_RESULT"
@@ -1051,10 +1131,13 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
             # Run in subshell to prevent set -e from killing the daemon on cleanup failure.
             (cleanup_old_memory_files) || true
             echo "[entrypoint] Bisync baseline established, starting daemon..."
-            start_sync_daemon
         else
-            echo "[entrypoint] Bisync baseline failed, daemon not started"
+            echo "[entrypoint] WARNING: Bisync baseline failed — starting daemon anyway (daemon has its own recovery)" | tee -a /tmp/sync.log
         fi
+        # Always start daemon — even if baseline failed.
+        # The daemon has its own retry + resync fallback + vanishing-file recovery.
+        # A dead daemon means zero sync for the entire session.
+        start_sync_daemon
     ) &
     BISYNC_INIT_PID=$!
     echo "[entrypoint] Bisync init running in background (PID $BISYNC_INIT_PID)"
