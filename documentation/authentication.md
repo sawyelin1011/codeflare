@@ -540,7 +540,9 @@ Standalone admin page at `/admin/subscriptions` (routes to `web-ui/src/component
 **Warning banners** (Layout.tsx):
 - Displayed at usage thresholds: 80%, 95%, 100% of monthly quota
 - Color-coded: yellow (80%), orange (95%), red (100%)
-- Uses `getUsageWarningLevel()` from session store
+- 80% and 95% banners include a dismiss button (×) — dismiss state is session-scoped (resets on page reload)
+- 100% banner is not dismissible (blocks session creation)
+- Uses `getUsageWarningLevel()` from session store; `dismissedWarning` is a component-local `createSignal` in `Layout.tsx`
 - "New Session" button disabled when quota is exceeded (`isAtUsageQuota()`)
 
 ### Migration Strategy
@@ -685,7 +687,9 @@ In practice, `resolveOrProvisionUser()` always writes both `subscriptionTier` an
 
 ### CF Access Configuration Strategy
 
-The setup wizard (Step 5 in `src/routes/setup/index.ts`) calls `handleCreateAccessApp()` in `src/routes/setup/access.ts` to configure Cloudflare Access. The key architectural decision is **login_method vs. groups**.
+**When this step runs:** The setup wizard calls `handleCreateAccessApp()` only when GitHub OIDC is NOT configured (`OAUTH_CLIENT_ID` is absent). When `SAAS_MODE=active` and `OAUTH_CLIENT_ID` is set, the `create_access_app` step is skipped entirely — the Worker handles authentication directly via the GitHub OAuth routes, and creating a CF Access application on the same domain would intercept requests before the Worker runs, breaking the OIDC login flow. A synthetic `success` result is emitted so the setup wizard UI does not stall. (Issue #140.)
+
+When CF Access provisioning does run (Step 5 in `src/routes/setup/index.ts`), it calls `handleCreateAccessApp()` in `src/routes/setup/access.ts`. The key architectural decision is **login_method vs. groups**.
 
 #### Why login_method in SaaS mode (not groups)
 
