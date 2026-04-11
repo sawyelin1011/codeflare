@@ -1059,14 +1059,13 @@ fi
 # Configure Claude Code settings.json with hooks (advanced) or just settings (default)
 PLUGIN_DIR="$USER_HOME/.claude/plugins"
 if [ "${SESSION_MODE:-default}" = "advanced" ]; then
-    # PreToolUse hooks are gated with "if" permission-rule syntax so they only
-    # fire on relevant commands instead of every Bash call:
-    #   - block-attributed-commits: runs on git * and gh * (catches commit,
-    #     merge, tag, notes, gh pr/issue/release create/edit/comment), with
-    #     further narrowing inside the script
-    #   - git-push-review-reminder: runs only on git push*, and itself
-    #     exits silently unless sdd/ is bootstrapped (vibe-coding gate)
-    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(git push*)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
+    # PreToolUse: block-attributed-commits fires on git * and gh * to catch
+    #   AI attribution in commits/PRs/issues/releases.
+    # PostToolUse: git-push-review-reminder fires AFTER git push completes
+    #   (not before) so the directive arrives in the same turn as the push
+    #   result. The assistant acts silently — no user-facing acknowledgment.
+    #   Only fires if sdd/ is bootstrapped (vibe-coding gate).
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git push*)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
     echo "[entrypoint] Advanced mode: configuring settings.json with hooks"
 else
     SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true}'
@@ -1075,12 +1074,39 @@ fi
 SETTINGS_FILE="$USER_CLAUDE_DIR/settings.json"
 if [ -f "$SETTINGS_FILE" ]; then
     TMP_SETTINGS=$(mktemp)
-    if jq --argjson cfg "$SETTINGS_CONFIG" '. * $cfg' "$SETTINGS_FILE" > "$TMP_SETTINGS" 2>/dev/null; then
+    JQ_ERR=$(mktemp)
+    # Implements REQ-AGENT-008
+    # Merge non-hooks settings with *, rebuild hooks separately to avoid
+    # jq array-replace destroying user-added hooks or leaving stale managed hooks.
+    # "Managed" = command path contains codeflare-(hooks|memory)/scripts/.
+    if jq --argjson cfg "$SETTINGS_CONFIG" '
+      . as $orig |
+      (del(.hooks) * ($cfg | del(.hooks))) +
+      {hooks: (
+        (($orig.hooks // {}) | keys) + (($cfg.hooks // {}) | keys) | unique |
+        map(. as $type |
+          ($orig.hooks[$type] // []) as $existArr |
+          ($cfg.hooks[$type] // []) as $cfgArr |
+          {key: $type, value: (
+            [$existArr[].matcher, $cfgArr[].matcher] | unique |
+            map(. as $m |
+              [$existArr[] | select(.matcher == $m) | (.hooks // [])[] |
+                select((.command // "") | test("codeflare-(hooks|memory)/scripts/") | not)
+              ] as $user |
+              [$cfgArr[] | select(.matcher == $m) | (.hooks // [])[]] as $mgr |
+              {matcher: $m, hooks: ($user + $mgr)}
+            ) | map(select(.hooks | length > 0))
+          )}
+        ) | from_entries |
+        with_entries(select(.value | length > 0))
+      )}
+    ' "$SETTINGS_FILE" > "$TMP_SETTINGS" 2>"$JQ_ERR"; then
         mv "$TMP_SETTINGS" "$SETTINGS_FILE"
     else
-        echo "[entrypoint] WARNING: Could not merge settings config (malformed settings.json?)"
+        echo "[entrypoint] WARNING: Could not merge settings config: $(cat "$JQ_ERR")"
         rm -f "$TMP_SETTINGS"
     fi
+    rm -f "$JQ_ERR"
 else
     echo "$SETTINGS_CONFIG" | jq '.' > "$SETTINGS_FILE"
 fi

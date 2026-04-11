@@ -108,9 +108,9 @@ Multi-agent support, preseed system, and session modes.
 1. Session mode is stored as `sessionMode?: 'default' | 'advanced'` in `UserPreferences` (KV).
 2. `resolveSessionMode(prefs)` is the single source of truth for the `?? 'default'` fallback.
 3. Mode selection is available in Settings > Session Defaults.
-4. Mode takes effect only on explicit "Recreate AI agent skills & rules" click or new bucket creation.
-5. Existing users keep all their current R2 files until they recreate.
-6. No migration is required; existing users are unaffected by mode changes until explicit action.
+4. Mode takes effect on any of: explicit "Recreate AI agent skills & rules" click, new bucket creation, Stripe mode change (upgrade or downgrade via webhook), subscription termination, or Settings toggle of `sessionMode`.
+5. On Stripe-driven or Settings-driven reconciliation, preseed files are overwritten to match the new mode; user-created files are never deleted (see REQ-AGENT-005 Constraints).
+6. Reconciliation triggered by webhooks or Settings is non-fatal: failure does not block the webhook response or the preference write.
 
 **Constraints:**
 - Only tiers with `'advanced'` in their `sessionModes` array can use Pro mode (see REQ-SUB-014).
@@ -148,7 +148,7 @@ Multi-agent support, preseed system, and session modes.
 1. Default mode seeds 25 files to R2.
 2. Advanced mode seeds 180 files to R2.
 3. Pro mode enables memory persistence (`.memory/` directory synced via rclone); Standard mode excludes the entire `.memory/**` directory from sync.
-4. Pro mode registers hooks in `settings.json` with command-pattern gates so they only fire on relevant Bash calls: two PreToolUse entries for commit attribution blocking (gated on `Bash(git *)` and `Bash(gh *)`, covering git commit/merge/tag/notes and gh pr/issue/release create/edit/comment/review/merge), one PreToolUse entry for the git-push review reminder (gated on `Bash(git push*)`), and one UserPromptSubmit entry for memory capture; Standard mode merges only `skipDangerousModePermissionPrompt`.
+4. Pro mode registers hooks in `settings.json` with command-pattern gates so they only fire on relevant Bash calls: two PreToolUse entries for commit attribution blocking (gated on `Bash(git *)` and `Bash(gh *)`, covering git commit/merge/tag/notes and gh pr/issue/release create/edit/comment/review/merge), one PostToolUse entry for the git-push review reminder (gated on `Bash(git push*)`) so the directive arrives in the same turn as the push result, and one UserPromptSubmit entry for memory capture; Standard mode merges only `skipDangerousModePermissionPrompt`.
 
 **Constraints:**
 - Cleanup on mode switch is scoped strictly to preseed-managed keys; user-created files are never deleted.
@@ -229,8 +229,8 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 1. On first bucket creation, `reconcileAgentConfigs(mode, { overwrite: false, cleanup: false })` writes mode-appropriate files to R2.
 2. During container startup, initial `rclone sync` from R2 restores preseed files to the container's config directories (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`, `~/.config/opencode/`).
-3. `entrypoint.sh` merges settings into `~/.claude/settings.json` using `jq` recursive merge, preserving user's existing settings.
-4. In advanced mode, settings merge includes hook registrations (PreToolUse, UserPromptSubmit).
+3. `entrypoint.sh` merges settings into `~/.claude/settings.json` using a hooks-aware merge: non-hook fields use recursive merge; hook arrays are rebuilt per event type by preserving user-added hooks (any hook whose command does not match codeflare-* managed paths) and replacing managed hooks with the current platform version.
+4. In advanced mode, settings merge includes hook registrations (PreToolUse, PostToolUse, UserPromptSubmit).
 5. `entrypoint.sh` merges `enabledPlugins` into `~/.claude/.claude.json` to enable codeflare-memory and codeflare-hooks plugins (permanent, not mode-gated; missing plugin files are silently skipped).
 6. Settings merge handles three cases: file doesn't exist (create), file exists (recursive merge), file malformed (skip with warning).
 
@@ -289,10 +289,14 @@ Multi-agent support, preseed system, and session modes.
 7. When `GH_TOKEN` is present, `entrypoint.sh` configures `git config --global credential.helper` for HTTPS auth.
 8. `CLOUDFLARE_ACCOUNT_ID` is auto-fetched from the Cloudflare API when a Cloudflare API token is stored.
 
+9. GitHub token creation offers three scope tiers (Minimal, Recommended, Advanced) via a selector in the connect flow. Recommended is pre-selected. The URL pre-fills the correct scopes per tier.
+10. Cloudflare token creation directs users to use the "Edit Cloudflare Workers" template with account and zone selection. No scope pre-fill (Cloudflare template URLs are broken).
+11. A documentation page lists all scopes per tier with explanations of why each is needed, linked from the UI via "See all scopes".
+
 **Constraints:**
-- GitHub PAT template pre-fills 19 permissions via provider-specific URL parameters.
-- Cloudflare token template pre-fills 13 scopes.
-- Copilot CLI checks env vars in order: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`; auth fails silently if the token lacks Copilot scope.
+- GitHub Minimal: 1 scope (contents). Recommended: 6 scopes (contents, PRs, actions, workflows, administration, secrets). Advanced: all 19 scopes including Copilot.
+- Cloudflare: "Edit Cloudflare Workers" template covers Workers, KV, R2, Pages, Containers, Routes. Users add extra scopes (D1, DNS, Access, Turnstile) when their agent requests them.
+- Copilot CLI checks env vars in order: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`; auth fails silently if the token lacks Copilot scope — requires Advanced tier.
 
 **Applies To:** User
 **Priority:** P1

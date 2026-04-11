@@ -2,6 +2,21 @@
 
 Semantic changes to the specification. Git history captures diffs; this file captures intent.
 
+## 2026-04-11
+- Updated REQ-MEM-001, REQ-MEM-003, REQ-MEM-007, REQ-MEM-008: memory capture agent upgraded from haiku to sonnet for higher-quality observations. Compaction threshold raised from 150 to 1000 observations; compaction target changed from 50-80 per project to ~500 total.
+- Updated REQ-MEM-001 AC2/AC7-AC8: memory-capture hook now injects MCP memory scan directive on first message (search_nodes). Message counting method corrected in spec.
+- Updated REQ-MEM-002 AC2: first-run baseline now also injects memory scan directive before exiting.
+- Updated REQ-AGENT-010 AC9-AC11: GitHub token creation now offers three scope tiers (Minimal/Recommended/Advanced). Cloudflare simplified to "Edit Cloudflare Workers" template. Documentation page for all scopes.
+- Updated REQ-AGENT-005 AC4: git-push-review-reminder moved from PreToolUse to PostToolUse so the directive arrives in the same turn as the push result
+- Updated REQ-AGENT-008 AC3-AC4: entrypoint hooks merge now preserves user-added hooks while replacing managed hooks; PostToolUse added to hook event types
+- REQ-SUB-020 promoted to Implemented: multi-currency pricing code complete with full test coverage
+
+## 2026-04-10
+- Added REQ-SUB-020: Multi-currency pricing via Stripe `currency_options`. Subscribe page and checkout auto-detect visitor currency from `CF-IPCountry` (CHF/USD/EUR/GBP).
+- Removed multi-currency pricing from Out of Scope.
+- Updated REQ-AGENT-004 AC4-AC6: session mode now auto-reconciles on Stripe mode change, subscription termination, and Settings toggle -- no longer requires explicit recreate click
+- Updated REQ-SUB-015 AC6-AC7: reconciliation generalized from downgrade-only to any mode change; added AC7 for subscription deletion reconciliation
+
 ## 2026-04-08
 - SDD opt-in is now binary (REQ-AGENT-021 AC4): non-SDD projects get zero post-push review agents (vibe-coding mode), while projects with an `sdd/` folder get the full code-reviewer + spec-reviewer + doc-updater workflow. The `git-push-review-reminder` hook enforces the gate by exiting silently when `sdd/README.md` is missing.
 - REQ-AGENT-005 AC4 updated: the two PreToolUse hooks now use command-pattern `if` gates (`Bash(git *)`, `Bash(gh *)`, `Bash(git push*)`) so they only fire on relevant commands, and the attribution-blocking surface expanded to cover git merge/tag/notes and gh pr/issue/release edit/comment/review/merge in addition to commits and PR creation.
