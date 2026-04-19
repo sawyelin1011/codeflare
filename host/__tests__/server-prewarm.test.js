@@ -21,9 +21,9 @@ describe('getPrewarmConfig (server integration)', () => {
     assert.equal(cfg.command, null);
   });
 
-  it('returns the base command for tab 1', () => {
-    const cfg = getPrewarmConfig([{ id: '1', command: 'cu --silent', label: 'Claude' }]);
-    assert.equal(cfg.command, 'cu');
+  it('returns first token of tab 1 command', () => {
+    const cfg = getPrewarmConfig([{ id: '1', command: 'claude --dangerously-skip-permissions', label: 'Claude' }]);
+    assert.equal(cfg.command, 'claude');
   });
 
   it('does not return quiescenceMs or readyPattern', () => {

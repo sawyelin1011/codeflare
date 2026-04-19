@@ -35,7 +35,7 @@ Multi-agent support, preseed system, and session modes.
 1. Six agent types are defined: `claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `bash`.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
-4. All agent CLIs have V8 compile cache warm-up at Docker build time (except Go binaries which are natively compiled).
+4. Node.js-based agent CLIs (Codex, Gemini, Copilot) run `--version` at Docker build time to trigger V8 compile cache warm-up via `NODE_COMPILE_CACHE`. Claude Code is a native binary and needs no warm-up. Go-based agents (OpenCode) are natively compiled.
 
 **Constraints:**
 - Agent CLI versions are installed via `@latest` at build time; versions may drift between deploys.
@@ -80,7 +80,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 1. `configure_tab_autostart()` in `entrypoint.sh` writes the agent's launch command into `.bashrc` for tab 1.
-2. The agent starts with `--silent --no-consent` flags (for Claude Code via `cu`).
+2. The agent starts with `--dangerously-skip-permissions` flag (for Claude Code via `claude`). The container sets `IS_SANDBOX=1` to allow this flag when running as root.
 3. Auto-start only runs for tab 1; user-created tabs (where `MANUAL_TAB=1`) skip autostart.
 4. The `.bashrc` autostart block sets `PATH="/usr/local/bin:/usr/bin:/bin:$PATH"` so PTY sessions find globally installed CLI tools.
 5. Pre-warm readiness is detected by first PTY output (any terminal output means the agent is ready).
@@ -343,7 +343,7 @@ Multi-agent support, preseed system, and session modes.
 1. `fastStartEnabled` preference (default: `true`) maps to `FAST_CLI_START` container env var.
 2. When enabled, auto-update checks are disabled for all 5 AI tools, eliminating 5-30s startup delay.
 3. Each tool has a specific disable mechanism:
-   - Claude Code: `CLAUDE_UNLEASHED_NO_UPDATE=1`, `CLAUDE_UNLEASHED_CHANNEL=stable` (env vars)
+   - Claude Code: `DISABLE_AUTOUPDATER=1` (env var)
    - OpenCode: `OPENCODE_DISABLE_AUTOUPDATE=1` (env var)
    - Copilot: `COPILOT_AUTO_UPDATE=false` (env var)
    - Gemini: `~/.gemini/settings.json` with `enableAutoUpdate: false` (jq merge preserving user customizations)

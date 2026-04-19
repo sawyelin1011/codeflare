@@ -24,7 +24,7 @@ Architectural and technology decisions that apply across all domains.
 | Linter | oxlint | Fast Rust-based linter for CI |
 | Testing | Vitest | Unit/integration tests; Puppeteer for E2E; fast-check for fuzzing |
 | Container Tools | git, gh, rclone, neovim, ripgrep, fd, fzf, yazi, lazygit, zoxide, tmux, htop, jq, bat | Pre-installed developer toolchain in every container |
-| AI Agents | claude-unleashed, @openai/codex, @google/gemini-cli, opencode-ai, @github/copilot | Global npm packages, V8 compile cache pre-warmed at build time |
+| AI Agents | @anthropic-ai/claude-code, @openai/codex, @google/gemini-cli, opencode-ai, @github/copilot | Global npm packages; Claude Code runs as root via `IS_SANDBOX=1` + `--dangerously-skip-permissions` |
 
 ## Non-Functional Requirements
 
@@ -84,8 +84,7 @@ Tier configuration cached for 60s in `src/lib/subscription.ts`. Other cache TTLs
 | WebSocket retry delay | 1s (`WS_RETRY_DELAY_MS`) | `web-ui/src/stores/terminal.ts` |
 | Dashboard WS disconnect grace period | 60s (`DASHBOARD_WS_DISCONNECT_DELAY_MS`) | `web-ui/src/lib/constants.ts` |
 | Container fetch timeout | 5s (`CONTAINER_FETCH_TIMEOUT`) | `src/lib/constants.ts` |
-| V8 compile cache | Pre-warmed at Docker build time for all Node.js CLIs | `Dockerfile` |
-| Node compile cache dir | `/root/.cache/node-compile-cache` | `Dockerfile` ENV |
+| V8 compile cache | `NODE_COMPILE_CACHE=/root/.cache/node-compile-cache`, pre-warmed at Docker build time for Node.js CLIs (Codex, Gemini, Copilot) | `Dockerfile` ENV |
 | Context expiry threshold | 30 min (`CONTEXT_EXPIRY_MS`) | Frontend stale session detection |
 | Bucket name settle delay | 100ms | `src/lib/constants.ts` |
 
@@ -117,7 +116,7 @@ Three states (CLOSED/OPEN/HALF_OPEN) wrapping `container.fetch()` calls to preve
 ### Cost
 
 ### CON-COST-001: Idle containers hibernate (zero cost when not running)
-Containers stop after configurable `sleepAfter` (5m, 15m, 30m, 1h, 2h) with no terminal input. Default 30m for paying users, 5m for free tier. Timer resets only on actual user input (keypresses, not WebSocket reconnects or background polls). No running containers = no compute bill.
+Containers stop after configurable `sleepAfter` (5m, 15m, 30m, 1h, 2h) with no terminal input. Default 30m for paying users, 15m for free tier. Timer resets only on actual user input (keypresses, not WebSocket reconnects or background polls). No running containers = no compute bill.
 **Applies To:** System (container lifecycle), Admin (cost management)
 
 #### Additional Cost Mechanisms

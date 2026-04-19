@@ -10,12 +10,12 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2, 8px);
-  padding: 12px;
+  padding: var(--space-3);
   background: linear-gradient(135deg,
     var(--color-bg-elevated) 0%,
-    #18181b 100%);
+    var(--color-bg-surface) 100%);
   border: 1px solid var(--color-glass-border, rgba(255, 255, 255, 0.06));
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
   transition: all 150ms ease;
 }
 
@@ -39,35 +39,29 @@
   align-items: center;
 }
 
-.stat-card__title {
-  font-size: var(--text-xs, 0.75rem);
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--color-text-muted, #6b7280);
-}
+/* .stat-card__title — typography via .type-section-header */
 
 /* Metric rows — matches session card metric style */
 .stat-card__metrics {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1, 4px);
+  gap: 0;
 }
 
 .stat-card__metric {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: var(--space-1) 0;
 }
 
 .stat-card__metric-label {
   display: flex;
   align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  font-family: var(--font-mono);
+  gap: var(--space-1);
+  font-size: var(--text-xs);
   text-transform: uppercase;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.05em;
   line-height: 1.4;
   color: var(--color-text-muted, #6b7280);
 }
@@ -78,14 +72,13 @@
 }
 
 .stat-card__metric-value {
-  font-size: 11px;
-  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   text-transform: uppercase;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.05em;
   line-height: 1.4;
   color: var(--color-text-secondary);
   background: var(--color-bg-surface);
-  padding: 2px 6px;
+  padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-sm, 4px);
 }
 

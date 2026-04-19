@@ -21,7 +21,7 @@ CVE-2026-25679
 CVE-2026-27142
 
 # node-tar transitive dependency in globally-installed npm CLIs
-# (claude-unleashed, @openai/codex, @google/gemini-cli, opencode-ai).
+# (@anthropic-ai/claude-code, @openai/codex, @google/gemini-cli, opencode-ai).
 # These CLIs don't process untrusted tar archives at runtime.
 # Fix available (tar 7.5.3-7.5.8) but upstream packages haven't updated.
 CVE-2026-23745
@@ -153,3 +153,23 @@ CVE-2026-27135
 # systemd (libsystemd0, libudev1): arbitrary code execution via spurious IPC
 # Container doesn't use systemd IPC; no fix available in bookworm.
 CVE-2026-29111
+
+# Go stdlib in rclone v1.73.2 / lazygit v0.60.0: chain building work amplification
+# These are CLI tools in sandboxed container, not exposed to untrusted certificate chains.
+CVE-2026-32280
+
+# Go stdlib in rclone v1.73.2 / lazygit v0.60.0: Root.Chmod symlink traversal
+# Container runs trusted code only; these tools don't use Root.Chmod on untrusted paths.
+CVE-2026-32282
+
+# jq 1.6: out-of-bounds read in jv_parse_sized() on malformed input
+# jq processes trusted JSON from entrypoint scripts and hooks, not user-controlled input. No fix in bookworm.
+CVE-2026-39979
+
+# jq 1.6: DoS via crafted JSON object
+# Same as above — jq only processes trusted entrypoint/hook JSON. No fix in bookworm.
+CVE-2026-40164
+
+# cpython 3.11: arbitrary code execution or information disclosure
+# python3 is used for ECC observe hooks only (stdlib, no network, no untrusted input). No fix in bookworm.
+CVE-2026-6100

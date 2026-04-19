@@ -6,15 +6,21 @@
 @import './styles/design-tokens.css';
 @import './styles/animations.css';
 @import './styles/components.css';
+@import './styles/typography.css';
 
 /* ==========================================================================
    Reset & Base Styles
    ========================================================================== */
 
-* {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+  font-family: inherit;
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-default) var(--color-bg-surface);
 }
 
 html, body, #root {
@@ -24,7 +30,7 @@ html, body, #root {
 }
 
 body {
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
   font-size: var(--text-base);
   line-height: var(--leading-normal);
   color: var(--color-text-primary);
@@ -53,12 +59,6 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--color-text-muted);
-}
-
-/* Firefox scrollbar */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: var(--color-border-default) var(--color-bg-surface);
 }
 
 /* ==========================================================================

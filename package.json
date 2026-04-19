@@ -25,9 +25,9 @@
     "knip": "knip"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.2.4",
+    "@cloudflare/containers": "^0.3.2",
     "aws4fetch": "^1.0.20",
-    "hono": "^4.12.12",
+    "hono": "^4.12.14",
     "zod": "^4.3.6"
   },
   "overrides": {
@@ -37,10 +37,10 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.14.2",
     "@cloudflare/workers-types": "4.20260405.1",
-    "@types/node": "^25.5.2",
+    "@types/node": "^25.6.0",
     "@vitest/coverage-v8": "^4.1.2",
     "fast-check": "^4.6.0",
-    "knip": "^6.3.1",
+    "knip": "^6.4.1",
     "oxlint": "^1.59.0",
     "puppeteer": "^24.40.0",
     "typescript": "^5.9.3",

@@ -13,7 +13,7 @@ Every session comes pre-loaded with your choice of AI coding agent:
 
 | Agent | Description |
 |---|---|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Anthropic's agentic CLI (uses [claude-unleashed](https://github.com/nikolanovoselec/claude-unleashed) behind the scenes for root permission bypass and controlled updates) |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Anthropic's agentic CLI (runs with `IS_SANDBOX=1` + `--dangerously-skip-permissions` for root container support) |
 | [Codex](https://github.com/openai/codex) | OpenAI's coding agent |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | Google's terminal agent |
 | [GitHub Copilot](https://docs.github.com/en/copilot) | GitHub's AI coding agent |
@@ -23,10 +23,9 @@ Every session comes pre-loaded with your choice of AI coding agent:
 *Pro mode features (knowledge graph, curated skills, advanced workflows) are primarily designed for Claude Code. Other agents receive rules and agent definitions but may not support all Pro capabilities.*
 
 <details>
-<summary><strong>Why Claude Unleashed under the hood?</strong></summary>
-<a id="why-claude-unleashed"></a>
+<summary><strong>How does Claude Code run as root?</strong></summary>
 
-Cloudflare Containers run as root. Claude Code refuses to run with `--dangerously-skip-permissions` as root - even inside an ephemeral container where the root check is protecting a filesystem that won't exist in 30 seconds. Heroic. [Claude Unleashed](https://github.com/nikolanovoselec/claude-unleashed) is a wrapper that politely disagrees with this decision, patching around the restriction at source level. Handles root detection, auto-updates, and mode switching. Pre-installed in every Codeflare container because arguing with your tools is not a productive use of compute. In the UI, it shows up as "Claude Code" - because that's what it is, just without the unnecessary guardrails.
+Cloudflare Containers run as root. Claude Code normally refuses `--dangerously-skip-permissions` as root. The official workaround is setting `IS_SANDBOX=1`, which tells the CLI it's running in a sandboxed environment. Combined with `--dangerously-skip-permissions`, this gives fully autonomous operation without permission prompts. No wrapper, no patcher, no hacks -- just an environment variable that Anthropic's own engineers documented for this exact use case.
 
 </details>
 
@@ -67,7 +66,7 @@ Codeflare is built for Cloudflare. Not adapted, not ported - built on it, for it
 - Push & Deploy - connect your GitHub and Cloudflare accounts once in Settings. Every session gets automatic auth. No more pasting tokens into terminals like it's 2019.
 - Dashboard for managing sessions, browsing files, and inviting users (or revoking them when they get too creative). Live CPU/memory/disk metrics per session. Three-color status: green (active), yellow (idle but alive), gray (stopped).
 - Usage dashboard - track daily and monthly compute hours, see quota remaining, per-user Timekeeper Durable Object accumulates seconds and flushes to KV every 5 minutes.
-- Configurable auto-sleep - containers stop after a period of inactivity (no terminal input). Choose 5m, 15m, 30m, 1h, or 2h in Settings. Free tier is locked to 5m. Sleep is input-aware: the timer only resets when you actually type something, not on WebSocket reconnects or background polls.
+- Configurable auto-sleep - containers stop after a period of inactivity (no terminal input). Choose 5m, 15m, 30m, 1h, or 2h in Settings. Free tier is locked to 15m. Sleep is input-aware: the timer only resets when you actually type something, not on WebSocket reconnects or background polls.
 - CPU cost scales to zero when idle. You pay for what you use. Nothing when you don't.
 
 ## Architecture
@@ -181,7 +180,7 @@ Variables and secrets are set in your fork under `Settings` → `Secrets and var
 | `MAX_SESSIONS_ADMIN` | var | `10` | Max concurrent running sessions per admin. Set to any number. Ignored in SaaS mode — tier config controls session limits instead |
 | `ENCRYPTION_KEY` | secret | unset | AES-256 key for encrypting API keys in KV and files in R2 (SSE-C). Must be exactly 32 bytes of random data, base64-encoded. Generate: `openssl rand -base64 32`. When unset, credentials are stored as plaintext |
 | `RUNNER` | var | `ubuntu-latest` | GitHub Actions runner for CI/CD workflows. Set to a custom runner label if you use self-hosted runners |
-| `CLAUDE_UNLEASHED_CACHE_BUSTER` | var | unset | Set to `active` to force Docker to reinstall the AI agent layer (claude-unleashed) on every deploy, bypassing the Docker cache. Useful after agent updates. When unset or any other value, the cached layer is reused for faster builds |
+| `CLAUDE_CODE_CACHE_BUSTER` | var | unset | Set to `active` to force Docker to reinstall the AI agent layer (@anthropic-ai/claude-code) on every deploy, bypassing the Docker cache. Useful after agent updates. When unset or any other value, the cached layer is reused for faster builds |
 | `STRESS_TEST_MODE` | var | unset | Set to `active` to bypass ALL rate limits (HTTP, WebSocket, container start). For integration/stress testing only. **Never set to `active` in production** — it disables all rate limiting |
 
 #### Onboarding mode
