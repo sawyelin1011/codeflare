@@ -71,3 +71,41 @@ export function getUsageWarningLevel(): UsageWarningLevel {
   if (pct >= 80) return '80';
   return 'none';
 }
+
+// ============================================================================
+// Dismissed quota warning (per UTC month)
+// Implements REQ-SUB-018
+// ============================================================================
+
+type DismissedLevel = '80' | '95' | null;
+
+function getDismissedKey(): string {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  return `cf_dismissed_quota_${y}-${m}`;
+}
+
+function loadDismissedLevel(): DismissedLevel {
+  try {
+    const v = localStorage.getItem(getDismissedKey());
+    if (v === '80' || v === '95') return v;
+  } catch { /* localStorage unavailable */ }
+  return null;
+}
+
+// Signal acts as a reactive trigger; actual value is read fresh from localStorage
+// on each get so long-lived tabs pick up a new month's empty key automatically.
+const [dismissedSignal, setDismissedSignal] = createSignal<DismissedLevel>(loadDismissedLevel());
+
+export function getDismissedQuotaLevel(): DismissedLevel {
+  dismissedSignal(); // reactive dependency — re-runs consumers on setDismissedQuotaLevel
+  return loadDismissedLevel();
+}
+
+export function setDismissedQuotaLevel(level: '80' | '95'): void {
+  try {
+    localStorage.setItem(getDismissedKey(), level);
+  } catch { /* localStorage unavailable */ }
+  setDismissedSignal(level);
+}

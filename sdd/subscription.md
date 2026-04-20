@@ -460,7 +460,7 @@ Tiers, billing, usage tracking, and quotas.
 1. `/app/usage` page shows progress ring for monthly usage, stat cards (today, this month, tier quota).
 2. Polls `GET /api/usage` for real-time data from Timekeeper DO with KV fallback.
 3. Warning banners at 80%, 95%, 100% thresholds in Layout.
-4. The 80% and 95% banners include a dismiss button (×) that hides the banner for the current session. Dismiss state is session-scoped (resets on page reload so the warning reappears if still relevant).
+4. The 80% and 95% banners include a dismiss button (×) that hides the banner until the next monthly quota rollover. Dismissal is persisted per UTC month so a page reload does not resurface the warning, but the warning returns automatically when the quota resets at the start of the next month. Dismissing the 95% banner also hides the 80% banner (since 95% implies 80%).
 5. The 100% (quota exceeded) banner is not dismissible since it blocks session creation.
 
 **Constraints:**
@@ -514,6 +514,27 @@ Tiers, billing, usage tracking, and quotas.
 **Applies To:** User
 **Priority:** P1
 **Dependencies:** REQ-SUB-004
+**Verification:** Automated test
+
+**Status:** Implemented
+
+---
+
+## REQ-SUB-021: Billing Cycle Alignment
+
+**Intent:** New paid subscriptions are billed on the 1st of each UTC calendar month so that recurring charges and monthly quota resets happen on the same date, eliminating the mid-cycle quota refresh that previously gave users roughly twice the paid quota between two billing charges.
+
+**Acceptance Criteria:**
+1. When a user starts a Stripe checkout for a paid tier, the resulting subscription is anchored so that all recurring charges occur on the 1st of UTC month at 00:00:00.
+2. The first charge is prorated for the partial period between the subscription's effective start (subscription creation for non-trial subscriptions, or trial end for trial subscriptions) and the next 1st of UTC month (e.g., subscribing on the 15th of a 30-day month with no trial results in a roughly 50% prorated first charge).
+3. Subsequent monthly charges occur on the 1st of each UTC month.
+4. Monthly quota reset and billing cycle both roll over on the same calendar date.
+5. Existing subscriptions created before this behavior are not migrated — they retain their original billing anniversary.
+6. When a free trial is active, the billing cycle anchor is the first 1st of UTC month strictly after the trial ends, so billing begins on that anchor date once the trial completes (or is ended early by quota consumption). Trial length itself is unaffected.
+
+**Applies To:** User
+**Priority:** P1
+**Dependencies:** REQ-SUB-004, REQ-SUB-006
 **Verification:** Automated test
 
 **Status:** Implemented
