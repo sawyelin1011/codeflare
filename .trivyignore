@@ -170,6 +170,32 @@ CVE-2026-39979
 # Same as above — jq only processes trusted entrypoint/hook JSON. No fix in bookworm.
 CVE-2026-40164
 
+# jq 1.6 / libjq1: DoS or potential arbitrary code execution via malformed JSON
+# jq only processes trusted entrypoint/hook JSON. No fix in bookworm.
+CVE-2026-32316
+
 # cpython 3.11: arbitrary code execution or information disclosure
 # python3 is used for ECC observe hooks only (stdlib, no network, no untrusted input). No fix in bookworm.
 CVE-2026-6100
+
+# Go stdlib in rclone v1.73.2 / lazygit v0.60.0: crypto/x509 DoS via inefficient cert chain validation
+# These are CLI tools in sandboxed container, not exposed to untrusted certificate chains.
+CVE-2026-32281
+
+# Go stdlib in rclone v1.73.2 / lazygit v0.60.0: TLS DoS via multiple key update messages
+# Container doesn't expose TLS endpoints; these tools make outbound TLS only to trusted services.
+CVE-2026-32283
+
+# rclone 1.73.5: unauthorized access via unauthenticated Remote Control endpoint
+# Container does not run `rclone rcd` or use `--rc` flag; only `rclone bisync` for R2 sync.
+# Remote Control endpoint is not exposed. No fixed version available upstream.
+CVE-2026-41176
+
+# rclone 1.73.5: unauthenticated local command execution via exposed RC endpoint
+# Same as above — RC endpoint is not enabled in this container.
+CVE-2026-41179
+
+# libgcrypt20 1.10.1-3: DoS and buffer overflow via crafted ECDH ciphertext
+# System library transitive dep; container does not process untrusted ECDH ciphertext.
+# No fix available in Debian bookworm.
+CVE-2026-41989
