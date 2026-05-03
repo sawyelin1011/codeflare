@@ -8,7 +8,7 @@ Multi-agent support, preseed system, and session modes.
 |---------|-----------|
 | Agent | One of six supported AI coding tools (`claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
 | Preseed | A set of configuration files (rules, skills, agents, commands, plugins) generated from a single Claude Code source of truth and deployed to each user's R2 bucket |
-| Session Mode | Either Standard (`default`, 25 preseed files) or Pro (`advanced`, 180 preseed files) controlling the scope of agent enhancements seeded to a user's storage |
+| Session Mode | Either Standard (`default`) or Pro (`advanced`) controlling the scope of agent enhancements seeded to a user's storage |
 | Manifest | The declarative `manifest.json` file that maps each preseed source file to its applicable modes and drives the code generation pipeline |
 
 ### Out of Scope
@@ -127,6 +127,11 @@ Multi-agent support, preseed system, and session modes.
 
 ## REQ-AGENT-005: Pro Mode Includes Additional Skills, Rules, Agents, and MCP Servers
 
+<!-- sdd-allow-large: the 11-row Standard/Pro content matrix IS the
+     contract of this REQ. The matrix and the four numbered AC
+     bullets below are the minimum surface needed to specify what
+     Pro mode means. Splitting would fragment a single decision. -->
+
 **Intent:** Pro mode must provide a significantly enhanced agent experience with more rules, skills, agent definitions, commands, hooks, and memory persistence.
 
 **Acceptance Criteria:**
@@ -134,21 +139,21 @@ Multi-agent support, preseed system, and session modes.
 | Content Category | Standard (default) | Pro (advanced) |
 |-----------------|-------------------|----------------|
 | Memory plugin and rule | No | Yes |
-| Core environment rules (ci-monitoring, cloudflare-environment, no-local-builds, deploy-credentials) | Yes | Yes |
-| Cloudflare stack, ship, ship references skills | Yes | Yes |
+| Core environment rules | Yes | Yes |
+| Universal coding skills (Cloudflare stack, ship references) | Yes | Yes |
 | consult-llm skill (Claude Code only) | No | Yes |
-| block-attributed-commits hook (Claude Code only) | No | Yes |
-| git-push-review-reminder hook (Claude Code only) | No | Yes |
-| Language rules (23 files: common, TS, Python, Go, Swift) | No | Yes |
-| Agent definitions (8: architect, code-reviewer, spec-reviewer, etc.) | No | Yes |
-| Commands (5: /brainstorm, /debug, /deploy, /review, /sdd) | No | Yes |
-| Cherry-picked skills (14: api-design, backend-patterns, spec-driven-development, etc.) | No | Yes |
+| Pro-mode hooks (commit attribution + PR-boundary review pipeline) | No | Yes |
+| Language rules (TypeScript, Python, Go, Swift, common) | No | Yes |
+| Code-review and SDD agent definitions | No | Yes |
+| Slash commands (Claude Code only) | No | Yes |
+| Cherry-picked skills (API/backend/frontend patterns, SDD scaffolding) | No | Yes |
+| Discipline triad rules (spec, docs, tests) | No | Yes |
 | Known marketplaces plugin config | Yes | Yes |
 
-1. Default mode seeds 25 files to R2.
-2. Advanced mode seeds 180 files to R2.
+1. Standard mode seeds the rows above marked Yes in the Standard column to R2.
+2. Pro mode seeds the rows above marked Yes in the Pro column to R2 (a strict superset of Standard).
 3. Pro mode enables memory persistence (`.memory/` directory synced via rclone); Standard mode excludes the entire `.memory/**` directory from sync.
-4. Pro mode registers hooks in `settings.json` with command-pattern gates so they only fire on relevant Bash calls: two PreToolUse entries for commit attribution blocking (gated on `Bash(git *)` and `Bash(gh *)`, covering git commit/merge/tag/notes and gh pr/issue/release create/edit/comment/review/merge), one PostToolUse entry for the git-push review reminder (gated on `Bash(git push*)`) so the directive arrives in the same turn as the push result, and one UserPromptSubmit entry for memory capture; Standard mode merges only `skipDangerousModePermissionPrompt`.
+4. Pro mode registers hooks in `settings.json` with command-pattern gates so they only fire on relevant Bash calls: PreToolUse entries for commit attribution blocking (gated on git/gh commands), a PostToolUse entry for the PR-boundary trigger classifier (fires on `gh pr create` or push-to-PR-tracked-branch), a Stop entry for the PR HEAD SHA checkpoint (blocks turn-end until the review pipeline observes the new PR head), and a UserPromptSubmit entry for memory capture; Standard mode merges only `skipDangerousModePermissionPrompt`.
 
 **Constraints:**
 - Cleanup on mode switch is scoped strictly to preseed-managed keys; user-created files are never deleted.
@@ -172,7 +177,7 @@ Multi-agent support, preseed system, and session modes.
 3. `scripts/generate-agent-seed.mjs` reads the manifest and source files, generating `src/lib/agent-seed.generated.ts` with an `AGENTS_SEEDED_CONFIGS` array.
 4. The generator is manifest-driven; files not in the manifest are ignored.
 5. No duplicate preseed source files exist on disk.
-6. Total generated output is 184 documents across all 5 agents.
+6. The generator produces output for all supported agents (Claude Code as the source-of-truth lane plus adapted lanes for Codex, Gemini, Copilot, OpenCode).
 
 **Constraints:**
 - The generator must be re-run when preseed source files or the manifest change.
@@ -204,14 +209,7 @@ Multi-agent support, preseed system, and session modes.
 **Constraints:**
 - Hooks, commands, and plugins are excluded from non-CC agents (they are CC-specific features).
 - `rules/memory.md` and `consult-llm` skill are excluded from non-CC agents (they depend on CC-specific MCP).
-
-| Agent | Total Documents |
-|-------|-----------------|
-| Claude Code | 74 |
-| Codex | 28 |
-| Gemini | 36 |
-| Copilot | 10 |
-| OpenCode | 36 |
+- Each non-CC agent gets a strictly-smaller config than Claude Code, since CC is the source-of-truth lane and other agents drop CC-specific content (hooks, slash commands, plugins, MCP-dependent rules/skills).
 
 **Applies To:** User
 **Priority:** P1
@@ -393,7 +391,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 1. `preseed/agents/claude/manifest.json` is the single declaration of all preseed files and their mode assignments.
-2. The manifest contains 74 total entries across: rules (25, including spec-discipline), agents (8), commands (6), skills (27, including 13 SDD scaffolding templates), plugins (8).
+2. The manifest organizes entries by type: rules (including the discipline triad: spec-discipline, documentation-discipline, tdd-discipline), agents, commands, skills (including SDD scaffolding templates), and plugins (memory and hook plugins).
 3. Each entry specifies `"modes"` as an array of `"default"`, `"advanced"`, or both.
 4. The generator script (`scripts/generate-agent-seed.mjs`) is manifest-driven and ignores files not in the manifest.
 5. The generated output (`src/lib/agent-seed.generated.ts`) contains the `AGENTS_SEEDED_CONFIGS` array used at runtime.
@@ -553,7 +551,7 @@ Multi-agent support, preseed system, and session modes.
 1. Pro mode preseeds the `spec-driven-development` skill, the `/sdd` command, the `spec-discipline` rule (loaded into every agent's instructions), and the `spec-reviewer` + `doc-updater` agents.
 2. `/sdd init` scaffolds a new `sdd/` from templates for greenfield projects; in import mode it derives a spec from existing source code. When a package manifest is generated, top-level dependency versions are resolved at scaffold time via the ecosystem's registry (npm, Cargo, pip, Go) rather than emitted from memory; the Cloudflare Workers stack pins `wrangler`, `@cloudflare/workers-types`, `@cloudflare/vitest-pool-workers`, and `vitest` as a single co-resolved cohort. Lockfile generation during `/sdd init` is a scoped carveout to the no-local-builds rule (resolution only, with `--ignore-scripts` on npm; no installs, tests, or builds).
 3. Three autonomy modes (`interactive`, `auto`, `unleashed`) are selectable via `sdd/config.yml`. Interactive and auto modes apply fixes on the current branch (auto silently, interactive after confirmation). Unleashed mode is the walk-away autopilot: it applies SAFE + RISKY + JUDGMENT fixes on the current branch via per-category `[sdd-clean]` commits, forces `enforce_tdd: true`, and uses conservative JUDGMENT auto-resolution that never overwrites intent. Unleashed does not create a new branch and does not open a pull request; `git revert <sha>` on a per-category commit is the rollback surface, and `sdd/.last-clean-run.md` plus each commit message carry the audit log.
-4. After every push, `spec-reviewer` runs first then `doc-updater` runs second (sequential, never parallel) on any project containing `sdd/`; on non-SDD projects (no `sdd/` folder) no review agents run at all — the `git-push-review-reminder` hook exits silently and the push proceeds friction-free (vibe-coding mode).
+4. On PR-boundary events (a new pull request opens for the current branch via `gh pr create`, OR a new push lands on a branch that already has an open PR), `spec-reviewer` runs first then `doc-updater` runs second (sequential, never parallel) on any project containing `sdd/`. A plain push to a branch with no open PR does NOT trigger reviews — that case is deferred until the PR opens. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge), so the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks. On non-SDD projects (no `sdd/` folder) no review agents run at all — every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
 5. `/sdd clean` rescues rotted specs with conservative JUDGMENT auto-resolution that never overwrites spec intent (mark Partial + Notes, move to Out of Scope, shrink in place).
 6. The workflow is project-agnostic and self-limits to 2 fix rounds per commit cycle to prevent micro-fix spirals.
 7. In `auto` and `unleashed` modes, spec-reviewer and doc-updater refuse to run on `main`/`master` without an explicit `--branch-confirmed` flag.

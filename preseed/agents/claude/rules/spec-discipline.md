@@ -4,6 +4,12 @@ These rules apply to any project that has an `sdd/` folder. They are loaded into
 
 The full SDD workflow lives in the `spec-driven-development` skill. These rules are the non-negotiable enforcement layer that runs even when the skill is not explicitly invoked.
 
+**Sibling rule files**:
+- `documentation-discipline.md` — what may NOT appear in `documentation/`, per-file/per-cell budgets, lane separation. Enforced by doc-updater.
+- `tdd-discipline.md` — what counts as a real test (no text-matching theater, no tautology, no mock-only theater). Enforced by code-reviewer.
+
+Together the three files define the spec / docs / tests lane discipline. spec-reviewer enforces this file.
+
 ## What the spec is
 
 `sdd/` is the single source of truth for **what the product does and why**. It is not a record of what the code currently does. It is not a bug tracker. It is not a changelog of every commit. It is the target state the product is trying to reach.
@@ -110,6 +116,47 @@ A REQ may opt out of length warnings with an HTML comment: `<!-- sdd-allow-large
 - Avoid "should" — use "must" or describe the observable outcome
 - Avoid vague terms like "responsive", "fast", "user-friendly" — specify the criterion (e.g., "loads in under 2 seconds on 4G mobile")
 
+## Run-on AC bullets
+
+A single AC bullet that runs longer than ~150 words almost always conjoins multiple observable behaviors with semicolons or commas. Each observable behavior should be its own bullet so tests can target it individually.
+
+Detection: any AC bullet matching either of:
+- exceeding 150 words, OR
+- containing 3+ semicolons not inside a comma-separated enumeration
+
+Note: a bare "5+ ands" rule false-positives on enumeration patterns ("supports CSV, TSV, JSON, XML, YAML, and Parquet") which describe a single observable behavior across a list. Ignore the conjunction count when the conjunctions appear inside a comma-separated list — focus instead on semicolons (which usually mark separate behaviors) and total bullet length.
+
+Severity: MEDIUM. Auto-fix in `auto`/`unleashed`: split at conjunctions, preserving every clause as a separate bullet under the same AC heading. Never silently drop a clause.
+
+## Mechanism leakage in AC bullets
+
+An AC bullet describes WHAT the user observes, not HOW it's implemented. The following are mechanism tokens that leak into ACs and should move to `documentation/`:
+
+- Cookie attributes: `HttpOnly`, `SameSite=Lax`, `Secure`, `Path=/`, `Max-Age=…`
+- Header names with vendor prefix: `Cf-Access-Jwt-Assertion`, `X-Forwarded-For`, `X-Request-Id`
+- Internal middleware names: `csrfMiddleware`, `rateLimiter`, `requireAuth`
+- HTTP method + path enumerations inside non-API REQs (the path goes in the AC for an API REQ — but not in a UI REQ)
+- Query parameter internal names: `?_t=`, `?nonce=`
+- Cache directive strings: `s-maxage=60, stale-while-revalidate=300`
+- Crypto algorithm names: `RS256`, `HS512`, `AES-256-GCM` (the standard reference is fine; the algorithm choice is implementation)
+
+A user does not observe `HttpOnly`. They observe "JavaScript on the page cannot read the session token." The first goes in `documentation/security.md`, the second goes in the AC.
+
+Severity: MEDIUM. Auto-fix in `auto`/`unleashed`: rewrite the AC bullet to describe the user-observable consequence; move the mechanism description to `documentation/security.md` (or the relevant lane file) with a backlink to the REQ.
+
+## Changelog drift (no AC change → no changelog entry)
+
+`sdd/changes.md` is a product changelog. An entry is justified only when an AC changed in a user-observable way OR a REQ was added/deprecated/moved. The drift pattern: changelog entries appearing for spec format fixes, prose tightening, or implementation-leakage cleanup with no corresponding AC delta.
+
+Detection on every spec-reviewer run:
+
+1. For each new entry in `sdd/changes.md` (added in the diff): scan the same diff for any AC change in the REQ the entry references
+2. If the entry references no REQ, OR the diff shows no AC delta in the referenced REQ → the entry is drift
+
+Severity: LOW (cleanup). Auto-fix in `unleashed`: delete the drift entry. In `auto`: list under deferred LOW. In `interactive`: confirm before deletion.
+
+This pattern enforces the changelog-discipline rules already in this file ("When NOT to add a changelog entry") at the per-commit level instead of relying on humans to remember.
+
 ## Changelog discipline
 
 `sdd/changes.md` is a **product changelog**, not a verification log. Strict format:
@@ -157,6 +204,33 @@ The Stop hook (`enforce-review-spawn.sh`) supports three bypass methods so the *
 **Hard rule for all agents**: do NOT create `sdd/.skip-next-review`, do NOT write the bypass phrase in your own output, do NOT instruct the user to add it. The hook exists to enforce SDD discipline; routing around it from inside the agent is the failure mode the hook was built to prevent.
 
 If the review pipeline is genuinely blocking legitimate work (e.g., the hook is misfiring on a chained-pipeline detection bug), fix the hook in a separate commit rather than bypassing it.
+
+## Operational requirements for the Stop hook
+
+The v5 Stop hook (`enforce-review-spawn.sh`) uses `gh pr view` as its authoritative truth signal — it queries the current branch for an open PR and the PR HEAD SHA on every Stop event (with a cheap `@{u}`-based short-circuit when the local remote-tracking ref is fresh and matches the last ack). Reflog is no longer read at runtime in v5; the v4 reflog mention in the script header is preserved as a documentation reference only.
+
+This means the hook needs:
+- `gh` on PATH and authenticated for the project's GitHub remote.
+- `sdd/README.md` to exist (vibe-coding gate).
+- For the cheap-path optimization to fire (~200-500ms saved per Stop event in the post-review tail of a session): `git rev-parse @{u}` must resolve to a remote-tracking ref. A vanilla `git clone https://github.com/owner/repo.git` sets this up automatically.
+
+If you cloned with `-b <branch>` and later checked out a different branch, or used `git checkout -B <branch> origin/<branch>` without `--track`, the cheap path silently won't fire and every Stop event will pay the gh round-trip. Repair tracking once with:
+
+```bash
+git branch --set-upstream-to=origin/<branch> <branch>
+```
+
+The hook is fail-safe (any unexpected error → exit 0), so missing upstream or missing gh just means the optimization or enforcement is skipped — never a hard lock-out.
+
+### Known under-block conditions
+
+The Stop hook deliberately under-blocks (lets a push through unreviewed) rather than over-blocks (locks the user out) in three cases:
+
+1. **PR HEAD changed via the GitHub web UI** (amend from the UI, branch reset via API, force-push from another machine): the current Claude session has no `git push` line in its transcript, so PUSH_LINE detection exits 0 and no enforcement fires this turn. Review fires on the next local push to the branch — the new PR HEAD is still un-acked, so the next push correctly re-triggers the pipeline.
+2. **Spec-reviewer subagent errored** before writing `completed</status>` for its tool-use id: doc-updater is not required and the push is allowed to proceed. The user sees the spec-reviewer failure in the agent's own report; rerunning spec-reviewer manually then satisfies the gate on the next Stop.
+3. **Transcript file rotated or truncated mid-session**: PUSH_LINE detection silently exits 0. Review fires on the next push.
+
+DRAFT PRs (`gh pr view` reports `state: OPEN` for drafts) are treated as fully open. Drafts often want early feedback, and silently skipping review on them would surprise users whose draft is the de-facto review target. Users who want a review-free WIP should defer the PR open until ready, or use a per-push USER bypass.
 
 ## Severity classification on findings
 
