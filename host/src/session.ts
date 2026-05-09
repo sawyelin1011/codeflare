@@ -124,7 +124,7 @@ export class Session {
     this.manual = manual;
     this.ptyProcess = null;
     this.clients = new Set();
-    this.headlessTerminal = new HeadlessTerminal({ cols: 80, rows: 24, scrollback: 400, allowProposedApi: true });
+    this.headlessTerminal = new HeadlessTerminal({ cols: 80, rows: 24, scrollback: 1000, allowProposedApi: true });
     this.serializeAddon = new SerializeAddon();
     this.headlessTerminal.loadAddon(this.serializeAddon);
     this.createdAt = new Date().toISOString();
@@ -143,7 +143,7 @@ export class Session {
     this._log = options.log ?? (() => {});
     this._logWsEvent = options.logWsEvent ?? (() => {});
     this._activityTracker = options.activityTracker ?? null;
-    this._ptyKeepaliveMs = options.ptyKeepaliveMs ?? 2700000;
+    this._ptyKeepaliveMs = options.ptyKeepaliveMs ?? 7200000;
   }
 
   /**
