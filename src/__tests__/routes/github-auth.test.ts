@@ -16,6 +16,9 @@ vi.mock('../../lib/logger', () => ({
 // Import mocked functions after vi.mock so overrides work per-test
 import { signSessionJWT } from '../../lib/session-jwt';
 import githubAuthRoutes from '../../routes/github-auth';
+import { signOauthState } from '../../lib/oauth-state';
+
+const TEST_SECRET = 'test-jwt-secret';
 
 let mockKV: ReturnType<typeof createMockKV>;
 let originalFetch: typeof globalThis.fetch;
@@ -67,21 +70,30 @@ describe('GitHub OAuth Routes', () => {
       expect(location).toContain('redirect_uri=');
     });
 
-    it('sets oauth_state cookie', async () => {
+    it('does not set oauth_state cookie (stateless HMAC-signed state in URL)', async () => {
       const app = createApp();
       const res = await app.request('/login');
 
       const setCookie = res.headers.get('Set-Cookie') ?? '';
-      expect(setCookie).toContain('oauth_state=');
-      expect(setCookie).toContain('HttpOnly');
-      expect(setCookie).toContain('Secure');
-      expect(setCookie).toContain('SameSite=Lax');
+      expect(setCookie).not.toContain('oauth_state=');
     });
 
-    it('returns 500 when OAUTH_CLIENT_ID missing', async () => {
+    it('embeds an HMAC-signed state token (nonce.iat.sig) in the GitHub redirect URL', async () => {
+      const app = createApp();
+      const res = await app.request('/login');
+
+      const location = res.headers.get('Location') ?? '';
+      const stateMatch = location.match(/state=([^&]+)/);
+      expect(stateMatch).not.toBeNull();
+      const state = decodeURIComponent(stateMatch![1]);
+      // nonce.iat.sig — three dot-separated segments
+      expect(state.split('.')).toHaveLength(3);
+    });
+
+    it('returns 404 (looks unmounted) when OAUTH_CLIENT_ID missing', async () => {
       const app = createApp({ OAUTH_CLIENT_ID: undefined } as unknown as Partial<Env>);
       const res = await app.request('/login');
-      expect(res.status).toBe(500);
+      expect(res.status).toBe(404);
     });
   });
 
@@ -108,12 +120,11 @@ describe('GitHub OAuth Routes', () => {
       }) as typeof globalThis.fetch;
     }
 
-    it('returns 500 when OAUTH_JWT_SECRET missing', async () => {
+    it('returns 404 (looks unmounted) when OAUTH_JWT_SECRET missing', async () => {
       const app = createApp({ OAUTH_JWT_SECRET: undefined } as unknown as Partial<Env>);
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
-      expect(res.status).toBe(500);
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
+      expect(res.status).toBe(404);
     });
 
     it('redirects to /?error=access_denied when GitHub returns error', async () => {
@@ -124,28 +135,37 @@ describe('GitHub OAuth Routes', () => {
       expect(res.headers.get('Location')).toContain('error=access_denied');
     });
 
-    it('returns 403 when state cookie missing', async () => {
+    it('redirects to /?error=session-expired when state param missing', async () => {
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=abc');
+      const res = await app.request('/callback?code=test-code');
 
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toContain('error=session-expired');
     });
 
-    it('returns 403 when state mismatch', async () => {
+    it('redirects to /?error=session-expired when state signature is forged', async () => {
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=wrong', {
-        headers: { Cookie: 'oauth_state=correct' },
-      });
+      // Valid format, garbage signature — must fail HMAC verify
+      const res = await app.request('/callback?code=test-code&state=nonce.1700000000.invalidsig');
 
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toContain('error=session-expired');
+    });
+
+    it('redirects to /?error=session-expired when state was signed with a different secret', async () => {
+      const app = createApp();
+      const wrongSecretState = await signOauthState('different-secret');
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(wrongSecretState)}`);
+
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toContain('error=session-expired');
     });
 
     it('sets codeflare_session cookie on success', async () => {
       mockGitHubSuccess();
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       const setCookie = res.headers.get('Set-Cookie') ?? '';
@@ -155,11 +175,33 @@ describe('GitHub OAuth Routes', () => {
       expect(setCookie).toContain('SameSite=Lax');
     });
 
+    it('rejects replay of a previously-redeemed state token (single-use enforcement)', async () => {
+      mockGitHubSuccess();
+      const app = createApp();
+      const state = await signOauthState(TEST_SECRET);
+
+      // First redemption succeeds
+      const first = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
+      expect(first.status).toBe(302);
+      expect(first.headers.get('Location')).toContain('/app/');
+
+      // Second redemption with the SAME state must be rejected as a replay,
+      // even though the HMAC signature still verifies and the iat is fresh
+      const second = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
+      expect(second.status).toBe(302);
+      expect(second.headers.get('Location')).toContain('error=session-expired');
+    });
+
+    it('returns 404 (looks unmounted) when OAUTH_CLIENT_ID missing', async () => {
+      const app = createApp({ OAUTH_CLIENT_ID: undefined } as unknown as Partial<Env>);
+      const res = await app.request(`/callback?code=x&state=y`);
+      expect(res.status).toBe(404);
+    });
+
     it('returns 400 when code is missing but state is valid', async () => {
       const app = createApp();
-      const res = await app.request('/callback?state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(400);
     });
@@ -170,9 +212,8 @@ describe('GitHub OAuth Routes', () => {
       ) as typeof globalThis.fetch;
 
       const app = createApp();
-      const res = await app.request('/callback?code=bad-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=bad-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(502);
     });
@@ -180,9 +221,8 @@ describe('GitHub OAuth Routes', () => {
     it('redirects to /app/subscribe for new user', async () => {
       mockGitHubSuccess();
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       expect(res.headers.get('Location')).toContain('/app/subscribe');
@@ -195,9 +235,8 @@ describe('GitHub OAuth Routes', () => {
       });
 
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       expect(res.headers.get('Location')).toContain('/app/');
@@ -211,9 +250,8 @@ describe('GitHub OAuth Routes', () => {
       });
 
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       expect(res.headers.get('Location')).toContain('/app/');
@@ -227,9 +265,8 @@ describe('GitHub OAuth Routes', () => {
       });
 
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       expect(res.headers.get('Location')).toContain('/app/subscribe');
@@ -241,9 +278,8 @@ describe('GitHub OAuth Routes', () => {
       ) as typeof globalThis.fetch;
 
       const app = createApp();
-      const res = await app.request('/callback?code=bad-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=bad-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(502);
     });
@@ -259,9 +295,8 @@ describe('GitHub OAuth Routes', () => {
       }) as typeof globalThis.fetch;
 
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(502);
     });
@@ -284,9 +319,8 @@ describe('GitHub OAuth Routes', () => {
       }) as typeof globalThis.fetch;
 
       const app = createApp();
-      const res = await app.request('/callback?code=test-code&state=test-state', {
-        headers: { Cookie: 'oauth_state=test-state' },
-      });
+      const state = await signOauthState(TEST_SECRET);
+      const res = await app.request(`/callback?code=test-code&state=${encodeURIComponent(state)}`);
 
       expect(res.status).toBe(302);
       expect(res.headers.get('Location')).toContain('error=no-verified-email');

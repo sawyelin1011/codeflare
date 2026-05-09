@@ -1,6 +1,8 @@
 /**
  * GitHub OAuth routes for SaaS mode authentication.
  *
+ * Implements REQ-AUTH-002.
+ *
  * Replaces Cloudflare Access when SAAS_MODE=active and OAUTH_CLIENT_ID is set.
  * Mounts at /auth/github — login, callback, and logout.
  */
@@ -10,9 +12,9 @@ import { signSessionJWT } from '../lib/session-jwt';
 import { createLogger } from '../lib/logger';
 import { toError } from '../lib/error-types';
 import { parseUserRecord } from '../lib/user-record';
-import { getCookieValue } from '../lib/access';
 import { getBaseUrl } from '../lib/kv-keys';
 import { isActiveTier } from '../lib/subscription';
+import { signOauthState, verifyOauthState, parseOauthState, claimOauthNonce } from '../lib/oauth-state';
 import { createRateLimiter } from '../middleware/rate-limit';
 
 const logger = createLogger('github-auth');
@@ -26,17 +28,34 @@ const callbackRateLimiter = createRateLimiter({
   keyPrefix: 'github-auth',
 });
 
+/**
+ * Rate limit /login. Each call now performs an HMAC sign + redirect
+ * response, so an unauthenticated attacker could otherwise drive
+ * arbitrary HMAC ops. 30/min/IP is generous for legitimate retries
+ * during 2FA setup or first-time GitHub registration.
+ */
+const loginRateLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 30,
+  keyPrefix: 'github-login',
+});
+
 // ---------------------------------------------------------------------------
 // GET /login — Redirect to GitHub OAuth authorize
 // ---------------------------------------------------------------------------
-app.get('/login', async (c) => {
+app.get('/login', loginRateLimiter, async (c) => {
   const clientId = c.env.OAUTH_CLIENT_ID;
   if (!clientId || !c.env.OAUTH_CLIENT_SECRET || !c.env.OAUTH_JWT_SECRET) {
-    logger.error('GitHub OAuth not configured — missing secrets');
-    return c.json({ error: 'OAuth not configured' }, 500);
+    // Return 404 instead of 500 on non-SaaS deployments so the route
+    // looks unmounted to outside callers (no information disclosure
+    // about misconfiguration).
+    return c.notFound();
   }
 
-  const state = crypto.randomUUID();
+  // Stateless HMAC-signed state. No cookie -> works on iOS WebKit
+  // (Safari + Brave) where ITP suppressed the SameSite=Lax oauth_state
+  // cookie on the github.com -> codeflare.ch redirect bounce-back.
+  const state = await signOauthState(c.env.OAUTH_JWT_SECRET);
   const origin = await getBaseUrl(c.env.KV, c.req.url);
   const redirectUri = `${origin}/auth/github/callback`;
 
@@ -47,7 +66,6 @@ app.get('/login', async (c) => {
     state,
   });
 
-  c.header('Set-Cookie', `oauth_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=300`);
   return c.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
 });
 
@@ -56,8 +74,8 @@ app.get('/login', async (c) => {
 // ---------------------------------------------------------------------------
 app.get('/callback', callbackRateLimiter, async (c) => {
   if (!c.env.OAUTH_CLIENT_ID || !c.env.OAUTH_CLIENT_SECRET || !c.env.OAUTH_JWT_SECRET) {
-    logger.error('GitHub OAuth not configured — missing secrets');
-    return c.json({ error: 'OAuth not configured' }, 500);
+    // See /login: 404 instead of 500 on non-SaaS deployments.
+    return c.notFound();
   }
 
   const url = new URL(c.req.url);
@@ -74,15 +92,25 @@ app.get('/callback', callbackRateLimiter, async (c) => {
     return c.redirect(`${base}/?error=${encodeURIComponent(safeError)}`);
   }
 
-  // Validate state — cookie vs query param (CSRF protection)
+  // Validate state — HMAC signature + 30-minute iat window (CSRF protection).
+  // On failure, redirect to the login page with an error param so the user
+  // gets a clean retry path instead of a raw JSON 403.
   const queryState = url.searchParams.get('state');
-  const cookieState = getCookieValue(c.req.header('Cookie') ?? null, 'oauth_state');
-  if (!cookieState || !queryState || cookieState !== queryState) {
-    return c.json({ error: 'Invalid OAuth state' }, 403);
+  if (!queryState || !(await verifyOauthState(queryState, c.env.OAUTH_JWT_SECRET))) {
+    return c.redirect(`${base}/?error=session-expired`);
   }
 
-  // Clear state cookie
-  c.header('Set-Cookie', `oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`);
+  // Single-use enforcement: the nonce inside the verified state must not
+  // have been redeemed before. Closes the OAuth-CSRF replay window where
+  // an attacker who captures a state token (browser history, referrer
+  // leak, server log) could otherwise race the legitimate user to
+  // /callback within the 30-minute window using the attacker's own
+  // GitHub authorization code. parseOauthState returns the nonce only
+  // after verifyOauthState has already succeeded above, so we trust it.
+  const parsed = parseOauthState(queryState);
+  if (!parsed || !(await claimOauthNonce(c.env.KV, parsed.nonce, 1800))) {
+    return c.redirect(`${base}/?error=session-expired`);
+  }
 
   const code = url.searchParams.get('code');
   if (!code) {
