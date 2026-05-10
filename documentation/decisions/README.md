@@ -716,11 +716,11 @@ The original justification considered was per-PTY RAM cleanup when one tab in a 
 
 **Decision:** Ship context-mode in two layers with separate gating.
 
-The **MCP server layer** registers `mcpServers["context-mode"]` in `~/.claude.json` for every user on every session at a hardcoded version pin in `entrypoint.sh`. This exposes the `ctx_*` helper tools to the agent universally so they can be called manually regardless of tier or session mode.
+The **MCP server layer** exposes `ctx_*` helper tools to the agent so they can be called manually regardless of session mode. How the MCP server is registered depends on tier: Custom + Pro users receive it via the `mcpServers` block declared in the preseed `plugin.json`, which Claude Code's plugin loader reads automatically when the plugin folder is present. Non-Custom users have no plugin folder on disk, so `entrypoint.sh` injects the `mcpServers["context-mode"]` entry directly into `~/.claude.json` at session start. Both paths invoke the bare `context-mode` binary installed globally in the Docker image at build time (`npm install -g context-mode@<ver>` reading the version from `preseed/agents/claude/plugins/context-mode/.claude-plugin/plugin.json`); no source is redistributed since the npm package is fetched from the public registry during image build.
 
 The **plugin folder layer** delivers `~/.claude/plugins/context-mode/` (containing the plugin manifest and `hooks/hooks.json`) as a preseed asset, R2-bisync'd into the user's bucket only when the user's effective tier is `unlimited` (Custom) AND session mode is `advanced` (Pro). The R2 seed filter in `src/lib/r2-seed.ts:getConfigsForMode` strips the entire `.claude/plugins/context-mode/` subtree from the deploy set when the user's tier or mode does not qualify.
 
-The container's `entrypoint.sh` detects the preseeded plugin manifest and, when present, adds `context-mode: true` to `enabledPlugins` so the four hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) auto-route tool calls. When the manifest is absent, the entrypoint falls back to the hardcoded version pin for the MCP registration only and skips the `enabledPlugins` entry.
+The container's `entrypoint.sh` detects the preseeded plugin manifest. When the manifest is present (Custom + Pro), the plugin loader has already registered the MCP server via `plugin.json`; `entrypoint.sh` skips the `~/.claude.json` injection entirely to avoid duplicate registration and instead adds `context-mode: true` to `enabledPlugins` so the four hooks (PreToolUse, PostToolUse, PreCompact, SessionStart) auto-route tool calls. When the manifest is absent (non-Custom tier), the entrypoint injects `mcpServers["context-mode"]` into `~/.claude.json` using the version pin and skips `enabledPlugins` (no auto-routing for non-Custom users).
 
 The MCP layer is what users observe as "context-mode is always available"; the plugin layer is the premium behavior change reserved for Custom-tier Pro users.
 
@@ -741,12 +741,12 @@ The MCP layer is what users observe as "context-mode is always available"; the p
 **Trade-offs accepted:**
 
 - The preseed plugin's `hooks/hooks.json` carries the pinned version four times (one per event command string). A future generator could fan this out from a single pin.
-- First-call latency: `npx -y context-mode@<pinned>` downloads the package from npm on first invocation per session. Subsequent invocations are cache-served. Baking `npm install -g context-mode@<pinned>` into the Dockerfile would eliminate this; deferred until measured cost justifies it.
+- First-call latency: resolved by codeflare#309. The Dockerfile bakes `npm install -g context-mode@<pinned>` into the image and patches the bundles, so the binary is on PATH from session start with no first-call download delay.
 - A tier downgrade requires a reconcile pass (already triggered by `/api/preferences` PATCH and Stripe webhook handlers) to remove the plugin folder from R2. Until reconcile fires, a freshly-downgraded user could still load context-mode on next session, bounded to the next PATCH or webhook event.
 
 **License posture (ELv2):** context-mode is licensed under Elastic License 2.0, which is source-available but explicitly prohibits providing the software as a hosted or managed service that gives third parties access to substantial features of the software. Codeflare's integration is sized to stay within ELv2's permitted-use envelope on three axes.
 
-*No redistribution.* Codeflare does not redistribute context-mode source. The npm package is fetched by the user's own container from the npm registry at `npx -y context-mode@<pinned>` invocation time. Our preseed contains only plugin metadata (`plugin.json`, `hooks/hooks.json`, `README.md`) which is our own configuration code, not context-mode's source.
+*No redistribution.* Codeflare does not redistribute context-mode source. The npm package is fetched from the npm registry at Docker image build time and installed globally; users receive a pre-built image, not the source. Our preseed contains only plugin metadata (`plugin.json`, `README.md`) which is our own configuration code, not context-mode's source.
 
 *No commercial automation.* Commercial (non-Custom) users receive `mcpServers["context-mode"]` registration so `ctx_*` tools appear in the agent's tool list, but our preseed contains no skill, rule, agent definition, command, or hook that instructs Claude to invoke those tools. The agent's tool-selection is its own, exactly as it is for any other listed MCP tool. Codeflare provides no automation or routing layer for commercial users.
 
@@ -758,8 +758,11 @@ A future contributor who adds a SessionStart-style ctx_* nudge, a context-mode s
 
 **Implementation references:**
 
-- Preseed assets: `preseed/agents/claude/plugins/context-mode/.claude-plugin/plugin.json`, `preseed/agents/claude/plugins/context-mode/hooks/hooks.json`, `preseed/agents/claude/plugins/context-mode/README.md`
-- Manifest: `preseed/agents/claude/manifest.json` (three new entries with `modes: ["advanced"]`)
+- Preseed assets: `preseed/agents/claude/plugins/context-mode/.claude-plugin/plugin.json` (bare manifest; matches `codeflare-memory`/`codeflare-hooks` shape), `preseed/agents/claude/plugins/context-mode/README.md`
+- Manifest: `preseed/agents/claude/manifest.json` (two entries with `modes: ["advanced"]`)
+- Runtime wiring: `entrypoint.sh` registers the `context-mode` MCP server in `~/.claude.json` (`command: "context-mode"`, no args) and appends four `context-mode hook claude-code <event>` commands to `~/.claude/settings.json` when the plugin manifest is present and `SESSION_MODE=advanced`. Mirrors the wiring path used by `codeflare-memory` and `codeflare-hooks`.
+- Build-time install: the Dockerfile runs `npm install -g context-mode@<ver>` reading the version from `preseed/agents/claude/plugins/context-mode/.claude-plugin/plugin.json`, then prepends a 2-line `createRequire` shim to both `cli.bundle.mjs` and `server.bundle.mjs` in the global install.
+- esbuild ESM-bundle bug (codeflare#309): without the shim, `ctx_execute` and `ctx_batch_execute` fail on every dynamic `require('node:*')` with `Dynamic require of "node:fs" is not supported` because esbuild does not inject a CommonJS-require polyfill in `--format=esm` output. The bug reproduces under both Node and Bun ESM loaders, so a runtime swap from `npx` to `bunx` does not fix it. The build-time patch is the durable fix until upstream `mksglu/context-mode` ships a release with the esbuild banner.
 - R2 seed tier filter: `src/lib/r2-seed.ts` (`getConfigsForMode(mode, contextModeEnabled)`, `getPreseedKeysNotInMode`, `reconcileAgentConfigs`)
 - Worker-side tier gate: `src/routes/container/lifecycle.ts` (`contextModeEnabled = effectiveTier === 'unlimited' && sessionMode === 'advanced'`)
 - Worker-side reconcile call sites: `src/routes/preferences.ts`, `src/routes/storage/seed.ts`, `src/routes/stripe-webhook.ts`

@@ -10,11 +10,10 @@ const { mockFetch, mockCreateR2Client, mockGetR2Url, testState } = vi.hoisted(()
       key ? `${endpoint}/${bucket}/${key}` : `${endpoint}/${bucket}`
     ),
     testState: {
-      // Five-doc fixture isolating the tier-gating dimension:
+      // Four-doc fixture isolating the tier-gating dimension:
       //   - common rule (default + advanced, NOT context-mode) - never gated
       //   - codeflare-hooks plugin (advanced, NOT context-mode)  - mode-only gate
       //   - context-mode plugin manifest (advanced, IS context-mode)
-      //   - context-mode hooks.json (advanced, IS context-mode)
       //   - context-mode README (advanced, IS context-mode)
       agentDocs: [
         {
@@ -32,13 +31,7 @@ const { mockFetch, mockCreateR2Client, mockGetR2Url, testState } = vi.hoisted(()
         {
           key: '.claude/plugins/context-mode/.claude-plugin/plugin.json',
           contentType: 'application/json; charset=utf-8',
-          content: '{"name":"context-mode","version":"1.0.111"}',
-          modes: ['advanced'] as ('default' | 'advanced')[],
-        },
-        {
-          key: '.claude/plugins/context-mode/hooks/hooks.json',
-          contentType: 'application/json; charset=utf-8',
-          content: '{"hooks":{}}',
+          content: '{"name":"context-mode","version":"1.0.118"}',
           modes: ['advanced'] as ('default' | 'advanced')[],
         },
         {
@@ -71,6 +64,7 @@ import {
   getConfigsForMode,
   getPreseedKeysNotInMode,
   reconcileAgentConfigs,
+  reseedContextModePlugin,
 } from '../../lib/r2-seed';
 
 const env = {
@@ -85,18 +79,16 @@ describe('getConfigsForMode tier gating', () => {
     const docs = getConfigsForMode('advanced', true);
     const keys = docs.map((d) => d.key);
     expect(keys).toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
-    expect(keys).toContain('.claude/plugins/context-mode/hooks/hooks.json');
     expect(keys).toContain('.claude/plugins/context-mode/README.md');
     expect(keys).toContain('.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json');
     expect(keys).toContain('.claude/rules/common.md');
-    expect(docs).toHaveLength(5);
+    expect(docs).toHaveLength(4);
   });
 
   it('contextModeEnabled=false strips ALL context-mode keys but keeps other advanced files', () => {
     const docs = getConfigsForMode('advanced', false);
     const keys = docs.map((d) => d.key);
     expect(keys).not.toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
-    expect(keys).not.toContain('.claude/plugins/context-mode/hooks/hooks.json');
     expect(keys).not.toContain('.claude/plugins/context-mode/README.md');
     // Non-context-mode advanced files still present:
     expect(keys).toContain('.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json');
@@ -129,7 +121,6 @@ describe('getPreseedKeysNotInMode tier gating', () => {
   it('contextModeEnabled=false in advanced mode flags context-mode keys for cleanup', () => {
     const keys = getPreseedKeysNotInMode('advanced', false);
     expect(keys).toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
-    expect(keys).toContain('.claude/plugins/context-mode/hooks/hooks.json');
     expect(keys).toContain('.claude/plugins/context-mode/README.md');
     // Non-context-mode advanced files NOT flagged for cleanup:
     expect(keys).not.toContain('.claude/plugins/codeflare-hooks/.claude-plugin/plugin.json');
@@ -170,9 +161,8 @@ describe('reconcileAgentConfigs tier gating', () => {
       contextModeEnabled: true,
     });
 
-    expect(result.written).toHaveLength(5);
+    expect(result.written).toHaveLength(4);
     expect(result.written).toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
-    expect(result.written).toContain('.claude/plugins/context-mode/hooks/hooks.json');
     expect(result.written).toContain('.claude/plugins/context-mode/README.md');
   });
 
@@ -185,12 +175,11 @@ describe('reconcileAgentConfigs tier gating', () => {
       contextModeEnabled: false,
     });
 
-    // 2 advanced non-context-mode files written, 3 context-mode files deleted
+    // 2 advanced non-context-mode files written, 2 context-mode files deleted
     expect(result.written).toHaveLength(2);
     expect(result.deleted).toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
-    expect(result.deleted).toContain('.claude/plugins/context-mode/hooks/hooks.json');
     expect(result.deleted).toContain('.claude/plugins/context-mode/README.md');
-    expect(result.deleted).toHaveLength(3);
+    expect(result.deleted).toHaveLength(2);
   });
 
   it('Standard mode never deploys context-mode regardless of contextModeEnabled', async () => {
@@ -212,5 +201,44 @@ describe('reconcileAgentConfigs tier gating', () => {
       contextModeEnabled: false,
     });
     expect(disabled.written).toEqual(['.claude/rules/common.md']);
+  });
+});
+
+describe('reseedContextModePlugin', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('contextModeEnabled=false short-circuits with no R2 calls', async () => {
+    const result = await reseedContextModePlugin(env, bucket, endpoint, false);
+    expect(result.written).toEqual([]);
+    expect(result.skipped).toEqual([]);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('contextModeEnabled=true overwrites both context-mode files unconditionally', async () => {
+    mockFetch.mockResolvedValue(new Response('', { status: 200 }));
+
+    const result = await reseedContextModePlugin(env, bucket, endpoint, true);
+
+    expect(result.written).toHaveLength(2);
+    expect(result.written).toContain('.claude/plugins/context-mode/.claude-plugin/plugin.json');
+    expect(result.written).toContain('.claude/plugins/context-mode/README.md');
+
+    // All calls must be PUTs (overwrite=true skips the HEAD-existence phase)
+    const putCalls = mockFetch.mock.calls.filter((c) => c[1]?.method === 'PUT');
+    const headCalls = mockFetch.mock.calls.filter((c) => c[1]?.method === 'HEAD');
+    expect(putCalls).toHaveLength(2);
+    expect(headCalls).toHaveLength(0);
+  });
+
+  it('does NOT touch non-context-mode files (codeflare-hooks plugin, common rule)', async () => {
+    mockFetch.mockResolvedValue(new Response('', { status: 200 }));
+
+    await reseedContextModePlugin(env, bucket, endpoint, true);
+
+    const writtenUrls = mockFetch.mock.calls.map((c) => String(c[0]));
+    expect(writtenUrls.some((u) => u.includes('codeflare-hooks'))).toBe(false);
+    expect(writtenUrls.some((u) => u.includes('rules/common.md'))).toBe(false);
   });
 });
