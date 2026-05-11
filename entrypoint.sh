@@ -1142,9 +1142,10 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     #   protection to require PRs into main; see common/git-workflow.md.
     # Base advanced-mode hooks (codeflare-memory + codeflare-hooks).
     #
-    # Issue #317: git-push-review-reminder.sh is registered on BOTH the Bash
+    # Issue #317 / #319: both review-reminder (PostToolUse) AND
+    # block-attributed-commits (PreToolUse) are registered on BOTH the Bash
     # matcher AND the MCP shell-tool matcher (mcp__context-mode__ctx_execute,
-    # mcp__context-mode__ctx_batch_execute). The MCP entry is added
+    # mcp__context-mode__ctx_batch_execute). The MCP entries are added
     # unconditionally — not gated on context-mode plugin presence — so the
     # configuration is uniform across users with and without context-mode:
     #
@@ -1153,9 +1154,13 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     #     inert. Adds zero overhead and zero behavior change.
     #   - Users WITH context-mode: when enforce-ctx-mode.sh denies `gh pr
     #     create` / `gh pr merge` in Bash and forces them through
-    #     ctx_execute, the review-reminder still fires from the MCP matcher.
-    #     Closes the silent-bypass discovered in ai-news-digest PR #247.
-    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
+    #     ctx_execute, the review-reminder still fires from the MCP matcher
+    #     AND block-attributed-commits still catches attribution lines in
+    #     `gh pr create --body "...Co-Authored-By..."` redirected through
+    #     ctx_execute. Closes the silent-bypass discovered in ai-news-digest
+    #     PR #247 and the matching bug-class flagged by issue #319 in the
+    #     enforce-review-spawn Stop hook.
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
     # context-mode hooks (Custom tier only, gated on plugin manifest presence).
     # Implements REQ-AGENT-005. Same four hooks the upstream context-mode
     # plugin would self-register via hooks.json — we wire them through
@@ -1180,6 +1185,17 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
           )
         ')
         echo "[entrypoint] Advanced mode: context-mode hooks added to settings.json (version $CONTEXT_MODE_VERSION)"
+    fi
+    # Hardening: validate SETTINGS_CONFIG is well-formed JSON before it
+    # reaches the settings.json merge below. The literal heredoc-style
+    # quoting on line ~1163 uses interleaved `'"$PLUGIN_DIR"'` insertions —
+    # a single typo (missing close-quote, stray comma) produces a string
+    # bash accepts but Claude Code silently rejects at runtime, hooks just
+    # never fire. Fail loudly here instead.
+    if ! printf '%s' "$SETTINGS_CONFIG" | jq empty 2>/dev/null; then
+        echo "[entrypoint] FATAL: SETTINGS_CONFIG is not valid JSON after assembly" >&2
+        echo "[entrypoint] First 200 chars: $(printf '%s' "$SETTINGS_CONFIG" | cut -c1-200)" >&2
+        exit 1
     fi
     echo "[entrypoint] Advanced mode: configuring settings.json with hooks"
 else

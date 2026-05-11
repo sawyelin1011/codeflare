@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 # PreToolUse hook - blocks git commits / GitHub surfaces with Claude attribution.
 #
-# Gated in settings.json by `"if": "Bash(git *)"` + `"if": "Bash(gh *)"` so this
-# script only runs for git and gh commands, never for unrelated Bash calls.
+# Registered in settings.json on two matcher entries covering three tool names:
+#   1. matcher "Bash"                          (with `"if": "Bash(git *)"` /
+#                                               `"if": "Bash(gh *)"` predicates)
+#   2. matcher "mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute"
+#      (pipe-alternated regex covering both ctx-mode shell and batch tools)
+#
 # Within those, it further narrows to commands that can introduce attribution
 # into a git object or a GitHub surface (commit messages, merge messages, tag
 # annotations, notes, PR titles/bodies/comments/reviews, issue titles/bodies/
 # comments, release titles/notes). Read-only commands (git status, git log,
 # gh run view, gh auth status, etc.) early-exit for free.
+#
+# Companion to issue #317 (git-push-review-reminder.sh) and issue #319
+# (enforce-review-spawn.sh): when context-mode's enforce-ctx-mode.sh denies
+# `gh pr create` / `gh pr edit` in Bash, agents retry through MCP shell tools.
+# Without the multi-shape parsing below, COMMAND was empty for those calls
+# and attribution lines could land via ctx_execute / ctx_batch_execute.
 #
 # Commands NOT covered (by design):
 #   - git push            -- pushes existing commits; attribution was caught at
@@ -22,11 +32,46 @@ set -e
 INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty' 2>/dev/null) || true
 
-# Only check Bash tool
-[[ "$TOOL_NAME" != "Bash" ]] && exit 0
+# Accept Bash and the MCP shell tools. Anything else exits silently.
+case "$TOOL_NAME" in
+  Bash) ;;
+  mcp__*ctx_execute) ;;
+  mcp__*ctx_batch_execute) ;;
+  *) exit 0 ;;
+esac
 
-# Extract command
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null) || true
+# Extract the command(s) from any of three supported tool-input shapes:
+#
+#   1. Bash tool                  -> .tool_input.command          (string)
+#   2. mcp__*__ctx_execute        -> .tool_input.code             (string, only
+#                                   when .tool_input.language == "shell";
+#                                   defense in depth - the MCP server enforces
+#                                   language as a required schema field, so a
+#                                   missing language field silently exits this
+#                                   branch and the hook allows the call. If
+#                                   the upstream schema ever stops requiring
+#                                   language, this gate falls open and so does
+#                                   the matching gate in enforce-review-spawn.sh.)
+#   3. mcp__*__ctx_batch_execute  -> .tool_input.commands[].command (array of
+#                                   objects; concatenated with `"; "` so the
+#                                   existing per-command regex matches each.
+#                                   The separator is load-bearing: changing it
+#                                   could let a single regex span two entries
+#                                   and produce a false-positive across an
+#                                   entry boundary - test fixtures in
+#                                   host/__tests__/block-attributed-commits.test.js
+#                                   pin the current join semantics.)
+COMMAND=$(echo "$INPUT" | jq -r '
+  if (.tool_input.command // "") != "" then
+    .tool_input.command
+  elif (.tool_input.language // "") == "shell" and (.tool_input.code // "") != "" then
+    .tool_input.code
+  elif (.tool_input.commands | type? == "array") then
+    [.tool_input.commands[]?.command // empty] | join("; ")
+  else
+    empty
+  end
+' 2>/dev/null) || true
 
 # Narrow to commands that can introduce attribution into git or GitHub.
 # Anything not in this set is read-only or harmless — exit immediately.
