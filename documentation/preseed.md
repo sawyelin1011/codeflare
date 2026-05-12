@@ -1,11 +1,5 @@
 # Agent Preseed System
 
-<!-- doc-allow-large: dense reference document — manifest structure,
-     per-agent document counts, hook script roles, deployment paths
-     and troubleshooting recipes are all load-bearing reference
-     material that needs to live in one navigable file. Splitting
-     would force readers between sibling pages mid-lookup. -->
-
 **Audience:** Developers
 
 How AI agent rules, agents, commands, skills, and plugins are deployed
@@ -20,22 +14,26 @@ Users choose between **Default** and **Advanced** session modes via
 Settings > Session Defaults. The mode controls which preseed files are
 deployed on Recreate or new bucket creation.
 
-| Content | Default | Advanced |
-|---------|---------|----------|
-| Memory plugin & rule | No | Yes |
-| CI monitoring, environment, no-local-builds, deploy-credentials rules | Yes | Yes |
-| Cloudflare stack, ship, ship references skills | Yes | Yes |
-| `consult-llm` skill (CC only) | No | Yes |
-| CC hooks: `block-attributed-commits`, `git-push-review-reminder`, `enforce-review-spawn` | No | Yes |
-| Language rules (23 files: common, TS, Python, Go, Swift) | No | Yes |
-| Agent definitions (8: architect, code-reviewer, spec-reviewer, etc.) | No | Yes |
-| Commands (5: /brainstorm, /debug, /deploy, /review, /sdd) | No | Yes |
-| Cherry-picked skills (8: api-design, backend-patterns, etc.) | No | Yes |
-| `spec-discipline` rule (universal SDD enforcement, all 5 agents) | No | Yes |
-| `documentation-discipline` rule (per-file/per-cell budgets, lane separation) | No | Yes |
-| `tdd-discipline` rule (test-quality patterns, third sibling of the discipline triad) | No | Yes |
-| SDD template scaffolding (13 files for `/sdd init`) | No | Yes |
-| Known marketplaces plugin config | Yes | Yes |
+| Content | Default | Advanced | Advanced on Custom tier |
+|---------|---------|----------|-------------------------|
+| Memory plugin & rule | No | Yes | Yes |
+| CI monitoring, environment, no-local-builds, deploy-credentials rules | Yes | Yes | Yes |
+| Cloudflare stack, ship, ship references skills | Yes | Yes | Yes |
+| `consult-llm` skill (CC only) | No | Yes | Yes |
+| CC hooks: `block-attributed-commits`, `git-push-review-reminder`, `enforce-review-spawn` | No | Yes | Yes |
+| Language rules (23 files: common, TS, Python, Go, Swift) | No | Yes | Yes |
+| Agent definitions (8: architect, code-reviewer, spec-reviewer, etc.) | No | Yes | Yes |
+| Commands (5: /brainstorm, /debug, /deploy, /review, /sdd) | No | Yes | Yes |
+| Cherry-picked skills (8: api-design, backend-patterns, etc.) | No | Yes | Yes |
+| `spec-discipline` rule (universal SDD enforcement, all 5 agents) | No | Yes | Yes |
+| `documentation-discipline` rule (per-file/per-cell budgets, lane separation) | No | Yes | Yes |
+| `tdd-discipline` rule (test-quality patterns, third sibling of the discipline triad) | No | Yes | Yes |
+| SDD template scaffolding (13 files for `/sdd init`) | No | Yes | Yes |
+| Known marketplaces plugin config | Yes | Yes | Yes |
+| context-mode MCP server (`ctx_*` helper tools, always-on) | Yes | Yes | Yes |
+| context-mode plugin folder (auto-routing hooks for context-window reduction) | No | No | Yes |
+
+The Custom-tier column reflects the extra delivery surface for users on the `unlimited` subscription tier in Advanced mode. The context-mode helper tools (`ctx_*`) are universally available so the agent can always invoke them on demand; the plugin folder that adds automatic context-window-reduction routing is delivered only to Advanced + Custom users.
 
 **Storage**: `sessionMode?: 'default' | 'advanced'` in
 `UserPreferences` (KV). Undefined = `'default'`.
@@ -310,68 +308,13 @@ See [AD49](decisions/README.md#ad49-context-mode-delivered-as-preseed-plugin-not
 
 ## Troubleshooting
 
-- **Attribution blocking not working**: Check
-  `~/.claude/settings.json` has `PreToolUse` hook entries pointing
-  to `block-attributed-commits.sh` on two matcher entries covering
-  three tool names: a `Bash` matcher (with `"if": "Bash(git *)"`
-  and `"if": "Bash(gh *)"` predicates) AND a pipe-alternated MCP
-  matcher `"matcher": "mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute"`.
-  Verify the script exists at
-  `~/.claude/plugins/codeflare-hooks/scripts/block-attributed-commits.sh`.
-  If attribution appears via `gh pr create` in a context-mode session,
-  the MCP matcher entry is missing — re-run the entrypoint or check
-  the `SETTINGS_CONFIG` merge in `entrypoint.sh`.
-- **Review-spawn enforcement not firing on push**: see
-  [Resetting the review-spawn checkpoint](#resetting-the-review-spawn-checkpoint)
-  below.
-- **Default mode has hooks**: If `settings.json` has hook entries in
-  default mode, the entrypoint SESSION_MODE gating may have failed.
-  Remove them:
-  `jq 'del(.hooks)' ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json`.
-
-### Resetting the review-spawn checkpoint
-
-The `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode
-when `sdd/` and `sdd/README.md` are present. It triggers at PR-boundary
-events: `gh pr create` runs in the session, OR a push lands on a
-branch that already has an open PR (the hook calls `gh pr view` to
-check). Enforcement only fires when the open PR targets `main` or
-`master`. PRs into intermediate branches (`develop`, `staging`) are
-silently deferred until that branch's own PR-to-`main` opens. If `gh`
-returns an open PR but `baseRefName` is unexpectedly empty (a
-transient `gh` quirk), the hook fails open and enforcement fires
-rather than silently skipping. A plain push to a branch with no open
-PR intentionally does NOT trigger enforcement: reviews are deferred
-until the PR opens. Direct pushes to `main` are expected to be blocked
-by GitHub branch protection; if branch protection is off and a direct
-push lands, spawn the review agents manually after the push.
-
-The hook tracks the most recently acknowledged PR HEAD SHA in
-`.git/sdd-last-ack-pr-head`. Acknowledgment advances only when the
-full pipeline (code-reviewer + spec-reviewer + doc-updater) is
-observed for the current PR HEAD.
-
-Three USER-ONLY bypass methods exist (the agent must never invoke
-these autonomously): the user deletes `sdd/.skip-next-review`
-(sentinel was consumed), the user says "skip review" in a message,
-or the user waits for the 3-strike circuit breaker to clear after
-3 blocks on the same un-acknowledged PR HEAD.
-
-If enforcement fires spuriously after a legitimate pipeline
-completed, reset both checkpoints:
-
-```bash
-rm .git/sdd-last-ack-pr-head .git/sdd-review-block-count
-```
-
-The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present
-from a prior install) is auto-deleted on the first v5 invocation,
-so no manual cleanup is needed for the v4 → v5 migration path.
+See [Preseed Troubleshooting](preseed-troubleshooting.md) for hook debugging, attribution blocking issues, and review-spawn checkpoint reset.
 
 ---
 
 ## Related Documentation
 
+- [Preseed Troubleshooting](preseed-troubleshooting.md) — Hook debugging and checkpoint reset
 - [Memory](memory.md) — MCP memory server, capture/compact, R2 sync
   of memory files
 - [Container](container.md#claude-code-integration) — Claude Code

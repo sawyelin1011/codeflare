@@ -50,7 +50,19 @@ The reader of `documentation/` is a developer who already knows what the product
 | `documentation/decisions/<adr>.md` | 100 lines per ADR | LOW (100-150) / MEDIUM (150-250) / HIGH (>250) |
 | Other files in `documentation/` | 250 lines | LOW (250-400) / MEDIUM (400-600) / HIGH (>600) |
 
-A file may opt out of length warnings with an HTML comment near the top: `<!-- doc-allow-large -->`. Use sparingly and only for genuinely complex references whose full surface needs to live in one place (e.g., a complete OpenAPI dump).
+A file may opt out of length warnings with an HTML comment near the top, but the marker MUST carry structured justification:
+
+```markdown
+<!-- doc-allow-large: ADR-NN reason -->
+```
+
+Required shape:
+
+- The marker MUST carry a colon and a justification body. Bare `<!-- doc-allow-large -->` is rejected.
+- The body MUST reference an existing ADR (`ADR-NN` or `AD-NN`) in `documentation/decisions/`, OR a `pending.md` entry with a follow-up date in ISO format `pending:YYYY-MM-DD`.
+- doc-updater verifies the referenced ADR or pending entry exists every run (see Pass 6 below).
+
+This converts the hatch from a silent perma-license into a decision that lives in the ADR ledger — discoverable and revisitable. The same rules mirror to `<!-- sdd-allow-large -->` in `spec-discipline.md` (enforced by spec-reviewer).
 
 ## Per-element budgets
 
@@ -113,9 +125,41 @@ The fix: the original ADR is immutable. Write a new ADR that references the orig
 
 This is enforced as a HIGH finding by doc-updater because dual-narrative ADRs corrupt the decision log — readers cannot tell which decision is current.
 
+## Per-lane format templates
+
+Each canonical lane file follows a per-section template so readers can scan the file in one pass instead of reverse-engineering each section's format. Templates are sibling-registered to the lane separation table.
+
+| File | Required per-section fields |
+|---|---|
+| `documentation/api-reference.md` | Per endpoint section: `**Method:** {GET\|POST\|...}`, `**Path:**`, `**Auth:**`, `**Request:**` (or "no body"), `**Response:**` (status code list with one-line description each), `**Implements:** (REQ-X-NNN)` |
+| `documentation/configuration.md` | Per env var section: `**Variable:**`, `**Default:**`, `**Required:**` (yes/no), `**Consumed by:** {file/module}`, `**Implements:** (REQ-X-NNN if applicable)` |
+| `documentation/deployment.md` | Per command/runbook section: `**When:**` (trigger), `**Command:**` (fenced block), `**Verifies:**` (success signal), `**Rollback:**` |
+| `documentation/security.md` | Per policy section: `**Threat:**`, `**Mitigation:**`, `**Verification:**` (test/audit reference), `**Implements:** (REQ-X-NNN)` |
+| `documentation/architecture.md` | Per component section: `**Responsibility:**` (one-sentence), `**Inputs:**`, `**Outputs:**`, `**Source:**` (file path or `src/foo/**`) |
+| `documentation/troubleshooting.md` | Per recipe section: `**Symptom:**`, `**Cause:**`, `**Fix:**`, `**Prevention:**` (optional) |
+| `documentation/decisions/<adr>.md` | ADR header: `**Status:** {Proposed\|Accepted\|Superseded\|Reclassified} ({YYYY-MM-DD})`, `**Context:**`, `**Decision:**`, `**Consequences:**`, optional `**Supersedes:**`, optional `**Overrides:**` |
+
+**Rules of engagement**:
+
+- Templates apply per **section** (`##` or `###` heading), not per file. A top-of-file preamble paragraph is exempt.
+- Sections describing a different concern than their lane (e.g., a `## Glossary` section at the bottom of `configuration.md`) are exempt — they're flagged separately by Pass 4 lane-violation detection.
+- A section that legitimately has no value for a field uses an explicit marker: `**Auth:** none (public endpoint)` rather than omission. The marker counts as the field being present.
+- Missing fields are emitted by Pass 5 as MEDIUM findings naming the section and the missing field list.
+
+**Two equivalent shapes**. A section satisfies the template if it carries the required fields in EITHER of these shapes — Pass 5 accepts both:
+
+- **Per-item shape**: one section per item (one endpoint, one env var, one threat, one recipe) with each required field as a bolded label/value pair (`**Method:** GET`, `**Auth:** Cloudflare Access`, ...).
+- **Grouped-table shape**: one section per area (`### Session Management`, `### Container Lifecycle`) listing multiple items in a markdown table whose **column headers contain the required fields**. The table itself counts as the contract for every row. Per-row prose (notes, edge-case warnings) can follow the table.
+
+The required-field set is the same in both shapes — only the encoding differs. For `api-reference.md`, a grouped table must carry columns named at least `Method`, `Path`, `Auth`, `Implements` (Request/Response shapes can live in body prose below the table when they're shared across the section's endpoints). For `configuration.md`, a grouped table must carry columns `Variable`, `Default`, `Required`, `Consumed by`, `Implements`. For `security.md`, `Threat`, `Mitigation`, `Verification`, `Implements`. For `troubleshooting.md`, `Symptom`, `Cause`, `Fix`. For `architecture.md`, `Component`, `Responsibility`, `Source`. For `deployment.md`, `When`, `Command`, `Verifies`, `Rollback`.
+
+Pass 5 picks the shape per-section: if a section contains a recognized table (its column headers match ≥3 of the required fields), Pass 5 enforces the grouped-table shape; otherwise it enforces the per-item shape. A section is free to mix (a table for the bulk of items + a per-item subsection for one that needs extended prose); each subsection is evaluated independently.
+
+The full project's template set is the registry above. Projects may extend it via a `templates` field in `sdd/config.yml` (future), but the canonical lane templates are not overridable — the lane is the contract.
+
 ## Enforcement passes (run by doc-updater)
 
-doc-updater runs four passes on every PR-boundary trigger:
+doc-updater runs six passes on every PR-boundary trigger:
 
 ### Pass 1 — Per-element budget enforcement
 
@@ -137,11 +181,74 @@ In `auto` and `unleashed` modes, doc-updater proposes a split: identifies natura
 
 Scan each `documentation/` file for paragraphs that read like AC text (`must`, `shall`, `ensures that`, `the system rejects`). These belong in `sdd/` not `documentation/` and signal that someone wrote intent in the wrong place. Flag as MEDIUM with the target REQ ID (or "no matching REQ" if none exists, escalating to HIGH because it indicates an unspec'd feature).
 
-### Pass 4 — Lane-violation detection
+### Pass 4 — Lane-violation detection (pattern-based)
 
-Scan each file against its lane in the table above. If `architecture.md` contains a section titled `## API Endpoints` with route+method+status-code content, it's a lane violation — flag as MEDIUM and propose moving the section to `api-reference.md` with a backlink in `architecture.md`.
+Scan each file against its declared lane using **per-lane content signatures**, not a single hardcoded example. The pattern catalogue:
 
-Dual-narrative ADR detection runs alongside pass 4 against `documentation/decisions/`.
+| Signature | Belongs in | Flagged in |
+|---|---|---|
+| HTTP method + path + status code triplet (e.g., `POST /api/foo → 201`) | `api-reference.md` | `architecture.md`, `deployment.md`, `configuration.md`, `security.md` |
+| Env var name + default value + consumption point | `configuration.md` | `architecture.md`, `deployment.md`, `security.md` |
+| Shell command intended to be copy-pasted at deploy time | `deployment.md` | `api-reference.md`, `troubleshooting.md` (unless `Fix:` block), `architecture.md` |
+| Symptom → Cause → Fix recipe block | `troubleshooting.md` | `deployment.md`, `architecture.md`, `api-reference.md` |
+| Threat model paragraph (attacker capability + system response) | `security.md` | `architecture.md`, `api-reference.md`, `configuration.md` |
+| Auth/rate-limit rationale (why the limits exist, not what they are) | `security.md` OR ADR | `api-reference.md`, `configuration.md` |
+| Decision rationale ("we chose X because…", "we tried X then Y") | ADR (`documentation/decisions/`) | `architecture.md`, `troubleshooting.md`, `deployment.md` |
+| Admin-only endpoint with operator runbook prose | `api-reference.md` (the contract) **and** `deployment.md` (the runbook) — split, do not duplicate | wherever the unsplit blob currently lives |
+
+For each match, emit a MEDIUM finding naming **the source file**, **the section heading**, **the detected signature**, and **the proposed target lane**. The proposed-move plan is written into `documentation/.doc-coverage.md` so operators can review before accepting.
+
+Dual-narrative ADR detection runs alongside Pass 4 against `documentation/decisions/`.
+
+Triggering examples from the original audit that motivated the pattern catalogue:
+
+- `deployment.md` containing the admin-routes contract → split: contract to `api-reference.md`, deploy-time runbook stays in `deployment.md` with a backlink.
+- `deployment.md` containing the dev-bypass diagnostic recipe → move to `troubleshooting.md`.
+- `api-reference.md` paragraphs explaining "why fingerprint-drift checks exist" → move to `security.md` or a fresh ADR.
+
+### Pass 5 — Format-template enforcement
+
+For each canonical lane file, walk every `##`/`###` section and verify it carries the required fields from the per-lane template registry above in **either** of the two shapes defined in the "Two equivalent shapes" rule (per-item bolded fields or grouped-table column headers). Emit a MEDIUM finding per section listing the **missing field set**.
+
+Shape detection per section:
+
+1. If the section contains a markdown table whose header row matches ≥3 of the lane's required fields → enforce **grouped-table shape**. Missing fields are columns absent from the header row. The body prose may carry the remaining contract fields (e.g., a single `**Request:**` block shared across all endpoints in a `### Session Management` section).
+2. Otherwise → enforce **per-item shape**. Missing fields are bolded label/value pairs absent from the section body.
+
+Per-section findings name the source file, section heading, detected shape, and missing field list:
+
+```
+documentation/api-reference.md
+  Section "### Session Management" (line 27) — grouped-table shape detected
+    Missing columns: Auth, Implements
+documentation/api-reference.md
+  Section "### Inquiry email delivery" (line 142) — per-item shape detected
+    Missing fields: **Auth:**, **Response:**, **Implements:**
+```
+
+The pass does NOT auto-rewrite existing sections — restructuring prose or backfilling per-row Auth/Implements values is genuine authoring work. In `unleashed` mode, the agent appends one of:
+
+- For grouped-table sections: a placeholder column (e.g., adds an `| Implements |` header and a `TBD` cell per row) so the contract surface is visible and the operator can fill values in a follow-up commit
+- For per-item sections: a `**Implements:** TBD` placeholder marker so the missing-field set is resolved
+
+The values must still be filled in by the user — the placeholder satisfies the structural rule, not the contract.
+
+### Pass 6 — Hatch justification audit
+
+For every `<!-- doc-allow-large: ... -->` marker in `documentation/` files (and every `<!-- sdd-allow-large: ... -->` marker the spec-reviewer mirror reports for `sdd/`):
+
+| Condition | Severity | Action |
+|---|---|---|
+| Bare marker (no colon or justification) | MEDIUM | Rewrite to `<!-- doc-allow-large: TODO open ADR -->` and emit finding prompting the user to file an ADR. |
+| Marker references an ADR that does not exist in `documentation/decisions/` | HIGH | Orphan reference — flag immediately, do not auto-fix. |
+| Marker references an ADR with `Status: Superseded` | HIGH | The decision the hatch relied on has been overturned. Flag for review. |
+| Marker references an ADR with `Status: Accepted` older than 180 days | LOW | Reminder to revisit the decision; the project may have grown past the original justification. |
+| Marker references `pending:YYYY-MM-DD` with the date in the past | LOW | Follow-up overdue. |
+| Marker is well-formed and current | (no finding) | Accept. |
+
+The same audit applies to `<!-- doc-template-exempt: ... -->` markers introduced by Pass 5: the marker's body must reference an ADR or `pending:YYYY-MM-DD`, and the same severity table governs orphan / superseded / aged / overdue conditions. spec-reviewer applies an identical audit to `<!-- sdd-allow-large -->`.
+
+Date math is performed against the system date at run time. ADR `Status` is parsed from the ADR file's header field.
 
 ## Severity classification on doc findings
 
@@ -184,7 +291,7 @@ Same rules as spec-reviewer (see `spec-discipline.md` "Working tree and branch s
 | File | Committed to git | Purpose |
 |---|---|---|
 | `documentation/decisions/README.md` | Yes | ADR index — auto-maintained by doc-updater |
-| `documentation/.doc-coverage.md` | Yes | Output of doc-updater coverage runs |
+| `documentation/.doc-coverage.md` | Yes | Output of doc-updater coverage runs and Pass 4 proposed-move plans |
 | `documentation/.review-needed.md` | Yes | Doc findings escalated for human review |
 
 Nothing in `documentation/` is gitignored.

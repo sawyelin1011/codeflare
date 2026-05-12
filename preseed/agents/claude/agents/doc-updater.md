@@ -165,24 +165,71 @@ Implementation-prose paragraphs belong in `sdd/` REQs, not `documentation/`. For
 - If a matching REQ exists (REQ ID nearby in the doc, OR an `sdd/` REQ has overlapping AC text): MEDIUM finding, propose moving the prose to the REQ
 - If NO matching REQ exists: HIGH finding (unspec'd shipped feature). Escalate to spec-reviewer via `sdd/.review-needed.md`.
 
-### Pass 4 — Lane-violation detection
+### Pass 4 — Lane-violation detection (pattern-based)
 
-Scan each file against its declared lane in `documentation-discipline.md`:
+Scan each file against the per-lane content signatures defined in `documentation-discipline.md` "Pass 4 — Lane-violation detection". The pattern catalogue is the authoritative list — do NOT hardcode individual examples in this agent's logic. Detection signatures (read from the rule file):
 
-- `architecture.md` containing route + method + status-code content → lane violation, belongs in `api-reference.md`
-- `api-reference.md` containing architecture rationale or component layout → belongs in `architecture.md`
-- `configuration.md` containing API contracts → belongs in `api-reference.md`
-- `deployment.md` containing env var documentation → belongs in `configuration.md`
+- HTTP method + path + status code triplet → `api-reference.md`
+- Env var name + default + consumption point → `configuration.md`
+- Copy-paste deploy command → `deployment.md`
+- Symptom → Cause → Fix recipe → `troubleshooting.md`
+- Threat model paragraph → `security.md`
+- Decision rationale ("we chose X because…") → ADR
+- Admin-only endpoint with operator runbook prose → split between `api-reference.md` (contract) and `deployment.md` (runbook)
 
-MEDIUM finding with proposed move + backlink rewrite.
+For each match, emit a MEDIUM finding naming the source file, section heading, detected signature, and proposed target lane. Write the proposed-move plan into `documentation/.doc-coverage.md` so operators can review before accepting.
 
-Dual-narrative ADR detection (in `documentation/decisions/`) runs alongside pass 4. Detect by:
+Dual-narrative ADR detection (in `documentation/decisions/`) runs alongside Pass 4. Detect by:
 
 - Two `## Decision` headings in one ADR file
 - Phrases like "this was later changed", "we updated this in", "now we do X instead"
 - `Status: Accepted` followed by paragraphs describing a different decision
 
 Dual-narrative ADRs are HIGH findings — propose splitting into a new ADR with `Supersedes:` field and marking the original `Status: Superseded by <new-adr>.md`.
+
+### Pass 5 — Format-template enforcement
+
+For each canonical lane file (`api-reference.md`, `configuration.md`, `deployment.md`, `security.md`, `architecture.md`, `troubleshooting.md`, and ADR files), walk every `##`/`###` section and verify it carries the required fields per the template registry in `documentation-discipline.md` "Per-lane format templates" in EITHER of the two shapes defined under "Two equivalent shapes" (per-item bolded fields OR grouped-table column headers).
+
+Shape detection per section:
+
+1. If the section contains a markdown table whose header row matches ≥3 of the lane's required fields → enforce **grouped-table shape**. Missing fields are columns absent from the header row.
+2. Otherwise → enforce **per-item shape**. Missing fields are bolded label/value pairs absent from the section body.
+
+Emit MEDIUM findings naming the source file, section heading, detected shape, and missing field list:
+
+```
+documentation/api-reference.md
+  Section "### Session Management" (line 27) — grouped-table shape detected
+    Missing columns: Auth, Implements
+documentation/api-reference.md
+  Section "### Inquiry email delivery" (line 142) — per-item shape detected
+    Missing fields: **Auth:**, **Response:**, **Implements:**
+```
+
+Rules:
+
+- A top-of-file preamble paragraph is exempt (no `##` heading yet).
+- Sections describing a different concern than their lane are exempt for Pass 5 (they're flagged separately by Pass 4 lane-violation).
+- An explicit "field has no value" marker counts as the field being present: `**Auth:** none (public endpoint)` for per-item shape, or `none` as the cell value for grouped-table shape. Omission does not.
+- Pass 5 never rewrites existing prose — restructuring is genuine authoring work. In `unleashed` mode, append placeholders: a `| Implements |` column with `TBD` cells for grouped-table shape, or a `**Implements:** TBD` line for per-item shape. The user must fill the values.
+
+### Pass 6 — Hatch justification audit
+
+For every `<!-- doc-allow-large: ... -->` marker in `documentation/` files:
+
+| Condition | Severity |
+|---|---|
+| Bare marker (no colon or justification) | MEDIUM |
+| Marker references an ADR that does not exist | HIGH |
+| Marker references an ADR with `Status: Superseded` | HIGH |
+| Marker references an ADR with `Status: Accepted` >180 days old | LOW (reminder) |
+| Marker references `pending:YYYY-MM-DD` with the date in the past | LOW (follow-up overdue) |
+| Well-formed and current | no finding |
+
+The same audit applies to `<!-- doc-template-exempt: ... -->` markers introduced by Pass 5 — same severity table, same date math.
+
+Date math is performed against system date at run time. The ADR `Status` field is parsed from the file header (`**Status:** Accepted (YYYY-MM-DD)` shape). spec-reviewer mirrors this pass for `<!-- sdd-allow-large -->` markers in `sdd/`.
 
 ## Phase 3: Apply (mode-dependent)
 
