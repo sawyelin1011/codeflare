@@ -18,7 +18,7 @@ The user only invokes `/sdd` directly to:
 - Bootstrap a new project (`/sdd init`)
 - Manually add or modify requirements (`/sdd edit`, `/sdd add`)
 - Rescue a rotted spec (`/sdd clean`)
-- Switch autonomy mode (`/sdd autonomous`)
+- Switch autonomy mode (`/sdd mode`)
 
 ## Spec structure
 
@@ -117,7 +117,7 @@ The user comes back to new commits on the current branch. They inspect the per-c
 | `/sdd edit {domain}` | Add or modify requirements in an existing domain (interactive, always needs user input) |
 | `/sdd add {domain}` | Create a new domain in an existing spec |
 | `/sdd clean` | Refactor a rotted spec — applies SAFE/RISKY/JUDGMENT fixes per current mode |
-| `/sdd autonomous {on\|off\|unleashed}` | Set the mode in `sdd/config.yml` |
+| `/sdd mode {interactive\|auto\|unleashed}` | Set the mode in `sdd/config.yml` |
 
 The full command syntax is documented in the `/sdd` command file.
 
@@ -146,25 +146,50 @@ To get autonomous review on a project, ensure:
 
 The hooks fail-safe in the right direction: if `gh` is missing or transiently fails, the Stop hook errs toward enforcement (better to over-block on uncertain truth than miss an unreviewed PR-to-main); the PostToolUse directive errs toward emission. Either way, the user can always invoke review agents manually via the `Task` tool.
 
-## /sdd init — bootstrapping a project (greenfield OR existing codebase)
+## /sdd init — bootstrapping a project (greenfield, import, or resume)
 
-`/sdd init` handles two scenarios:
+`/sdd init` handles three scenarios:
 
 1. **Greenfield**: empty project, no existing code. Agent bootstraps from prose.
-2. **Existing codebase**: project already has source code. Agent enters **import mode** — analyzes the existing code, derives a spec from observed behavior, presents it for user confirmation, and writes the scaffolding.
+2. **Import**: project already has source code, no `sdd/` yet. Agent enters **Import Mode** — derives a spec where behavior is clear from source/tests/comments/commits, files the unclear parts to `sdd/init-triage.md` with concrete Context + Recommendation, and writes the scaffolding.
+3. **Resume**: `sdd/` already exists and `sdd/init-triage.md` has `**Status:** open` items. Agent enters **Resume Mode** — surfaces one open triage item at a time with refreshed Context + Recommendation, the user accepts/corrects/marks-lost, the answer folds into the relevant REQ.
 
-The agent detects the scenario automatically by counting source files in the project. >5 source files → existing codebase → import mode. ≤5 → greenfield.
+The agent detects the scenario automatically — source-file count for greenfield-vs-import, presence of open triage items for resume.
 
-In **import mode**, the agent:
-- Reads README.md, package.json (or equivalent), top-level configs to understand intent
-- Analyzes directory structure to identify domains
-- Reads representative source files to derive REQs
-- Tentatively marks all derived REQs as `Status: Implemented`
-- Searches existing test files for feature/route names; demotes REQs without test coverage to `Partial` with `Notes:` explaining what's missing
-- Presents derived spec for user confirmation, one domain at a time
-- Writes scaffolding (sdd/, documentation/, root README) WITHOUT touching existing code, existing README, or existing documentation/ files
+### Import Mode — two-output model
 
-Import mode is **always interactive** even in `auto` or `unleashed` config — inferring intent from code is genuinely judgment-required and the user must validate the result.
+Import Mode is the migration path from legacy manual coding to autonomous agentic coding. It produces two outputs simultaneously:
+
+- **Official spec REQs** in `sdd/{domain}.md` — for behavior that is clearly determinable from the full discovery surface. Normal REQ shape, normal SDD discipline.
+- **Triage entries** in `sdd/init-triage.md` — for anything unclear (magic numbers without rationale, retry policies without context, ambiguous contracts, orphan code, missing Intent). Each entry carries the agent's **Context** (file:line, git author, commit refs, related tests, PRs, issues, releases, comments) and **Recommendation** (best-guess answer with one-line Rationale). The user reviews and decides; they don't perform archaeology from scratch.
+
+**Discovery surface is the full project history, not just source code.** Intent in legacy systems often lives outside the working tree - in PR descriptions, issue threads (open and closed), code-review comments, and release notes. Import Mode pulls every available source: working tree (README, configs, source, tests, inline comments, ADRs), git history (commits, tags), and the GitHub corpus when a remote is present (PRs with review comments via `gh pr view --comments`, issues with comments via `gh issue view --comments`, releases via `gh release view`, wiki via the API). When a PR references an issue ("Closes #142"), Context follows the chain backward through every linked artifact rather than stopping at the first hit.
+
+**Degradation when GitHub sources are unreachable.** The GitHub corpus is best-effort, not mandatory. Detect failure conditions up front (non-GitHub remote - GitLab / Bitbucket / Forgejo / Gerrit; `gh auth status` fails; rate-limited; private repo with insufficient token scope; air-gapped network). If any condition holds, skip the GitHub sources entirely and proceed with working-tree + git-log evidence only. Print a one-line notice to the user before scaffolding (`Note: discovery used working tree + git log only ({reason} - GitHub sources unavailable).`) and append the same notice to the `sdd/changes.md` import entry. Triage Context fields reference whatever artifact refs are reachable; the audit trail honestly reflects what the agent saw.
+
+While `sdd/init-triage.md` contains any `**Status:** open` items, the project is in **SDD transition**. `sdd/config.yml` carries `transition: true`. During transition, the PR-boundary review pipeline is **entirely suspended**: code-reviewer, spec-reviewer, and doc-updater do not fire on any push or PR event. PostToolUse + Stop hooks short-circuit. `/sdd mode unleashed` is rejected.
+
+When the queue drains to zero (every item `resolved` or `lost`), `transition: true` clears automatically. Full SDD discipline applies on the next push and autonomous agentic development is unlocked. `enforce_tdd` is NOT auto-flipped - the user sets it manually when ready (typically after adding REQ-ID references to test names in the imported source). `sdd/init-triage.md` is preserved as the audit record.
+
+Import Mode writes CLEAR REQs to `sdd/{domain}.md` files automatically, without user confirmation. The agent's confidence threshold (single matching domain, unambiguous behavior, clear evidence in code/PRs/tests) is the gate; anything below it becomes a triage entry. Only the triage queue surfaces unclear/ambiguous items for user judgment, one at a time in Resume Mode. To correct any CLEAR REQ after import, the user runs `/sdd edit {domain}`.
+
+### Resume Mode — picking up where you left off
+
+When `/sdd init` is re-invoked on a project where `sdd/init-triage.md` has open items, the agent enters Resume Mode. The agent:
+
+1. **Checks the working tree is clean** (`git status --porcelain` empty). Refuses to start if uncommitted changes are present - Resume Mode commits per decision and would otherwise mix WIP edits with triage commits. Same gate as `/sdd clean`.
+2. **Sanity-checks transition state**. If `transition: true` is missing from `sdd/config.yml` but open items exist, restores it quietly. If `transition: true` is set but `sdd/init-triage.md` is unreadable, aborts with a recovery hint (restore from git history or remove the flag manually).
+3. **Prints a mode-auto notice** when `sdd/config.yml` says `mode: auto`: Resume Mode is always interactive, the auto setting is suspended for this run and resumes after the queue drains.
+4. **Surfaces one item at a time** with **refreshed** Context (re-read source, re-check git log, re-fetch related PRs - the codebase may have evolved since the prior session). The user picks one of: **accept** the recommendation, **correct** it, mark it **lost** (one-line Reason required), **skip** for now, or **quit**.
+
+Only `accept` and `correct` promote the answer into the official spec REQs. `correct` opens an editor for free-form prose where the user describes **what the thing is for** (purpose → REQ Intent) and **how it works** (observable behavior → REQ ACs); the agent folds the prose into the relevant REQ's fields named in the triage entry's `**Target REQ:**` field (no re-inference at resolution time). `skip` leaves the triage item open in `sdd/init-triage.md` and writes nothing to the spec - skipped items resurface on the next Resume Mode run. `lost` records the gap but does not fabricate an Intent. Each decision is its own commit.
+
+**Transition-closure step** runs after every resolved/lost decision. When zero `**Status:** open` items remain:
+
+- `transition: true` is cleared from `sdd/config.yml`
+- A closure entry is appended to `sdd/changes.md` (e.g., `SDD transition complete. {Total} triage items resolved ({R} accepted, {C} corrected, {L} lost).`)
+- `enforce_tdd` is NOT changed - the user flips it to `true` manually when ready for TDD enforcement (typically after adding REQ-ID test names)
+- The agent enters Plan Mode (same hard gate as greenfield `/sdd init` step 17) so the first feature work on top of the now-real spec is plan-gated
 
 In **greenfield mode**, the agent:
 
@@ -192,7 +217,7 @@ In **greenfield mode**, the agent:
 
 The agent does not need internet access — all templates are bundled in `references/templates/`.
 
-If `sdd/` already exists, `/sdd init` aborts with an error. Use `--force` to overwrite (destructive — confirm with user first).
+If `sdd/` already exists with no open triage items, `/sdd init` aborts with an error pointing the user at `/sdd clean` for spec rescue. If open triage items exist, `/sdd init` enters Resume Mode.
 
 ### Dependency version resolution
 
@@ -230,7 +255,7 @@ In **interactive** mode: reports findings batch-by-batch, asks for confirmation 
 
 In **auto** mode: applies SAFE and RISKY fixes silently on the current branch. JUDGMENT items go to `sdd/.review-needed.md`.
 
-In **unleashed** mode: applies SAFE + RISKY + JUDGMENT fixes on the current branch (using conservative defaults for JUDGMENT), commits per category, pushes directly. No new branch, no PR. `enforce_tdd: true` is forced. The commits land where the user pushed from.
+In **unleashed** mode: applies SAFE + RISKY + JUDGMENT fixes on the current branch (using conservative defaults for JUDGMENT), commits per category, pushes directly. No new branch, no PR. If `enforce_tdd: false`, unleashed refuses to run and emits a finding asking the user to either flip the value or use `auto` instead - the per-project opt-out is preserved. Commits land where the user pushed from.
 
 ### Safety nets
 
@@ -241,14 +266,12 @@ In all modes:
 - **`[sdd-clean]` commit tag** that bypasses round-detection in spec-reviewer
 - **Sequential execution** (spec-reviewer first, then doc-updater)
 
-In `auto` mode specifically:
-- Refuses to run on `main` or `master` without `--branch-confirmed`
-
 In `unleashed` mode specifically:
 - Pushes commits directly to the current branch (no new branch, no PR)
-- Refuses to run on `main`/`master` without `--branch-confirmed`
-- Each commit is per-category and tagged `[sdd-clean]` — `git revert <sha>` is the rollback surface
+- Each commit is per-category and tagged `[sdd-clean]` - `git revert <sha>` is the rollback surface
 - Full audit log lives in `sdd/.last-clean-run.md` + the per-category commit messages
+
+Both `auto` and `unleashed` push to the currently checked-out branch. The user is responsible for checking out a feature/dev branch before invoking if they don't want commits landing on the current branch.
 
 ### What gets cleaned
 
@@ -259,12 +282,9 @@ In `unleashed` mode specifically:
 - **Oversized REQs** (>50 lines) → flagged; in unleashed mode, implementation prose extracted to docs while Intent + AC stay verbatim
 - **Bloated `changes.md`** (verification log entries, commit SHAs, multi-paragraph entries) → archived to `sdd/changes-archive-YYYY-MM.md`, new file written with user-facing entries only
 - **Status: Implemented REQs without test coverage** → if `enforce_tdd: true`, demoted to `Partial` with `Notes:` explaining what's missing; if `enforce_tdd: false`, written to `sdd/.coverage-report.md` only
-- **Status: Planned/Partial REQs with source code but no test** → if `enforce_tdd: true`, HIGH finding + auto-promote `Planned → Partial` with `Notes:` (requires the `Implements REQ-X-NNN` annotation convention in source files — see `spec-discipline.md` → Source code ↔ REQ annotations)
+- **Status: Planned/Partial REQs with source code but no test** → if `enforce_tdd: true`, HIGH finding + auto-promote `Planned → Partial` with `Notes:`
 - **Test quality heuristics** → AC-count vs test-count check, tautology detection, skipped-test detection (all run when `enforce_tdd: true`)
 - **Missing doc→spec backlinks** → generated automatically (links from `documentation/` files to relevant REQ IDs)
-- **Approved split proposals** → spec-reviewer drafts `sdd/.split-proposals/{REQ-ID}.md` for any REQ at ≥12 ACs or ≥50 lines without a valid `<!-- sdd-allow-large -->` hatch. AC text is lifted verbatim into 3–7 candidate child REQs. The user reviews and flips `**Status:** Draft` to `**Status:** Approved`; `/sdd clean` then executes the split, updates the parent, and deletes the proposal. Splits are never auto-applied — even in `unleashed` mode the proposal stays at Draft until the user approves.
-- **Out-of-Scope collisions** → REQs marked Implemented while a sibling Out-of-Scope bullet claims the same feature is not in scope. Full-spec pass (not diff-scoped) with ≥2 content-word overlap heuristic. Conservative resolution removes the Out-of-Scope bullet (the feature shipped); user can override per finding.
-- **Hatch justification audit** → `<!-- sdd-allow-large -->` and `<!-- doc-allow-large -->` markers must reference an existing ADR or a dated `pending:YYYY-MM-DD` entry. Bare markers → MEDIUM rewrite. Orphan ADR refs → HIGH. Superseded ADR refs → HIGH. Aged-Accepted ADR refs (>180 days) → LOW reminder. Converts a silent perma-license into a decision discoverable in the ADR ledger.
 - **False-positive ADRs** in `documentation/decisions/` (static-analyzer accommodations, naming-compat notes, risk acceptance with no alternative considered, implementation notes framed as decisions) → reclassified to their canonical home (inline source comment, `troubleshooting.md`, `configuration.md`, or `security.md`). The original `### AD-N:` heading is preserved as a `Status: Reclassified` stub so inbound `AD-N` references keep resolving. See `documentation-discipline.md` "What is NOT an ADR" — applied by `/sdd clean` (the PR-boundary doc-updater passes only flag, never reclassify, to avoid surprising the user mid-PR).
 
 ## /sdd edit — adding or modifying requirements
@@ -290,16 +310,20 @@ Same as `/sdd edit` but creates a new domain file. The agent:
 4. Updates the domain index in `sdd/README.md`
 5. Updates glossary and changelog
 
-## /sdd autonomous — switching modes
+**NEXT ACTION - MANDATORY: enter Plan Mode** before any source/test/config edits. Same gate as `/sdd init` and `/sdd edit` (see "Plan Mode integration" below).
+
+## /sdd mode — switching autonomy
 
 ```bash
-/sdd autonomous on              # mode = auto (writes to sdd/config.yml)
-/sdd autonomous unleashed on    # mode = unleashed
-/sdd autonomous off             # mode = interactive
-/sdd autonomous status          # show current mode + recent ADRs with Overrides: headers
+/sdd mode interactive   # agent asks before every fix (default)
+/sdd mode auto          # agent silently applies safe fixes
+/sdd mode unleashed     # agent does everything without asking
+/sdd mode               # show current mode
 ```
 
 The setting is persistent (committed to git as `sdd/config.yml`) and travels with the project. Per-command overrides via `--interactive`, `--auto`, `--unleashed` flags on `/sdd clean`.
+
+**Transition gate on `unleashed`**: `/sdd mode unleashed` is rejected while `sdd/config.yml` carries `transition: true` (the import triage queue still has open items). Unleashed mode runs blind and auto-resolves JUDGMENT; triage items require user judgment by construction. The user must drain the triage queue via Resume Mode first. `/sdd mode auto` and `/sdd mode interactive` are both allowed during transition; they do not bypass user judgment on individual triage items.
 
 ## Test discipline
 
@@ -313,7 +337,7 @@ test('REQ-AUTH-001: rejects expired JWT tokens', () => {
 });
 ```
 
-When `enforce_tdd: true` (the default), REQs without test references get downgraded to `Partial` with a `Notes:` field, and REQs whose source code exists but lacks tests get flagged and auto-promoted `Planned → Partial`. Source code must annotate each REQ it implements with a comment like `Implements REQ-X-NNN` so spec-reviewer has something concrete to grep (see `spec-discipline.md` → Source code ↔ REQ annotations). Projects that genuinely cannot admit automated testing (pure visual design systems, for example) can opt out with `enforce_tdd: false`.
+When `enforce_tdd: true` (the default), REQs without test references get downgraded to `Partial` with a `Notes:` field, and REQs whose source code exists but lacks tests get flagged and auto-promoted `Planned → Partial`. spec-reviewer matches by REQ-ID substring in test files (see test naming example above). Projects that genuinely cannot admit automated testing (pure visual design systems, for example) can opt out with `enforce_tdd: false`.
 
 **Bug fix discipline**: when fixing a bug, write a failing test that reproduces it BEFORE writing the fix. The test proves the bug exists and proves the fix works. The `tdd-guide` agent enforces this proactively.
 

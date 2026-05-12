@@ -532,21 +532,62 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 1. Pro mode preseeds the `spec-driven-development` skill, the `/sdd` command, the `spec-discipline` rule (loaded into every agent's instructions), and the `spec-reviewer` + `doc-updater` agents.
-2. `/sdd init` scaffolds a new `sdd/` from templates for greenfield projects; in import mode it derives a spec from existing source code. When a package manifest is generated, top-level dependency versions are resolved at scaffold time via the ecosystem's registry (npm, Cargo, pip, Go) rather than emitted from memory; the Cloudflare Workers stack pins `wrangler`, `@cloudflare/workers-types`, `@cloudflare/vitest-pool-workers`, and `vitest` as a single co-resolved cohort. Lockfile generation during `/sdd init` is a scoped carveout to the no-local-builds rule (resolution only, with `--ignore-scripts` on npm; no installs, tests, or builds).
-3. Three autonomy modes (`interactive`, `auto`, `unleashed`) are selectable via `sdd/config.yml`. Interactive and auto modes apply fixes on the current branch (auto silently, interactive after confirmation). Unleashed mode is the walk-away autopilot: it applies SAFE + RISKY + JUDGMENT fixes on the current branch via per-category `[sdd-clean]` commits, forces `enforce_tdd: true`, and uses conservative JUDGMENT auto-resolution that never overwrites intent. Unleashed does not create a new branch and does not open a pull request; `git revert <sha>` on a per-category commit is the rollback surface, and `sdd/.last-clean-run.md` plus each commit message carry the audit log.
-4. PR-boundary review fires only for PRs targeting `main` or `master`: either a new pull request opens with that target via `gh pr create`, or a new push lands on a branch that already has an open PR with that target. On these triggers `spec-reviewer` runs first, then `doc-updater` runs second (sequential, never parallel) on any project containing `sdd/`.
-5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews. The case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed.
-6. A plain push to a branch with no open PR does NOT trigger reviews.
-7. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge); the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks.
-8. On non-SDD projects (no `sdd/` folder) no review agents run at all. Every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
-9. `/sdd clean` rescues rotted specs with conservative JUDGMENT auto-resolution that never overwrites spec intent (mark Partial + Notes, move to Out of Scope, shrink in place).
-10. The workflow is project-agnostic and self-limits to 2 fix rounds per commit cycle to prevent micro-fix spirals.
-11. In `auto` and `unleashed` modes, spec-reviewer and doc-updater refuse to run on `main`/`master` without an explicit `--branch-confirmed` flag.
+2. `/sdd init` scaffolds a new `sdd/` from templates for greenfield projects.
+3. In import mode, `/sdd init` derives a spec from existing source code rather than scaffolding from templates.
+4. When `/sdd init` generates a package manifest, top-level dependency versions are resolved at scaffold time via the ecosystem's registry (npm, Cargo, pip, Go) rather than emitted from memory. The Cloudflare Workers stack pins `wrangler`, `@cloudflare/workers-types`, `@cloudflare/vitest-pool-workers`, and `vitest` as a single co-resolved cohort.
+5. Lockfile generation during `/sdd init` is a scoped carveout to the no-local-builds rule (resolution only, with `--ignore-scripts` on npm; no installs, tests, or builds).
+6. Three autonomy modes (`interactive`, `auto`, `unleashed`) are selectable via `sdd/config.yml`. Interactive and auto modes apply fixes on the current branch (auto silently, interactive after confirmation). Unleashed mode is the walk-away autopilot: it applies SAFE + RISKY + JUDGMENT fixes on the current branch via per-category `[sdd-clean]` commits, refuses to run when `enforce_tdd: false` (preserves the per-project opt-out; user flips manually or uses `auto` instead), and uses conservative JUDGMENT auto-resolution that never overwrites intent. Unleashed does not create a new branch and does not open a pull request; `git revert <sha>` on a per-category commit is the rollback surface, and `sdd/.last-clean-run.md` plus each commit message carry the audit log.
+7. PR-boundary review fires only for PRs targeting `main` or `master`: either a new pull request opens with that target via `gh pr create`, or a new push lands on a branch that already has an open PR with that target. On these triggers `spec-reviewer` runs first, then `doc-updater` runs second (sequential, never parallel) on any project containing `sdd/`.
+8. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews. The case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed.
+9. A plain push to a branch with no open PR does NOT trigger reviews.
+10. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge); the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks.
+11. On non-SDD projects (no `sdd/` folder) no review agents run at all. Every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
+12. `/sdd clean` rescues rotted specs with conservative JUDGMENT auto-resolution that never overwrites spec intent (mark Partial + Notes, move to Out of Scope, shrink in place).
+13. The workflow is project-agnostic. Each review agent self-limits to 2 fix rounds per commit cycle scoped to its own lane (spec-reviewer counts only commits touching `sdd/**`; doc-updater counts only commits touching `documentation/**`) to prevent micro-fix spirals without cross-contaminating lanes.
+14. In `auto` and `unleashed` modes, spec-reviewer and doc-updater push to whatever branch is currently checked out; the user is responsible for checking out the right branch before invoking.
+15. The three review-agent disciplines (doc, spec, tdd) each enforce structural compliance plus content-quality. doc-updater runs structural passes (shape, budgets, lane) and content-quality passes (verification truth-check, Implements-vs-AC cross-walk, stale code-block detection against source, content-preservation on trims, stranger cold-read usability). spec-reviewer runs the spec analogs (REQ-test truth-check beyond literal ID match, vendor/protocol drift, content-preservation on shrink). code-reviewer flags tests whose name claims behavior the assertions don't verify (the test-name-lies antipattern in tdd-discipline). Auto-fixes derive concrete content from source/REQ when possible. Load-bearing clauses that would be lost to a word-cap trim are promoted to surrounding prose or the trim is reverted with a finding.
 
 **Constraints:**
 - Status semantics, `Deprecated` requirements, the spec-discipline enforcement layer, and the `enforce_tdd` test-coverage rule follow `rules/spec-discipline.md`.
+- The structural-vs-content-quality split, per-pass severity and auto-fix behavior, and the cold-read task registry follow `rules/documentation-discipline.md`.
 
 **Priority:** P1
 **Dependencies:** REQ-AGENT-005, REQ-AGENT-006, REQ-AGENT-007
+**Verification:** Manual check
+**Status:** Implemented
+
+## REQ-AGENT-022: Legacy-codebase transition to SDD via init triage
+
+**Intent:** Enterprises migrating a legacy codebase from manual development to autonomous agentic development need a transition path that converts un-extracted intent into a real spec. `/sdd init` Import Mode runs discovery against the full project history — working tree, git log, pull requests, issues (open and closed), code-review comments, release notes, wiki — and produces two outputs from the same pass: official REQs for behavior clear from that surface, and a triage queue for everything unclear, with the agent's concrete Context and Recommendation populated up front. The user resolves the queue at their own pace; until it drains, the project is in SDD transition. Once the queue is empty, full SDD discipline applies and autonomous agentic coding is unlocked, because the agent has a real contract to reason against.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+1. `/sdd init` Import Mode emits two outputs simultaneously: spec REQs in `sdd/{domain}.md` for anything clearly determinable from the full discovery surface, and triage entries in `sdd/init-triage.md` for anything unclear (magic numbers without rationale, retry policies without context, ambiguous contracts, orphan code, missing Intent, domain-placement guesses).
+2. The discovery surface during Import Mode is the full project history, not just source code. The agent pulls evidence from the working tree (README, configs, source, tests, inline comments, ADR-shaped files), git history (commit messages on entry-point files, tag annotations), and — when a GitHub remote is detected — pull requests with their review comments and inline threads (`gh pr list --state all`, `gh pr view {n} --comments`), issues open and closed with their comments (`gh issue list --state all`, `gh issue view {n} --comments`), release notes (`gh release list`, `gh release view {tag}`), and the wiki via the GitHub API. When one artifact references another ("Closes #142"), the agent follows the chain backward through every linked artifact rather than stopping at the first hit.
+3. Every entry in `sdd/init-triage.md` carries `**Context:**` (concrete evidence — file path + line range, git author of last meaningful change, commit SHA + subject, related tests, related PR numbers, related issue numbers, related release tags) and `**Recommendation:**` (the agent's specific best-guess answer) with `**Rationale:**` (one line tying the recommendation to specific Context evidence). Vague Context (no refs, no authors, no artifact numbers) and placeholder Recommendations (`TBD`, `(inferred)`, `unknown`) are rejected as malformed triage entries.
+4. Triage entries use `**Status:** open | resolved | lost`. `lost` requires a one-line `**Reason:**` field explaining why the information is genuinely unrecoverable.
+5. While `sdd/init-triage.md` contains any `Status: open` items, `sdd/config.yml` carries `transition: true` and the project is in SDD transition. During transition the entire review pipeline is suspended: code-reviewer, spec-reviewer, and doc-updater do not fire on any push or PR event (PR-boundary hooks short-circuit to no-op; manually-invoked review agents exit no-op with a one-line notice). `/sdd mode unleashed` is rejected with a message naming the open-item count.
+6. Re-invoking `/sdd init` on a project where `sdd/` already exists and `sdd/init-triage.md` has at least one open item enters Resume Mode rather than aborting. Resume Mode surfaces one open item at a time, refreshing its Context before presenting (re-reads source, re-checks git log, re-fetches related PRs, issues, and releases).
+7. The user chooses one of five decisions per item:
+   - `accept`: use the recommendation as-is and fold into the relevant REQ.
+   - `correct`: free-form prose describing what the thing is for and how it works; agent folds purpose into REQ Intent and behavior into AC bullets.
+   - `lost`: record the gap with a one-line Reason; the related REQ (if any) gets a `Notes: intent lost during SDD transition - see TRIAGE-{NNN}` annotation; nothing is fabricated into the spec.
+   - `skip`: leave Status: open, write nothing to the spec, advance to next.
+   - `quit`: commit progress and exit.
+8. Only `accept` and `correct` promote anything into the official spec. `skip` and `lost` write nothing to `sdd/{domain}.md`.
+9. Each decision is its own commit (`[sdd-init] resolve TRIAGE-{NNN}` or `mark lost`).
+10. Resume Mode entry refuses to start when the working tree has uncommitted changes (same gate as `/sdd clean`) and is always interactive regardless of `sdd/config.yml`'s `mode`. When `mode: auto` is set, Resume Mode prints a one-line notice that auto is suspended for this run and resumes after the queue drains.
+11. When the last `Status: open` item is resolved or marked `lost`, the resolving commit clears `transition: true` from `sdd/config.yml`, appends a closure entry to `sdd/changes.md` recording totals (accepted / corrected / lost), and the agent enters Plan Mode (same hard gate as greenfield `/sdd init`) so the first feature work on top of the now-real spec is plan-gated. `enforce_tdd` is NOT auto-flipped - the user changes it manually when ready for TDD enforcement (typically after adding REQ-ID references to test names in the imported source). `sdd/init-triage.md` is preserved as the audit record.
+12. The PR-boundary review pipeline (PostToolUse `git-push-review-reminder` + Stop `enforce-review-spawn` hooks) short-circuits to no-op while `sdd/init-triage.md` has open items, so legacy code does not trigger code-reviewer / spec-reviewer / doc-updater until the spec is real.
+13. When the GitHub corpus is unreachable during Import Mode discovery (non-GitHub remote, `gh auth status` fails, rate-limited, private repo with insufficient token scope, air-gapped), the agent skips GitHub sources and proceeds with working-tree + git-log evidence only. A one-line notice naming the reason is printed before scaffolding and appended to the `sdd/changes.md` import entry.
+
+**Constraints:**
+- Triage items live only in `sdd/init-triage.md`. No separate state file, no JSON mirror, no machine-readable index. Git history is the audit trail for who resolved which item with what decision.
+- Triage workflow is interactive only. `auto` and `unleashed` modes do not auto-resolve triage items - the entire point is that judgment is required, and triage cannot be bypassed without abandoning the transition guarantees.
+- `sdd/init-triage.md` is owned by `/sdd init`. spec-reviewer reads it to determine transition state and to verify resolved items' REQs received the fold-in; doc-updater does not touch it.
+
+**Priority:** P1
+**Dependencies:** REQ-AGENT-021
 **Verification:** Manual check
 **Status:** Implemented

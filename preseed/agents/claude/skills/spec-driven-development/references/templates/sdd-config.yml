@@ -21,9 +21,21 @@ mode: interactive
 # When false, spec-reviewer only writes sdd/.coverage-report.md without
 # modifying the spec.
 #
-# Forced to true in unleashed mode (commits land on the current branch; TDD enforcement is non-negotiable).
+# Unleashed mode refuses to run when this is false (preserves the per-project
+# opt-out). User flips to true manually when ready, or uses auto mode instead.
 # Default true — TDD is the contract; opt out per project if needed.
 enforce_tdd: true
+
+# transition: set automatically by /sdd init Import Mode and cleared
+# automatically when the sdd/init-triage.md queue drains.
+# Do NOT set this by hand - it is managed by the /sdd init lifecycle.
+# While transition: true is set:
+#   - PR-boundary review pipeline is entirely suspended (no
+#     code-reviewer, spec-reviewer, or doc-updater fires on push or PR)
+#   - /sdd mode unleashed is rejected
+# On queue drain, transition: true clears. enforce_tdd is NOT auto-flipped -
+# the user changes it manually when ready for TDD enforcement.
+# transition: false
 
 # Test discovery globs — where spec-reviewer looks for REQ ID references in test files.
 # Detection is binary: the REQ ID literally appears in a test file or it doesn't.

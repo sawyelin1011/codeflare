@@ -94,7 +94,8 @@ files), `consult-llm`, `api-design`, `backend-patterns`,
 `content-hash-cache-pattern`, `database-migrations`,
 `deployment-patterns`, `frontend-patterns`, `iterative-retrieval`,
 `search-first`, `spec-driven-development` (+ 13 reference templates
-for `/sdd init` scaffolding). Preseeded to
+for `/sdd init` scaffolding; covers the three Import/Resume modes
+for legacy-codebase transition documented below). Preseeded to
 `~/.claude/skills/<name>/SKILL.md` (and adapted equivalents for
 agents that support skills). `consult-llm` is CC-only (depends on
 MCP tool).
@@ -305,6 +306,33 @@ and redirected to the equivalent `ctx_*` tools. Per-call bypass via
 context-mode is licensed under [Elastic License 2.0](https://github.com/mksglu/context-mode/blob/main/LICENSE).
 The integration is sized to stay within ELv2's permitted-use envelope.
 See [AD49](decisions/README.md#ad49-context-mode-delivered-as-preseed-plugin-not-runtime-install) for the full design + license analysis.
+
+## /sdd init Modes
+
+`/sdd init` is the single entry point for bootstrapping SDD on a project. It detects one of three scenarios from project state and dispatches automatically:
+
+- **Greenfield** — empty project. Agent drafts vision / actors / domains / requirements from the user's prose and writes scaffolding.
+- **Import** — substantive existing code, no `sdd/` yet. Two-output model: behavior clearly determinable from source / tests / comments / commits / PRs becomes official REQs in `sdd/{domain}.md`; everything unclear (magic numbers, retry policies, ambiguous contracts, orphan code) becomes triage entries in `sdd/init-triage.md` with the agent's `**Context:**` (file:line, git author, commit refs, related tests/PRs) and `**Recommendation:**` (best-guess answer with one-line `**Rationale:**`) populated up front.
+- **Resume** — `sdd/` exists and `sdd/init-triage.md` has at least one `**Status:** open` item. Agent surfaces one item at a time with refreshed Context. Five decisions: `accept` (use the recommendation as-is, fold into REQ), `correct` (free-form prose describing what the thing is for and how it works; agent folds purpose into Intent and behavior into ACs), `lost` (one-line Reason required, no spec write), `skip` (stays open, no spec write), `quit`. Only `accept` and `correct` promote anything into the official spec.
+
+While `sdd/init-triage.md` contains any open items, `sdd/config.yml` carries `transition: true`. The transition gate condition is the conjunction `transition: true` in config AND `**Status:** open` items in the triage file (case-insensitive on `open`); all enforcement layers test both. During transition the entire review pipeline is suspended:
+
+- PR-boundary hooks (`git-push-review-reminder` PostToolUse + `enforce-review-spawn` Stop) short-circuit to no-op so no reviewer spawns on push or PR events
+- Manually-invoked review agents (code-reviewer, spec-reviewer, doc-updater) check the same gate and exit no-op with a one-line notice
+- `/sdd mode unleashed` is rejected (judgment is required for triage; cannot run blind)
+
+**Resume Mode** is always interactive regardless of `sdd/config.yml`'s `mode` setting. It refuses to start on a dirty working tree (same gate as `/sdd clean`). When `mode: auto` is active, a one-line suspension notice is printed at entry.
+
+**Transition closure.** When the last open item is resolved or marked `lost`, the closure commit:
+1. Clears `transition: true` from `sdd/config.yml`
+2. Appends a closure entry to `sdd/changes.md` recording totals (accepted / corrected / lost)
+3. The agent enters Plan Mode -- the first feature work on the now-real spec is plan-gated
+
+`enforce_tdd` is NOT touched by the closure commit. The user changes it manually when ready for TDD enforcement (typically after adding REQ-ID references to test names in the imported source).
+
+Full SDD discipline applies on the next push; autonomous agentic development is unlocked. `sdd/init-triage.md` is preserved as the audit record. Implements [REQ-AGENT-022](../sdd/agents.md#req-agent-022).
+
+**GitHub corpus degradation.** When Import Mode cannot reach GitHub (non-GitHub remote, `gh auth status` failure, rate-limited, air-gapped), discovery falls back to working-tree + git-log evidence only. A one-line notice naming the reason is appended to the `sdd/changes.md` import entry; triage Context fields reference whatever artifact refs are reachable.
 
 ## Troubleshooting
 

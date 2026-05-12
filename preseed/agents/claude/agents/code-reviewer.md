@@ -24,6 +24,18 @@ A plain push to a branch with no open PR does NOT trigger you — that case is d
 
 When invoked:
 
+0. **Transition gate (Phase 0, before any other work).** Run this check FIRST. If the project is in SDD transition, exit no-op with the notice `SDD transition in progress; review suspended until triage drains.` Single rule across all review agents; see `spec-discipline.md` → SDD transition state. The literal check (same regex shape as `spec-reviewer` and `doc-updater`):
+   ```bash
+   if [ -f sdd/config.yml ] \
+      && grep -q '^transition:[[:space:]]*true' sdd/config.yml \
+      && [ -f sdd/init-triage.md ] \
+      && grep -qiE '^\*\*Status:\*\*[[:space:]]+open\b' sdd/init-triage.md; then
+     echo "SDD transition in progress; review suspended until triage drains."
+     exit 0
+   fi
+   ```
+   Emit the notice and stop without writing any review report. Same gate shape as `git-push-review-reminder.sh` and `enforce-review-spawn.sh`.
+
 1. **Gather the full diff** — Resolve the diff source from the PR base when a PR exists, falling back to upstream-aware syntax otherwise:
    ```bash
    PR_BASE=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null)
@@ -273,6 +285,15 @@ Flag at MEDIUM severity:
   `assert.match(content, /file\.md.*350/)` breaks on whitespace
   changes, table reformatting. Prefer structural extraction or
   anchor on stable boundaries separately.
+- **Test name lies about what's asserted** — a test named
+  `it('rejects expired JWT', ...)` whose body asserts
+  `expect(result.length > 0)` or `expect(mockAuth).toHaveBeenCalled()`.
+  The named behavior is never exercised. Read the test name as a
+  one-sentence contract, read the assertions, ask: "if the implementation
+  is correct but the named behavior is broken, does at least one
+  assertion fail?" If no, the test name lies. Especially insidious for
+  tests named after a REQ ID — they satisfy the spec-discipline source-vs-
+  test literal-match rule (CQ-1) but verify nothing the REQ promises.
 
 ```javascript
 // BAD: text-matching theater — passes on any file containing the word
@@ -384,6 +405,3 @@ When reviewing AI-generated changes, prioritize:
 3. Hidden coupling or accidental architecture drift
 4. Caller impact — AI tools frequently change function signatures without updating all callers
 
-## REQ annotations (when `sdd/` exists)
-
-In projects with an `sdd/` folder, every source file implementing observable behavior from a REQ must include a comment annotating it: `// Implements REQ-X-NNN` (or language equivalent). Review rule: if a changed source file implements behavior matching a REQ's acceptance criteria but lacks the annotation → MEDIUM finding, suggest the specific annotation line. See `spec-discipline.md` → Source code ↔ REQ annotations.

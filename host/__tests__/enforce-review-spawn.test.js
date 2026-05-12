@@ -529,29 +529,27 @@ describe('enforce-review-spawn.sh — bypass 2: magic phrase', () => {
 });
 
 describe('enforce-review-spawn.sh — fail-safe behavior', () => {
-  it('exits 0 silently when timestamp extraction fails (regression for fail-open bug)', () => {
-    // This test pins the fix for the awk `ts > ""` fail-open bug.
-    // A push line with no extractable timestamp must NOT silently
-    // skip enforcement via awk's string-compare semantics — it must
-    // hit the explicit empty-PUSH_TS guard and exit 0.
+  it('classifies agents earlier in the transcript than the push as stale', () => {
+    // Pins the line-number ordering contract for spawned_after_push.
+    // The transcript is append-only JSONL, so a subagent_type entry
+    // that appears BEFORE the push line is definitionally pre-push
+    // and must not satisfy enforcement.
     const cwd = makeFixture();
     withSdd(cwd);
-    const binDir = fakeGh(cwd, ghReturning('OPEN', 'newsha'));
-    // Bash command line with NO timestamp field
-    const pushLineNoTs = JSON.stringify({
-      type: 'assistant',
-      message: {
-        content: [
-          { type: 'tool_use', name: 'Bash', input: { command: 'git push origin develop' } },
-        ],
-      },
-    });
-    const t = writeTranscript(cwd, [pushLineNoTs]);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [
+      AGENT_LINE('code-reviewer', '2026-05-03T11:59:59Z', 'toolu_stale_cr'),
+      AGENT_LINE('spec-reviewer', '2026-05-03T11:59:59Z', 'toolu_stale_sr'),
+      AGENT_LINE('doc-updater', '2026-05-03T11:59:59Z', 'toolu_stale_du'),
+      PUSH_LINE(),
+    ]);
     const r = runHook(cwd, { transcriptPath: t, binDir });
     assert.equal(r.status, 0);
-    assert.equal(r.stdout, '',
-      'missing timestamp must short-circuit before the spawned_after_push helper, ' +
-      'not silently disable enforcement via awk string comparison');
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'agents earlier in the transcript than the push must not count');
+    assert.match(r.stdout, /code-reviewer/);
+    assert.match(r.stdout, /spec-reviewer/);
+    assert.match(r.stdout, /doc-updater/);
   });
 
   it('does not match "git push" inside echo strings (regression for substring false-positive)', () => {
@@ -721,5 +719,131 @@ describe('enforce-review-spawn.sh — MCP shell tool input shapes (issue #319)',
     const r = runHook(cwd, { transcriptPath: t, binDir });
     assert.equal(r.status, 0);
     assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+  });
+});
+
+describe('enforce-review-spawn.sh - SDD transition gate (REQ-AGENT-022)', () => {
+  function withTransitionConfig(cwd, { transition = true } = {}) {
+    writeFileSync(
+      join(cwd, 'sdd/config.yml'),
+      `mode: interactive\nenforce_tdd: false\n${transition ? 'transition: true' : '# transition: false'}\n`,
+    );
+  }
+
+  function withTriage(cwd, body) {
+    writeFileSync(join(cwd, 'sdd/init-triage.md'), body);
+  }
+
+  it('exits 0 silently and never calls gh when transition + open triage', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    withTransitionConfig(cwd);
+    withTriage(cwd, '## TRIAGE-001\n**Status:** open\n');
+    const binDir = ghPoison(cwd); // gh must NOT be called during transition
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '');
+    assert.doesNotMatch(r.stderr || '', /POISON_GH_CALLED/,
+      'transition gate must short-circuit before any gh round-trip');
+  });
+
+  it('exits 0 silently for mixed-case Status: Open (case-insensitive grep)', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    withTransitionConfig(cwd);
+    withTriage(cwd, '## TRIAGE-001\n**Status:**  Open\n');
+    const binDir = ghPoison(cwd);
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '');
+  });
+
+  it('proceeds to enforcement when transition: true but no open items remain', () => {
+    // Corrupted closure state: spec-reviewer is supposed to flag this.
+    // The hook must NOT suppress so the run can reach spec-reviewer.
+    const cwd = makeFixture();
+    withSdd(cwd);
+    withTransitionConfig(cwd);
+    withTriage(cwd, '## TRIAGE-001\n**Status:** resolved\n## TRIAGE-002\n**Status:** lost\n');
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'no open items must let enforcement reach gh so spec-reviewer can flag the corrupted state');
+  });
+
+  it('proceeds to enforcement when init-triage.md is missing entirely', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    // Normal project: no transition config, no triage file
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+  });
+
+  it('proceeds to enforcement when transition: false even with open triage items', () => {
+    // Conjunction guard: both transition: true AND open items required.
+    const cwd = makeFixture();
+    withSdd(cwd);
+    withTransitionConfig(cwd, { transition: false });
+    withTriage(cwd, '## TRIAGE-001\n**Status:** open\n');
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+  });
+});
+
+describe('enforce-review-spawn.sh - PR MERGED/CLOSED with un-acked HEAD', () => {
+  it('records a finding in sdd/.review-needed.md and exits 0 when MERGED without prior ack', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    // Seed a different last-ack so CURRENT_PR_HEAD != LAST_ACK
+    const gitCommonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd, encoding: 'utf-8',
+    }).stdout.trim();
+    writeFileSync(join(cwd, gitCommonDir, 'sdd-last-ack-pr-head'), 'priorAckSHA\n');
+    const binDir = fakeGh(cwd, ghReturning('MERGED', 'mergedHeadSHA', 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '', 'merged PRs never block (merge already happened)');
+    const findings = readFileSync(join(cwd, 'sdd/.review-needed.md'), 'utf-8');
+    assert.match(findings, /PR MERGED/,
+      'merged un-acked PR HEAD must surface in review-needed.md for retroactive visibility');
+    assert.match(findings, /mergedH/,
+      'finding includes the un-acked HEAD prefix');
+  });
+});
+
+describe('enforce-review-spawn.sh - 3-strike circuit breaker GIVEUP state', () => {
+  it('blocks 3 times for the same SHA, then sticks in GIVEUP and exits 0 forever', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'stuckSHA', 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+
+    // First 3 calls: block
+    for (let i = 0; i < 3; i++) {
+      const r = runHook(cwd, { transcriptPath: t, binDir });
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /"decision"\s*:\s*"block"/, `strike ${i + 1} should block`);
+    }
+    // Fourth call: counter must have flipped to GIVEUP, exit 0 silently
+    const r4 = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r4.status, 0);
+    assert.equal(r4.stdout, '',
+      'after 3 strikes the counter is GIVEUP for this SHA; further Stop events exit 0');
+    // Fifth call: still GIVEUP (sticky, not re-armed)
+    const r5 = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r5.status, 0);
+    assert.equal(r5.stdout, '',
+      'GIVEUP is sticky for the same SHA - no re-arm on subsequent Stop events');
   });
 });

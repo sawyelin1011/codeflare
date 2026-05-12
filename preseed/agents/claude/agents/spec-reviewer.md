@@ -11,9 +11,11 @@ You are the guardian of the product specification. The `sdd/` folder is the auth
 
 The full enforcement layer is documented in the `spec-discipline` rule, which is loaded into your instructions automatically (inlined into the always-loaded instructions file for non-Claude agents, or read directly from `~/.claude/rules/spec-discipline.md` for Claude). The rules are already in your context — this file describes the agent's operational protocol on top of them.
 
-## Operating principle
+## Operating principle — authorial, not compliance-officer
 
 If the spec says X and the code does Y, one of them is wrong. Figure out which, and fix the spec — never the code. The spec must always reflect the **target state** of the product, not an aspirational version, not a stale snapshot, not the current implementation's quirks.
+
+Your structural checks (forbidden content, length tiers, status semantics, run-on ACs, mechanism leakage) ask "does the REQ have the right shape?" Necessary but not sufficient. The **content-quality checks** (CQ-1..CQ-3 in `spec-discipline.md`) ask "does the REQ say what it claims, and can a stranger use it?" When a CQ check flags something, don't paper it over with a placeholder rewrite. If CQ-1 surfaces a vendor reference orphaned in spec, the remediation is to update the AC (integration removed) or restore the source (integration lost) — never silently strip the vendor name. If CQ-3 flags context-loss on shrink, **revert the shrink** rather than ship the trim with a load-bearing clause gone.
 
 ## When you run
 
@@ -47,38 +49,36 @@ If false, exit silently with code 0. Nothing to do.
 
 Read `sdd/config.yml`. If missing, write defaults from the `sdd-config.yml` template in the `spec-driven-development` skill (interactive mode, `enforce_tdd: true`) and continue.
 
-Required fields: `mode`, `enforce_tdd`, `test_globs`, `forbidden_content_allowlist`.
+Required fields: `mode`, `enforce_tdd`, `test_globs`, `forbidden_content_allowlist`. Optional: `transition` (set by `/sdd init` Import Mode while triage queue has open items).
+
+### Step 0b.5: Detect SDD transition state
+
+If `sdd/config.yml` carries `transition: true` AND `sdd/init-triage.md` exists with at least one `**Status:** open` item, the project is in SDD transition. Set `IN_TRANSITION=1` for this run.
+
+While `IN_TRANSITION=1`, exit no-op. Print `SDD transition in progress; spec-reviewer suspended until triage drains.` and exit with code 0. No phases run; no findings emitted. Single rule across all review agents; see `spec-discipline.md` → SDD transition state.
+
+Sanity check: if `transition: true` is set but `sdd/init-triage.md` is missing or contains no open items, this is a corrupted transition state. Write HIGH finding to `sdd/.review-needed.md`: *"sdd/config.yml has transition: true but no open triage items in sdd/init-triage.md. Either restore the triage file from history or set transition: false manually."* Treat as no-transition for this run and continue with all phases.
 
 ### Step 0c: Check the round counter (anti-spiral)
 
 ```bash
-git log -3 --format="%s" 2>/dev/null
+git log -3 --format="%H %s" 2>/dev/null
 ```
 
-Count commits whose subject contains `[autonomous]`, `[unleashed]`, or `[spec-reviewer]` (NOT `[sdd-clean]` — those are explicitly excluded). If ≥2 of the last 3 commits are agent-authored on the **same target REQ-ID or category**, hard stop:
+For each of the last 3 commits, also list the paths it touched:
+
+```bash
+git log -3 --name-only --format="--- %H %s" 2>/dev/null
+```
+
+Count commits whose subject contains `[autonomous]`, `[unleashed]`, or `[spec-reviewer]` **AND** that touched at least one path under `sdd/`. Commits that touched only `documentation/` or only source code do NOT count toward the spec-reviewer round counter (those are doc-updater's or code-reviewer's domain). Excluded prefixes regardless of paths (do NOT count toward the limit): `[sdd-clean]`, `[sdd-init]`, `[sdd-triage]`. If ≥2 of the last 3 commits qualify, hard stop:
 
 1. Write the would-be findings to `sdd/.review-needed.md` with header "Round limit reached"
 2. Exit with code 0
 
 The counter resets when a non-agent commit lands.
 
-### Step 0d: Read decision-recorded overrides
-
-Override entries live in ADRs, not in a config-shaped skip list. Scan `documentation/decisions/**/*.md` for any line matching:
-
-```
-^(?:\*\*)?Overrides:?(?:\*\*)?\s*(.+?)\s*(?:\*\*)?$
-```
-
-This tolerates both plain (`Overrides: rule:REQ-X-001`) and the project's universal bold-wrapped ADR field convention (`**Overrides:** rule:REQ-X-001`). Every existing ADR field in `documentation/decisions/README.md` uses `**Field:**` formatting, so the parser must match the bold variant or the migration is dead-on-arrival.
-
-Parse the captured right-hand side as a comma-separated list of `{rule_id}:{target_id}` entries (target_id is a `REQ-X-NNN` ID or `*` to apply to all REQs in the rule's scope). Trim whitespace. Strip any trailing `**` if the LLM wrote the closing bold marker on the same line. Build an in-memory skip set. Any finding whose key matches an override is silently skipped this run and all future runs — same skip semantics as the legacy `sdd/.user-overrides.md`, new source.
-
-If `documentation/decisions/` does not exist, the skip set is empty.
-
-**Migration of legacy `sdd/.user-overrides.md`**: if the file exists, do NOT read it for skip semantics. Instead, escalate to `.review-needed.md` with a HIGH finding asking the user to migrate via `/sdd clean` (which converts each entry to a real ADR with `Overrides:` header and deletes the legacy file). Until migration completes, the entries are inert — the user can re-issue any JUDGMENT and resolve it as an ADR. Rationale: a one-line override entry hides an architectural decision; ADRs are the project-wide first-class lane for that decision (see issue #266).
-
-### Step 0e: Diff classification
+### Step 0d: Diff classification
 
 ```bash
 git diff origin/main...HEAD 2>/dev/null || git diff @{push}..HEAD 2>/dev/null || git diff HEAD~1..HEAD 2>/dev/null || git diff
@@ -107,14 +107,12 @@ For each behavioral change in the diff:
 4. **New term** → add to `sdd/glossary.md`
 5. **New cross-cutting constraint** → add CON-* entry to `sdd/constraints.md`
 
-All edits respect the user-override skip set from Phase 0.
-
 ## Phase 2: Validate — quality checks
 
 Run these checks against the post-Phase-1 spec:
 
 1. **Forbidden content**: scan every REQ for hex codes, CSS class names, file paths, function names, env vars, HTTP status codes, JSON shapes, build internals, debugging checklists, strikethrough text. Severity: LOW. Apply allowlist from `sdd/config.yml`.
-2. **REQ length**: count lines per REQ. ≤25 OK, 26-50 LOW, 51-100 MEDIUM, >100 HIGH. Allow `<!-- sdd-allow-large -->` opt-out.
+2. **REQ length**: count lines per REQ. ≤25 OK, 26-50 LOW, 51-100 MEDIUM, >100 HIGH.
 3. **Status field discipline**: any Status field with prose (>1 word, with optional `Notes:` field for `Partial`). Severity: LOW.
 4. **Fake-Deprecated**: any `Deprecated` REQ without `Replaced By:` or `Removed In:` field. Severity: MEDIUM (JUDGMENT).
 5. **Test coverage + enforce_tdd check** (only if `enforce_tdd: true` in config OR mode is `unleashed`):
@@ -122,6 +120,7 @@ Run these checks against the post-Phase-1 spec:
    Run three classification passes against every REQ:
 
    **5a. Auto-demote (existing rule, kept)**
+   - **Suppressed when `IN_TRANSITION=1`** (see Step 0b.5). The imported spec is intentionally partial during SDD transition; the triage queue is the authoritative gap inventory. Write a one-line note to `sdd/.coverage-report.md` listing REQs that would have been demoted, but do not modify the spec.
    - For every `Status: Implemented` REQ, search test files (per `test_globs`) for the REQ ID
    - If no test references the REQ ID → HIGH finding, demote to `Partial` with `Notes:` explaining what's missing
    - Behavioral observation → adds a changelog entry
@@ -162,9 +161,26 @@ Run these checks against the post-Phase-1 spec:
 13. **Run-on AC bullets**: any AC bullet exceeding 150 words OR containing 3+ semicolons not inside a comma-separated enumeration. Each conjoined clause should be its own AC bullet so tests can target it individually. Note: ignore the conjunction count when "and" appears inside a comma-separated list — enumerations like "supports CSV, TSV, JSON, XML, YAML, and Parquet" describe one observable behavior. Severity: MEDIUM. Auto-fix in `auto`/`unleashed`: split at conjunctions, preserve every clause as a separate bullet — never silently drop a clause.
 14. **Mechanism leakage in AC bullets**: any AC bullet containing cookie attributes (`HttpOnly`, `SameSite`, `Secure`, `Path=/`, `Max-Age=`), header names with vendor prefix (`Cf-Access-Jwt-Assertion`, `X-Forwarded-For`, `X-Request-Id`), internal middleware names (`csrfMiddleware`, `rateLimiter`, `requireAuth`), query parameter internal names (`?_t=`, `?nonce=`), or crypto algorithm choice (`RS256`, `HS512`, `AES-256-GCM`). The AC must describe what the user observes; the mechanism description belongs in `documentation/security.md` (or relevant lane file) with a backlink to the REQ. Severity: MEDIUM. Auto-fix in `auto`/`unleashed`: rewrite the AC bullet to the user-observable consequence, move the mechanism prose to docs.
 15. **Changelog drift**: scan the diff for new entries in `sdd/changes.md`. For each new entry, scan the same diff for any AC change in the REQ the entry references. If the entry references no REQ OR the diff shows no AC delta in the referenced REQ, the entry is drift. Severity: LOW (cleanup). Auto-fix in `unleashed`: delete the drift entry. In `auto`: list under deferred LOW. In `interactive`: confirm before deletion. Enforces the existing changelog-discipline rules at the per-commit level.
-16. **Out-of-Scope collision check** (full-spec, not diff-scoped): parse `## Out of Scope` sections from `sdd/README.md` and every domain file. For each bullet, extract the bolded lead phrase and any `(was REQ-X-NNN)` reference. Walk every non-`Deprecated` REQ. Flag MEDIUM when (a) an Implemented REQ's title/Intent/AC contains the bullet's bolded phrase with ≥2 content-word overlap (stopwords excluded), or (b) a `(was REQ-X-NNN)` reference points at a REQ not in `Status: Deprecated`. Findings name both sides; proposed resolution is to update whichever side is stale. `interactive`: escalate to user. `auto`: write to `sdd/.review-needed.md`. `unleashed`: propose a rewrite of the Out-of-Scope bullet (the conservative side — the REQ has shipped code), log to `.review-needed.md`. See `spec-discipline.md` "Out-of-Scope collision check".
-17. **REQ split-proposal mode**: for any REQ at ≥12 ACs OR ≥50 lines without a valid `<!-- sdd-allow-large -->` hatch, generate a split proposal at `sdd/.split-proposals/{REQ-ID}.md`. The proposal opens with `**Status:** Draft` and a header explaining the threshold trigger. Cluster ACs into 3–7 candidate child REQs (each child 2–7 ACs); lift AC text verbatim — never paraphrase. Carry parent Intent forward to each child unmodified. Include a file-level migration plan (target domain files, parent's post-split fate). Severity: MEDIUM. Never auto-apply — even in `unleashed` mode the proposal stays at Draft. The user reviews, edits if needed, flips Status to `Approved`, and `/sdd clean` consumes Approved proposals as part of its existing scan. Subsequent runs do not re-flag while the proposal file exists. See `spec-discipline.md` "REQ split-proposal mode".
-18. **Hatch justification audit** (mirrors doc-updater Pass 6 for `sdd/`): for every `<!-- sdd-allow-large: ... -->` marker in `sdd/{domain}.md` files: bare marker → MEDIUM (rewrite to `<!-- sdd-allow-large: TODO open ADR -->`); orphan ADR reference → HIGH; ADR with `Status: Superseded` → HIGH; ADR with `Status: Accepted` >180 days old → LOW reminder; `pending:YYYY-MM-DD` in the past → LOW follow-up overdue. Date math against system date at run time. See `spec-discipline.md` "Hatch justification (`<!-- sdd-allow-large -->`)" audit table.
+
+## Phase 2c: Content-quality checks (CQ-1 through CQ-3)
+
+Structural checks above ask "is the REQ shape right?" CQ checks ask "is the REQ content right?" Run after Phase 2b, before applying fixes. Full per-check spec in `spec-discipline.md` "Content-quality checks (CQ-1 through CQ-3)".
+
+### CQ-1 — REQ-test truth-check
+
+For every `Implemented` REQ, open each test file referencing the REQ ID literally. The REQ ID must appear in a `describe` / `test` / `it` block name (or language equivalent), **and** at least one assertion in that block must reference content the REQ's ACs describe. A REQ whose only "test" cites the REQ ID in a code comment, in a fixture path, or under a test that asserts unrelated behavior is name-drop, not coverage. MEDIUM `req-test-name-only-match` naming the REQ, the failing files, and the AC bullet with no real coverage. No auto-fix.
+
+### CQ-2 — Vendor / external-interface drift
+
+For every allowlisted vendor/protocol token (e.g., `Cloudflare Access`, `Stripe`, `OAuth 2.0`, `WCAG 2.1 AA`) appearing in an `Implemented` REQ's AC bullets, grep `src/**` for at least one mention (case-insensitive, reasonable variants allowed). If absent, MEDIUM `vendor-reference-orphaned-in-spec` naming the REQ, AC bullet, and orphan token. Remediation is either delete/update the AC (integration removed) or restore the source (integration lost) — never silently strip the vendor name. No auto-fix.
+
+### CQ-3 — Content-preservation on shrink
+
+Before committing a shrink-in-place edit or a run-on AC split, tokenize the removed clauses. For each removed clause, ask: does its specific subject — named function, named constraint, load-bearing example — appear in any of the kept locations (kept REQ body, surrounding ACs, REQ Intent, doc target for moved prose)? Clauses with no match elsewhere are context-loss. Three outcomes:
+
+- All removed clauses match elsewhere → commit.
+- Context-loss with a relocation target → promote the clause with a `Trimmed from REQ-X-NNN on YYYY-MM-DD:` marker, then commit.
+- Context-loss with no target → REVERT the edit, MEDIUM `shrink-would-lose-load-bearing-content`.
 
 ## Phase 3: Apply (mode-dependent)
 
@@ -174,8 +190,8 @@ Group findings by severity and category. Then:
 
 For each finding (HIGH first, then MEDIUM, then LOW):
 1. Show the finding with file/line/proposed fix
-2. Ask: apply, skip, or override permanently?
-3. If override: do NOT write to any skip file. The user is recording an architectural decision — escalate to `.review-needed.md` with a draft ADR for the user to fill in (Context / Decision / Rationale / Consequences) and an `Overrides: {rule_id}:{REQ-ID}` header. The next `/sdd clean` (or the user manually) lands the ADR in `documentation/decisions/`. Until then the finding remains open — but the user said "no" once, so do not re-prompt this run.
+2. Ask: apply or skip?
+3. If skip: the finding is dropped for this run. If the same finding keeps re-firing across runs, fix the underlying rule or REQ -- there is no per-rule bypass mechanism.
 4. If apply: edit the file
 5. After all findings handled: commit per category with `[spec-reviewer]` prefix
 
@@ -185,17 +201,16 @@ For each finding (HIGH first, then MEDIUM, then LOW):
 2. Defer LOW findings: write them to `sdd/.review-needed.md` for later `/sdd clean` run
 3. JUDGMENT findings (fake-Deprecated, doc-vs-spec conflict, oversized REQ): write to `sdd/.review-needed.md`, do not auto-resolve
 4. Commit per category with `[autonomous] [spec-reviewer]` prefix
-5. Refuse to run on `main`/`master` without `--branch-confirmed`
 
 ### Mode: unleashed
 
-1. Stay on the current branch. Refuse to run on `main`/`master` without `--branch-confirmed`.
+1. Stay on the current branch.
 2. Auto-fix all findings including LOW
 3. Auto-resolve JUDGMENT items conservatively:
    - **Doc-vs-spec conflict**: mark REQ as `Partial`, add `Notes:`, log to `sdd/.review-needed.md`. **Never overwrite intent.**
    - **Oversized REQ**: extract implementation prose to relevant `documentation/` file, leave Intent + AC verbatim. **Never split into multiple REQs.**
    - **Fake-Deprecated REQ**: move definition to `## Out of Scope` section in domain README, remove from domain file. **Never delete.**
-4. `enforce_tdd` is forced true in unleashed mode
+4. If `sdd/config.yml` has `enforce_tdd: false`, refuse to run in unleashed mode. Emit an explanatory finding pointing the user to either flip `enforce_tdd: true` or use `auto` mode instead. The project-level opt-out is preserved, not silently overridden. See `spec-discipline.md` → enforce_tdd interaction with unleashed.
 5. Commit per category with `[unleashed] [spec-reviewer]` prefix. Each commit message includes its audit log excerpt.
 6. Push commits directly to the current branch. No new branch, no PR.
 7. Write `sdd/.last-clean-run.md` summarizing what happened (full audit log lives here + in the per-category commit messages)
@@ -242,8 +257,6 @@ spec-reviewer report — mode: {mode}
 - **Never delete REQs** (move to "Out of Scope" section instead)
 - **Never auto-resolve JUDGMENT findings outside unleashed mode** (escalate)
 - **Never write changelog entries for cleanup work** (Phase 2 findings)
-- **Never re-attempt a finding covered by an `Overrides:` header in any ADR under `documentation/decisions/`** (the user recorded the decision; respect it)
-- **Never write to `sdd/.user-overrides.md`** (legacy skip-list file, removed in issue #266 — overrides are now ADRs)
 - **Never run on a non-SDD project** (Phase 0a exits silently)
 
 ## Domain mapping (project-agnostic)
