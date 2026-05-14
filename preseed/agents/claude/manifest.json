@@ -464,5 +464,53 @@
     "modes": [
       "advanced"
     ]
+  },
+  "plugins/graphify/.claude-plugin/plugin.json": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "plugins/graphify/README.md": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/graphify-mcp-lazy.py": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/graphify-active-repo.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/graphify-session-start.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/graphify-clone-prompt.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/graph-first-nudge.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "rules/graph-first.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/graphify/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
   }
 }

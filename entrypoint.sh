@@ -279,8 +279,14 @@ RCLONE_FILTERS_COMMON=(
     # MCP server state — logs and thread history, ephemeral
     --filter "- .local/state/**"
 
-    # Wrangler — deploy logs, regenerated
+    # Wrangler - deploy logs, regenerated
     --filter "- .config/.wrangler/**"
+
+    # graphify (REQ-AGENT-023) - knowledge-graph outputs live in the repo,
+    # not in R2. Repo owners commit graphify-out/ to git; the working tree
+    # gets them on clone. Repos without push permission keep graphify-out/
+    # local and ephemeral. R2 bisync does not touch graphify-out/ either way.
+    --filter "- **/graphify-out/**"
 )
 
 # In default mode, exclude entire .memory/ directory (no persistent memory)
@@ -1118,6 +1124,60 @@ else
 fi
 echo "[entrypoint] context-mode MCP server registered in .claude.json (version $CONTEXT_MODE_VERSION)"
 
+# ---------------------------------------------------------------------------
+# Configure graphify MCP server. (Implements REQ-AGENT-023)
+#
+# graphify is installed at build time at /root/.local/bin/graphify (uv tool
+# install graphifyy[mcp,sql,pdf]). The MCP server is invoked as
+# `python3 -m graphify.serve`; the server discovers graphify-out/graph.json
+# from cwd per-invocation, so no graph path is registered here.
+#
+# Unlike context-mode, graphify is NOT tier-gated:
+#   - Plugin folder ships to ALL session modes (Standard + Pro)
+#   - MCP server is registered unconditionally on session mode (capability
+#     is ambient; only the SKILL + RULE + hooks that teach the agent to use
+#     it are advanced-mode-only via manifest.json gating)
+#
+# Plays cleanly with and without context-mode: graphify's own subagent
+# chunking handles main-context bounding when context-mode is absent (non-
+# Custom tiers); when context-mode is present, subagent Read/Grep during
+# /graphify extraction route through ctx_execute for bonus token savings.
+# ---------------------------------------------------------------------------
+GRAPHIFY_MANIFEST="$USER_HOME/.claude/plugins/graphify/.claude-plugin/plugin.json"
+GRAPHIFY_VERSION="unknown"
+if [ -f "$GRAPHIFY_MANIFEST" ]; then
+    GRAPHIFY_VERSION=$(jq -r '.version // "unknown"' "$GRAPHIFY_MANIFEST" 2>/dev/null || echo "unknown")
+fi
+# Use the uv-isolated venv's python, not system python3. `uv tool install`
+# (Dockerfile) installs graphifyy into /root/.local/share/uv/tools/graphifyy/
+# and only exposes the `graphify` CLI shim on PATH - the package is invisible
+# to system python3, so `python3 -m graphify.serve` would die with
+# ModuleNotFoundError. Pointing the MCP server at the venv's own interpreter
+# is the supported way to reach internal modules of a uv-installed tool.
+#
+# Run via the graphify-mcp-lazy.py wrapper rather than `-m graphify.serve`
+# directly. Upstream graphify.serve sys.exit(1)s if graphify-out/graph.json
+# is missing at startup; in Codeflare sessions there's no clean way to
+# restart Claude Code (killing the session kills the container), so the
+# server has to come up against a missing graph and hot-reload when one
+# appears. The wrapper subclasses nx.DiGraph and watches the file mtime;
+# tool list stays static (always 7 tools), only G's contents swap.
+GRAPHIFY_PY="/root/.local/share/uv/tools/graphifyy/bin/python"
+GRAPHIFY_WRAPPER="$USER_HOME/.claude/plugins/graphify/scripts/graphify-mcp-lazy.py"
+GRAPHIFY_MCP_CONFIG=$(jq -n --arg py "$GRAPHIFY_PY" --arg wrap "$GRAPHIFY_WRAPPER" '{mcpServers:{"graphify":{command:$py,args:[$wrap]}}}')
+if [ -f "$USER_CLAUDE_JSON" ]; then
+    TMP_JSON=$(mktemp)
+    if jq --argjson mcp "$GRAPHIFY_MCP_CONFIG" '. * $mcp' "$USER_CLAUDE_JSON" > "$TMP_JSON" 2>/dev/null; then
+        mv "$TMP_JSON" "$USER_CLAUDE_JSON"
+    else
+        echo "[entrypoint] WARNING: Could not merge graphify MCP config (malformed .claude.json?)"
+        rm -f "$TMP_JSON"
+    fi
+else
+    echo "$GRAPHIFY_MCP_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
+fi
+echo "[entrypoint] graphify MCP server registered in .claude.json (version $GRAPHIFY_VERSION)"
+
 # Configure Claude Code settings.json with hooks (advanced) or just settings (default)
 PLUGIN_DIR="$USER_HOME/.claude/plugins"
 if [ "${SESSION_MODE:-default}" = "advanced" ]; then
@@ -1185,6 +1245,53 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
           )
         ')
         echo "[entrypoint] Advanced mode: context-mode hooks added to settings.json (version $CONTEXT_MODE_VERSION)"
+    fi
+    # graphify hooks (advanced session mode + plugin manifest present).
+    # Implements REQ-AGENT-023 AC3 + AC4:
+    #   - SessionStart (matcher "startup") injects context if a graph
+    #     exists in cwd, or a build-suggestion reminder for code repos
+    #     without a graph. Never auto-builds.
+    #   - PostToolUse on Bash + the two MCP shell tools detects
+    #     `git clone` / `gh repo clone` and injects an AskUserQuestion
+    #     triage directive. Idempotent per cloned dir.
+    #   - PreToolUse on Grep|Glob (non-custom tier) and on the two ctx
+    #     grep-equivalents ctx_search|ctx_batch_execute (custom tier)
+    #     injects a soft nudge to use mcp__graphify__* when a graph
+    #     exists in cwd. Never blocks - the use/don't-use call requires
+    #     semantic judgment a hook can't reliably make.
+    # The MCP server itself is registered above unconditionally; these
+    # hooks are the load-bearing discipline pieces, gated on advanced.
+    if [ -f "$GRAPHIFY_MANIFEST" ]; then
+        # active-repo hook: tracks current repo for the MCP wrapper.
+        # Ships to ADVANCED ONLY (per AD52 / REQ-AGENT-023: MCP server +
+        # wrapper register in both modes, but all hooks - including this
+        # one - stay in advanced). Matchers cover Bash, Edit/Write/Read/
+        # NotebookEdit (universal across tiers), and the three ctx_execute
+        # variants (custom-tier users where `cd` happens inside ctx_execute
+        # shells that Claude Code's session cwd never sees).
+        GRAPHIFY_HOOKS=$(jq -n --arg dir "$PLUGIN_DIR" '{
+          SessionStart: [
+            {matcher:"startup",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graphify-session-start.sh")}]}
+          ],
+          PostToolUse: [
+            {matcher:"Bash",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graphify-clone-prompt.sh")}]},
+            {matcher:"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graphify-clone-prompt.sh")}]},
+            {matcher:"Bash|Edit|Write|Read|NotebookEdit",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graphify-active-repo.sh")}]},
+            {matcher:"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_execute_file|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graphify-active-repo.sh")}]}
+          ],
+          PreToolUse: [
+            {matcher:"Grep|Glob",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graph-first-nudge.sh")}]},
+            {matcher:"mcp__context-mode__ctx_search|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graph-first-nudge.sh")}]}
+          ]
+        }')
+        SETTINGS_CONFIG=$(echo "$SETTINGS_CONFIG" | jq --argjson gf "$GRAPHIFY_HOOKS" '
+          .hooks as $h | .hooks = (
+            ($h | keys) + ($gf | keys) | unique |
+            map(. as $k | {key: $k, value: (($h[$k] // []) + ($gf[$k] // []))}) |
+            from_entries
+          )
+        ')
+        echo "[entrypoint] Advanced mode: graphify hooks added (SessionStart + PostToolUse on clone + PreToolUse graph-first nudge)"
     fi
     # Hardening: validate SETTINGS_CONFIG is well-formed JSON before it
     # reaches the settings.json merge below. The literal heredoc-style
@@ -1261,12 +1368,16 @@ if [ -d "$USER_CLAUDE_DIR/hooks" ]; then
 fi
 
 # Enable plugins (silently skipped if plugin files absent in default mode).
-# context-mode is conditionally enabled via the preseed-plugin gate below.
+# context-mode and graphify are conditionally enabled via the preseed-plugin gates.
 if [ -f "$CONTEXT_MODE_MANIFEST" ]; then
     PLUGINS_CONFIG='{"enabledPlugins":{"codeflare-memory":true,"codeflare-hooks":true,"context-mode":true}}'
     echo "[entrypoint] context-mode plugin enabled (preseed manifest present)"
 else
     PLUGINS_CONFIG='{"enabledPlugins":{"codeflare-memory":true,"codeflare-hooks":true}}'
+fi
+if [ -f "$GRAPHIFY_MANIFEST" ]; then
+    PLUGINS_CONFIG=$(echo "$PLUGINS_CONFIG" | jq '.enabledPlugins["graphify"] = true')
+    echo "[entrypoint] graphify plugin enabled (preseed manifest present)"
 fi
 if [ -f "$USER_CLAUDE_JSON" ]; then
     TMP_PLUGINS=$(mktemp)

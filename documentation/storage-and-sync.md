@@ -57,6 +57,7 @@ All bisync commands use `--ignore-checksum` to skip post-transfer MD5 verificati
 | `~/.cpan/**` | **NO** | Perl CPAN package manager cache, regenerated |
 | `~/.gemini/tmp/**` | **NO** | Gemini CLI temp files (ripgrep binary, chat logs) |
 | `~/.local/share/opencode/log/**`, `opencode.db-shm`, `opencode.db-wal` | **NO** | OpenCode session logs and SQLite temp files |
+| `**/graphify-out/**` (REQ-AGENT-023) | **NO** | Knowledge-graph artifacts live in the repo, not in R2. Repo owners commit `graphify-out/` to git; the working tree gets them on clone. Repos without push permission keep the graph local-only and ephemeral. R2 bisync is not in the graphify persistence path. |
 
 ## rclone Sync Modes
 
