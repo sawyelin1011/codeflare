@@ -189,6 +189,7 @@ const server = http.createServer(async (req: http.IncomingMessage, res: http.Ser
         userPath: syncInfo.userPath,
         prewarmReady,
         initFlagObserved,
+        terminalServiceReady,
         cpu: sysMetrics.cpu,
         mem: sysMetrics.mem,
         hdd: sysMetrics.hdd,
@@ -314,6 +315,18 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
   const isManualTab = query.manual === '1';
   const connectedAt = Date.now();
 
+  // Reject early: port 8080 binds before R2 sync + .bashrc autostart writes.
+  // If we accept now we'd spawn a fresh PTY with no autostart in .bashrc, and
+  // the user would land in bare bash instead of their configured agent.
+  // Close with 1013 (Try Again Later) so the client's reconnect logic retries
+  // after a brief delay. Once the entrypoint touches the init-complete flag
+  // and the pre-warm session is in the map, this gate opens.
+  if (!terminalServiceReady) {
+    log('info', 'WS upgrade rejected: terminal service warming up', { initFlagObserved, sessionId: sessionId?.substring(0, 8) });
+    ws.close(1013, 'container-warming-up');
+    return;
+  }
+
   if (!sessionId) {
     ws.close(1008, 'Session ID required');
     return;
@@ -428,12 +441,20 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 // Pre-warm state (module-level so /health endpoint can read prewarmReady)
 let prewarmReady = false;
 let prewarmStartTime = 0;
-// True after waitForInitFlag observes the flag file; false if it timed out
-// or no flag was configured. Exposed via /health for production debugging:
-// a session stuck at `prewarmReady=false` with `initFlagObserved=false` means
-// the entrypoint never wrote the init-complete flag (sync hung, jq merge
-// failed, etc.).
+// True after waitForInitFlag observes the flag file. Stays false if the
+// 130s timeout fallback fires instead (entrypoint hung). Exposed via
+// /health for production debugging: an `initFlagObserved=false`
+// combined with `terminalServiceReady=true` means the host server is
+// serving traffic from the timeout-fallback path (image-default state,
+// not user-restored). `initFlagObserved=false` + `terminalServiceReady=false`
+// is the cold-start warm-up window — normal and transient.
 let initFlagObserved = false;
+// True after the init flag is observed AND the pre-warm session is in the
+// session map. Until then, /terminal WS upgrades are rejected with 1013 so
+// the user's reconnect storm doesn't get a fresh PTY spawned against pre-sync
+// state (no .claude.json yet, no .bashrc autostart yet — which would land
+// the user in bare bash instead of their configured agent).
+let terminalServiceReady = false;
 
 const parsedTabConfig: TabConfigEntry[] = (() => {
   try { return JSON.parse(process.env.TAB_CONFIG ?? '[]') as TabConfigEntry[]; } catch { return []; }
@@ -493,6 +514,12 @@ server.listen(PORT, '0.0.0.0', async () => {
   const prewarmSession = new Session(PREWARM_SESSION_ID, 'Terminal', false, sessionOptions);
   sessionManager.sessions.set(PREWARM_SESSION_ID, prewarmSession);
   prewarmSession.start();
+  // Open the /terminal WS gate AFTER prewarm.start() returns so any client
+  // that gets through finds a Session with ptyProcess already spawned (no
+  // TOCTOU window where adoption races against the PTY fork). Fresh
+  // (non-tab-1) sessions created from here on also read the final .bashrc
+  // because waitForInitFlag has already resolved.
+  terminalServiceReady = true;
   prewarmStartTime = Date.now();
   log('info', 'Pre-warming tab 1 PTY', { command: prewarmConfig.command, ptyAlive: prewarmSession.ptyProcess !== null, ptyPid: prewarmSession.ptyProcess?.pid ?? null });
 
