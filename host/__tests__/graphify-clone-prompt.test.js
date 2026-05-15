@@ -1,8 +1,9 @@
-// Verifies REQ-AGENT-023 AC4: the PostToolUse clone-prompt hook
+// Verifies REQ-AGENT-025 AC1+AC2: the PostToolUse clone-prompt hook
 // recognises `git clone` and `gh repo clone` across the three supported
 // tool-input shapes (Bash, mcp__context-mode__ctx_execute, ctx_batch_execute),
 // rejects substring false positives, extracts the cloned directory from
-// tool_response stdout, and is idempotent per cloned dir.
+// tool_response stdout (including MCP content shape), and is idempotent
+// per cloned dir.
 import { describe, it, before, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -172,6 +173,162 @@ describe('graphify-clone-prompt.sh', () => {
     assert.ok(a.json && b.json, 'distinct dirs each emit a directive');
     assert.ok(a.json.hookSpecificOutput.additionalContext.includes('/tmp/dirA'));
     assert.ok(b.json.hookSpecificOutput.additionalContext.includes('/tmp/dirB'));
+  });
+
+  it('MCP content shape: ctx_execute with .tool_response.content[].text emits directive (regression: bug fixed where stdout-shape parsing missed MCP responses entirely, causing the hook to leak the placeholder "the repo you just cloned" and skip graph-present detection)', () => {
+    const { json, stdout } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: '/agent/cwd',
+      tool_input: { language: 'shell', code: 'git clone https://github.com/foo/bar /tmp/mcp-bar' },
+      tool_response: { content: [ { type: 'text', text: "Cloning into '/tmp/mcp-bar'..." } ] },
+    }, fakeHome);
+    assert.ok(json, 'MCP content shape must produce a directive');
+    assert.ok(
+      json.hookSpecificOutput.additionalContext.includes('/tmp/mcp-bar'),
+      'directive must name the cloned dir extracted from MCP content array'
+    );
+    assert.ok(
+      !json.hookSpecificOutput.additionalContext.includes('the repo you just cloned'),
+      'directive must NOT contain the placeholder string when extraction succeeded'
+    );
+  });
+
+  it('MCP content shape: ctx_execute + relative target + graph present at $cwd/<target>/graphify-out/graph.json -> graph-present branch (real-world bug: cloning codeflare while graphify-out was committed misfired the no-graph branch)', () => {
+    const targetParent = mkdtempSync(join(baseTmp, 'mcp-rel-'));
+    const repoName = 'repo-with-graph';
+    mkdirSync(join(targetParent, repoName, 'graphify-out'), { recursive: true });
+    writeFileSync(join(targetParent, repoName, 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: targetParent,
+      tool_input: { language: 'shell', code: `git clone https://github.com/foo/bar ${repoName}` },
+      tool_response: { content: [ { type: 'text', text: `Cloning into '${repoName}'...` } ] },
+    }, fakeHome);
+    assert.ok(json, 'MCP + relative + graph present must still emit a directive');
+    const ctx = json.hookSpecificOutput.additionalContext;
+    assert.ok(/do NOT prompt/i.test(ctx), 'graph-present branch must be taken when graph exists at $cwd/<target>/graphify-out/graph.json');
+    assert.ok(!ctx.includes('AskUserQuestion'), 'graph-present branch must NOT mention AskUserQuestion');
+  });
+
+  it('URL-derivation fallback: when stdout has no Cloning line, repo name is parsed from clone URL and resolved against cwd (catches grep-filtered or stderr-only clone output)', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'url-derive-'));
+    mkdirSync(join(cwdDir, 'codeflare', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'codeflare', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone https://github.com/nikolanovoselec/codeflare.git' },
+      tool_response: { content: [ { type: 'text', text: '(no Cloning line; stdout was grep-filtered)' } ] },
+    }, fakeHome);
+    assert.ok(json, 'URL-derivation must still produce a directive');
+    assert.ok(
+      /do NOT prompt/i.test(json.hookSpecificOutput.additionalContext),
+      'fallback must detect existing graph via $cwd/<url-basename>/graphify-out/graph.json'
+    );
+  });
+
+  it('ctx_batch_execute MCP content: commands array + .content[].text response is parsed correctly', () => {
+    const targetParent = mkdtempSync(join(baseTmp, 'batch-'));
+    mkdirSync(join(targetParent, 'repo', 'graphify-out'), { recursive: true });
+    writeFileSync(join(targetParent, 'repo', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_batch_execute',
+      cwd: targetParent,
+      tool_input: { commands: [
+        { label: 'prep',  command: 'mkdir -p /tmp/x' },
+        { label: 'clone', command: 'git clone https://x/y repo' },
+      ]},
+      tool_response: { content: [ { type: 'text', text: "Cloning into 'repo'..." } ] },
+    }, fakeHome);
+    assert.ok(json);
+    assert.ok(/do NOT prompt/i.test(json.hookSpecificOutput.additionalContext));
+  });
+
+  it('URL-derivation skips CLI flags: `git clone --depth 1 <url>` derives the repo name, not the flag value (regression: bare-token awk picked "1" as the target)', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'depth-flag-'));
+    mkdirSync(join(cwdDir, 'codeflare', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'codeflare', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone --depth 1 https://github.com/nikolanovoselec/codeflare.git' },
+      tool_response: { content: [ { type: 'text', text: '(stdout filtered, no Cloning line)' } ] },
+    }, fakeHome);
+    assert.ok(json, '`--depth 1` form must still produce a directive');
+    const ctx = json.hookSpecificOutput.additionalContext;
+    assert.ok(
+      /do NOT prompt/i.test(ctx),
+      'URL-derivation must skip the --depth flag value and find the existing graph at <cwd>/codeflare/graphify-out/graph.json'
+    );
+    assert.ok(
+      !/[/`]1[/`]/.test(ctx) && !ctx.includes('cwd/1'),
+      'directive must NOT cite "1" (the --depth value) as the cloned target'
+    );
+  });
+
+  it('URL-derivation handles `--branch foo --depth 1` (multiple flag pairs before the URL)', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'multi-flag-'));
+    mkdirSync(join(cwdDir, 'myrepo', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'myrepo', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone --branch main --depth 1 https://x/myrepo.git' },
+      tool_response: { content: [ { type: 'text', text: '(no Cloning line)' } ] },
+    }, fakeHome);
+    assert.ok(json);
+    assert.ok(/do NOT prompt/i.test(json.hookSpecificOutput.additionalContext));
+  });
+
+  it('URL-derivation handles `--depth=1` long-opt with equals (no separate value token to skip)', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'eq-flag-'));
+    mkdirSync(join(cwdDir, 'repo', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'repo', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone --depth=1 https://x/repo.git' },
+      tool_response: { content: [ { type: 'text', text: '(no Cloning line)' } ] },
+    }, fakeHome);
+    assert.ok(json);
+    assert.ok(/do NOT prompt/i.test(json.hookSpecificOutput.additionalContext));
+  });
+
+  it('URL-derivation strips trailing `;` / `&&` separator from derived token (regression: chained command poisoned the target)', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'chained-'));
+    mkdirSync(join(cwdDir, 'repo', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'repo', 'graphify-out', 'graph.json'), '{}');
+
+    const { json } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone https://x/repo.git; echo done' },
+      tool_response: { content: [ { type: 'text', text: '(no Cloning line)' } ] },
+    }, fakeHome);
+    assert.ok(json);
+    assert.ok(/do NOT prompt/i.test(json.hookSpecificOutput.additionalContext));
+  });
+
+  it('jq-resilience: non-array `content` (string) does not crash; falls through to URL-derivation', () => {
+    const cwdDir = mkdtempSync(join(baseTmp, 'jq-resil-'));
+    mkdirSync(join(cwdDir, 'repo', 'graphify-out'), { recursive: true });
+    writeFileSync(join(cwdDir, 'repo', 'graphify-out', 'graph.json'), '{}');
+
+    const { json, status } = runHook({
+      tool_name: 'mcp__context-mode__ctx_execute',
+      cwd: cwdDir,
+      tool_input: { language: 'shell', code: 'git clone https://x/repo.git' },
+      tool_response: { content: 'oops not an array' },
+    }, fakeHome);
+    assert.equal(status, 0, 'hook must never exit non-zero on pathological content shape');
+    assert.ok(json, 'pathological content shape must still fall through to URL-derivation');
+    assert.ok(/do NOT prompt/i.test(json.hookSpecificOutput.additionalContext));
   });
 
   it('fail-safe: malformed input exits 0 with no output', () => {

@@ -60,15 +60,88 @@ if ! echo "$COMMAND" | grep -qE '(^\s*|[;&|]\s*)(git\s+clone|gh\s+repo\s+clone)(
 fi
 
 # Extract the cloned target directory from tool_response stdout
-# ("Cloning into 'foo'..." line).
+# ("Cloning into 'foo'..." line). The Bash tool exposes stdout under
+# .tool_response.stdout; MCP tools (ctx_execute, ctx_batch_execute)
+# return their captured stdout inside a content array per MCP spec
+# (.tool_response.content[] | .text). Without the content-array
+# fallback, ctx_execute clones fail target-dir extraction and the
+# hook misfires the "no graph" branch even when one is present.
 RESPONSE=$(echo "$INPUT" | jq -r '
   .tool_response.stdout
   // .tool_response.output
   // .tool_response.stderr
+  // ((try (.tool_response.content // [] | map(.text? // empty)) catch []) | join("\n"))
   // empty
 ' 2>/dev/null) || true
 
 TARGET_DIR=$(echo "$RESPONSE" | grep -oE "Cloning into '[^']+'" 2>/dev/null | head -n 1 | sed "s/Cloning into '//; s/'$//")
+
+# Resolve TARGET_DIR against the hook envelope's cwd when it is relative.
+# Claude Code populates `.cwd` for every hook fire regardless of tool. A
+# relative TARGET_DIR (e.g. "codeflare") would otherwise be checked
+# against the hook process's cwd, which is not the agent's cwd at clone
+# time - the existence check silently fails for the common case of
+# `cd <parent> && git clone <repo>`.
+HOOK_CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null) || true
+if [ -n "$TARGET_DIR" ] && [ -n "$HOOK_CWD" ]; then
+  case "$TARGET_DIR" in
+    /*) ;; # already absolute
+    *) TARGET_DIR="$HOOK_CWD/$TARGET_DIR" ;;
+  esac
+fi
+
+# Belt-and-braces: if stdout parsing failed entirely (unusual MCP
+# response shape, filtered output, or stderr-only clone log), derive the
+# clone target from the command itself. Parse the repo name out of the
+# URL or slug, skipping over CLI flags. Combined with HOOK_CWD this
+# catches existing graphify-out/ detection for clone shapes that bypass
+# the stdout extraction.
+#
+# Flag handling: `git clone --depth 1 https://x/y` (canonical shallow
+# clone) and `git clone --branch foo --depth 1 ...` must NOT pick the
+# flag value as the target. We strip everything after `clone` and then
+# take the first non-flag positional token. Long-opt forms with `=`
+# (e.g. `--depth=1`) work without special-casing; bare flag-then-value
+# pairs (`--depth 1`) require skipping the next token, which awk does
+# by treating any leading-dash token as "skip and continue".
+if [ -z "$TARGET_DIR" ] && [ -n "$HOOK_CWD" ]; then
+  # Everything after `git clone` / `gh repo clone`. Use sed because grep
+  # -oE captures only the matched substring, not the trailing args.
+  ARGS=$(printf '%s' "$COMMAND" | sed -nE 's/.*(git[[:space:]]+clone|gh[[:space:]]+repo[[:space:]]+clone)[[:space:]]+(.*)/\2/p' | head -n 1)
+  if [ -n "$ARGS" ]; then
+    # Pick the first token that does NOT start with `-` and is not the
+    # value of a flag that takes an argument. We approximate by skipping
+    # any token preceded by a `-`-prefixed token (covers `--depth 1`,
+    # `-o key`, etc). Conservative: false positives only cost a missed
+    # detection, never a wrong one.
+    DERIVED=$(printf '%s\n' "$ARGS" | awk '{
+      skip_next = 0
+      for (i = 1; i <= NF; i++) {
+        if (skip_next) { skip_next = 0; continue }
+        if ($i ~ /^-/) {
+          # If the flag has no `=`, the next token is its value
+          if ($i !~ /=/) skip_next = 1
+          continue
+        }
+        print $i
+        exit
+      }
+    }')
+    # Strip command separators that may ride along on the chosen token
+    # when the command is chained without surrounding whitespace.
+    DERIVED=${DERIVED%%[;&|]*}
+  fi
+  if [ -n "$DERIVED" ]; then
+    case "$DERIVED" in
+      *://*|*@*:*|*.git) DERIVED=$(basename "$DERIVED" .git) ;;
+      */*)               DERIVED=$(basename "$DERIVED") ;;
+    esac
+    case "$DERIVED" in
+      /*) TARGET_DIR="$DERIVED" ;;
+      *)  TARGET_DIR="$HOOK_CWD/$DERIVED" ;;
+    esac
+  fi
+fi
 
 # Idempotency marker keyed on the target directory. Only write the marker
 # when we successfully extracted a real path - otherwise repeated clones
