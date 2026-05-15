@@ -279,8 +279,18 @@ RCLONE_FILTERS_COMMON=(
     # MCP server state — logs and thread history, ephemeral
     --filter "- .local/state/**"
 
-    # Wrangler - deploy logs, regenerated
-    --filter "- .config/.wrangler/**"
+    # Wrangler - deploy logs and per-user state, regenerated. Covers the
+    # root-level $HOME/.wrangler/ which is distinct from the XDG-located
+    # $HOME/.config/.wrangler/ (the latter is subsumed by the .config/**
+    # rule below).
+    --filter "- .wrangler/**"
+
+    # ~/.config/** - tool configs that all regenerate on first use:
+    # configstore (npm), fish (shell), opencode, uv (Python tooling),
+    # wrangler (XDG location), rclone (R2 secrets).
+    # No codeflare-managed state lives under .config/ - all of that sits
+    # at $HOME root (.claude.json, .claude/, .codex/, .gemini/, .copilot/).
+    --filter "- .config/**"
 
     # graphify (REQ-AGENT-023) - knowledge-graph outputs live in the repo,
     # not in R2. Repo owners commit graphify-out/ to git; the working tree
