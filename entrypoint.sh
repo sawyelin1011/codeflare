@@ -971,6 +971,46 @@ fi
 init_sync_log
 
 # ============================================================================
+# Start terminal server EARLY so port 8080 binds before Cloudflare's container
+# port-wait timeout (~10-15s) elapses. The server will not begin PTY pre-warm
+# until /tmp/codeflare-init-complete is written at the end of this script —
+# this preserves the existing readiness contract (loading screen still waits
+# for sync + prewarm) while moving the slow init work off the port-wait path.
+# ============================================================================
+export CODEFLARE_INIT_FLAG_FILE=/tmp/codeflare-init-complete
+rm -f "$CODEFLARE_INIT_FLAG_FILE"
+
+echo "[entrypoint] Starting terminal server on port 8080..."
+# Subshell-scope the cd so the rest of the entrypoint's cwd is unchanged.
+(cd /app/host && HOME="$USER_HOME" TERMINAL_PORT=8080 \
+    CODEFLARE_INIT_FLAG_FILE="$CODEFLARE_INIT_FLAG_FILE" \
+    node dist/server.js) &
+TERMINAL_PID=$!
+echo "$TERMINAL_PID" > /tmp/terminal.pid
+echo "[entrypoint] Terminal server started with PID $TERMINAL_PID (prewarm gated on $CODEFLARE_INIT_FLAG_FILE)"
+
+# Probe port 8080 (not just kill -0): a live node process that hasn't reached
+# server.listen() yet would pass the old check but fail Cloudflare's port-wait.
+# /health is auth-exempt (host/src/server.ts authExemptPaths), so this works
+# before CONTAINER_AUTH_TOKEN is wired up. Poll up to 5s; fail-open if not
+# bound (host server may still come up while the rest of init runs).
+PORT_BOUND=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS -o /dev/null --max-time 1 http://127.0.0.1:8080/health 2>/dev/null; then
+        PORT_BOUND=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$PORT_BOUND" = "1" ]; then
+    echo "[entrypoint] Terminal server is listening on port 8080"
+elif kill -0 "$TERMINAL_PID" 2>/dev/null; then
+    echo "[entrypoint] WARNING: Terminal server alive (PID $TERMINAL_PID) but port 8080 not bound after 5s"
+else
+    echo "[entrypoint] WARNING: Terminal server process died before binding port 8080!"
+fi
+
+# ============================================================================
 # R2 SYNC STARTUP
 # ============================================================================
 # Note: Claude Code consent is pre-accepted via bypassPermissionsModeAccepted in .claude.json.
@@ -1453,24 +1493,15 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
 fi
 
 # ============================================================================
-# Start servers AFTER initial sync completes
+# Init complete — release the terminal server's PTY pre-warm.
+# The server has been listening on port 8080 since the top of MAIN EXECUTION;
+# it has been polling for this flag file before spawning the tab-1 PTY so
+# that pre-warm reads the final .claude.json / .bashrc rather than pre-sync
+# state.
 # ============================================================================
+touch "$CODEFLARE_INIT_FLAG_FILE"
+echo "[entrypoint] Init complete — wrote $CODEFLARE_INIT_FLAG_FILE (releasing PTY pre-warm)"
 
-echo "[entrypoint] Starting terminal server on port 8080..."
-cd /app/host && HOME="$USER_HOME" TERMINAL_PORT=8080 node dist/server.js &
-TERMINAL_PID=$!
-echo "$TERMINAL_PID" > /tmp/terminal.pid
-echo "[entrypoint] Terminal server started with PID $TERMINAL_PID"
-
-sleep 0.5
-
-if kill -0 "$TERMINAL_PID" 2>/dev/null; then
-    echo "[entrypoint] Terminal server is running"
-else
-    echo "[entrypoint] WARNING: Terminal server failed to start!"
-fi
-
-# Terminal server now handles all endpoints (health metrics consolidated)
 echo "[entrypoint] Startup complete. Servers running:"
 echo "[entrypoint]   - Terminal server (port 8080): PID $TERMINAL_PID"
 SYNC_PID=$(cat /tmp/sync-daemon.pid 2>/dev/null || echo '')

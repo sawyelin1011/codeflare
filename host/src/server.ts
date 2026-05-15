@@ -188,6 +188,7 @@ const server = http.createServer(async (req: http.IncomingMessage, res: http.Ser
         syncError: syncInfo.error,
         userPath: syncInfo.userPath,
         prewarmReady,
+        initFlagObserved,
         cpu: sysMetrics.cpu,
         mem: sysMetrics.mem,
         hdd: sysMetrics.hdd,
@@ -427,6 +428,12 @@ wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
 // Pre-warm state (module-level so /health endpoint can read prewarmReady)
 let prewarmReady = false;
 let prewarmStartTime = 0;
+// True after waitForInitFlag observes the flag file; false if it timed out
+// or no flag was configured. Exposed via /health for production debugging:
+// a session stuck at `prewarmReady=false` with `initFlagObserved=false` means
+// the entrypoint never wrote the init-complete flag (sync hung, jq merge
+// failed, etc.).
+let initFlagObserved = false;
 
 const parsedTabConfig: TabConfigEntry[] = (() => {
   try { return JSON.parse(process.env.TAB_CONFIG ?? '[]') as TabConfigEntry[]; } catch { return []; }
@@ -434,14 +441,53 @@ const parsedTabConfig: TabConfigEntry[] = (() => {
 const prewarmConfig = getPrewarmConfig(parsedTabConfig);
 const PREWARM_TIMEOUT_MS = 20000;     // Hard cap: consider ready after 20s regardless
 const PREWARM_ORPHAN_MS = 120000;     // Kill pre-warmed session if not adopted within 2min
+// Init-flag wait must exceed entrypoint's SYNC_TIMEOUT (120s in initial_sync_from_r2)
+// + slack, so a legitimately-slow R2 sync never trips the fallback. If the
+// entrypoint dies before writing the flag, the fallback releases pre-warm against
+// image-default state (intentional — fail-open keeps the terminal reachable).
+const PREWARM_INIT_WAIT_MS = 130000;
+const PREWARM_INIT_POLL_MS = 250;
+
+// Wait for the entrypoint to write its init-complete flag file before pre-warming.
+// Allows the entrypoint to start the HTTP server early (so port 8080 binds inside
+// Cloudflare's container port-wait window) without spawning the tab-1 PTY before
+// the user's R2-restored state (.claude.json, .bashrc, MCP server registrations)
+// is in place. On R2-sync failure or no-R2-credentials the entrypoint still writes
+// the flag — pre-warm then runs against image-default state, which is intentional
+// (a half-restored terminal is more useful than no terminal).
+// No-ops in tests and dev mode where CODEFLARE_INIT_FLAG_FILE is unset.
+function waitForInitFlag(): Promise<void> {
+  const flagPath = process.env.CODEFLARE_INIT_FLAG_FILE;
+  if (!flagPath) return Promise.resolve();
+  const start = Date.now();
+  return new Promise((resolve) => {
+    const tick = (): void => {
+      if (fs.existsSync(flagPath)) {
+        initFlagObserved = true;
+        log('info', 'Init-complete flag observed, starting pre-warm', { flagPath, waitedMs: Date.now() - start });
+        resolve();
+        return;
+      }
+      if (Date.now() - start >= PREWARM_INIT_WAIT_MS) {
+        log('warn', 'Init-complete flag not seen within timeout, starting pre-warm anyway', { flagPath, timeoutMs: PREWARM_INIT_WAIT_MS });
+        resolve();
+        return;
+      }
+      setTimeout(tick, PREWARM_INIT_POLL_MS);
+    };
+    tick();
+  });
+}
 
 // Start server
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   log('info', 'Terminal server listening', { port: PORT });
   log('info', 'Workspace config', { workspace: WORKSPACE_DEFAULT, workingDir: getWorkingDirectory(), keepAliveSec: PTY_KEEPALIVE_MS / 1000 });
 
   // Start periodic cleanup of dead sessions
   sessionManager.startCleanup();
+
+  await waitForInitFlag();
 
   // Pre-warm tab 1 PTY so the first client connect is instant
   const prewarmSession = new Session(PREWARM_SESSION_ID, 'Terminal', false, sessionOptions);
