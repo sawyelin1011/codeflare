@@ -485,7 +485,7 @@ describe('container DO class', () => {
       expect(mockStorage.delete).toHaveBeenCalledWith('bucketName');
     });
 
-    it('graceful shutdown: falls back to SIGKILL when the container is still running after the 25 s timeout', async () => {
+    it('graceful shutdown: falls back to SIGKILL when the container is still running after the 75 s timeout', async () => {
       vi.useFakeTimers();
       try {
         mockStorage.get.mockImplementation(async (key: string) => {
@@ -500,14 +500,65 @@ describe('container DO class', () => {
         const stopSpy = vi.spyOn(instance, 'stop' as any).mockResolvedValue(undefined);
 
         const destroyPromise = instance.destroy();
-        // Advance just past the 25s timeout so the polling loop exits via the
-        // wall-clock branch, not the running=false branch.
-        await vi.advanceTimersByTimeAsync(26_000);
+        // Advance just past the 75s timeout so the polling loop exits via the
+        // wall-clock branch, not the running=false branch. 75s pairs with the
+        // entrypoint.sh shutdown bisync 60s budget plus a 15s buffer.
+        await vi.advanceTimersByTimeAsync(76_000);
         await destroyPromise;
 
         expect(stopSpy).toHaveBeenCalledWith('SIGTERM');
         // Container is still "running" — polling timed out, super.destroy() ran anyway
         expect(mockContainerRuntime.running).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('onStop logs shutdownElapsedMs reflecting real elapsed time between destroy and onStop', async () => {
+      vi.useFakeTimers();
+      try {
+        mockStorage.get.mockImplementation(async (key: string) => {
+          if (key === 'bucketName') return 'test-bucket';
+          return null;
+        });
+        mockContainerRuntime.running = true;
+
+        const instance = new ContainerClass(mockCtx as any, mockEnv);
+        // Stop spy that takes "real" time to flip running flag. Drives
+        // _shutdownStartedAt to actually accumulate elapsed time the
+        // assertion below can pin a lower bound on.
+        vi.spyOn(instance, 'stop' as any).mockImplementation(async () => {
+          // simulate a slow shutdown (e.g. bisync still running)
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          mockContainerRuntime.running = false;
+        });
+
+        const loggerInfo = (instance as any).logger.info as ReturnType<typeof vi.fn>;
+        loggerInfo.mockClear();
+
+        const destroyPromise = instance.destroy();
+        // Drive enough fake time for the 1500ms stop + polling pollMs to
+        // finish; 2000 is comfortably above both.
+        await vi.advanceTimersByTimeAsync(2000);
+        await destroyPromise;
+
+        // Drive additional time before onStop fires, so any regression
+        // that computes elapsed-ms incorrectly (e.g. uses onStop's own
+        // start rather than destroy's _shutdownStartedAt) shows up as a
+        // smaller-than-expected number.
+        await vi.advanceTimersByTimeAsync(3000);
+        await instance.onStop();
+
+        const stoppedCall = loggerInfo.mock.calls.find(
+          (call) => call[0] === 'Container stopped',
+        );
+        expect(stoppedCall).toBeDefined();
+        const meta = stoppedCall![1] as { shutdownElapsedMs: number | null };
+        expect(meta.shutdownElapsedMs).toBeTypeOf('number');
+        // Lower bound: destroy ran ~2s, then 3s before onStop = 5s total.
+        // Pin to 4500 to absorb timer fuzz but still fail if the
+        // implementation reports onStop's own elapsed (3000) or zero.
+        expect(meta.shutdownElapsedMs).toBeGreaterThanOrEqual(4500);
       } finally {
         vi.useRealTimers();
       }
@@ -800,6 +851,11 @@ describe('container DO class', () => {
         if (key === 'bucketName') return 'test-bucket';
         return null;
       });
+      // Ensure destroy()'s SIGTERM polling exits immediately rather than
+      // running the full 75s budget (which exceeds vitest's 30s test
+      // timeout). The graceful-shutdown behaviour itself is covered by
+      // the dedicated tests above.
+      mockContainerRuntime.running = false;
 
       const instance = new ContainerClass(mockCtx as any, mockEnv);
       await instance.destroy();

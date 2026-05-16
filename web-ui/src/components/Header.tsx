@@ -1,6 +1,5 @@
 import { Component, Show, For, createMemo, createSignal, createEffect, onMount, onCleanup } from 'solid-js';
 import {
-  mdiXml,
   mdiCogOutline,
   mdiShieldAccount,
   mdiAccountOutline,
@@ -17,6 +16,7 @@ import {
   mdiFileCabinet,
   mdiOpenInNew,
   mdiClockTimeEightOutline,
+  mdiChartGantt,
 } from '@mdi/js';
 import Icon from './Icon';
 import SessionSwitcher from './SessionSwitcher';
@@ -34,6 +34,7 @@ interface HeaderProps {
   userName?: string;
   onSettingsClick?: () => void;
   onStoragePanelToggle?: () => void;
+  onVaultOpen?: () => void;
   onLogoClick?: () => void;
   sessions: SessionWithStatus[];
   activeSessionId: string | null;
@@ -49,7 +50,7 @@ interface HeaderProps {
  *
  * Layout:
  * +-----------------------------------------------------------------------------------+
- * | [</>] [Session Switcher]          [Avatar] [Bookmarks] [Storage] [Settings] [Dashboard] |
+ * | [</>] [Session Switcher]          [Avatar] [Bookmarks] [Vault] [Storage] [Settings] [Dashboard] |
  * +-----------------------------------------------------------------------------------+
  */
 const Header: Component<HeaderProps> = (props) => {
@@ -221,7 +222,7 @@ const Header: Component<HeaderProps> = (props) => {
         onClick={() => props.onLogoClick?.()}
         role={props.onLogoClick ? 'button' : undefined}
       >
-        <Icon path={mdiXml} size={22} class="header-logo-icon" />
+        <Icon path={mdiViewDashboardOutline} size={22} class="header-logo-icon" />
       </div>
 
       {/* Session Switcher */}
@@ -513,6 +514,22 @@ const Header: Component<HeaderProps> = (props) => {
           </Show>
         </div>
 
+        {/* Vault button — opens the persistent Obsidian-style vault
+            (SilverBullet) in a new tab. Rendered only when the parent
+            passes onVaultOpen (terminal-view + active session present);
+            otherwise the button does not appear. */}
+        <Show when={props.onVaultOpen}>
+          <button
+            class="header-vault-button"
+            data-testid="header-vault-button"
+            title="Open vault"
+            type="button"
+            onClick={() => props.onVaultOpen?.()}
+          >
+            <Icon path={mdiChartGantt} size={20} />
+          </button>
+        </Show>
+
         {/* Storage button */}
         <button
           class="header-storage-button"
@@ -533,17 +550,6 @@ const Header: Component<HeaderProps> = (props) => {
           onClick={() => props.onSettingsClick?.()}
         >
           <Icon path={mdiCogOutline} size={20} class="settings-rotate" />
-        </button>
-
-        {/* Dashboard button */}
-        <button
-          class="header-dashboard-button"
-          data-testid="header-dashboard-button"
-          title="Return to dashboard"
-          type="button"
-          onClick={() => props.onLogoClick?.()}
-        >
-          <Icon path={mdiViewDashboardOutline} size={20} />
         </button>
       </div>
     </header>

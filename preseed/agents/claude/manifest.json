@@ -39,7 +39,17 @@
       "advanced"
     ]
   },
-  "plugins/codeflare-memory/scripts/memory-compact-prompt.md": {
+  "plugins/codeflare-vault/.claude-plugin/plugin.json": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-vault/scripts/vault-monitor-hook.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-vault/scripts/vault-extract-prompt.md": {
     "modes": [
       "advanced"
     ]
@@ -51,6 +61,11 @@
     ]
   },
   "rules/memory.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "rules/vault.md": {
     "modes": [
       "advanced"
     ]
@@ -499,6 +514,11 @@
     ]
   },
   "plugins/graphify/scripts/graph-first-nudge.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/enforce-graphify.sh": {
     "modes": [
       "advanced"
     ]

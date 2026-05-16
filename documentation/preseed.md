@@ -125,8 +125,8 @@ skills. The discipline triad — `spec-discipline`,
 core-minimum rules (Pro-mode SDD workflow opt-in: identity, status
 vocabulary, severity, and skill pointers; detection algorithms and
 content-quality checks live in their respective `*-enforce` skill
-families). `memory` rule is advanced-only (depends on MCP memory
-server). ECC-derived language rules in
+families). `memory` rule is advanced-only (references CC-specific
+mcp__graphify__* tools and the vault hook system). ECC-derived language rules in
 `{common,typescript,python,golang,swift}/` subdirs (2 + 4*4 = 18
 files, advanced only). Common rules cover security and coding
 style. Language-specific rules provide conventions for TypeScript,
@@ -161,18 +161,18 @@ All preseed content is deployed via the manifest pipeline:
    (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`,
    `~/.config/opencode/`)
 
-**Manifest structure (91 total entries)**:
-- `rules/` (25): core (3 default+advanced: cloudflare-environment,
-  no-local-builds, git-workflow; + 4 advanced-only: memory,
+**Manifest structure (103 total entries)**:
+- `rules/` (27): core (3 default+advanced: cloudflare-environment,
+  no-local-builds, git-workflow; + 5 advanced-only: memory, vault,
   spec-discipline, documentation-discipline, tdd-discipline),
-  common (2: coding-style, security), typescript (4), python (4),
-  golang (4), swift (4)
+  common (2: coding-style, security), graph-first (1, advanced),
+  typescript (4), python (4), golang (4), swift (4)
 - `agents/` (9): architect, build-error-resolver, code-reviewer,
   deep-reviewer, doc-updater, refactor-cleaner, security-reviewer,
   spec-reviewer, tdd-guide (advanced only)
 - `commands/` (5): brainstorm, debug, deploy, review, sdd
   (advanced only)
-- `skills/` (39): cloudflare-stack, github-cloudflare-ship (+2
+- `skills/` (40): cloudflare-stack, github-cloudflare-ship (+2
   refs), ci-monitoring, pr-workflow, deploy-credentials (the five
   default+advanced skills), consult-llm, api-design,
   backend-patterns, content-hash-cache-pattern, database-migrations,
@@ -181,17 +181,22 @@ All preseed content is deployed via the manifest pipeline:
   for /sdd init scaffolding), spec-enforce, spec-enforce-ac,
   spec-enforce-truth, doc-enforce, doc-enforce-lanes,
   doc-enforce-shape, doc-enforce-truth, tdd-enforce,
-  git-review-pipeline
-- `plugins/` (13): known_marketplaces.json (default+advanced),
-  codeflare-memory plugin (4 files, advanced only: plugin.json,
-  memory-capture.sh, memory-agent-prompt.md,
-  memory-compact-prompt.md), codeflare-hooks plugin (5 files,
+  git-review-pipeline, graphify
+- `plugins/` (22): known_marketplaces.json (default+advanced),
+  codeflare-memory plugin (3 files, advanced only: plugin.json,
+  memory-capture.sh, memory-agent-prompt.md), codeflare-vault plugin
+  (3 files, advanced only: plugin.json, vault-monitor-hook.sh,
+  vault-extract-prompt.md), codeflare-hooks plugin (5 files,
   advanced only: plugin.json, block-attributed-commits.sh,
   git-push-review-reminder.sh, enforce-review-spawn.sh,
-  lib/gh-pr-state.sh — shared helper sourced by both PR-aware
+  lib/gh-pr-state.sh - shared helper sourced by both PR-aware
   hooks), context-mode plugin (3 files, advanced only: plugin.json,
-  README.md, scripts/enforce-ctx-mode.sh — admin-only Custom-tier
-  routing enforcement, see Third-party plugin section below)
+  README.md, scripts/enforce-ctx-mode.sh - admin-only Custom-tier
+  routing enforcement, see Third-party plugin section below),
+  graphify plugin (8 files, default+advanced for plugin.json + README
+  + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
+  graphify-session-start.sh, graphify-clone-prompt.sh,
+  graph-first-nudge.sh, enforce-graphify.sh)
 
 ## Multi-Agent Preseed
 
@@ -233,8 +238,10 @@ files exist on disk.
 
 **Excluded from non-CC agents**: hooks (CC hook system), commands (CC
 slash commands), plugins (CC plugin system, including
-codeflare-memory), `rules/memory.md` (depends on MCP memory server),
-`consult-llm` skill (depends on CC-specific MCP tool).
+codeflare-memory and codeflare-vault), `rules/memory.md` (references
+CC-specific `mcp__graphify__*` tools and the vault hook system),
+`rules/vault.md` (same reason), `consult-llm` skill (depends on
+CC-specific MCP tool).
 
 **Adaptation pipeline**: For each non-CC agent, the generator: (1)
 concatenates applicable rules into a single instructions file, (2)
@@ -331,6 +338,21 @@ context-mode is licensed under [Elastic License 2.0](https://github.com/mksglu/c
 The integration is sized to stay within ELv2's permitted-use envelope.
 See [AD49](decisions/README.md#ad49-context-mode-delivered-as-preseed-plugin-not-runtime-install) for the full design + license analysis.
 
+### Graphify hard-block PreToolUse hook (REQ-AGENT-024)
+
+In advanced session mode, `enforce-graphify.sh` is a second PreToolUse hook on the graphify plugin that complements the existing `graph-first-nudge.sh` soft nudge. The soft nudge fires on every grep-class call with an `additionalContext` reminder; the hard-block fires only after the pattern persists.
+
+Mechanics:
+
+- **Matchers**: `Grep`, `Bash`, `mcp__context-mode__ctx_execute`, `mcp__context-mode__ctx_batch_execute`, `mcp__context-mode__ctx_execute_file`. Covers both standard tiers (where `Grep`/`Bash` fire natively) and custom tier (where `enforce-ctx-mode.sh` denies `Grep` and forces routing through the `ctx_execute*` family).
+- **Gating**: only fires when `graphify-out/graph.json` exists in the agent's cwd, so vibe-coding repos are unaffected.
+- **Threshold**: blocks the next structural search after 3 grep-class tool calls in the same turn (counted by walking the transcript backward to the last real user prompt) when no `mcp__graphify__*` call (or `graphify query|path|explain` CLI invocation) has been made.
+- **Classification**: SEARCH = first-word `grep|rg|ag|ack`, `git grep`, `find` with `-name|-path|-iname|-ipath|-regex`, or `awk` with `/regex/` body. The shell parser reuses `extract_subs` + `normalize_command` + chain-op splitter from `enforce-ctx-mode.sh`, so command/process substitution, heredocs, quoted regions, and pipeline segments cannot slip past.
+- **User-only bypass**: `touch /tmp/graphify-bypass` (one-shot, auto-deleted on use) or include `skip graph` (case-insensitive) in a user message. The agent must never create the sentinel.
+- **Fail-safe**: any unexpected error returns exit 0 with no output. Never locks the user out.
+
+The hook surfaces blocks as `hookSpecificOutput.permissionDecision: deny` with a `BLOCKED: <N> structural searches since last user prompt, 0 graphify queries...` reason so the agent's next-turn context carries the directive to consult the graph.
+
 ## /sdd init Modes
 
 `/sdd init` is the single entry point for bootstrapping SDD on a project. It detects one of three scenarios from project state and dispatches automatically:
@@ -367,8 +389,8 @@ See [Preseed Troubleshooting](preseed-troubleshooting.md) for hook debugging, at
 ## Related Documentation
 
 - [Preseed Troubleshooting](preseed-troubleshooting.md) — Hook debugging and checkpoint reset
-- [Memory](memory.md) — MCP memory server, capture/compact, R2 sync
-  of memory files
+- [Memory](memory.md) - Vault-based cross-session memory and the
+  capture hook chain
 - [Container](container.md#claude-code-integration) — Claude Code
   configuration
 - [Storage & Sync](storage-and-sync.md) — R2 sync internals

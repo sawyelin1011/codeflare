@@ -28,6 +28,7 @@ This skill drives `/graphify` knowledge-graph extraction inside the Codeflare co
      This wires the graphify semantic merge driver for `graph.json`. The driver itself is registered globally in the container image, so this `.gitattributes` line is the only per-repo setup needed. Without it, concurrent edits produce corrupt JSON on merge.
    - Stage and commit `graphify-out/graph.json`, `GRAPH_REPORT.md`, `.graphify_root`, `.graphify_labels.json`, and optionally `graph.html` + `wiki/`. Subsequent contributors clone the repo and inherit the graph for free.
    - For repos the user does NOT have push permission to (cloned open-source projects, read-only forks): graphify-out/ stays in the working tree only, ephemeral, no R2 fallback. Do not try to persist via bisync.
+   - **Before the commit step, merge this repo's graph into the unified global graph** so `mcp__graphify__*` tool calls see it alongside the vault and any other active repos: `flock /tmp/graphify-global.lock graphify global add graphify-out/graph.json --as <repo-basename>`. Hash-keyed and idempotent. The `flock` serialises against the capture sonnet and the vault-monitor sonnet, which also write the global graph.
 
    When two sessions both run `graphify update .` and produce conflicting `graph.json`, the merge driver auto-resolves on `git merge` / `git pull`. No manual JSON wrangling.
 
@@ -500,11 +501,8 @@ G = build_from_json(extraction)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
-if G.number_of_nodes() > 5000:
- print(f'Graph has {G.number_of_nodes()} nodes - too large for HTML viz. Use Obsidian vault instead.')
-else:
- to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None)
- print('graph.html written - open in any browser, no server needed')
+to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None)
+print('graph.html written - open in any browser, no server needed')
 "
 ```
 
@@ -1234,4 +1232,4 @@ graphify claude uninstall # remove the section
 - Never skip the corpus check warning.
 - Always show token cost in the report.
 - Never hide cohesion scores behind symbols - show the raw number.
-- Never run HTML viz on a graph with more than 5,000 nodes without warning the user.
+- Never skip HTML viz. Codeflare sets `GRAPHIFY_VIZ_NODE_LIMIT=100000` globally in entrypoint.sh; if a build ever logs `Skipped graph.html`, re-export the limit and rebuild before reporting done.

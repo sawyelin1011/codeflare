@@ -54,6 +54,11 @@ USER_CLAUDE_JSON="$USER_HOME/.claude.json"
 mkdir -p "$USER_HOME" "$USER_WORKSPACE" "$USER_CLAUDE_DIR"
 export HOME="$USER_HOME"
 
+# Force HTML visualization generation regardless of graph size.
+# Default graphify limit is 5000 nodes; codeflare repos routinely exceed this.
+# Codeflare policy: graph.html is never skipped (user directive).
+export GRAPHIFY_VIZ_NODE_LIMIT=100000
+
 # Track sync status
 SYNC_STATUS="pending"
 SYNC_ERROR=""
@@ -262,7 +267,12 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .codex/.tmp/**"              # plugin clones + sync temp files (17MB+, regenerated)
     --filter "- .codex/version.json"         # version check cache
 
-    # Memory capture — exclude all counter files (ephemeral per-session)
+    # Memory capture - exclude all counter files (ephemeral per-session).
+    # ~/.memory/ as a whole survived the MCP-memory removal because the
+    # capture-hook gate (memory-capture.sh) still writes counter + .vars
+    # files there. No session-*.jsonl files are written any more; legacy
+    # ones from pre-vault sessions sit on R2 unread until the user
+    # deletes them.
     --filter "- .memory/counter/**"
 
     # Perl CPAN cache — created by Perl module installs during build, regenerated
@@ -292,17 +302,22 @@ RCLONE_FILTERS_COMMON=(
     # at $HOME root (.claude.json, .claude/, .codex/, .gemini/, .copilot/).
     --filter "- .config/**"
 
+    # vault (REQ-MEMORY-100) - persistent Obsidian-style vault must sync to R2.
+    # This include MUST precede the global graphify-out exclude below: rclone
+    # uses first-match, so without this line the vault's own graphify-out/
+    # would be caught by the exclude pattern and silently never bisync.
+    --filter "+ .obsidian_vault/**"
+
+    # Global graphify graph is rebuilt at boot from per-project graphs and
+    # the vault. Keep it ephemeral; it has no R2 round-trip value.
+    --filter "- .graphify/**"
+
     # graphify (REQ-AGENT-023) - knowledge-graph outputs live in the repo,
     # not in R2. Repo owners commit graphify-out/ to git; the working tree
     # gets them on clone. Repos without push permission keep graphify-out/
     # local and ephemeral. R2 bisync does not touch graphify-out/ either way.
     --filter "- **/graphify-out/**"
 )
-
-# In default mode, exclude entire .memory/ directory (no persistent memory)
-if [ "${SESSION_MODE:-default}" != "advanced" ]; then
-    RCLONE_FILTERS_COMMON+=('--filter' '- .memory/**')
-fi
 
 if [ "$SYNC_MODE" = "metadata" ]; then
     RCLONE_FILTERS=(
@@ -656,21 +671,239 @@ start_sync_daemon() {
 }
 
 # ============================================================================
+# Vault-monitor daemon (REQ-MEMORY-102)
+#
+# Polls .obsidian_vault/ every 60s for user edits (curated notes, pasted
+# files) and signals the UserPromptSubmit hook by writing a marker file.
+# The hook spawns a background sonnet that runs graphify extraction on
+# the changed files and merges them into the global graph.
+#
+# Two-marker design avoids the "daemon advances mtime before extractor
+# reads it" race:
+#   vault-monitor.tick   - heartbeat, touched every loop (diagnostics).
+#   vault-extract.last   - high-water mark, touched ONLY by the extract
+#                          sonnet after successful global-graph merge.
+#                          Daemon's find -newer compares against this.
+#   vault-extract.vars   - trigger file. Daemon writes when find returns
+#                          non-empty; hook deletes on pickup.
+#
+# If extraction fails the marker stays old; next tick re-discovers the
+# same files (eventual consistency, no work lost).
+#
+# Excluded paths: raw/sessions/ (agent-owned, written by capture hook
+# which already merges), graphify-out/ (derived), .silverbullet/ (config
+# + cache, no semantic content).
+# ============================================================================
+start_vault_monitor_daemon() {
+    local VAULT_ROOT="$HOME/.obsidian_vault"
+    local HOOK_CACHE="$HOME/.cache/codeflare-hooks"
+    local TICK_MARKER="$HOOK_CACHE/vault-monitor.tick"
+    local LAST_MARKER="$HOOK_CACHE/vault-extract.last"
+    local VARS_FILE="$HOOK_CACHE/vault-extract.vars"
+
+    mkdir -p "$HOOK_CACHE"
+
+    echo "[entrypoint] Starting vault-monitor daemon (every 60s)..."
+
+    while true; do
+        sleep 60
+
+        # Heartbeat first so a hung find/loop is visible from outside.
+        touch "$TICK_MARKER" 2>/dev/null || true
+
+        # Vault may not exist yet (init_obsidian_vault still racing on
+        # cold boot). Skip silently — next tick will find it.
+        [ -d "$VAULT_ROOT" ] || continue
+
+        # Don't re-trigger while a previous extraction is still pending.
+        # Hook deletes vars on pickup; sonnet touches last on success.
+        if [ -f "$VARS_FILE" ]; then
+            continue
+        fi
+
+        # find -newer requires the reference file to exist. Seeded by
+        # init_obsidian_vault on boot but guard anyway.
+        [ -f "$LAST_MARKER" ] || touch "$LAST_MARKER"
+
+        # Look for any user-touched markdown/asset under the vault that
+        # is newer than the high-water mark. Excludes agent-owned and
+        # derived subtrees.
+        local CHANGED
+        CHANGED=$(find "$VAULT_ROOT" \
+            \( -path "$VAULT_ROOT/raw/sessions" -o \
+               -path "$VAULT_ROOT/graphify-out" -o \
+               -path "$VAULT_ROOT/.silverbullet" \) -prune -o \
+            -type f -newer "$LAST_MARKER" -print 2>/dev/null | head -n 50)
+
+        if [ -n "$CHANGED" ]; then
+            # Write the trigger atomically (mv from tmp avoids the hook
+            # reading a half-written file).
+            local TMP="$VARS_FILE.tmp.$$"
+            {
+                printf 'VAULT_ROOT=%s\n' "$VAULT_ROOT"
+                printf 'TRIGGERED_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+                printf 'CHANGED_FILES<<EOF\n%s\nEOF\n' "$CHANGED"
+            } > "$TMP" 2>/dev/null
+            mv "$TMP" "$VARS_FILE" 2>/dev/null || rm -f "$TMP"
+            echo "[vault-monitor] $(date '+%Y-%m-%d %H:%M:%S') Detected vault changes, marker written" | tee -a /tmp/sync.log >/dev/null
+        fi
+    done &
+
+    VAULT_MONITOR_PID=$!
+    echo "$VAULT_MONITOR_PID" > /tmp/vault-monitor.pid
+    echo "[entrypoint] Vault-monitor daemon started with PID $VAULT_MONITOR_PID"
+}
+
+# ============================================================================
+# SilverBullet supervisor (REQ-MEMORY-103)
+#
+# Runs the SilverBullet markdown editor server on 127.0.0.1:3030 against
+# the persistent vault. Localhost-only — the Worker proxy at
+# /api/vault/:sid/ is the auth boundary (verified-tier + rate-limited).
+#
+# Supervised by a restart loop because the server is the user-facing
+# editor; a crash mid-session must not require a container restart.
+# 5s backoff matches the existing terminal-server crash-restart pattern.
+# ============================================================================
+start_silverbullet_supervisor() {
+    local VAULT_ROOT="$HOME/.obsidian_vault"
+    local SB_BIN="${SILVERBULLET_BIN:-/usr/local/bin/silverbullet}"
+    local SB_PORT="${SILVERBULLET_PORT:-3030}"
+    local SB_HOST="${SILVERBULLET_HOST:-127.0.0.1}"
+
+    if [ ! -x "$SB_BIN" ]; then
+        echo "[entrypoint] WARNING: silverbullet binary not found at $SB_BIN; vault editor will be unreachable" >&2
+        return 0
+    fi
+
+    echo "[entrypoint] Starting SilverBullet supervisor on $SB_HOST:$SB_PORT (vault=$VAULT_ROOT)..."
+
+    # setsid unconditionally creates a new session + process group so the
+    # shutdown handler can kill the supervisor AND its silverbullet child
+    # in one `kill -- -PID` call. Was `set -m` previously, but bash
+    # silently ignores job control in non-interactive subshells, leaving
+    # silverbullet orphaned and binding port 3030 against the next session.
+    setsid bash -c '
+        VAULT_ROOT="$1"
+        SB_BIN="$2"
+        SB_HOST="$3"
+        SB_PORT="$4"
+        while true; do
+            # Vault may not exist on first boot if baseline+init are still
+            # racing. Wait it out instead of crash-looping; the daemon
+            # itself will not start cleanly with a missing space dir.
+            if [ ! -d "$VAULT_ROOT" ]; then
+                sleep 5
+                continue
+            fi
+            "$SB_BIN" --hostname "$SB_HOST" --port "$SB_PORT" "$VAULT_ROOT" \
+                >> /tmp/silverbullet.log 2>&1
+            echo "[silverbullet] $(date '"'"'+%Y-%m-%d %H:%M:%S'"'"') exited (code $?), restarting in 5s..." | tee -a /tmp/silverbullet.log
+            sleep 5
+        done
+    ' silverbullet-supervisor "$VAULT_ROOT" "$SB_BIN" "$SB_HOST" "$SB_PORT" \
+        >> /tmp/silverbullet.log 2>&1 &
+
+    SILVERBULLET_SUPERVISOR_PID=$!
+    echo "$SILVERBULLET_SUPERVISOR_PID" > /tmp/silverbullet.pid
+    echo "[entrypoint] SilverBullet supervisor started with PID $SILVERBULLET_SUPERVISOR_PID"
+}
+
+# ============================================================================
 # Shutdown handler - final bisync on SIGTERM/SIGINT/EXIT
 # ============================================================================
 shutdown_handler() {
+    SHUTDOWN_STARTED_AT=$(date +%s)
     echo "[entrypoint] Received shutdown signal, performing final bisync..."
 
-    # Kill sync daemon via PID file
-    kill "$(cat /tmp/sync-daemon.pid 2>/dev/null)" 2>/dev/null || true
+    # Kill background daemons via PID file. Walk the descendant tree so
+    # rclone/silverbullet grandchildren die alongside the supervising
+    # subshell - signalling the subshell alone would leave them orphaned
+    # and (for silverbullet) holding port 3030, breaking the next session.
+    walk_kill() {
+        local sig="$1" root="$2"
+        [ -z "$root" ] && return 0
+        local descendants
+        descendants=$(pgrep -P "$root" 2>/dev/null)
+        kill "-${sig}" "$root" 2>/dev/null || true
+        for child in $descendants; do
+            walk_kill "$sig" "$child"
+        done
+    }
+    kill_pidfile_subtree() {
+        local pidfile="$1"
+        local pid
+        pid="$(cat "$pidfile" 2>/dev/null)"
+        [ -z "$pid" ] && return 0
+        walk_kill TERM "$pid"
+    }
+    kill_pidfile_subtree /tmp/sync-daemon.pid
+    kill_pidfile_subtree /tmp/vault-monitor.pid
+    kill_pidfile_subtree /tmp/silverbullet.pid
 
-    # Perform final bisync to R2 (only if baseline was established)
-    echo "[entrypoint] Final bisync to R2..."
+    # Perform final bisync to R2 (only if baseline was established).
+    # Wrap in `timeout 60` so the DO's destroy() SIGKILL budget (75s,
+    # set in src/container/index.ts) always lands AFTER we either
+    # finished or gave up cleanly — never mid-write to R2.
+    #
+    # Pre-vault history: shutdown bisync had no timeout, the DO killed
+    # after 25s, and a long bisync of last-minute edits left R2 in a
+    # partial state. The next session loaded that partial state and
+    # looked stale, forcing the user to delete the session manually.
+    # See bundled fix in vault PR.
+    echo "[entrypoint] Final bisync to R2 (60s budget)..."
     if [ -f /tmp/.bisync-initialized ]; then
-        if bisync_with_r2; then
+        # Background bisync + watchdog that hard-kills at 60s. Cannot use
+        # `timeout(1)` directly because bisync_with_r2 is a shell function;
+        # timeout's bash -c child would not see it without `export -f` +
+        # propagating every env var it reads.
+        #
+        # We need the watchdog to kill the rclone child too (not just the
+        # subshell). `kill -TERM "$BISYNC_PID"` alone only signals the
+        # wrapping subshell - rclone keeps running and the half-uploaded
+        # files land in R2 anyway.
+        #
+        # bisync_with_r2 is a shell function that depends on multiple
+        # global arrays (RCLONE_FILTERS) and helper functions, so we
+        # cannot exec it under setsid via `bash -c` without recreating
+        # the whole environment. Instead, we recursively walk the
+        # descendant tree with pgrep at signal time. Two levels covers
+        # rclone's typical depth (subshell -> bash -> rclone -> child).
+        ( bisync_with_r2 ) &
+        BISYNC_PID=$!
+        # SIGTERM-then-SIGKILL grace pattern. 50s budget for normal bisync,
+        # 10s additional after SIGTERM for rclone to flush + abort pending
+        # multipart uploads cleanly (2s was previously too tight - rclone
+        # needs more headroom to avoid leaving partial uploads in R2).
+        # Total 60s, matching the budget the DO destroy() leaves us.
+        kill_subtree() {
+            local sig="$1" root="$2"
+            [ -z "$root" ] && return 0
+            local descendants
+            descendants=$(pgrep -P "$root" 2>/dev/null)
+            kill "-${sig}" "$root" 2>/dev/null
+            for child in $descendants; do
+                kill_subtree "$sig" "$child"
+            done
+        }
+        ( sleep 50
+          kill_subtree TERM "$BISYNC_PID"
+          sleep 10
+          kill_subtree KILL "$BISYNC_PID"
+        ) &
+        WATCHDOG_PID=$!
+        wait "$BISYNC_PID" 2>/dev/null
+        BISYNC_RC=$?
+        kill "$WATCHDOG_PID" 2>/dev/null
+        wait "$WATCHDOG_PID" 2>/dev/null
+        # Bash reports 143 (128 + SIGTERM) or 137 (128 + SIGKILL) when
+        # the watchdog fired - surface that as a timeout in the log.
+        if [ "$BISYNC_RC" -eq 0 ]; then
             echo "[entrypoint] Final bisync completed successfully"
+        elif [ "$BISYNC_RC" -eq 143 ] || [ "$BISYNC_RC" -eq 137 ]; then
+            echo "[entrypoint] Final bisync TIMED OUT after 60s - last writes may not have synced. Increase budget if this is frequent."
         else
-            echo "[entrypoint] Final bisync failed!"
+            echo "[entrypoint] Final bisync failed with rc=$BISYNC_RC"
         fi
     else
         echo "[entrypoint] Skipping final bisync - baseline never established"
@@ -681,7 +914,8 @@ shutdown_handler() {
         kill "$TERMINAL_PID" 2>/dev/null || true
     fi
 
-    echo "[entrypoint] Shutdown complete"
+    SHUTDOWN_ELAPSED=$(( $(date +%s) - SHUTDOWN_STARTED_AT ))
+    echo "[entrypoint] Shutdown complete (elapsed: ${SHUTDOWN_ELAPSED}s)"
     exit 0
 }
 
@@ -892,68 +1126,92 @@ BASHRC_FOOTER
 }
 
 # ============================================================================
-# Memory file merge/cleanup for persistent memory across sessions
+# Vault skeleton init (REQ-MEMORY-100, REQ-MEMORY-105)
 # ============================================================================
-merge_memory_files() {
-    local MEMORY_DIR="$USER_HOME/.memory"
-    local SESSION_FILE="$MEMORY_DIR/session-${SESSION_ID}.jsonl"
-    mkdir -p "$MEMORY_DIR"
+# Idempotent on every boot. Creates the .obsidian_vault/ skeleton if absent,
+# copies preseeded SilverBullet config + (best-effort) Atlas plug from
+# /opt/silverbullet-preseed/, seeds the global graphify graph with the vault,
+# and initializes the vault-monitor two-marker filesystem state so the daemon
+# (started later in this entrypoint) has sensible baselines.
+#
+# Called after establish_bisync_baseline so we never overwrite R2-restored
+# content with an empty skeleton on returning sessions.
+# ============================================================================
+init_obsidian_vault() {
+    local VAULT="$USER_HOME/.obsidian_vault"
+    local PRESEED_DIR=/opt/silverbullet-preseed
+    local HOOK_CACHE="$USER_HOME/.cache/codeflare-hooks"
 
-    local FILES=()
-    while IFS= read -r -d '' f; do FILES+=("$f"); done \
-        < <(find "$MEMORY_DIR" -name "session-*.jsonl" -type f -print0 2>/dev/null)
+    # Always ensure hook cache dir exists (used by daemons + hooks below).
+    mkdir -p "$HOOK_CACHE"
 
-    if [ ${#FILES[@]} -eq 0 ]; then
-        echo "[entrypoint] No memory files to merge"; return 0
+    if [ ! -d "$VAULT" ]; then
+        echo "[entrypoint] Initializing vault skeleton at $VAULT"
+        mkdir -p "$VAULT/raw/sessions" "$VAULT/raw/pasted" "$VAULT/notes" \
+                 "$VAULT/graphify-out" "$VAULT/.silverbullet/_plug"
+
+        cat > "$VAULT/README.md" <<'VAULT_README_EOF'
+# Vault
+
+Persistent memory across codeflare sessions. Edit anything here in
+SilverBullet (Vault button in the codeflare header). Two hooks keep the
+unified graphify graph fresh:
+
+- **Transcript capture** fires every 15 chat prompts; the background sonnet
+  writes session observations to `raw/sessions/` and re-extracts them into
+  the vault graph.
+- **Vault monitor** watches everything outside `raw/sessions/` for user
+  edits (60s polling) and re-extracts on the next chat prompt when
+  changes are detected.
+
+## Structure
+
+- `raw/sessions/`  agent-written session captures; do not hand-edit.
+- `raw/pasted/`    drag-zone for PDFs, screenshots, anything.
+- `notes/`         curated, organised prose.
+- `graphify-out/`  the vault project graph (regenerated automatically).
+- `.silverbullet/` SilverBullet config + plugs.
+
+## First-time
+
+The vault starts empty. Captures begin landing after roughly 15 prompts
+in your first session. Cross-session memory becomes useful from session
+two onward.
+VAULT_README_EOF
+
+        printf '{"directed":true,"multigraph":false,"graph":{},"nodes":[],"links":[]}' \
+            > "$VAULT/graphify-out/graph.json"
+
+        # SilverBullet preseed config — always present.
+        if [ -f "$PRESEED_DIR/config.yaml" ]; then
+            cp "$PRESEED_DIR/config.yaml" "$VAULT/.silverbullet/config.yaml"
+        fi
+        # Atlas plug — best-effort. Absence is fine; graph viz falls back
+        # to graphify-out/graph.html.
+        if [ -f "$PRESEED_DIR/atlas.plug.js" ]; then
+            cp "$PRESEED_DIR/atlas.plug.js" "$VAULT/.silverbullet/_plug/atlas.plug.js"
+        else
+            echo "[entrypoint] Atlas plug absent from preseed; vault visualisation will fall back to graphify-out/graph.html"
+        fi
+
+        echo "[entrypoint] Vault skeleton initialized"
     fi
-    if [ ${#FILES[@]} -eq 1 ] && [ "${FILES[0]}" = "$SESSION_FILE" ]; then
-        echo "[entrypoint] Single memory file already matches current session"; return 0
+
+    # Seed the global graph with the vault. Hash-keyed idempotent — safe to
+    # re-run on every boot. Best-effort: if graphify global isn't available
+    # (e.g. graphify plugin disabled), continue.
+    if command -v graphify >/dev/null 2>&1; then
+        flock /tmp/graphify-global.lock graphify global add \
+            "$VAULT/graphify-out/graph.json" --as vault 2>/dev/null \
+            || echo "[entrypoint] vault global-add deferred (graphify not ready)"
     fi
 
-    echo "[entrypoint] Merging ${#FILES[@]} memory files into $SESSION_FILE"
-    cat "${FILES[@]}" | node -e "
-        const lines = require('fs').readFileSync('/dev/stdin','utf8').split('\n').filter(l=>l.trim());
-        const entities = new Map(); const relations = new Set();
-        for (const line of lines) {
-            try {
-                const item = JSON.parse(line);
-                if (item.type === 'entity') {
-                    const existing = entities.get(item.name);
-                    if (existing) {
-                        const obs = new Set([...existing.observations, ...item.observations]);
-                        existing.observations = [...obs];
-                    } else { entities.set(item.name, {...item}); }
-                } else if (item.type === 'relation') { relations.add(JSON.stringify(item)); }
-            } catch {}
-        }
-        const out = [...entities.values(), ...[...relations].map(r=>JSON.parse(r))];
-        console.log(out.map(o=>JSON.stringify(o)).join('\n'));
-    " > "$SESSION_FILE.tmp"
-    mv "$SESSION_FILE.tmp" "$SESSION_FILE"
-    # Old session files are NOT deleted here — cleanup_old_memory_files() runs
-    # after bisync baseline so deletions propagate correctly to R2.
-    # Direct R2 deletion is unsafe: concurrent sessions would lose their active file
-    # when bisync propagates the deletion to the other container.
-    echo "[entrypoint] Memory merge complete (old files kept for bisync baseline)"
-}
-
-cleanup_old_memory_files() {
-    local MEMORY_DIR="$USER_HOME/.memory"
-    local KEEP=5
-    local count=0
-
-    # Keep the 3 newest session files (by mtime), delete the rest.
-    # Matches typical concurrent session count; old counters are orphans anyway.
-    # Bisync propagates local deletions to R2 on the next cycle.
-    while IFS= read -r f; do
-        rm -f "$f"
-        count=$((count + 1))
-    done < <(find "$MEMORY_DIR" -name "session-*.jsonl" -type f -printf '%T@ %p\n' 2>/dev/null \
-        | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2-)
-
-    if [ $count -gt 0 ]; then
-        echo "[entrypoint] Cleaned up $count old memory files (kept $KEEP newest)"
-    fi
+    # Initialize vault-monitor two-marker state (see daemon section). Only
+    # seed vault-extract.last if absent — re-seeding on every boot would
+    # mask user-curated changes made since the last extraction in a prior
+    # session that didn't complete extraction before shutdown.
+    [ -f "$HOOK_CACHE/vault-extract.last" ] || touch "$HOOK_CACHE/vault-extract.last"
+    [ -f "$HOOK_CACHE/vault-monitor.tick" ] || touch "$HOOK_CACHE/vault-monitor.tick"
 }
 
 # ============================================================================
@@ -1038,12 +1296,6 @@ else
     update_sync_status "skipped" "$SYNC_ERROR"
 fi
 
-# Merge memory files from previous sessions (after R2 sync pulls them down)
-# Old files kept — cleanup happens after bisync baseline (Phase 2)
-if [ -n "${SESSION_ID:-}" ] && [ "${SESSION_MODE:-default}" = "advanced" ]; then
-    merge_memory_files
-fi
-
 # Pre-accept Claude Code's bypass permissions consent
 # Claude Code stores this in ~/.claude.json (bypassPermissionsModeAccepted field)
 # This prevents the interactive "WARNING: Claude Code running in Bypass Permissions mode" prompt
@@ -1059,28 +1311,10 @@ else
 fi
 echo "[entrypoint] Claude Code bypass permissions consent pre-accepted"
 
-# Configure memory MCP server for Claude Code
-# MCP servers are configured in ~/.claude.json (not ~/.claude/settings.json)
-# See: https://code.claude.com/docs/en/mcp — "User and local scope: ~/.claude.json"
+# Counter directory used by the memory-capture UserPromptSubmit hook
+# (the hook fires every N prompts to trigger vault capture; the MCP memory server
+# itself was removed — vault is now the persistent memory store).
 if [ -n "${SESSION_ID:-}" ]; then
-    MEMORY_MCP_CONFIG="{\"mcpServers\":{\"memory\":{\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-memory\"],\"env\":{\"MEMORY_FILE_PATH\":\"${USER_HOME}/.memory/session-${SESSION_ID}.jsonl\"}}}}"
-    if [ -f "$USER_CLAUDE_JSON" ]; then
-        # Recursive merge — preserves ALL existing config (bypass consent, other MCP servers, etc.)
-        # jq `*` merges objects recursively: only mcpServers.memory is added/updated
-        TMP_JSON=$(mktemp)
-        if jq --argjson mcp "$MEMORY_MCP_CONFIG" '. * $mcp' "$USER_CLAUDE_JSON" > "$TMP_JSON" 2>/dev/null; then
-            mv "$TMP_JSON" "$USER_CLAUDE_JSON"
-        else
-            # jq failed (malformed JSON?) — do NOT overwrite, skip instead
-            echo "[entrypoint] WARNING: Could not merge memory MCP config (malformed .claude.json?)"
-            rm -f "$TMP_JSON"
-        fi
-    else
-        echo "$MEMORY_MCP_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
-    fi
-    echo "[entrypoint] Memory MCP server configured for Claude Code"
-
-    # Create counter directory for memory capture hook
     mkdir -p "$USER_HOME/.memory/counter"
 fi
 
@@ -1270,7 +1504,7 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     #     ctx_execute. Closes the silent-bypass discovered in ai-news-digest
     #     PR #247 and the matching bug-class flagged by issue #319 in the
     #     enforce-review-spawn Stop hook.
-    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"}]}]}}'
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-vault/scripts/vault-monitor-hook.sh"}]}]}}'
     # context-mode hooks (Custom tier only, gated on plugin manifest presence).
     # Implements REQ-AGENT-005. Same four hooks the upstream context-mode
     # plugin would self-register via hooks.json — we wire them through
@@ -1331,7 +1565,9 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
           ],
           PreToolUse: [
             {matcher:"Grep|Glob",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graph-first-nudge.sh")}]},
-            {matcher:"mcp__context-mode__ctx_search|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graph-first-nudge.sh")}]}
+            {matcher:"mcp__context-mode__ctx_search|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/graph-first-nudge.sh")}]},
+            {matcher:"Grep|Bash",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/enforce-graphify.sh")}]},
+            {matcher:"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_execute_file|mcp__context-mode__ctx_batch_execute",hooks:[{type:"command",command:("bash " + $dir + "/graphify/scripts/enforce-graphify.sh")}]}
           ]
         }')
         SETTINGS_CONFIG=$(echo "$SETTINGS_CONFIG" | jq --argjson gf "$GRAPHIFY_HOOKS" '
@@ -1476,17 +1712,23 @@ if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
     (
         echo "[entrypoint] Establishing bisync baseline in background..."
         if establish_bisync_baseline; then
-            # Cleanup old memory files AFTER baseline — bisync will propagate deletions to R2.
-            # Run in subshell to prevent set -e from killing the daemon on cleanup failure.
-            (cleanup_old_memory_files) || true
             echo "[entrypoint] Bisync baseline established, starting daemon..."
         else
             echo "[entrypoint] WARNING: Bisync baseline failed — starting daemon anyway (daemon has its own recovery)" | tee -a /tmp/sync.log
         fi
-        # Always start daemon — even if baseline failed.
-        # The daemon has its own retry + resync fallback + vanishing-file recovery.
-        # A dead daemon means zero sync for the entire session.
+        # ----------------------------------------------------------------------
+        # Vault skeleton + global graph seed (REQ-MEMORY-100, REQ-MEMORY-105)
+        # Runs AFTER baseline so we never overwrite R2-restored vault content
+        # with an empty skeleton on returning sessions.
+        # Idempotent: skip if vault directory already present.
+        # ----------------------------------------------------------------------
+        (init_obsidian_vault) || echo "[entrypoint] WARNING: vault init failed; continuing"
+        # Always start daemons — even if baseline failed.
+        # Each daemon has its own retry + recovery; a dead daemon means
+        # zero sync (or zero vault ingestion) for the entire session.
         start_sync_daemon
+        start_vault_monitor_daemon
+        start_silverbullet_supervisor
     ) &
     BISYNC_INIT_PID=$!
     echo "[entrypoint] Bisync init running in background (PID $BISYNC_INIT_PID)"

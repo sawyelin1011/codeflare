@@ -17,6 +17,8 @@ See [Preseed System](preseed.md) for session modes, components, deployment pipel
 - **Default mode has hooks**: If `settings.json` has hook entries in default mode, the entrypoint `SESSION_MODE` gating may have failed. Remove them:
   `jq 'del(.hooks)' ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json`.
 
+- **`/dev/fd/63: No such file or directory` from a hook**: a bash hook using process substitution (`done < <(...)`) is being invoked in a runner where `/proc/self/fd` is not available, so the kernel cannot resolve the `/dev/fd/<N>` symlink the shell created. Codeflare's own hooks all use here-strings (`done <<< "$STR"`) for this reason: here-strings stage through a real temp file and work in every runner. If you author a custom hook that hits this error, switch the read loop's redirection to a here-string.
+
 ---
 
 ## Resetting the Review-Spawn Checkpoint
@@ -25,7 +27,7 @@ The `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode when `sd
 
 The hook tracks the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Acknowledgment advances only when the full pipeline (code-reviewer + spec-reviewer + doc-updater) is observed for the current PR HEAD.
 
-Three USER-ONLY bypass methods exist (the agent must never invoke these autonomously): the user deletes `sdd/.skip-next-review` (sentinel was consumed), the user says "skip review" in a message, or the user waits for the 3-strike circuit breaker to clear after 3 blocks on the same un-acknowledged PR HEAD.
+Three USER-ONLY bypass methods exist (the agent must never invoke these autonomously): the user runs `touch /tmp/review-bypass` (one-shot sentinel; per-session, not committed, auto-deleted on use), the user says "skip review" in a message, or the user waits for the 3-strike circuit breaker to clear after 3 blocks on the same un-acknowledged PR HEAD.
 
 If enforcement fires spuriously after a legitimate pipeline completed, reset both checkpoints:
 
@@ -40,5 +42,5 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 ## Related Documentation
 
 - [Preseed System](preseed.md) - Session modes, components, deployment, multi-agent support
-- [Memory](memory.md) - MCP memory server, capture/compact, R2 sync
+- [Memory](memory.md) - Vault-based cross-session memory, automatic capture, hook mechanics
 - [Container](container.md#claude-code-integration) - Claude Code configuration
