@@ -78,4 +78,31 @@ describe('Dockerfile graphify install (REQ-AGENT-023, REQ-AGENT-026)', () => {
       'merge-driver registration must not be conditional on SESSION_MODE'
     );
   });
+
+  it('REQ-AGENT-023: graphify CLI shim symlinked onto system PATH', () => {
+    // uv tool install lands the shim at /root/.local/bin/graphify which is
+    // not on the default container PATH; without this symlink every bash
+    // subshell launched by a hook gates on `command -v graphify` returning
+    // false and silently noops the global-graph add step (see entrypoint.sh
+    // self-heal counterpart for the runtime safety net).
+    assert.ok(
+      dockerfile.includes(
+        'ln -sf /root/.local/share/uv/tools/graphifyy/bin/graphify /usr/local/bin/graphify'
+      ),
+      'Dockerfile must symlink the graphify shim into /usr/local/bin so non-interactive bash subshells can resolve it'
+    );
+    // The symlink must land BEFORE `graphify --version` smoke-tests so the
+    // smoke test exercises the canonical lookup path, not just the uv shim.
+    // Match all occurrences (a future Dockerfile change that introduces a
+    // second symlink for an alternative path must still keep the FIRST
+    // one ahead of the smoke test).
+    const allLinks = [...dockerfile.matchAll(/ln -sf \/root\/\.local\/share\/uv\/tools\/graphifyy\/bin\/graphify/g)];
+    const allSmokes = [...dockerfile.matchAll(/graphify --version/g)];
+    assert.ok(allLinks.length >= 1, 'at least one graphify shim symlink must exist');
+    assert.ok(allSmokes.length >= 1, 'at least one `graphify --version` smoke test must exist');
+    assert.ok(
+      allLinks[0].index < allSmokes[0].index,
+      'first ln -sf must precede the first graphify --version smoke test'
+    );
+  });
 });

@@ -65,6 +65,48 @@ export interface VaultRouteResult {
  * `/api/vault/:sid/status` does NOT count as a vault proxy path — the
  * caller (src/index.ts) checks for that pattern before calling us.
  */
+/**
+ * Synthesise `X-Requested-With: XMLHttpRequest` on a request clone when
+ * (and ONLY when) the caller has already validated the request's Origin
+ * against the codeflare CORS allowlist. The synthesis lets SilverBullet's
+ * client.js writes (which never set the header) bypass the CSRF guard in
+ * `authenticateRequest` without weakening protection: per the Fetch spec,
+ * browsers always set Origin on cross-origin state-changing requests, so
+ * once Origin is allowlist-validated, the X-Requested-With check is
+ * redundant defence.
+ *
+ * Safety invariant (enforced by THIS function, not by call-site ordering):
+ *   - If `originValidated` is false → return the original request unchanged.
+ *   - If the request already carries `X-Requested-With` → unchanged.
+ *   - If the method is not state-changing (GET/HEAD/OPTIONS) → unchanged.
+ *   - Otherwise clone the FULL request (preserves body, signal, etc.) and
+ *     set the synthesised header.
+ *
+ * The full-clone form `new Request(request, { headers })` is critical:
+ * `authenticateRequest` only reads method + headers today, but the next
+ * change there could legitimately need the body (e.g. to verify a CSRF
+ * token in the payload); a partial reconstruction would silently fail.
+ *
+ * Browser baseline this depends on: Origin set on every cross-origin
+ * state-changing request. True in all major browsers since 2020
+ * (Chrome 76+, Firefox 70+, Safari 13.1+). Older browsers fall through
+ * the `originValidated=false` branch and hit the original CSRF guard.
+ *
+ * Exported solely so the unit test in src/__tests__/routes/vault.test.ts
+ * can pin the behavioural cases (validated+write synthesises; validated
+ * +read passes through; not-validated passes through; header-already-
+ * present passes through; cloned body preserved; case-insensitive method).
+ */
+export function maybeSynthesizeCsrfHeader(request: Request, originValidated: boolean): Request {
+  if (!originValidated) return request;
+  const method = request.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return request;
+  if (request.headers.has('X-Requested-With')) return request;
+  const headers = new Headers(request.headers);
+  headers.set('X-Requested-With', 'XMLHttpRequest');
+  return new Request(request, { headers });
+}
+
 export function validateVaultRoute(request: Request): VaultRouteResult {
   const url = new URL(request.url);
   const match = url.pathname.match(/^\/api\/vault\/([^/]+)(\/.*)$/);
@@ -142,6 +184,7 @@ export async function handleVaultRequest(
   // tab the user opens, and we want to keep the same allowlist as the
   // rest of the app rather than minting a new policy here.
   const origin = request.headers.get('Origin');
+  let originValidated = false;
   if (origin) {
     const originAllowed = await isAllowedOrigin(origin, env);
     if (!originAllowed) {
@@ -151,13 +194,19 @@ export async function handleVaultRequest(
         { status: 403, headers: jsonHeaders },
       );
     }
+    originValidated = true;
   }
 
   try {
     let user;
     let bucketName;
     try {
-      ({ user, bucketName } = await authenticateRequest(request, env));
+      // SilverBullet's client.js writes pages via PUT/DELETE/PATCH without
+      // `X-Requested-With`. See `maybeSynthesizeCsrfHeader` for the full
+      // security analysis; safety is enforced inside the helper, not by
+      // statement ordering here.
+      const requestForAuth = maybeSynthesizeCsrfHeader(request, originValidated);
+      ({ user, bucketName } = await authenticateRequest(requestForAuth, env));
     } catch (err) {
       if (err instanceof AuthError) {
         return new Response(JSON.stringify({ error: err.message, code: 'AUTH_FAILED' }),
