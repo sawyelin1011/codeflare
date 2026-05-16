@@ -537,6 +537,15 @@ describe('enforce-review-spawn.sh — fail-safe behavior', () => {
     // The transcript is append-only JSONL, so a subagent_type entry
     // that appears BEFORE the push line is definitionally pre-push
     // and must not satisfy enforcement.
+    //
+    // Check 1 only enforces code-reviewer + spec-reviewer (the two
+    // parallel agents in round 1 of the protocol). doc-updater is
+    // enforced by Check 2 once spec-reviewer's `completed</status>`
+    // tool-use marker appears AFTER the push. With no SPEC_DONE_LINE
+    // in this transcript, Check 2 doesn't fire, so doc-updater is
+    // NOT in the block reason. That separate enforcement path is
+    // covered by "blocks demanding doc-updater after spec-reviewer
+    // completes" above.
     const cwd = makeFixture();
     withSdd(cwd);
     const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
@@ -552,7 +561,6 @@ describe('enforce-review-spawn.sh — fail-safe behavior', () => {
       'agents earlier in the transcript than the push must not count');
     assert.match(r.stdout, /code-reviewer/);
     assert.match(r.stdout, /spec-reviewer/);
-    assert.match(r.stdout, /doc-updater/);
   });
 
   it('does not match "git push" inside echo strings (regression for substring false-positive)', () => {
@@ -848,5 +856,184 @@ describe('enforce-review-spawn.sh - 3-strike circuit breaker GIVEUP state', () =
     assert.equal(r5.status, 0);
     assert.equal(r5.stdout, '',
       'GIVEUP is sticky for the same SHA - no re-arm on subsequent Stop events');
+  });
+});
+
+// Variants of PUSH_LINE that carry transcript-side cwd hints. These pin
+// the codeflare layout where the agent's invocation CWD is the parent
+// of the cloned repo (e.g. /home/user/workspace/) rather than the repo
+// itself. Without these hints the hook silently exits 0 from a non-repo
+// CWD and bypasses the entire enforcement chain.
+const PUSH_LINE_WITH_ENVELOPE_CWD = (repoDir, ts = '2026-05-16T12:00:00.000Z') =>
+  JSON.stringify({
+    type: 'assistant',
+    cwd: repoDir,
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'Bash',
+          input: { command: 'git push origin develop' },
+        },
+      ],
+    },
+    timestamp: ts,
+  });
+
+const PUSH_LINE_WITH_CD_PREFIX = (repoDir, ts = '2026-05-16T12:00:00.000Z') =>
+  JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'Bash',
+          input: { command: `cd ${repoDir} && git push origin develop` },
+        },
+      ],
+    },
+    timestamp: ts,
+  });
+
+describe('enforce-review-spawn.sh - repo-dir derivation from PUSH_LINE', () => {
+  it('blocks when invoked from a non-repo CWD if PUSH_LINE envelope .cwd points at the repo', () => {
+    // Codeflare layout: agent CWD = /home/user/workspace/ (no .git),
+    // repo at /home/user/workspace/codeflare/. Hook must chdir into
+    // the repo before evaluating gates.
+    const repoDir = makeFixture();
+    withSdd(repoDir);
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE_WITH_ENVELOPE_CWD(repoDir)]);
+    // Invoke hook from the PARENT directory (not a git repo).
+    const parentCwd = resolve(repoDir, '..');
+    const r = runHook(parentCwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'must derive repo from PUSH_LINE .cwd and enforce, not silently exit');
+    assert.match(r.stdout, /code-reviewer/);
+    assert.match(r.stdout, /spec-reviewer/);
+  });
+
+  it('blocks when invoked from a non-repo CWD if PUSH_LINE command has `cd <repo> &&` prefix', () => {
+    // Second derivation path: the command itself starts with
+    // `cd /abs/path && git push ...`. This is the canonical shape
+    // for ctx_execute/Bash calls that target a specific repo.
+    const repoDir = makeFixture();
+    withSdd(repoDir);
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE_WITH_CD_PREFIX(repoDir)]);
+    const parentCwd = resolve(repoDir, '..');
+    const r = runHook(parentCwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'must derive repo from `cd <path>` command prefix and enforce');
+  });
+
+  it('exits 0 silently from non-repo CWD when PUSH_LINE has no derivable repo hint', () => {
+    // Bare `git push` with no envelope .cwd and no cd-prefix: the
+    // hook has no way to find the repo from the transcript. Must
+    // fail-safe to silent exit 0 (do NOT block based on a guess).
+    const repoDir = makeFixture();
+    withSdd(repoDir);
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE()]);  // no cwd hints
+    const parentCwd = resolve(repoDir, '..');
+    const r = runHook(parentCwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '',
+      'no derivable repo hint must fail-safe to silent exit, not block on guess');
+  });
+});
+
+// Tests for round-3 code-review findings on the Stop-hook restructure.
+
+const PUSH_LINE_WITH_QUOTED_CD = (repoDir, ts = '2026-05-16T12:00:00.000Z') =>
+  JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'Bash',
+          input: { command: `cd "${repoDir}" && git push origin develop` },
+        },
+      ],
+    },
+    timestamp: ts,
+  });
+
+const PUSH_LINE_WITH_SUBDIR_CD = (repoSubdir, ts = '2026-05-16T12:00:00.000Z') =>
+  JSON.stringify({
+    type: 'assistant',
+    message: {
+      content: [
+        {
+          type: 'tool_use',
+          name: 'Bash',
+          input: { command: `cd ${repoSubdir} && git push origin develop` },
+        },
+      ],
+    },
+    timestamp: ts,
+  });
+
+describe('enforce-review-spawn.sh - round-3 ordering and parser fixes', () => {
+  it('H1: vibe-coding project does NOT consume the /tmp/review-bypass sentinel', () => {
+    // The pre-fix shape ran bypass-1 (sentinel consumption) BEFORE the
+    // vibe-coding gate. On a project without sdd/, a routine Stop event
+    // would silently consume the user's one-shot bypass sentinel even
+    // though no enforcement was going to fire. Post-fix, the gate runs
+    // first and the sentinel is preserved.
+    const repoDir = makeFixture();
+    // Deliberately do NOT call withSdd(repoDir) - this is a vibe project.
+    const bypassFile = join(repoDir, 'review-bypass');
+    writeFileSync(bypassFile, '');
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE_WITH_ENVELOPE_CWD(repoDir)]);
+    const parentCwd = resolve(repoDir, '..');
+    const r = runHook(parentCwd, { transcriptPath: t, binDir, bypassFile });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, '');
+    assert.equal(existsSync(bypassFile), true,
+      'vibe-coding Stop event must NOT consume the bypass sentinel');
+  });
+
+  it('M2: cd into subdir of repo resolves to toplevel for vibe-gate evaluation', () => {
+    // `cd src/foo && git push` candidate dir is /repo/src/foo. Without
+    // show-toplevel resolution, the vibe-gate would check /repo/src/foo/sdd
+    // and fail (sdd/ lives at /repo/sdd). Post-fix the gate evaluates
+    // from the repo toplevel and enforcement proceeds correctly.
+    const repoDir = makeFixture();
+    withSdd(repoDir);
+    mkdirSync(join(repoDir, 'src/foo'), { recursive: true });
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE_WITH_SUBDIR_CD(join(repoDir, 'src/foo'))]);
+    const parentCwd = resolve(repoDir, '..');
+    const r = runHook(parentCwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'subdir candidate must resolve to repo toplevel so sdd/ gate passes');
+  });
+
+  it('M1: cd into a path with spaces (double-quoted) parses correctly', () => {
+    // The pre-fix CD_PATH regex `[^[:space:]&;|"]+` stopped at the first
+    // space, silently truncating quoted paths and falling through to
+    // envelope cwd (or eventually fail-safe exit 0). Post-fix the
+    // awk parser handles double-quoted paths.
+    // Use a path that genuinely contains a space character.
+    const parent = mkdtempSync(join(tmpdir(), 'enforce-spawn-spaces-'));
+    const repoDir = join(parent, 'dir with spaces');
+    mkdirSync(repoDir);
+    spawnSync('git', ['init', '-q'], { cwd: repoDir });
+    spawnSync('git', ['config', 'user.email', 'test@test'], { cwd: repoDir });
+    spawnSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir });
+    spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: repoDir });
+    withSdd(repoDir);
+    const binDir = fakeGh(repoDir, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(repoDir, [PUSH_LINE_WITH_QUOTED_CD(repoDir)]);
+    const r = runHook(parent, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'double-quoted cd path with spaces must parse correctly and enforce');
   });
 });

@@ -1645,7 +1645,9 @@ if [ -f "$SETTINGS_FILE" ]; then
     # Implements REQ-AGENT-008
     # Merge non-hooks settings with *, rebuild hooks separately to avoid
     # jq array-replace destroying user-added hooks or leaving stale managed hooks.
-    # "Managed" = command path contains codeflare-(hooks|memory)/scripts/,
+    # "Managed" = command path contains plugins/(codeflare-(hooks|memory|
+    # vault)|graphify)/scripts/ (anchored on the literal `plugins/` segment
+    # so unrelated future directories with the same basename cannot match),
     # references enforce-ctx-mode.sh (both the legacy ~/.claude/hooks/ path
     # and the current ~/.claude/plugins/context-mode/scripts/ path), OR is
     # a context-mode hook invocation (any of: bare `context-mode`,
@@ -1665,7 +1667,7 @@ if [ -f "$SETTINGS_FILE" ]; then
             [($existArr[] | .matcher // ""), ($cfgArr[] | .matcher // "")] | unique |
             map(. as $m |
               [$existArr[] | select((.matcher // "") == $m) | (.hooks // [])[] |
-                select((.command // "") | test("codeflare-(hooks|memory)/scripts/|enforce-ctx-mode\\.sh|(^context-mode |(bunx|npx) (-y )?context-mode@.* hook claude-code)") | not)
+                select((.command // "") | test("plugins/(codeflare-(hooks|memory|vault)|graphify)/scripts/|enforce-ctx-mode\\.sh|(^context-mode |(bunx|npx) (-y )?context-mode@.* hook claude-code)") | not)
               ] as $user |
               [$cfgArr[] | select((.matcher // "") == $m) | (.hooks // [])[]] as $mgr |
               {matcher: $m, hooks: ($user + $mgr)}
