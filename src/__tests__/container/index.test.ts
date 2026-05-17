@@ -158,6 +158,63 @@ describe('container DO class', () => {
       expect(mockCtx.blockConcurrencyWhile).toHaveBeenCalledTimes(1);
     });
 
+    it('restores containerAuthToken from storage so DO wake does not desync from a running container', async () => {
+      // Regression for the silent-401 bug: prior to persistence, every DO
+      // wake regenerated a fresh UUID via updateEnvVars() while the
+      // container process kept its old CONTAINER_AUTH_TOKEN env var, so the
+      // Bearer header attached by the fetch override no longer matched and
+      // every proxied request received `{"error":"Unauthorized"}` from
+      // host/src/server.ts until the user manually recreated the session.
+      const PRIOR_TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'test-bucket';
+        if (key === 'containerAuthToken') return PRIOR_TOKEN;
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      // Constructor's blockConcurrencyWhile body has multiple sequential
+      // awaits before updateEnvVars() fires; vi.waitFor polls until the
+      // microtask chain finishes (same pattern as the
+      // "constructor loads bucketName and calls updateEnvVars" test).
+      await vi.waitFor(() => {
+        expect(instance.envVars).toBeDefined();
+        expect(instance.envVars?.CONTAINER_AUTH_TOKEN).toBe(PRIOR_TOKEN);
+      });
+      // Storage.put must NOT be called with a new UUID for this key —
+      // we restored, not regenerated.
+      const putKeys = mockStorage.put.mock.calls.map((c) => c[0]);
+      expect(putKeys).not.toContain('containerAuthToken');
+    });
+
+    it('persists a freshly-generated containerAuthToken so subsequent wakes restore it', async () => {
+      // No prior token in storage → generator path. Must write back so the
+      // next wake's restore branch sees a value and skips re-generation.
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'test-bucket';
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      await vi.waitFor(() => {
+        expect(instance.envVars).toBeDefined();
+        expect(instance.envVars?.CONTAINER_AUTH_TOKEN).toMatch(/^[0-9a-f-]{36}$/);
+      });
+      const tok = instance.envVars?.CONTAINER_AUTH_TOKEN;
+
+      // And the generated token landed in storage under the same key the
+      // restore branch reads, so a subsequent wake will hit the restore
+      // path instead of regenerating.
+      await vi.waitFor(() => {
+        const putCalls = mockStorage.put.mock.calls;
+        const tokenPut = putCalls.find((c) => c[0] === 'containerAuthToken');
+        expect(tokenPut).toBeDefined();
+        expect(tokenPut?.[1]).toBe(tok);
+      });
+    });
+
   });
 
   describe('internal route dispatch', () => {

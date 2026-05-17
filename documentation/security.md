@@ -22,9 +22,13 @@ The `CLOUDFLARE_API_TOKEN` never enters the container. It stays in the Worker/DO
 
 **R2 token verification:** Cached tokens are validated before use via `verifyTokenExists()` in `r2-admin.ts`. This calls `GET /accounts/{accountId}/tokens/{tokenId}` through the circuit breaker. Only a 404 response (token definitively deleted) invalidates the cache and triggers fresh token creation. Transient errors (429, 500, 502, network errors, circuit breaker open) assume the token is still valid — this prevents a Cloudflare API blip from unnecessarily deleting a valid KV entry and causing rclone 401 errors. The verification runs on every `getOrCreateScopedR2Token()` cache hit.
 
-## Container Auth Token
+## Container Auth Token (REQ-SEC-012)
 
-A random UUID is generated per DO lifecycle and passed to the container as `CONTAINER_AUTH_TOKEN` env var. All requests proxied from the DO to the container via the public `fetch()` override include this token in the `Authorization: Bearer` header. The terminal server (`host/src/server.ts`) validates the token on all non-exempt paths. Internal paths (`/health`, `/activity`) are in `authExemptPaths` because `collectMetrics()` calls them directly via `ctx.container.getTcpPort(TERMINAL_SERVER_PORT).fetch(...)` from inside the DO class — that path enters the container over the SDK's private TCP plumbing and never runs through the public `fetch()` override, so no `Authorization` header is injected. The whitelist is safe because these two paths expose no user data and no mutable container state.
+A random shared secret is generated per DO lifecycle and proxied requests from the DO to the container include it in the `Authorization: Bearer` header. The terminal server (`host/src/server.ts`) validates the token on all non-exempt paths. Internal paths (`/health`, `/activity`) are whitelisted because `collectMetrics()` calls them directly via the SDK's private TCP plumbing (`ctx.container.getTcpPort(TERMINAL_SERVER_PORT).fetch(...)`), never through the public `fetch()` override -- so no `Authorization` header is injected. The whitelist is safe because these two paths expose no user data and no mutable container state.
+
+**Threat model -- silent Unauthorized after DO wake (AC5/AC6):** Without lifecycle-scoped persistence, every DO wake from hibernation regenerates a fresh token while the container process retains the original value, breaking every subsequent proxied request with `{"error":"Unauthorized"}` until the user manually recreates the session. The terminal, vault, and every other in-container HTTP surface go silently unreachable.
+
+**Mitigation:** The token is scoped to one DO lifecycle and survives hibernate/wake within that lifecycle; on `destroy()` it is cleared so the next session under the same DO ID starts fresh. Persistence mechanics (DO storage key, restore site, hibernate-window pinning, cleanup hook) live in [architecture.md](./architecture.md#container-do-container). The env-var name (`CONTAINER_AUTH_TOKEN`) is catalogued in [configuration.md](./configuration.md#environment-variables).
 
 ## Dual R2 Credential Architecture
 

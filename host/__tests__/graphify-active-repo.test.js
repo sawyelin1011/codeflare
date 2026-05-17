@@ -4,11 +4,12 @@
 // mcp__context-mode__ctx_execute / _file / batch). Resolution walks up
 // from the candidate dir to the nearest ancestor containing .git/ or
 // graphify-out/. Sentinel is only rewritten on change.
-import { describe, it, before, beforeEach } from 'node:test';
+import { describe, it, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -48,6 +49,15 @@ describe('graphify-active-repo.sh', () => {
 
   before(() => {
     baseTmp = mkdtempSync(join(tmpdir(), 'gf-active-'));
+  });
+
+  after(() => {
+    // rmSync removes symlinks as links (does NOT follow them), so the
+    // per-test symHome is unlinked without recursing into realHome.
+    // realHome is itself a subtree under baseTmp and gets removed
+    // independently on the same pass. `force: true` swallows ENOENT
+    // for anything an individual test already cleaned up.
+    rmSync(baseTmp, { recursive: true, force: true });
   });
 
   beforeEach(() => {
@@ -317,6 +327,123 @@ describe('graphify-active-repo.sh', () => {
     assert.equal(status, 0);
     assert.equal(sentinel(sentinelDir), repoB);
   });
+
+  // REQ-VAULT-004 AC4: vault skip. Entrypoint init seeds the vault under
+  // tag `user_vault`; a tool call inside the vault must NOT re-tag it
+  // with the directory basename (`.user_vault`) and the prune-on-switch
+  // logic must never get a chance to remove the entrypoint snapshot.
+  it('vault skip: candidate at $HOME/.user_vault exits without sentinel write', () => {
+    const fakeHome = mkdtempSync(join(baseTmp, 'home-'));
+    const vault = join(fakeHome, '.user_vault');
+    mkdirSync(join(vault, 'graphify-out'), { recursive: true });
+    mkdirSync(join(vault, 'notes'));
+    writeFileSync(join(vault, 'graphify-out', 'graph.json'), '{"nodes":[]}');
+
+    const result = spawnSync('bash', [HOOK], {
+      input: JSON.stringify({
+        tool_name: 'Read',
+        tool_input: { file_path: join(vault, 'notes', 'foo.md') },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, GRAPHIFY_SENTINEL_DIR: sentinelDir, HOME: fakeHome },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(sentinel(sentinelDir), null, 'vault must not be written to the active-repo sentinel');
+  });
+
+  it('vault skip: a tool call inside the vault does NOT clobber the active repo sentinel', () => {
+    const fakeHome = mkdtempSync(join(baseTmp, 'home-'));
+    const vault = join(fakeHome, '.user_vault');
+    mkdirSync(join(vault, 'graphify-out'), { recursive: true });
+    mkdirSync(join(vault, 'notes'));
+    writeFileSync(join(vault, 'graphify-out', 'graph.json'), '{"nodes":[]}');
+
+    const repoA = makeRepo(workspace, 'repo-a');
+    // Prime the sentinel with repoA via a normal call
+    runHook(
+      { tool_name: 'Bash', cwd: repoA, tool_input: { command: 'ls' } },
+      sentinelDir
+    );
+    assert.equal(sentinel(sentinelDir), repoA);
+
+    // Now simulate a tool call inside the vault (capture sonnet etc).
+    // The hook must NOT rewrite the sentinel away from repoA.
+    const result = spawnSync('bash', [HOOK], {
+      input: JSON.stringify({
+        tool_name: 'Read',
+        tool_input: { file_path: join(vault, 'raw', 'sessions', 'x.md') },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, GRAPHIFY_SENTINEL_DIR: sentinelDir, HOME: fakeHome },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(sentinel(sentinelDir), repoA, 'active repo must remain unchanged by a vault tool call');
+  });
+
+  // Regression: when $HOME is itself a symlink (or otherwise non-canonical),
+  // the raw string `$HOME/.user_vault` does NOT match the canonicalized
+  // REPO path. The production hook handles this via two guards (canonicalize
+  // $HOME, OR basename match). Because the script hardcodes `.user_vault`
+  // as the literal in BOTH branches, a test that uses the same literal
+  // cannot isolate one branch from the other - both fire on a vault under
+  // a symlinked $HOME. We therefore keep one union test for that case
+  // (asserts the skip happens; doesn't claim to isolate which branch
+  // caught it) AND one outside-$HOME test where only the basename branch
+  // can possibly match (legitimate isolation for that branch).
+  it('vault skip: symlinked $HOME (union of canonicalization + basename guards)', () => {
+    const realHome = mkdtempSync(join(baseTmp, 'real-home-'));
+    // randomUUID() under the already-unique `baseTmp`: no syscalls, no
+    // TOCTOU window between rm and symlink, no millisecond-collision risk.
+    const symHome = join(baseTmp, `sym-home-${randomUUID()}`);
+    symlinkSync(realHome, symHome);
+    const vault = join(realHome, '.user_vault');
+    mkdirSync(join(vault, 'graphify-out'), { recursive: true });
+    mkdirSync(join(vault, 'notes'));
+    writeFileSync(join(vault, 'graphify-out', 'graph.json'), '{"nodes":[]}');
+
+    const result = spawnSync('bash', [HOOK], {
+      input: JSON.stringify({
+        tool_name: 'Read',
+        tool_input: { file_path: join(symHome, '.user_vault', 'notes', 'foo.md') },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, GRAPHIFY_SENTINEL_DIR: sentinelDir, HOME: symHome },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(
+      sentinel(sentinelDir),
+      null,
+      'symlinked HOME must still trigger the vault skip; raw-string compare would miss this',
+    );
+  });
+
+  it('vault skip: basename fallback catches a vault reached from outside $HOME', () => {
+    // Counter-test: vault lives OUTSIDE $HOME (so the canonicalized-$HOME
+    // equality compare does NOT match), but is named `.user_vault`. The
+    // basename fallback is the only guard that can fire here. Reverting
+    // only the basename branch would leave this test red.
+    const realHome = mkdtempSync(join(baseTmp, 'real-home-bn-'));
+    const outsideVaultParent = mkdtempSync(join(baseTmp, 'outside-'));
+    const vault = join(outsideVaultParent, '.user_vault');
+    mkdirSync(join(vault, 'graphify-out'), { recursive: true });
+    mkdirSync(join(vault, 'notes'));
+    writeFileSync(join(vault, 'graphify-out', 'graph.json'), '{"nodes":[]}');
+
+    const result = spawnSync('bash', [HOOK], {
+      input: JSON.stringify({
+        tool_name: 'Read',
+        tool_input: { file_path: join(vault, 'notes', 'foo.md') },
+      }),
+      encoding: 'utf-8',
+      env: { ...process.env, GRAPHIFY_SENTINEL_DIR: sentinelDir, HOME: realHome },
+    });
+    assert.equal(result.status, 0);
+    assert.equal(
+      sentinel(sentinelDir),
+      null,
+      'a vault directory outside $HOME but named `.user_vault` must trigger the basename-fallback skip',
+    );
+  });
 });
 
 // Tests for the single-active-repo global-graph maintenance logic
@@ -342,6 +469,7 @@ function runHookNoGraphify(input, sentinelDir) {
 describe('graphify-active-repo.sh single-active-repo maintenance', () => {
   let baseTmp, sentinelDir, workspace;
   before(() => { baseTmp = mkdtempSync(join(tmpdir(), 'gf-maint-')); });
+  after(() => { rmSync(baseTmp, { recursive: true, force: true }); });
   beforeEach(() => {
     sentinelDir = mkdtempSync(join(baseTmp, 'sentinel-'));
     workspace = mkdtempSync(join(baseTmp, 'ws-'));

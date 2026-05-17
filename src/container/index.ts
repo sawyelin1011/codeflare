@@ -147,6 +147,14 @@ export class container extends Container<Env> {
       this._sessionId = await this.ctx.storage.get<string>(SESSION_ID_KEY) || null;
       this._usageSeconds = await this.ctx.storage.get<number>('usageSeconds') || 0;
       this._userEmail = await this.ctx.storage.get<string>('userEmail') || null;
+      // Restore the container auth token from storage. Without this,
+      // every DO wake regenerates a fresh UUID via updateEnvVars() while the
+      // container process (which may have been hibernated, not restarted)
+      // keeps its old CONTAINER_AUTH_TOKEN env var. Result: DO sends
+      // `Authorization: Bearer Y`, container compares against old `X` →
+      // `{"error":"Unauthorized"}` on every proxied request until the user
+      // recreates the session manually.
+      this._containerAuthToken = await this.ctx.storage.get<string>('containerAuthToken') || null;
 
       // Restore user-configured idle timeout (survives DO resets).
       // Storage key remains 'sleepAfter' for backwards compat with existing sessions.
@@ -192,9 +200,30 @@ export class container extends Container<Env> {
 
   /** Update envVars with current bucket name and credentials. */
   private updateEnvVars(): void {
-    // Generate auth token for container communication (once per DO lifecycle)
+    // Generate the container auth token on first need, then persist it so
+    // a subsequent DO wake restores the same value (the container's env
+    // var CONTAINER_AUTH_TOKEN, set when the container started, survives
+    // hibernation; the DO's in-memory copy does not, so re-generating here
+    // produces a token mismatch - see the restore in blockConcurrencyWhile).
+    // ctx.waitUntil pins the put to the request lifecycle so the runtime
+    // cannot hibernate the DO before the storage write commits; without
+    // that pin, a wake-then-immediately-hibernate sequence could regenerate
+    // a fresh token on the next wake even after this branch ran.
     if (!this._containerAuthToken) {
       this._containerAuthToken = crypto.randomUUID();
+      // Promise.resolve() wrap: in production ctx.storage.put returns a
+      // Promise per the Workers Runtime API, but some test mocks return
+      // undefined synchronously. Wrapping makes `.catch` safe in both.
+      const putPromise = Promise.resolve(
+        this.ctx.storage.put('containerAuthToken', this._containerAuthToken),
+      ).catch((err) => {
+        this.logger.warn('Failed to persist containerAuthToken', { error: toErrorMessage(err) });
+      });
+      // waitUntil is unavailable on some test mocks of ctx; guard so unit
+      // tests that don't stub it don't crash. Production always has it.
+      if (typeof this.ctx.waitUntil === 'function') {
+        this.ctx.waitUntil(putPromise);
+      }
     }
 
     this.envVars = buildEnvVars(this.envState, this.env);
@@ -422,6 +451,11 @@ export class container extends Container<Env> {
       await this.ctx.storage.delete('fastStartEnabled');
       await this.ctx.storage.delete('tabConfig');
       await this.ctx.storage.delete('sleepAfter');
+      // Drop the persisted auth token: the next session under this DO ID will
+      // be a different container instance with a fresh token, so reusing the
+      // old one would let an unrelated request out of a previous lifecycle
+      // authenticate against the new container.
+      await this.ctx.storage.delete('containerAuthToken');
       this._bucketName = null;
       this._sessionId = null;
       this._r2AccessKeyId = null;

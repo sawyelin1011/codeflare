@@ -159,6 +159,27 @@ done
 
 [ -z "$REPO" ] && exit 0
 
+# Vault is always-on in the global graph under the tag `user_vault`,
+# seeded by init_user_vault() at boot. The vault has its own
+# graphify-out/ subdir, so the walk-up loop above would otherwise treat
+# $HOME/.user_vault as a "repo" and re-tag it with its basename
+# (.user_vault) on every tool call that touches a vault file. That
+# duplicates entries in the global manifest and lets the prune-on-switch
+# logic later remove the basename-tag, leaving only the stale entrypoint
+# snapshot. Exit silently when the resolved REPO is the vault root.
+#
+# Two guards: REPO is already canonicalized via `cd ... && pwd`, so we
+# canonicalize $HOME the same way (symlinks, trailing slashes, mount
+# differences). Basename check is belt-and-suspenders in case a symlink
+# points at the vault from outside $HOME.
+HOME_RESOLVED=$(cd "$HOME" 2>/dev/null && pwd)
+# `[ -n "$HOME_RESOLVED" ] &&` guard: if $HOME is unset or unreadable, the
+# canonicalized compare would degrade to `[ "$REPO" = "/.user_vault" ]`
+# (silently inert). The basename fallback still catches the common case.
+if { [ -n "$HOME_RESOLVED" ] && [ "$REPO" = "$HOME_RESOLVED/.user_vault" ]; } || [ "$(basename "$REPO")" = ".user_vault" ]; then
+    exit 0
+fi
+
 SENTINEL_DIR="${GRAPHIFY_SENTINEL_DIR:-$HOME/.cache/codeflare-hooks}"
 mkdir -p "$SENTINEL_DIR" 2>/dev/null || true
 SENTINEL="$SENTINEL_DIR/graphify-active-cwd"
