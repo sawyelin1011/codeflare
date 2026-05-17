@@ -17,18 +17,41 @@ This skill drives `/graphify` knowledge-graph extraction inside the Codeflare co
 3. **Persistence lives in git, not R2.** The graph travels with the repo. After your first `/graphify` build in a repo the user has push permission to:
    - Add to the repo's `.gitignore` (create if absent):
      ```
+     # graphify caches (regenerable, large)
+     graphify-out/cache/
      graphify-out/.cache/
      graphify-out/.chunks/
+     graphify-out/manifest.json
+     graphify-out/obsidian/
+
+     # graphify working-tree intermediates (created mid-run; cleaned by
+     # Step 9, gitignored as the safety net for runs interrupted before
+     # cleanup runs)
+     .graphify_ast.json
+     .graphify_semantic.json
+     .graphify_semantic_new.json
+     .graphify_extract.json
+     .graphify_detect.json
+     .graphify_analysis.json
+     .graphify_cached.json
+     .graphify_uncached.txt
+     .graphify_chunk_*.txt
+     .graphify_old.json
+
+     # graphify per-machine markers (absolute path / regenerable label
+     # cache; useless on any other clone)
+     .graphify_root
+     .graphify_labels.json
      ```
-     These are local-only caches (FTS5 query index, subagent intermediates) that regenerate themselves. Everything else in `graphify-out/` is committed.
+     All regenerable on every run. The cache patterns prevent thousands of FTS5 index files leaking into git on a large repo; the intermediate patterns prevent a `git add -A` after an interrupted run pulling in detect/AST/semantic JSON that can be hundreds of MB on a big corpus; `graphify-out/obsidian/` is the auto-generated Obsidian-stub vault (one .md per graph node, 2000+ files on a medium repo) where every `graphify update .` rerun rewrites centrality + community labels in the frontmatter, producing massive diff noise in PRs. The standalone `graph.html` covers the casual-browse use case; anyone who wants the Obsidian-app workflow regenerates the stubs locally. Only `graph.json`, `GRAPH_REPORT.md`, `graph.html`, and optional `wiki/` are committed.
    - Add to the repo's `.gitattributes` (create if absent):
      ```
      graphify-out/graph.json merge=graphify
      ```
      This wires the graphify semantic merge driver for `graph.json`. The driver itself is registered globally in the container image, so this `.gitattributes` line is the only per-repo setup needed. Without it, concurrent edits produce corrupt JSON on merge.
-   - Stage and commit `graphify-out/graph.json`, `GRAPH_REPORT.md`, `.graphify_root`, `.graphify_labels.json`, and optionally `graph.html` + `wiki/`. Subsequent contributors clone the repo and inherit the graph for free.
+   - Stage and commit `graphify-out/graph.json`, `GRAPH_REPORT.md`, `graph.html`, and optionally `wiki/`. Subsequent contributors clone the repo and inherit the graph for free. (`.graphify_root` and `.graphify_labels.json` look durable but are per-machine markers - root contains an absolute path, labels cache regenerates every run - so they ride in `.gitignore` under their own marker-class section above.)
    - For repos the user does NOT have push permission to (cloned open-source projects, read-only forks): graphify-out/ stays in the working tree only, ephemeral, no R2 fallback. Do not try to persist via bisync.
-   - **Before the commit step, merge this repo's graph into the unified global graph** so `mcp__graphify__*` tool calls see it alongside the vault and any other active repos: `flock /tmp/graphify-global.lock graphify global add graphify-out/graph.json --as <repo-basename>`. Hash-keyed and idempotent. The `flock` serialises against the capture sonnet and the vault-monitor sonnet, which also write the global graph.
+   - **Before the commit step, merge this repo's graph into the unified global graph** so `mcp__graphify__*` tool calls see it alongside the vault and any other active repos: `flock /tmp/graphify-global.lock graphify global add graphify-out/graph.json --as <repo-basename>`. Hash-keyed and idempotent. The `flock` serialises against the capture agent (haiku) and the vault-extract agent (haiku), which also write the global graph.
 
    When two sessions both run `graphify update .` and produce conflicting `graph.json`, the merge driver auto-resolves on `git merge` / `git pull`. No manual JSON wrangling.
 
@@ -42,9 +65,21 @@ This skill drives `/graphify` knowledge-graph extraction inside the Codeflare co
 
 7. **Discipline rule.** When `graphify-out/graph.json` exists, `~/.claude/rules/graph-first.md` applies: prefer focused MCP queries over Grep for architecture, dependency, and call-flow questions.
 
+8. **Mandatory build-mode choice before any extraction.** Before dispatching Part B subagents (Step B2 of the upstream protocol), ALWAYS present the user with an `AskUserQuestion` offering exactly two modes:
+   - **AST-only** - free, no token cost; code structure + call/import/contains edges only; no semantic concepts from docs / papers / images.
+   - **Full (AST + semantic)** - AST plus N parallel Haiku subagents extracting concepts from docs / papers / images. Include the actual subagent count (`ceil(uncached_non_code_files / 22) + image_count`) and a wall-time estimate (~45s per parallel batch).
+
+   Default recommendation: choose by intent, not size. **AST-only** when the user is testing the build pipeline, exploring an unfamiliar repo for a one-off question, or has explicitly capped per-build cost (no docs / images get extracted, only structural edges). **Full** when this is a target project the user will work on long-term and wants the semantic concept graph from docs / READMEs / image diagrams in their MCP query results. The file count and word total are surfaced in the prompt so the user sees the cost surface, but they should not drive the recommendation - a 5000-file repo built once for long-term reference is still Full; a 50-file repo someone is poking at for ten minutes is still AST-only.
+
+   Skip the question only when (a) the corpus has zero docs / papers / images (code-only fast path makes the choice moot), or (b) `--no-semantic` was passed explicitly. If AST-only is chosen, skip Part B entirely and treat AST as the full extraction (same flow as the code-only fast path).
+
+   This choice is separate from the "split by subfolder" question the upstream protocol asks on > 200 files - ask both in sequence (subfolder first, then build mode against the chosen scope).
+
+9. **Spawn Part B semantic subagents with `model: "haiku"`.** Graphify semantic extraction is a templated structured-output task: each subagent reads files and emits chunk JSON matching graphify's schema. Same workload class as the vault-extract agent that already runs on Haiku. The `Task` calls in Step B2 must include `model: "haiku"` so per-build cost matches vault-extract economics (~1/8 of Opus, ~1/3 of Sonnet). Override to Sonnet only when `--mode deep` was passed; never escalate to Opus from this skill.
+
 ---
 
-The upstream graphify extraction pipeline is reproduced below in full. It is the canonical algorithm; do not improvise on it.
+The upstream graphify extraction pipeline is reproduced below in full. It is the canonical algorithm; do not improvise on it. The two operational notes above (#8 mandatory build-mode question, #9 Haiku subagents) are codeflare-specific overrides that bind on top of the upstream Step 2 + Step B2 below - apply them even where the upstream text does not mention them.
 
 ---
 
@@ -663,7 +698,8 @@ cost_path.write_text(json.dumps(cost, indent=2))
 print(f'This run: {input_tok:,} input tokens, {output_tok:,} output tokens')
 print(f'All time: {cost[\"total_input_tokens\"]:,} input, {cost[\"total_output_tokens\"]:,} output ({len(cost[\"runs\"])} runs)')
 "
-rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_analysis.json .graphify_labels.json
+rm -f .graphify_detect.json .graphify_extract.json .graphify_ast.json .graphify_semantic.json .graphify_semantic_new.json .graphify_analysis.json .graphify_labels.json
+rm -f .graphify_cached.json .graphify_uncached.txt .graphify_old.json .graphify_chunk_*.txt
 rm -f graphify-out/.needs_update 2>/dev/null || true
 ```
 
