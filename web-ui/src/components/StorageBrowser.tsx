@@ -4,6 +4,7 @@ import { sessionStore } from '../stores/session';
 import { getDownloadUrl } from '../api/storage';
 import { extractFilesFromDrop } from '../lib/file-upload';
 import { logger } from '../lib/logger';
+import { ALWAYS_VISIBLE_SPECIAL_PREFIXES } from '../lib/special-folders';
 import Button from './ui/Button';
 import StorageBreadcrumbs from './storage/StorageBreadcrumbs';
 import StorageToolbar from './storage/StorageToolbar';
@@ -46,7 +47,8 @@ const StorageBrowser: Component = () => {
 
   const displayedItems = createMemo(() => {
     const q = searchQuery();
-    const source = q
+    const isSearching = !!q;
+    const source = isSearching
       ? storageStore.searchFiles(q)
       : { objects: storageStore.objects, prefixes: storageStore.prefixes };
 
@@ -65,6 +67,26 @@ const StorageBrowser: Component = () => {
       };
     }
 
+    // Always-on special folders (Vault, Uploads, Temporary). These are
+    // auto-created by the container entrypoint and bisynced unconditionally,
+    // so they should appear in the storage panel even when R2 has no objects
+    // under them yet (otherwise a brand-new user sees a confusing empty panel
+    // and cannot tell whether the rows even exist). Skipped when the user is
+    // searching: synthetic rows have no objects[] entries to match against
+    // a query, so injecting them would falsely imply the search matched
+    // them. At any other prefix the standard listing wins.
+    if (storageStore.currentPrefix === '' && !isSearching) {
+      const missing = ALWAYS_VISIBLE_SPECIAL_PREFIXES.filter(
+        (p) => !workspaceFiltered.prefixes.includes(p),
+      );
+      if (missing.length > 0) {
+        workspaceFiltered = {
+          ...workspaceFiltered,
+          prefixes: [...workspaceFiltered.prefixes, ...missing].sort(),
+        };
+      }
+    }
+
     if (showHiddenItems()) {
       return workspaceFiltered;
     }
@@ -81,7 +103,10 @@ const StorageBrowser: Component = () => {
     }
   });
 
-  const [workspaceTooltipVisible, setWorkspaceTooltipVisible] = createSignal(false);
+  // Which special-folder info tooltip is currently expanded (workspace/,
+  // Vault/, Uploads/, Temporary/), or null. Single-tooltip state - opening a
+  // second one closes the first, matching the prior workspace-only behaviour.
+  const [openSpecialTooltip, setOpenSpecialTooltip] = createSignal<string | null>(null);
   const [lastSelectedId, setLastSelectedId] = createSignal<string | null>(null);
   const selectedKeySet = createMemo(() => new Set(storageStore.selectedKeys));
   const selectedPrefixSet = createMemo(() => new Set(storageStore.selectedPrefixes));
@@ -192,7 +217,10 @@ const StorageBrowser: Component = () => {
     storageStore.searchFiles(value);
   };
 
-  const triggerDownload = async (key: string) => {
+  // Returns true on success, false on caught failure. Callers in the
+  // multi-select path use the return value to aggregate a single
+  // user-visible summary rather than silently swallowing per-file errors.
+  const triggerDownload = async (key: string): Promise<boolean> => {
     try {
       const url = getDownloadUrl(key);
       const response = await fetch(url, { credentials: 'include' });
@@ -208,14 +236,26 @@ const StorageBrowser: Component = () => {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(blobUrl);
+      return true;
     } catch (e) {
       logger.error('[StorageBrowser] Download failed:', { key, error: e instanceof Error ? e.message : e });
+      return false;
     }
   };
 
   const handleDownloadSelected = async () => {
-    for (const key of storageStore.selectedKeys) {
-      await triggerDownload(key);
+    const keys = [...storageStore.selectedKeys];
+    let failed = 0;
+    for (const key of keys) {
+      const ok = await triggerDownload(key);
+      if (!ok) failed += 1;
+    }
+    if (failed > 0) {
+      // No global toast component is wired up yet; the per-file logger.error
+      // calls capture the detail and the alert surfaces the aggregate to the
+      // user so a partial batch failure does not look like silent success.
+      // eslint-disable-next-line no-alert
+      globalThis.alert?.(`${failed} of ${keys.length} downloads failed. See browser console for details.`);
     }
   };
 
@@ -305,8 +345,8 @@ const StorageBrowser: Component = () => {
           selectionModeEnabled={selectionModeEnabled}
           selectedKeySet={selectedKeySet}
           selectedPrefixSet={selectedPrefixSet}
-          workspaceTooltipVisible={workspaceTooltipVisible}
-          setWorkspaceTooltipVisible={setWorkspaceTooltipVisible}
+          openSpecialTooltip={openSpecialTooltip}
+          setOpenSpecialTooltip={setOpenSpecialTooltip}
           applySelection={applySelection}
           triggerDownload={triggerDownload}
           handleDragOver={handleDragOver}

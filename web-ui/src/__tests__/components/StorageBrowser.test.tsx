@@ -28,7 +28,19 @@ const mockSetSelection = vi.fn();
 const mockUploadFiles = vi.fn();
 const mockSelectAll = vi.fn();
 const mockClearSelection = vi.fn();
-const mockSearchFiles = vi.fn((_q: string) => ({ objects: mockObjects, prefixes: mockPrefixes }));
+// Match the real store contract: a search query filters by case-insensitive
+// substring against the object key and prefix string. Returning the full
+// unfiltered state (the previous behaviour) silently passed any test that
+// rendered the search bar without verifying the filtered result actually
+// reached the DOM. The filter mirrors the simple `.includes` semantics of
+// stores/storage.ts.searchFiles for the slice the component cares about.
+const mockSearchFiles = vi.fn((q: string) => {
+  const needle = q.toLowerCase();
+  return {
+    objects: mockObjects.filter((o: { key: string }) => o.key.toLowerCase().includes(needle)),
+    prefixes: mockPrefixes.filter((p: string) => p.toLowerCase().includes(needle)),
+  };
+});
 const mockFetchStats = vi.fn();
 const mockOpenPreview = vi.fn();
 const mockClosePreview = vi.fn();
@@ -423,34 +435,94 @@ describe('StorageBrowser', () => {
       render(() => <StorageBrowser />);
 
       const workspaceFolder = screen.getByTestId('folder-workspace');
-      const syncIcon = workspaceFolder.querySelector('[data-testid="workspace-container-icon"]');
+      const syncIcon = workspaceFolder.querySelector('[data-testid="special-folder-icon-workspace"]');
       expect(syncIcon).toBeInTheDocument();
     });
 
-    it('does not show container sync icon for non-workspace folders', () => {
+    it('does not show container sync icon for non-special folders', () => {
       mockPrefixes = ['docs/'];
       render(() => <StorageBrowser />);
 
       const docsFolder = screen.getByTestId('folder-docs');
-      const syncIcon = docsFolder.querySelector('[data-testid="workspace-container-icon"]');
-      expect(syncIcon).not.toBeInTheDocument();
+      // No `special-folder-icon-*` should be attached to an ordinary folder.
+      const anySpecialIcon = docsFolder.querySelector('[data-testid^="special-folder-icon-"]');
+      expect(anySpecialIcon).not.toBeInTheDocument();
     });
 
-    it('shows tooltip text when workspace container icon is clicked', () => {
+    it('shows tooltip text plus container path when workspace icon is clicked', () => {
       mockPrefixes = ['workspace/'];
       render(() => <StorageBrowser />);
 
       const workspaceFolder = screen.getByTestId('folder-workspace');
-      const syncIcon = workspaceFolder.querySelector('[data-testid="workspace-container-icon"]') as HTMLElement;
+      const syncIcon = workspaceFolder.querySelector('[data-testid="special-folder-icon-workspace"]') as HTMLElement;
       expect(syncIcon).toBeInTheDocument();
 
       // Click the icon to toggle tooltip
       fireEvent.click(syncIcon!);
 
-      // Tooltip text should appear
-      const tooltip = workspaceFolder.querySelector('.workspace-sync-tooltip');
+      // Tooltip body should contain the workspace description and the
+      // in-container path the user expects to find their files at.
+      const tooltip = workspaceFolder.querySelector(
+        '[data-testid="special-folder-tooltip-workspace"]',
+      );
       expect(tooltip).toBeInTheDocument();
-      expect(tooltip?.textContent).toBe('Holds your codebase and other assets. Disabling sync in settings is recommended, clone your repositories fresh every session.');
+      expect(tooltip?.textContent).toContain('Holds your codebase');
+      // In-container path must live in the dedicated path subspan, not
+      // anywhere in the tooltip text, so a regression that drops the
+      // path line still fails the assertion.
+      const pathLine = tooltip?.querySelector('.workspace-sync-tooltip-path');
+      expect(pathLine).toBeInTheDocument();
+      expect(pathLine?.textContent).toContain('/home/user/Workspace');
+    });
+
+    it('renders Vault, Uploads, Temporary at storage root even when R2 is empty', () => {
+      mockPrefixes = [];
+      mockObjects = [];
+      render(() => <StorageBrowser />);
+
+      // Three always-on special folders the entrypoint auto-creates and
+      // bisyncs. They must appear in the storage panel before any user
+      // content has landed under them.
+      expect(screen.getByTestId('folder-Vault')).toBeInTheDocument();
+      expect(screen.getByTestId('folder-Uploads')).toBeInTheDocument();
+      expect(screen.getByTestId('folder-Temporary')).toBeInTheDocument();
+    });
+
+    it('shows container path in Vault tooltip', () => {
+      mockPrefixes = [];
+      render(() => <StorageBrowser />);
+
+      const vaultFolder = screen.getByTestId('folder-Vault');
+      const icon = vaultFolder.querySelector('[data-testid="special-folder-icon-vault"]') as HTMLElement;
+      fireEvent.click(icon);
+      const tooltip = vaultFolder.querySelector('[data-testid="special-folder-tooltip-vault"]');
+      const pathLine = tooltip?.querySelector('.workspace-sync-tooltip-path');
+      expect(pathLine).toBeInTheDocument();
+      expect(pathLine?.textContent).toContain('/home/user/Vault');
+    });
+
+    it('opening a second tooltip closes the first (single-open behaviour)', () => {
+      mockPrefixes = ['workspace/'];
+      render(() => <StorageBrowser />);
+
+      const workspaceFolder = screen.getByTestId('folder-workspace');
+      const workspaceIcon = workspaceFolder.querySelector('[data-testid="special-folder-icon-workspace"]') as HTMLElement;
+      fireEvent.click(workspaceIcon);
+      expect(
+        workspaceFolder.querySelector('[data-testid="special-folder-tooltip-workspace"]'),
+      ).toBeInTheDocument();
+
+      const uploadsFolder = screen.getByTestId('folder-Uploads');
+      const uploadsIcon = uploadsFolder.querySelector('[data-testid="special-folder-icon-uploads"]') as HTMLElement;
+      fireEvent.click(uploadsIcon);
+
+      // Uploads tooltip is now open; workspace tooltip must be closed.
+      expect(
+        uploadsFolder.querySelector('[data-testid="special-folder-tooltip-uploads"]'),
+      ).toBeInTheDocument();
+      expect(
+        workspaceFolder.querySelector('[data-testid="special-folder-tooltip-workspace"]'),
+      ).not.toBeInTheDocument();
     });
   });
 
@@ -470,7 +542,7 @@ describe('StorageBrowser', () => {
         expect(globalThis.URL.revokeObjectURL).toHaveBeenCalled();
       });
 
-      // openPreview should NOT be called — download is triggered instead
+      // openPreview should NOT be called - download is triggered instead
       expect(mockOpenPreview).not.toHaveBeenCalled();
       // Verify the full download chain completed
       expect(globalThis.fetch).toHaveBeenCalledWith(
@@ -592,14 +664,37 @@ describe('StorageBrowser', () => {
   });
 
   describe('Empty State', () => {
-    it('shows empty message when no folders or files', () => {
+    it('shows empty message when no folders or files inside a sub-prefix', () => {
+      // At the storage root the always-on special folders
+      // (Vault/Uploads/Temporary) are injected into the listing even
+      // when R2 has nothing under them, so the panel is intentionally
+      // never empty at root after this change. The empty-state
+      // placeholder still has to fire one level down - pick a deep
+      // prefix that the special-folders injection ignores.
       mockPrefixes = [];
       mockObjects = [];
       mockWorkspaceSyncEnabled = false;
+      mockCurrentPrefix = 'some-folder/';
       render(() => <StorageBrowser />);
 
       expect(screen.getByTestId('storage-empty')).toBeInTheDocument();
       expect(screen.getByText(/No files found/)).toBeInTheDocument();
+    });
+
+    it('does NOT show the empty placeholder at root because special folders inject', () => {
+      // Reverse of the above: confirm the root contract. If a future
+      // change reintroduces an empty root, this test will catch it.
+      mockPrefixes = [];
+      mockObjects = [];
+      mockWorkspaceSyncEnabled = false;
+      mockCurrentPrefix = '';
+      render(() => <StorageBrowser />);
+
+      expect(screen.queryByTestId('storage-empty')).not.toBeInTheDocument();
+      // The three always-on prefixes are visible.
+      expect(screen.getByTestId('folder-Vault')).toBeInTheDocument();
+      expect(screen.getByTestId('folder-Uploads')).toBeInTheDocument();
+      expect(screen.getByTestId('folder-Temporary')).toBeInTheDocument();
     });
   });
 
@@ -747,7 +842,7 @@ describe('StorageBrowser', () => {
       const deleteBtn = screen.getByTitle('Delete selected');
       fireEvent.click(deleteBtn);
 
-      // Selection mode should be deactivated — checkbox should disappear
+      // Selection mode should be deactivated - checkbox should disappear
       // The select mode button should no longer be active
       const selectBtn = screen.getByTitle('Selection mode');
       expect(selectBtn.classList.contains('storage-icon-btn--active')).toBe(false);
