@@ -1,6 +1,6 @@
 # Vault Extraction Agent Prompt
 
-You are a vault extraction agent (haiku). Your job is to read the files
+You are a vault extraction agent (sonnet). Your job is to read the files
 the user has created or modified in the persistent vault since the last
 successful run, extract a knowledge-graph fragment from them **using your
 own conversation as the LLM**, build the resulting graph, and merge it
@@ -32,7 +32,7 @@ build steps from graphify's internal Python API.
 - `OUT_DIR`: `/home/user/Vault/graphify-out`
 - `VARS_FILE`: `~/.cache/codeflare-hooks/vault-extract.vars` (delete first)
 - `LAST_MARKER`: `~/.cache/codeflare-hooks/vault-extract.last` (high-water mark)
-- `LOCK`: `/tmp/graphify-global.lock` (serialises with capture haiku + active-repo hook)
+- `LOCK`: `/tmp/graphify-global.lock` (serialises with capture agent + active-repo hook)
 - `GRAPHIFY_PY`: `/root/.local/share/uv/tools/graphifyy/bin/python`
 - `GRAPHIFY_BIN`: `/usr/local/bin/graphify` (or absolute uv path as fallback)
 
@@ -72,7 +72,7 @@ find /home/user/Vault \
 
 Exclusions:
 
-- `Raw/Sessions/` - agent-owned, already merged by the capture haiku.
+- `Raw/Sessions/` - agent-owned, already merged by the capture agent.
 - `graphify-out/` - derived output, would create a feedback loop.
 - `.silverbullet/` - editor config + plug cache, no semantic content.
 - `Index.md`, `README.md`, `CONFIG.md`, `STYLES.md` - codeflare-authoritative preseed pages (REQ-VAULT-001 AC7); never user-edits.
@@ -94,10 +94,63 @@ Read each changed file with the Read tool. For each file, identify:
   graphs aggregates to a single node by label). Use the wikilink target
   as both `id` (normalised: lowercase, `[a-z0-9_]` only) and `label`
   (verbatim).
+- **PDFs** (`*.pdf` in the changed-files list): see the PDF sub-step
+  below. Do NOT fall through to the binary skip path.
 - **Edges** between nodes you create: file `contains` heading; heading
   `references` concept (for each `[[wikilink]]` under it); concept
   `conceptually_related_to` concept when they co-occur in a single
   bullet or paragraph.
+
+#### 3a. PDF handling (do NOT skip PDFs as binary)
+
+Vault PDFs typically arrive via SilverBullet drag-drop into Inbox or
+Notes. The `.md` note that wikilinks to the PDF is the only trace the
+prompt's text-only path captures - the PDF itself never reaches the
+graph. Both shapes need ingestion: the wikilink concept node (already
+covered above), AND a document node sourced from the PDF's actual
+contents.
+
+For each `*.pdf` in the changed-files list:
+
+1. **Read the PDF directly with the Read tool.** Claude's Read tool
+   handles PDFs natively - it renders pages as images and includes
+   them in your context, so you can "see" both text-layer and
+   scanned/image-only PDFs uniformly. For PDFs larger than 10 pages,
+   pass the `pages` parameter to limit to the first 20 pages (the
+   Read tool requires this for files > 10 pages and rejects the call
+   otherwise; without the cap the extraction would fail silently and
+   the high-water mark would still advance, leaving the PDF
+   permanently un-ingested).
+
+2. **Emit a document node for the PDF itself.** Label: the filename
+   without extension (e.g. `2026-05-18_21-44-36`). `file_type:
+   "document"`, `source_file:` the path relative to `/home/user/Vault/`
+   (e.g. `Inbox/2026-05-18/2026-05-18_21-44-36.pdf`).
+
+3. **Emit concept nodes for what you see.** Title text, prominent
+   headings, named entities (people, products, technologies),
+   identifiable diagrams, or named subjects visible on the rendered
+   pages. Each as a `concept` node with `source_file: null` so it
+   dedupes by label against other graphs. Add `references` edges from
+   the document node to each concept. Visual-only content (a single
+   photo with no caption) may yield only the document node itself -
+   that is still strictly better than the previous "skip silently"
+   behaviour.
+
+4. **Wikilink unification.** If the `.md` note that referenced the
+   PDF used a wikilink like `[[Inbox/2026-05-18/2026-05-18_21-44-36.pdf]]`,
+   it produced a concept node with that label. Emit an edge
+   `document<pdf_node> --cites--> concept<wikilink_label>` so the two
+   shapes line up in `global_add`'s external-label dedup. ID-normalise
+   the wikilink label the same way as the bullet list above
+   (lowercase + `[a-z0-9_]` only) so the edge target matches the
+   concept node ID you would have minted from the wikilink.
+
+5. **Failures are non-fatal.** If the Read tool errors on a specific
+   PDF (corrupt file, password-protected, unsupported encoding),
+   emit just the bare document node with `source_file:` set and move
+   on. The high-water marker advance still happens, so the next
+   extraction does not retry the same broken file forever.
 
 Edge confidence rubric (from graphify's schema):
 
@@ -141,20 +194,32 @@ Schema (must match exactly - graphify's merge step parses this verbatim):
 }
 ```
 
-If you cannot extract anything from a file (binary, unreadable, empty)
-log the path and skip; continue with the others. If ALL files fail,
-still write an empty chunk JSON (`{"nodes":[],"edges":[],"hyperedges":[],...}`)
-and continue - step 6 needs to advance the marker so we do not loop
-on the same broken files.
+If you cannot extract anything from a file (truly unreadable binary
+that is not a PDF, empty, permission-denied) log the path and skip;
+continue with the others. PDFs are NOT covered by this skip path -
+they go through sub-step 3a above. If ALL files fail, still write an
+empty chunk JSON (`{"nodes":[],"edges":[],"hyperedges":[],...}`) and
+continue - step 6 needs to advance the marker so we do not loop on
+the same broken files.
 
-### 4. Build a vault graph.json from the chunk
+### 4. Build a vault graph.json from the chunk, merging into the persistent vault-graph
 
 `graphify global add` needs a fully-built `graph.json` (with clustering
-metadata), not the raw chunk. Run the build via graphify's Python API:
+metadata), not the raw chunk. REQ-MEM-009: we must also accumulate the
+cumulative vault subgraph across extractions -- the previous design
+called `graphify global add --as user_vault` with only the latest
+chunk, and `--as <tag>` replaces the entire repo-tag contribution, so
+every vault edit wiped all prior vault knowledge from the global graph.
+The fix is to maintain a persistent `vault-graph.json` that grows
+monotonically: load it (or start fresh if missing), nx.compose the
+new chunk's nodes/edges into it via hash-keyed union, re-cluster, and
+write it back. The persistent graph is then what `graphify global add`
+consumes in step 5.
 
 ```bash
-flock /tmp/graphify-global.lock /root/.local/share/uv/tools/graphifyy/bin/python -c "
+( flock -w 5 /tmp/graphify-global.lock /root/.local/share/uv/tools/graphifyy/bin/python -c "
 import json
+import networkx as nx
 from pathlib import Path
 from graphify.build import build_from_json
 from graphify.cluster import cluster
@@ -162,31 +227,78 @@ from graphify.export import to_json
 
 chunk_path = Path('/home/user/Vault/graphify-out/.graphify_chunk_01.json')
 out_path = Path('/home/user/Vault/graphify-out/graph.json')
+vault_graph_path = Path('/home/user/Vault/graphify-out/vault-graph.json')
 
+# REQ-MEM-009 AC4: missing/unreadable persistent vault-graph.json is
+# recoverable -- start fresh. Any JSON parse error or KeyError on the
+# expected node_link shape means the file is corrupt; treat as missing.
+G_prior = nx.DiGraph()
+try:
+    if vault_graph_path.exists():
+        prior_blob = json.loads(vault_graph_path.read_text(encoding='utf-8'))
+        # node_link_graph default in nx 3.x reads 'edges'; vault-graph.json
+        # historically wrote 'links'. Try both so older files still load.
+        try:
+            G_prior = nx.node_link_graph(prior_blob, edges='links')
+        except (KeyError, TypeError):
+            G_prior = nx.node_link_graph(prior_blob)
+except (json.JSONDecodeError, KeyError, TypeError, OSError) as e:
+    print(f'vault-graph.json unreadable ({e}); starting fresh')
+    G_prior = nx.DiGraph()
+
+# Build the new chunk into a graph.
 extraction = json.loads(chunk_path.read_text(encoding='utf-8'))
-G = build_from_json(extraction)
-communities = cluster(G) if G.number_of_nodes() else {}
-to_json(G, communities, str(out_path))
-print(f'vault graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges')
-"
+G_new = build_from_json(extraction)
+
+# REQ-MEM-009 AC2: hash-keyed union -- nx.compose dedupes nodes by ID
+# (existing IDs keep their attributes; new IDs append). Edges are
+# unioned by (source, target) tuple.
+G_merged = nx.compose(G_prior, G_new)
+
+# REQ-MEM-009 AC1: persist the cumulative vault graph for the next
+# extraction to load.
+to_json(G_merged, cluster(G_merged) if G_merged.number_of_nodes() else {}, str(vault_graph_path))
+
+# Also write the per-extraction graph.json (kept for backwards-compat
+# with any caller that still reads the chunk-shaped artifact).
+to_json(G_merged, cluster(G_merged) if G_merged.number_of_nodes() else {}, str(out_path))
+
+print(f'vault graph: {G_merged.number_of_nodes()} nodes ({G_new.number_of_nodes()} new, {G_prior.number_of_nodes()} prior), {G_merged.number_of_edges()} edges')
+" ) || EXTRACT_FAILED=1
 ```
+
+If the Python step or `flock -w 5` failed (lock holder wedged or build error), `EXTRACT_FAILED` is set. Step 6 reads this flag and skips the marker-touch so the next 60s daemon tick re-discovers the same changed files. The wrapper used to be `|| true` (silent swallow); replaced because that allowed a silent failure to advance the high-water mark and lose the change permanently.
 
 The `flock` lock matches the one used by `graphify global add` in step 5
 and `graphify-active-repo.sh`, so concurrent writers do not stomp the
-manifest.
+manifest. REQ-MEM-009 AC5 scoping: each `flock` invocation here covers
+only its own command (the Python load+merge+persist above is one
+critical section; the `graphify global add` in step 5 is a second
+critical section). Both serialise against the same lock file, so a
+concurrent capture-pipeline or active-repo writer cannot interleave
+with either step; the two steps may interleave with each other in the
+brief window between them, but that is safe because step 5 reads a
+file step 4 has already fsynced.
 
 If the build prints `0 nodes, 0 edges`, that is fine - step 5 will
 no-op via `graphify global add`'s hash dedup. Continue to step 6.
 
-### 5. Merge the vault graph into the unified global graph
+### 5. Merge the cumulative vault graph into the unified global graph
+
+REQ-MEM-009 AC3: feed the persistent `vault-graph.json` (cumulative)
+to `graphify global add`, NOT the per-extraction chunk graph. The
+`--as user_vault` replace-semantics now publishes the cumulative
+vault state on every run instead of clobbering it.
 
 ```bash
-flock /tmp/graphify-global.lock /usr/local/bin/graphify global add \
-    /home/user/Vault/graphify-out/graph.json --as user_vault
+( flock -w 5 /tmp/graphify-global.lock /usr/local/bin/graphify global add \
+    /home/user/Vault/graphify-out/vault-graph.json --as user_vault ) || EXTRACT_FAILED=1
 ```
 
+Same pattern as step 4: any failure here (lock timeout, graphify CLI absent, malformed graph.json) sets `EXTRACT_FAILED=1` and step 6 will leave the high-water marker old so the daemon retries.
+
 `graphify global add` is hash-keyed and idempotent - re-running it
-with the same `graph.json` content is a no-op. Tagged `--as user_vault` so
+with the same `vault-graph.json` content is a no-op. Tagged `--as user_vault` so
 the global manifest can distinguish vault nodes from per-repo nodes.
 The internal `external_labels` pass dedupes concept nodes (those with
 `source_file: null`) against existing concept nodes by label, so
@@ -197,13 +309,22 @@ label.
 ### 6. Advance the high-water mark - FINAL step
 
 ```bash
-touch ~/.cache/codeflare-hooks/vault-extract.last
+if [ -z "${EXTRACT_FAILED:-}" ]; then
+    touch ~/.cache/codeflare-hooks/vault-extract.last
+else
+    echo "[vault-extract] step 4 or 5 failed; leaving high-water mark old for retry" >&2
+fi
 ```
 
-Only run this if steps 3-5 succeeded (or step 2 returned zero files,
-in which case advancing the marker is also correct). If any extraction
-or global-add failed, leave the marker old; the next daemon tick will
-re-discover the changed files and try again.
+The `EXTRACT_FAILED` gate is the programmatic enforcement of "only
+touch on success": steps 4 and 5 set the flag on any non-zero exit
+(lock timeout, graphify CLI missing, malformed JSON). If the flag is
+unset, all extractions succeeded (or step 2 returned zero files, in
+which case advancing the marker is also correct - there is nothing to
+retry). If set, the next 60s daemon tick will re-discover the same
+changed files and retry. Earlier versions of this prompt relied on the
+sonnet agent interpreting "only if steps 3-5 succeeded" prose, which
+allowed a silent failure to advance the marker and lose the change.
 
 ## Done
 

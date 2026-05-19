@@ -29,7 +29,7 @@ deployed on Recreate or new bucket creation.
 | `documentation-discipline` rule + doc-enforce skill family (4 skills: spine, lanes, shape, truth) | No | Yes | Yes |
 | `tdd-discipline` rule + tdd-enforce skill | No | Yes | Yes |
 | git-review-pipeline skill (SDD PR-boundary review pipeline) | No | Yes | Yes |
-| SDD template scaffolding (13 files for `/sdd init`) | No | Yes | Yes |
+| SDD template scaffolding (12 files for `/sdd init`) | No | Yes | Yes |
 | Known marketplaces plugin config | Yes | Yes | Yes |
 | context-mode MCP server (`ctx_*` helper tools, always-on) | Yes | Yes | Yes |
 | context-mode plugin folder (auto-routing hooks for context-window reduction) | No | No | Yes |
@@ -97,15 +97,20 @@ deep-reviewer agents) and `--verify-high` (Phase 7 external-LLM
 second-opinion); invoking it with no arguments prints a CLI help
 screen and exits without running.
 
-**Skills (24 SKILL.md files, 39 manifest entries including
+**Skills (29 SKILL.md files, 44 manifest entries including
 reference files)**: `cloudflare-stack`, `github-cloudflare-ship`
 (+ 2 reference files), `consult-llm`, `api-design`,
 `backend-patterns`, `content-hash-cache-pattern`,
 `database-migrations`, `deployment-patterns`, `frontend-patterns`,
 `iterative-retrieval`, `search-first`, `spec-driven-development`
-(+ 13 reference templates for `/sdd init` scaffolding; covers the
+(+ 12 reference templates for `/sdd init` scaffolding; covers the
 three Import/Resume modes for legacy-codebase transition documented
-below). SDD enforcement family (8 skills, advanced-only):
+below), `sdd-init`, `sdd-clean` (sub-command skills the `/sdd`
+dispatch table routes to for `init` and `clean`), `vault-operations`
+(layout, wikilink conventions, NEVER list - surfaced when an agent
+touches `~/Vault/`), `vault-note-capture` (writes "take a note"
+phrases to `~/Vault/Notes/<Category>/`), `graphify`. SDD
+enforcement family (8 skills, advanced-only):
 `spec-enforce` + `spec-enforce-ac` + `spec-enforce-truth`,
 `doc-enforce` + `doc-enforce-lanes` + `doc-enforce-shape` +
 `doc-enforce-truth`, `tdd-enforce`. Git-workflow family (4 skills):
@@ -115,22 +120,28 @@ below). SDD enforcement family (8 skills, advanced-only):
 agents that support skills). `consult-llm` is CC-only (depends on
 MCP tool).
 
-**Rules (25 files, 3 in both modes + 22 advanced-only)**: Core
-environment rules (`cloudflare-environment`, `no-local-builds`,
-`git-workflow`) in both modes - `git-workflow` is the umbrella
-core rule that delegates branched mechanics to the `ci-monitoring`,
-`git-review-pipeline`, `pr-workflow`, and `deploy-credentials`
-skills. The discipline triad - `spec-discipline`,
-`documentation-discipline`, `tdd-discipline` - is advanced-only
-core-minimum rules (Pro-mode SDD workflow opt-in: identity, status
-vocabulary, severity, and skill pointers; detection algorithms and
-content-quality checks live in their respective `*-enforce` skill
-families). `memory` rule is advanced-only (references CC-specific
-mcp__graphify__* tools and the vault hook system). ECC-derived language rules in
-`{common,typescript,python,golang,swift}/` subdirs (2 + 4*4 = 18
-files, advanced only). Common rules cover security and coding
-style. Language-specific rules provide conventions for TypeScript,
-Python, Go, and Swift.
+**Rules (27 files, 3 in both modes + 24 advanced-only)** (REQ-MEM-006,
+REQ-VAULT-007): Core environment rules (`cloudflare-environment`,
+`no-local-builds`, `git-workflow`) in both modes - `git-workflow` is
+the umbrella core rule that delegates branched mechanics to the
+`ci-monitoring`, `git-review-pipeline`, `pr-workflow`, and
+`deploy-credentials` skills. The discipline triad -
+`spec-discipline`, `documentation-discipline`, `tdd-discipline` - is
+advanced-only core-minimum rules (Pro-mode SDD workflow opt-in:
+identity, status vocabulary, severity, and skill pointers; detection
+algorithms and content-quality checks live in their respective
+`*-enforce` skill families). `memory` rule is advanced-only and
+carries the folded vault trigger/route content (references CC-specific
+`mcp__graphify__*` tools and the vault hook system).
+`vault-note-capture` rule is advanced-only and routes "take a note"
+phrases to the `vault-note-capture` skill. `graph-first` rule is
+advanced-only (graphify discipline, REQ-AGENT-023). `karpathy` rule
+is advanced-only (LLM coding-mistakes principles). ECC-derived
+language rules in `{common,typescript,python,golang,swift}/` subdirs
+(1 + 4*4 = 17 files, advanced only). `common/coding-style.md`
+covers shared style; the per-language `security.md` files stand
+alone after the `common/security.md` removal. Language-specific
+rules provide conventions for TypeScript, Python, Go, and Swift.
 
 **Known marketplaces**: `plugins/known_marketplaces.json` preseeds
 the official Anthropic plugin marketplace URL for user discovery.
@@ -161,33 +172,37 @@ All preseed content is deployed via the manifest pipeline:
    (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`,
    `~/.config/opencode/`)
 
-**Manifest structure (103 total entries)**:
+**Manifest structure (112 total entries)**:
 - `rules/` (27): core (3 default+advanced: cloudflare-environment,
-  no-local-builds, git-workflow; + 5 advanced-only: memory, vault,
-  spec-discipline, documentation-discipline, tdd-discipline),
-  common (2: coding-style, security), graph-first (1, advanced),
-  typescript (4), python (4), golang (4), swift (4)
-- `agents/` (9): architect, build-error-resolver, code-reviewer,
-  deep-reviewer, doc-updater, refactor-cleaner, security-reviewer,
-  spec-reviewer, tdd-guide (advanced only)
+  no-local-builds, git-workflow; + 7 advanced-only top-level: memory,
+  spec-discipline, documentation-discipline, tdd-discipline,
+  graph-first, karpathy, vault-note-capture), common (1: coding-style;
+  per-language security rules stand alone), typescript (4), python (4),
+  golang (4), swift (4)
+- `agents/` (11): architect, build-error-resolver, code-reviewer,
+  deep-reviewer, doc-updater, memory-capture, refactor-cleaner,
+  security-reviewer, spec-reviewer, tdd-guide, vault-extract
+  (advanced only)
 - `commands/` (5): brainstorm, debug, deploy, review, sdd
   (advanced only)
-- `skills/` (40): cloudflare-stack, github-cloudflare-ship (+2
+- `skills/` (44): cloudflare-stack, github-cloudflare-ship (+2
   refs), ci-monitoring, pr-workflow, deploy-credentials (the five
   default+advanced skills), consult-llm, api-design,
   backend-patterns, content-hash-cache-pattern, database-migrations,
   deployment-patterns, frontend-patterns, iterative-retrieval,
-  search-first, spec-driven-development (+13 reference templates
-  for /sdd init scaffolding), spec-enforce, spec-enforce-ac,
-  spec-enforce-truth, doc-enforce, doc-enforce-lanes,
+  search-first, spec-driven-development (+12 reference templates
+  for /sdd init scaffolding), sdd-init, sdd-clean (sub-command
+  skills), vault-operations, vault-note-capture, spec-enforce,
+  spec-enforce-ac, spec-enforce-truth, doc-enforce, doc-enforce-lanes,
   doc-enforce-shape, doc-enforce-truth, tdd-enforce,
   git-review-pipeline, graphify
-- `plugins/` (22): known_marketplaces.json (default+advanced),
-  codeflare-memory plugin (3 files, advanced only: plugin.json,
-  memory-capture.sh, memory-agent-prompt.md), codeflare-vault plugin
-  (3 files, advanced only: plugin.json, vault-monitor-hook.sh,
-  vault-extract-prompt.md), codeflare-hooks plugin (5 files,
-  advanced only: plugin.json, block-attributed-commits.sh,
+- `plugins/` (25): known_marketplaces.json (default+advanced),
+  codeflare-memory plugin (4 files, advanced only: plugin.json,
+  memory-capture.sh, memory-agent-prompt.md, prefilter-transcript.sh),
+  codeflare-vault plugin (3 files, advanced only: plugin.json,
+  vault-monitor-hook.sh, vault-extract-prompt.md), codeflare-hooks
+  plugin (6 files, advanced only: plugin.json,
+  block-attributed-commits.sh, block-local-builds.sh,
   git-push-review-reminder.sh, enforce-review-spawn.sh,
   lib/gh-pr-state.sh - shared helper sourced by both PR-aware
   hooks), context-mode plugin (3 files, advanced only: plugin.json,
@@ -239,8 +254,9 @@ files exist on disk.
 **Excluded from non-CC agents**: hooks (CC hook system), commands (CC
 slash commands), plugins (CC plugin system, including
 codeflare-memory and codeflare-vault), `rules/memory.md` (references
-CC-specific `mcp__graphify__*` tools and the vault hook system),
-`rules/vault.md` (same reason), `consult-llm` skill (depends on
+CC-specific `mcp__graphify__*` tools and the vault hook system; the
+vault trigger/route content lives in memory.md as folded subsections,
+not a separate rules/vault.md), `consult-llm` skill (depends on
 CC-specific MCP tool).
 
 **Adaptation pipeline**: For each non-CC agent, the generator: (1)
@@ -300,6 +316,8 @@ Handles three cases:
   text), does not overwrite
 
 ## Plugin Enablement
+
+(Implements [REQ-MEM-006](../sdd/memory.md#req-mem-006-memory-available-only-in-pro-advanced-mode), [REQ-VAULT-007](../sdd/vault.md#req-vault-007-vault-rules-and-plugin-are-preseeded-into-every-advanced-session).)
 
 `entrypoint.sh` merges `enabledPlugins` into `~/.claude/.claude.json`
 to enable both the `codeflare-memory` and `codeflare-hooks` plugins.
@@ -374,8 +392,22 @@ The hook surfaces blocks as `hookSpecificOutput.permissionDecision: deny` with a
 `/sdd init` is the single entry point for bootstrapping SDD on a project. It detects one of three scenarios from project state and dispatches automatically:
 
 - **Greenfield** - empty project. Agent drafts vision / actors / domains / requirements from the user's prose and writes scaffolding.
-- **Import** - substantive existing code, no `sdd/` yet. Two-output model: behavior clearly determinable from source / tests / comments / commits / PRs becomes official REQs in `sdd/{domain}.md`; everything unclear (magic numbers, retry policies, ambiguous contracts, orphan code) becomes triage entries in `sdd/init-triage.md` with the agent's `**Context:**` (file:line, git author, commit refs, related tests/PRs) and `**Recommendation:**` (best-guess answer with one-line `**Rationale:**`) populated up front.
+- **Import** - substantive existing code, no `sdd/` yet. Two-output model: behavior clearly determinable from source / tests / comments / commits / PRs becomes official REQs in `sdd/{domain}.md`; everything unclear (magic numbers, retry policies, ambiguous contracts, orphan code) becomes triage entries in `sdd/init-triage.md` with the agent's `**Context:**` (file:line, git author, commit refs, related tests/PRs) and `**Recommendation:**` (best-guess answer with one-line `**Rationale:**`) populated up front. Status default for CLEAR REQs honours `enforce_tdd`. Import Mode defaults `enforce_tdd: false` - CLEAR REQs whose source implements the AC land as `Status: Implemented` unconditionally (imported code predates REQ-ID test conventions; demoting everything to `Partial` would falsely brand the spec as incomplete). When `enforce_tdd: false`, each domain file receives a `_Verification: code-only (no automated coverage)._` footnote at the bottom; per-REQ `Notes:` fields are not used for this signal. Switch to `enforce_tdd: true` manually (in `sdd/config.yml`) once REQ-ID references have been added to test names.
 - **Resume** - `sdd/` exists and `sdd/init-triage.md` has at least one `**Status:** open` item. Agent surfaces one item at a time with refreshed Context. Five decisions: `accept` (use the recommendation as-is, fold into REQ), `correct` (free-form prose describing what the thing is for and how it works; agent folds purpose into Intent and behavior into ACs), `lost` (one-line Reason required, no spec write), `skip` (stays open, no spec write), `quit`. Only `accept` and `correct` promote anything into the official spec.
+
+**Interaction flow.** Both Greenfield and Import Mode run as a lean two-confirm flow: the agent asks one vision question (or accepts inline `$ARGUMENTS`), drafts the entire spec in memory (actors, domains, design principles, REQs in canonical shape, CON-* constraints, founding ADRs, glossary terms), presents the full draft as one review surface, and applies edits in place until the user accepts. The 10-15-turn one-domain-at-a-time confirmation chain is not used.
+
+**Enrichment pass.** After the draft is accepted, before any files are written, three passes run automatically in one in-memory cycle. All three query the project's `graphify-out/graph.json` for structural inputs; the post-clone PostToolUse hook (REQ-AGENT-025) prompts the user to build a graph immediately after `git clone`, so the graph is normally already in place by the time `/sdd init` runs:
+
+- **Cross-link pass** - `mcp__graphify__get_neighbors` returns every node that shares an edge with a referenced REQ / CON / concept; every drafted REQ that names another REQ in its body also gains it in `Dependencies:` as an anchor link `[REQ-X-NNN](#req-x-nnn-title-slug)`.
+- **ADR-seed pass** - `mcp__graphify__god_nodes(top_n=20)` returns the most-connected nodes (architectural pillars). 3-8 surviving candidates (tech stack, framework, deployment target, auth pattern, data store, key middleware) become founding ADRs in `documentation/decisions/README.md` with an index table and per-ADR sections. Candidates that fail the "What is NOT an ADR" test (no real alternative considered) are dropped.
+- **Glossary-seed pass** - `mcp__graphify__query_graph` for concept-tagged nodes (graphify emits these with `source_file: null`); each becomes a one-line glossary entry in `sdd/glossary.md`. Synonym clusters land in `documentation/README.md`'s synonym glossary slot.
+
+No additional user prompts during the enrichment cycle. When the graphify graph is missing at enrichment time (rare - the post-clone hook offered to build one), `/sdd init` prompts the user once for `/graphify cluster-only` (AST-only, free); on decline, enrichment falls back to an in-memory heuristic (literal-string matching across the draft) with a one-line notice in `sdd/changes.md` recording reduced cross-link density. The `mcp__graphify__*` MCP tools are tool-agnostic and work identically under both Bash and context-mode (`mcp__context-mode__ctx_*`) environments.
+
+**Scaffold slots.** At scaffold time `/sdd init` also touches `sdd/.review-needed.md`, `sdd/.coverage-report.md`, and `sdd/.last-clean-run.md` with a single `_Awaiting first run._` placeholder so the slot structure is visible from day one.
+
+**Tool surface compatibility.** Every `/sdd` sub-command (`init`, `edit`, `add`, `clean`, `mode`) works under both Bash and the context-mode MCP tool family (`mcp__context-mode__ctx_execute`, `mcp__context-mode__ctx_batch_execute`, `mcp__context-mode__ctx_search`). Discovery commands that produce more than 20 lines of output (`gh pr list --state all`, `git log --follow`, `npm view <pkg> peerDependencies`, full-tree scans, scaffold-only `npm install --package-lock-only`) route through `ctx_execute` / `ctx_batch_execute` in context-mode environments and through Bash in plain environments.
 
 While `sdd/init-triage.md` contains any open items, `sdd/config.yml` carries `transition: true`. The transition gate condition is the conjunction `transition: true` in config AND `**Status:** open` items in the triage file (case-insensitive on `open`); all enforcement layers test both. During transition the entire review pipeline is suspended:
 
@@ -392,7 +424,7 @@ While `sdd/init-triage.md` contains any open items, `sdd/config.yml` carries `tr
 
 `enforce_tdd` is NOT touched by the closure commit. The user changes it manually when ready for TDD enforcement (typically after adding REQ-ID references to test names in the imported source).
 
-Full SDD discipline applies on the next push; autonomous agentic development is unlocked. `sdd/init-triage.md` is preserved as the audit record. Implements [REQ-AGENT-022](../sdd/agents.md#req-agent-022).
+Full SDD discipline applies on the next push; autonomous agentic development is unlocked. `sdd/init-triage.md` is preserved as the audit record. Implements [REQ-AGENT-021](../sdd/agents.md#req-agent-021) AC17-AC21 and [REQ-AGENT-022](../sdd/agents.md#req-agent-022).
 
 **GitHub corpus degradation.** When Import Mode cannot reach GitHub (non-GitHub remote, `gh auth status` failure, rate-limited, air-gapped), discovery falls back to working-tree + git-log evidence only. A one-line notice naming the reason is appended to the `sdd/changes.md` import entry; triage Context fields reference whatever artifact refs are reachable.
 

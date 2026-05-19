@@ -36,6 +36,8 @@ export interface ContainerEnvState {
   _containerAuthToken: string | null;
   _sessionId: string | null;
   _userEmail: string | null;
+  /** REQ-MEM-001 AC3: user's IANA timezone (e.g. "Europe/Zurich"). */
+  _userTimezone: string | null;
 }
 
 /** Fields sent in the setBucketName body that may need updating on restart. */
@@ -69,6 +71,8 @@ export interface SetBucketNameCreds {
   cloudflareAccountId?: string;
   encryptionKey?: string;
   sessionMode?: string;
+  /** REQ-MEM-001 AC3: user's IANA timezone forwarded from /start. */
+  userTimezone?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +187,11 @@ export function buildEnvVars(
     ...(state._cloudflareAccountId && { CLOUDFLARE_ACCOUNT_ID: state._cloudflareAccountId }),
     // Session mode (controls memory persistence in entrypoint.sh)
     SESSION_MODE: state._sessionMode,
+    // REQ-MEM-001 AC3: user's IANA timezone. The capture haiku resolves
+    // wall-clock time as TZ="$USER_TIMEZONE" date '+%Y-%m-%dT...'; only
+    // emit when set so the entrypoint's existing fallback chain ($TZ ->
+    // /etc/timezone -> UTC) handles the unset case.
+    ...(state._userTimezone && { USER_TIMEZONE: state._userTimezone }),
   };
 }
 
@@ -232,6 +241,14 @@ export async function applyBucketName(
 
   // Store session mode in instance memory only (not persisted to DO storage; re-sent on each container start)
   if (r2Creds?.sessionMode) state._sessionMode = r2Creds.sessionMode;
+
+  // REQ-MEM-001 AC3: persist userTimezone so the capture pipeline sees
+  // the user's IANA zone on subsequent DO wakes too (the env var flows
+  // through buildEnvVars to the container's entrypoint).
+  if (r2Creds?.userTimezone) {
+    state._userTimezone = r2Creds.userTimezone;
+    await storage.put('userTimezone', r2Creds.userTimezone);
+  }
 
   // Use Worker-provided R2 credentials (most reliable — Worker definitely has secrets)
   if (r2Creds?.r2AccessKeyId) state._r2AccessKeyId = r2Creds.r2AccessKeyId;
@@ -297,7 +314,14 @@ export async function applyPrefsOnRestart(
     changed = true;
   }
 
-  // Always update LLM keys, deploy keys, and session mode on restart (read fresh each start)
+  // Always update LLM keys, deploy keys, and session mode on restart
+  // (read fresh each start). The `|| null` collapses an empty string
+  // to null — this is defence-in-depth. The upstream caller
+  // (buildSetBucketNameBody in src/routes/container/lifecycle.ts) uses
+  // a truthy `&& { key: value }` spread that omits the field entirely
+  // when the source value is empty, so an empty string never reaches
+  // this branch in practice; the `undefined` guard skips the block and
+  // state is preserved.
   if (input.openaiApiKey !== undefined) {
     state._openaiApiKey = input.openaiApiKey || null;
     changed = true;

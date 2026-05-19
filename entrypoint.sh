@@ -54,6 +54,31 @@ USER_CLAUDE_JSON="$USER_HOME/.claude.json"
 mkdir -p "$USER_HOME" "$USER_WORKSPACE" "$USER_CLAUDE_DIR"
 export HOME="$USER_HOME"
 
+# REQ-MEM-001 AC3 + AC9: propagate the user's IANA timezone (set by the
+# Worker from the browser via /api/preferences) into the container's
+# clock surface. Without this, every `date` inside the container
+# reports UTC even though the env var arrives - capture filenames
+# silently fall back to UTC and terminal `date` confuses users in
+# non-UTC zones. Three artifacts that all need to agree:
+#
+#   $TZ              - process-level (POSIX); inherited by every child
+#   /etc/timezone    - Debian/Ubuntu canonical file (some tools read this)
+#   /etc/localtime   - zoneinfo binary the libc loads for localtime(3)
+#
+# We only act if USER_TIMEZONE is set AND points to a real zoneinfo
+# file - typo'd or unknown zones (e.g. "Mars/Olympus") fall through
+# to UTC silently rather than crashing the boot. The Worker-side
+# isValidIanaTz validator catches typos at write time; this is the
+# belt-and-braces.
+if [ -n "${USER_TIMEZONE:-}" ] && [ -f "/usr/share/zoneinfo/$USER_TIMEZONE" ]; then
+    export TZ="$USER_TIMEZONE"
+    echo "$USER_TIMEZONE" > /etc/timezone 2>/dev/null || true
+    ln -sf "/usr/share/zoneinfo/$USER_TIMEZONE" /etc/localtime 2>/dev/null || true
+    echo "[entrypoint] Timezone set: $USER_TIMEZONE ($(date '+%Z %z'))"
+else
+    echo "[entrypoint] Timezone defaulting to UTC (USER_TIMEZONE='${USER_TIMEZONE:-unset}')"
+fi
+
 # Force HTML visualization generation regardless of graph size.
 # Default graphify limit is 5000 nodes; codeflare repos routinely exceed this.
 # Codeflare policy: graph.html is never skipped (user directive).
@@ -587,14 +612,69 @@ cleanup_old_transcripts() {
 }
 
 # ============================================================================
-# Background sync daemon - bisync every 60 seconds
+# Background sync daemon - bisync every 60 seconds, SIGUSR1-interruptible
+#
+# Manual triggers (storage-panel Sync-now, upload-side auto-trigger)
+# arrive as SIGUSR1 sent by host /internal/bisync-trigger to the daemon
+# PID at /tmp/sync-daemon.pid. The trap toggles BISYNC_REQUESTED
+# (interrupts the idle sleep) or BISYNC_RERUN_REQUESTED (queues exactly
+# one rerun after the current cycle), depending on whether a bisync is
+# mid-flight. N signals during one cycle coalesce to exactly one rerun
+# (REQ-STOR-015 AC5).
+#
+# Hibernation note: BISYNC_REQUESTED / BISYNC_RERUN_REQUESTED /
+# BISYNC_IN_FLIGHT live in this daemon process's bash memory. If the
+# container sleeps, the daemon is killed and the flags are lost. This
+# is acceptable: the container's next wake runs a forced baseline
+# bisync per REQ-STOR-004 AC4, absorbing any pending trigger. Do NOT
+# promote these flags to DO storage or KV - they are intentionally
+# ephemeral so wake-time baseline is authoritative. See AD56.
 # ============================================================================
 start_sync_daemon() {
-    echo "[entrypoint] Starting background bisync daemon (every 60s)..."
-    local CONSECUTIVE_FAILURES=0
+    echo "[entrypoint] Starting background bisync daemon (every 15min, SIGUSR1-interruptible)..."
 
     while true; do
-        sleep 60
+        # First-iteration init: install the SIGUSR1 trap inside the
+        # subshell (traps are reset to default in subshells, so the
+        # parent shell's trap would not apply here) and zero the
+        # coalescing flags. Subsequent iterations skip this block.
+        if [ -z "${TRAP_INSTALLED:-}" ]; then
+            BISYNC_REQUESTED=0
+            BISYNC_RERUN_REQUESTED=0
+            BISYNC_IN_FLIGHT=
+            # shellcheck disable=SC2064
+            trap 'if [ -n "$BISYNC_IN_FLIGHT" ]; then BISYNC_RERUN_REQUESTED=1; else BISYNC_REQUESTED=1; fi' USR1
+            CONSECUTIVE_FAILURES=0
+            TRAP_INSTALLED=1
+        fi
+
+        # Interruptible sleep. CRITICAL: a foreground `sleep 900` does
+        # NOT wake on SIGUSR1 -- bash queues the trap until the
+        # external sleep child returns naturally, so the manual
+        # trigger from the storage panel would effectively wait for
+        # the full 15-min cadence boundary. The fix is the standard
+        # bash pattern: background the sleep, then `wait` on its PID
+        # (the `wait` builtin IS interruptible by traps, unlike
+        # foreground waits on external commands). When SIGUSR1
+        # arrives, `wait` returns >128, the trap runs, we kill the
+        # still-running sleep, and the next iteration runs the
+        # bisync. Skip the sleep entirely if a trigger was queued
+        # while finishing the prior cycle (RERUN_REQUESTED) or while
+        # we were idle (REQUESTED). Cadence is 15 min (AD56).
+        if [ "$BISYNC_REQUESTED" = "0" ] && [ "$BISYNC_RERUN_REQUESTED" = "0" ]; then
+            sleep 900 &
+            SYNC_SLEEP_PID=$!
+            wait "$SYNC_SLEEP_PID" 2>/dev/null || true
+            # If the trap fired, sleep may still be alive in the
+            # background. Kill it so it does not linger across cycles
+            # (would leak one bash + one sleep process per trigger).
+            kill "$SYNC_SLEEP_PID" 2>/dev/null || true
+            unset SYNC_SLEEP_PID
+        fi
+        BISYNC_REQUESTED=0
+        BISYNC_RERUN_REQUESTED=0
+
+        BISYNC_IN_FLIGHT=1
 
         # Rotate sync log if too large (keep last 256KB when exceeding 512KB)
         if [ -f /tmp/sync.log ] && [ "$(stat -c%s /tmp/sync.log 2>/dev/null || echo 0)" -gt 524288 ]; then
@@ -628,6 +708,10 @@ start_sync_daemon() {
                     CONSECUTIVE_FAILURES=0
                     echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Recovery bisync succeeded" | tee -a /tmp/sync.log
                     update_sync_status "success" "null"
+                    # Clear in-flight before continue so the next
+                    # iteration's trap classifies signals correctly
+                    # (idle -> REQUESTED, not mid-flight -> RERUN).
+                    BISYNC_IN_FLIGHT=
                     continue
                 fi
             fi
@@ -666,6 +750,13 @@ start_sync_daemon() {
                 fi
             fi
         fi
+
+        # End of cycle: clear in-flight so the trap on a subsequent
+        # signal during the next sleep classifies it as REQUESTED
+        # (interrupt-sleep) rather than RERUN_REQUESTED (queue-after-
+        # current). The trap and these flags coalesce N signals during
+        # one cycle into exactly one rerun.
+        BISYNC_IN_FLIGHT=
     done &
 
     SYNC_DAEMON_PID=$!
@@ -872,18 +963,19 @@ shutdown_handler() {
     kill_pidfile_subtree /tmp/silverbullet.pid
 
     # Perform final bisync to R2 (only if baseline was established).
-    # Wrap in `timeout 60` so the DO's destroy() SIGKILL budget (75s,
+    # Wrap in a 120s watchdog so the DO's destroy() SIGKILL budget (135s,
     # set in src/container/index.ts) always lands AFTER we either
-    # finished or gave up cleanly — never mid-write to R2.
+    # finished or gave up cleanly - never mid-write to R2.
     #
-    # Pre-vault history: shutdown bisync had no timeout, the DO killed
-    # after 25s, and a long bisync of last-minute edits left R2 in a
-    # partial state. The next session loaded that partial state and
-    # looked stale, forcing the user to delete the session manually.
-    # See bundled fix in vault PR.
-    echo "[entrypoint] Final bisync to R2 (60s budget)..."
+    # History: shutdown bisync had no timeout originally; the DO killed
+    # after 25s and a long bisync of last-minute edits left R2 in a
+    # partial state. The vault PR raised the chain to 60s/75s; the
+    # 15-minute cadence change (AD56) raised it again to 120s/135s to
+    # cover the worst-case 15-minute accumulation on the final bisync.
+    # See AD57 for the budget rationale.
+    echo "[entrypoint] Final bisync to R2 (120s budget)..."
     if [ -f /tmp/.bisync-initialized ]; then
-        # Background bisync + watchdog that hard-kills at 60s. Cannot use
+        # Background bisync + watchdog that hard-kills at 120s. Cannot use
         # `timeout(1)` directly because bisync_with_r2 is a shell function;
         # timeout's bash -c child would not see it without `export -f` +
         # propagating every env var it reads.
@@ -901,11 +993,14 @@ shutdown_handler() {
         # rclone's typical depth (subshell -> bash -> rclone -> child).
         ( bisync_with_r2 ) &
         BISYNC_PID=$!
-        # SIGTERM-then-SIGKILL grace pattern. 50s budget for normal bisync,
-        # 10s additional after SIGTERM for rclone to flush + abort pending
-        # multipart uploads cleanly (2s was previously too tight - rclone
-        # needs more headroom to avoid leaving partial uploads in R2).
-        # Total 60s, matching the budget the DO destroy() leaves us.
+        # SIGTERM-then-SIGKILL grace pattern. 108s budget for normal bisync,
+        # 12s additional after SIGTERM for rclone to flush + abort pending
+        # multipart uploads cleanly (2s/10s was previously too tight - rclone
+        # needs more headroom to avoid leaving partial uploads in R2, and the
+        # 15-min cadence means a single final bisync can accumulate more
+        # changes than under the old 60s cadence).
+        # Total 120s, matching the budget the DO destroy() leaves us (135s
+        # minus 15s clean-exit buffer). See AD57.
         kill_subtree() {
             local sig="$1" root="$2"
             [ -z "$root" ] && return 0
@@ -916,9 +1011,9 @@ shutdown_handler() {
                 kill_subtree "$sig" "$child"
             done
         }
-        ( sleep 50
+        ( sleep 108
           kill_subtree TERM "$BISYNC_PID"
-          sleep 10
+          sleep 12
           kill_subtree KILL "$BISYNC_PID"
         ) &
         WATCHDOG_PID=$!
@@ -931,7 +1026,7 @@ shutdown_handler() {
         if [ "$BISYNC_RC" -eq 0 ]; then
             echo "[entrypoint] Final bisync completed successfully"
         elif [ "$BISYNC_RC" -eq 143 ] || [ "$BISYNC_RC" -eq 137 ]; then
-            echo "[entrypoint] Final bisync TIMED OUT after 60s - last writes may not have synced. Increase budget if this is frequent."
+            echo "[entrypoint] Final bisync TIMED OUT after 120s - last writes may not have synced. Increase budget if this is frequent."
         else
             echo "[entrypoint] Final bisync failed with rc=$BISYNC_RC"
         fi
@@ -1193,8 +1288,23 @@ init_user_vault() {
     # Critical directories. Always mkdir -p on every boot so a user who
     # deletes Raw/Sessions/, Notes/, etc. cannot break the agent hooks
     # or SilverBullet on the next session start.
-    mkdir -p "$VAULT/Raw/Sessions" "$VAULT/Raw/Pasted" "$VAULT/Notes" \
+    mkdir -p "$VAULT/Raw/Sessions" "$VAULT/Raw/Pasted" "$VAULT/Raw/Graphs" "$VAULT/Notes" \
              "$VAULT/graphify-out" "$VAULT/.silverbullet/_plug"
+
+    # Create-if-missing pages under Raw/Graphs/. These are user-editable
+    # index pages that link to the graphify-rendered viz HTML siblings;
+    # we ship initial content so a fresh vault has a Graphs/ folder
+    # visible in the treeview (treeview is page-driven; an empty
+    # directory does not render). Never overwritten -- if the user
+    # edits or deletes the page they stay deleted/edited.
+    local GRAPH_PAGE
+    for GRAPH_PAGE in "Vault Graph.md" "Global Graph.md"; do
+        if [ -f "$PRESEED_DIR/Raw/Graphs/$GRAPH_PAGE" ] \
+           && [ ! -f "$VAULT/Raw/Graphs/$GRAPH_PAGE" ]; then
+            cp "$PRESEED_DIR/Raw/Graphs/$GRAPH_PAGE" "$VAULT/Raw/Graphs/$GRAPH_PAGE"
+            echo "[entrypoint] Seeded Raw/Graphs/$GRAPH_PAGE"
+        fi
+    done
 
     # Preseed-managed pages. Always overwritten from preseed on every boot
     # so SilverBullet cannot be permanently broken by file deletion or by
@@ -1264,9 +1374,9 @@ init_user_vault() {
     # re-run on every boot. Best-effort: if graphify global isn't available
     # (e.g. graphify plugin disabled), continue.
     if command -v graphify >/dev/null 2>&1; then
-        flock /tmp/graphify-global.lock graphify global add \
+        flock -w 5 /tmp/graphify-global.lock graphify global add \
             "$VAULT/graphify-out/graph.json" --as user_vault 2>/dev/null \
-            || echo "[entrypoint] vault global-add deferred (graphify not ready)"
+            || echo "[entrypoint] vault global-add deferred (graphify not ready or lock timeout)"
     fi
 
     # Initialize vault-monitor two-marker state (see daemon section). Only
@@ -1579,7 +1689,7 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     #     ctx_execute. Closes the silent-bypass discovered in ai-news-digest
     #     PR #247 and the matching bug-class flagged by issue #319 in the
     #     enforce-review-spawn Stop hook.
-    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-vault/scripts/vault-monitor-hook.sh"}]}]}}'
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_execute_file|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-vault/scripts/vault-monitor-hook.sh"}]}]}}'
     # context-mode hooks (Custom tier only, gated on plugin manifest presence).
     # Implements REQ-AGENT-005. Same four hooks the upstream context-mode
     # plugin would self-register via hooks.json — we wire them through

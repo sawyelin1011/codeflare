@@ -25,23 +25,25 @@ removed.
 
 The vault (`/home/user/Vault/`) is rclone-bisynced to R2 as
 part of `/home/user/`. Both agent-written session captures
-(`Raw/Sessions/`) and user-curated notes (`Notes/`, `Raw/Pasted/`)
-survive container recycles. Memory persistence runs in advanced mode
-only; default-mode sessions still execute the capture hook for in-session
-context but the vault subtree never reaches R2.
+(`Raw/Sessions/`) and user-curated content under `Notes/`, `Inbox/`,
+`Journal/` (plus any attachments SilverBullet writes next to those
+notes) survive container recycles. Memory persistence runs in advanced
+mode only; default-mode sessions still execute the capture hook for
+in-session context but the vault subtree never reaches R2.
 
 The unified graph at `~/.graphify/global-graph.json` is the index layer:
 the capture agent, the vault-monitor agent, and `graphify-active-repo.sh`
 all merge their respective per-source graphs into it under a `flock` on
-`/tmp/graphify-global.lock`. See [vault.md](./vault.md) for the full
-contract.
+`/tmp/graphify-global.lock`. See [vault.md](./vault.md) for vault
+layout, capture paths, and the unified graph contract.
 
 ## Automatic Memory Capture
 
 Conversation context (decisions, debugging insights, observations) is
 automatically captured into the vault every 15 user messages. Implements
 [REQ-MEM-001](../sdd/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault),
-[REQ-MEM-002](../sdd/memory.md#req-mem-002-capture-triggers-every-15-user-messages).
+[REQ-MEM-002](../sdd/memory.md#req-mem-002-capture-triggers-every-15-user-messages),
+[REQ-MEM-008](../sdd/memory.md#req-mem-008-memory-prompt-files-preseeded-via-manifest-pipeline).
 
 The capture agent writes a markdown file to
 `Raw/Sessions/{ISO_TS}-{SID_SHORT}.md` (YAML frontmatter + Context /
@@ -72,12 +74,19 @@ The `memory-capture.sh` script runs as a **UserPromptSubmit hook**.
 5. **Counter update** -- writes current count + total lines back to the
    counter before emitting so subsequent invocations see delta `< 15`.
 6. **JSON output** -- emits `{hookSpecificOutput:{...,additionalContext}}`
-   pointing the main agent at `memory-agent-prompt.md` + the `.vars`
-   file. The main agent spawns a background haiku immediately.
+   instructing the main agent to dispatch the **memory-capture** named subagent
+   (Task tool with `subagent_type="memory-capture"`). The subagent's frontmatter
+   pins `model: sonnet`; the directive instructs the main agent not to pass a
+   model override.
 
 The capture agent deletes the `.vars` file as its first step (dedup
-gate), reads the transcript range, writes the vault file, and merges
-into the global graph.
+gate), runs `prefilter-transcript.sh` (jq filter that strips tool I/O,
+slash-command wrappers, and meta records -- 76x size reduction on a
+typical transcript), splits the clean NDJSON into chunks, processes each
+chunk into a scratchpad, then synthesises the final vault note and merges
+into the global graph. See [AD58](decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad)
+for the rationale (recency bias + haiku confabulation that motivated the
+switch from haiku to sonnet).
 
 ## Counter Storage
 
@@ -101,7 +110,7 @@ anymore.
 | Capture not firing | Counter not yet baselined, or transcript has `<15` new prompts | Check `~/.memory/counter/{session_id}` mtime; send a few more prompts and watch |
 | Capture spawns but no vault file | Capture agent failed mid-write | Check the agent's transcript for errors; the `.vars` file is gone but the counter has advanced -- next 15-prompt window will try again |
 | `mcp__graphify__query_graph` returns nothing | Global graph not built or wrapper still on per-repo | Verify `~/.graphify/global-graph.json` exists; restart MCP wrapper (it polls on a 2s loop) |
-| Same file extracted twice | Concurrent capture + vault-monitor tick | Both serialise via `flock /tmp/graphify-global.lock`; safe, but the last writer wins for that specific file's nodes |
+| Same file extracted twice | Concurrent capture + vault-monitor tick | Both serialise via `flock -w 5 /tmp/graphify-global.lock`; safe, but the last writer wins for that specific file's nodes |
 
 For hook registration, attribution-blocking, review-spawn enforcement,
 or session-mode gating issues, see [preseed.md](preseed.md#troubleshooting).

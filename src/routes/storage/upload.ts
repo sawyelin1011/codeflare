@@ -92,6 +92,12 @@ app.post('/', async (c) => {
   // Invalidate storage-stats cache so next poll/fetch gets fresh data
   await c.env.KV.delete(`storage-stats:${bucketName}`);
 
+  // REQ-STOR-015 keeps three triggers only: 15-min cadence, manual
+  // Sync-now button, container shutdown. R2 uploads do not auto-fan-
+  // out to running containers; the user clicks Sync-now to propagate
+  // immediately, or waits for the next 15-minute cycle. This avoids
+  // bursting Worker subrequest budget when uploading many files at
+  // once.
   return c.json({ key: sanitizedKey, size: binaryContent.length });
 });
 
@@ -202,6 +208,8 @@ app.post('/complete', async (c) => {
   // Invalidate storage-stats cache so next poll/fetch gets fresh data
   await c.env.KV.delete(`storage-stats:${bucketName}`);
 
+  // REQ-STOR-015: no upload-side auto-trigger - see simple-upload
+  // route above for the three-trigger rationale.
   return c.json({ key: sanitizedKey });
 });
 

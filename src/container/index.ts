@@ -106,12 +106,28 @@ export class container extends Container<Env> {
   private _encryptionKey: string | null = null;
   private _sessionMode: string = 'default';
   private _containerAuthToken: string | null = null;
+  /**
+   * Per-session vault encryption key (REQ-VAULT-008 AC1). 32 random
+   * bytes, base64-encoded. Generated on first ensureVaultKey() call,
+   * persisted in ctx.storage under 'vaultKey', restored on DO wake.
+   * Wiped by destroy() so deletion is forward-secret: a recovered
+   * browser profile after session DELETE cannot decrypt the orphaned
+   * IndexedDB ciphertext because the only key that ever existed lived
+   * in this DO's storage. The Worker /.config proxy reads this via
+   * RPC and injects it into SilverBullet's BootConfig so the browser
+   * encrypts IDB without prompting the user for a passphrase.
+   */
+  private _vaultKey: string | null = null;
   private _sessionId: string | null = null;
   private _userEmail: string | null = null;
+  /** REQ-MEM-001 AC3: user's IANA timezone (e.g. "Europe/Zurich"). */
+  private _userTimezone: string | null = null;
   /**
    * Timestamp captured at the start of destroy(); read by onStop() to
-   * log shutdown elapsed-ms. Helps telemetry decide whether the 75s
-   * SIGTERM budget is right or needs another bump.
+   * log shutdown elapsed-ms. Helps telemetry decide whether the 135s
+   * SIGTERM budget is right or needs another bump. A warn fires inside
+   * destroy() at 110s elapsed so sessions approaching the ceiling
+   * surface in logs before the 15-min cadence makes them routine.
    */
   private _shutdownStartedAt = 0;
   /** Monotonic usage counter (seconds) — sent to Timekeeper for delta computation */
@@ -147,6 +163,10 @@ export class container extends Container<Env> {
       this._sessionId = await this.ctx.storage.get<string>(SESSION_ID_KEY) || null;
       this._usageSeconds = await this.ctx.storage.get<number>('usageSeconds') || 0;
       this._userEmail = await this.ctx.storage.get<string>('userEmail') || null;
+      // REQ-MEM-001 AC3: restore the user's IANA timezone so the capture
+      // pipeline's TZ resolution produces wall-clock filenames after a
+      // DO wake (matches the pattern for sessionId / userEmail above).
+      this._userTimezone = await this.ctx.storage.get<string>('userTimezone') || null;
       // Restore the container auth token from storage. Without this,
       // every DO wake regenerates a fresh UUID via updateEnvVars() while the
       // container process (which may have been hibernated, not restarted)
@@ -155,6 +175,11 @@ export class container extends Container<Env> {
       // `{"error":"Unauthorized"}` on every proxied request until the user
       // recreates the session manually.
       this._containerAuthToken = await this.ctx.storage.get<string>('containerAuthToken') || null;
+      // REQ-VAULT-008 AC1: restore the per-session vault key on wake.
+      // Generation is lazy (ensureVaultKey()); restore is eager so the
+      // Worker /.config proxy can hand it out without ever waiting for
+      // a write on the request path.
+      this._vaultKey = await this.ctx.storage.get<string>('vaultKey') || null;
 
       // Restore user-configured idle timeout (survives DO resets).
       // Storage key remains 'sleepAfter' for backwards compat with existing sessions.
@@ -229,12 +254,108 @@ export class container extends Container<Env> {
     this.envVars = buildEnvVars(this.envState, this.env);
   }
 
+  /**
+   * REQ-VAULT-008 AC1: Return the per-session vault encryption key,
+   * generating + persisting on the first call. The key is 32 random
+   * bytes, base64-encoded so SilverBullet can use it as a string token
+   * in BootConfig. Repeated calls return the cached value -- no extra
+   * storage writes.
+   *
+   * The key is wiped only on container.destroy(); a DO hibernation +
+   * wake cycle restores the same key from ctx.storage (see the
+   * blockConcurrencyWhile restore branch). This is the guarantee that
+   * deletion is forward-secret: once destroy() runs, the key is gone
+   * everywhere and the browser's IDB ciphertext is unrecoverable.
+   *
+   * Worker callers reach this method via a DO RPC from the /.config
+   * proxy handler (REQ-VAULT-008 AC2).
+   */
+  async ensureVaultKey(): Promise<string> {
+    if (this._vaultKey) return this._vaultKey;
+
+    // Critical-section body: re-check cache, restore from storage,
+    // mint on first miss, and PERSIST INLINE before returning. Must
+    // run inside blockConcurrencyWhile so a concurrent second caller
+    // queued behind the first sees the persisted key on its own
+    // storage.get (REQ-VAULT-008 AC1). The put MUST be awaited inside
+    // the critical section — using waitUntil would let the block exit
+    // before the write commits, defeating the guard.
+    const mintAndPersist = async (): Promise<string> => {
+      if (this._vaultKey) return this._vaultKey;
+      const existing = await this.ctx.storage.get<string>('vaultKey');
+      if (existing) {
+        this._vaultKey = existing;
+        return existing;
+      }
+      // No cached key -- mint one. crypto.getRandomValues is the
+      // WebCrypto entry point available on the Workers runtime.
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      // Convert to base64 without Buffer (not available on Workers).
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const key = btoa(binary);
+      // Promise.resolve wrap matches the containerAuthToken pattern:
+      // production returns a real Promise but some test mocks return
+      // undefined synchronously, so awaiting the bare call would NPE
+      // without the wrap.
+      //
+      // CRITICAL: do NOT swallow persistence errors. If storage.put
+      // silently fails, we would return `key` to the caller (the
+      // Worker injects it into BootConfig, browser encrypts IDB with
+      // it), then on the next DO wake the storage.get(key) returns
+      // null and we mint a fresh key — permanently breaking IDB
+      // decryption. Better to throw and force the caller to retry.
+      try {
+        await Promise.resolve(this.ctx.storage.put('vaultKey', key));
+      } catch (err) {
+        // Clear the in-memory mint so the next call retries instead
+        // of returning a key we know was never persisted.
+        this._vaultKey = null;
+        const wrapped = err instanceof Error ? err : new Error(toErrorMessage(err));
+        this.logger.error('Failed to persist vaultKey', wrapped);
+        throw new Error(`ensureVaultKey: storage.put failed: ${toErrorMessage(err)}`);
+      }
+      this._vaultKey = key;
+      return key;
+    };
+
+    // Race guard: two concurrent first-callers must NOT both mint
+    // distinct keys. blockConcurrencyWhile serialises the full
+    // get + mint + put sequence so the second caller's storage.get
+    // sees the first caller's persisted key. Without this the browser
+    // could be handed key A while storage retains key B, permanently
+    // breaking IDB decryption on the next DO wake.
+    const blocker = this.ctx.blockConcurrencyWhile;
+    if (typeof blocker === 'function') {
+      let result = '';
+      await blocker.call(this.ctx, async () => {
+        result = await mintAndPersist();
+      });
+      return result;
+    }
+    // Test mocks without blockConcurrencyWhile: best-effort, no guard.
+    return mintAndPersist();
+  }
+
   /** Override fetch to handle internal routes via map-based dispatch. */
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const routeKey = `${request.method}:${url.pathname}`;
     const handler = this.internalRoutes.get(routeKey);
     if (handler) return handler(request);
+
+    // Note on POST /internal/bisync-trigger (REQ-STOR-015): the Worker
+    // fan-out at /api/sessions/sync calls this DO with that path. It is
+    // intentionally NOT in the internalRoutes map (no leading underscore)
+    // so it falls through to the standard forward path below: the DO
+    // injects the container auth token and super.fetch() routes it to
+    // the host server's matching handler. The 503 short-circuit on a
+    // hibernated container is the hibernation-safety guarantee for the
+    // Sync-now feature - no DO-side state, no daemon-PID cache, all
+    // decisions made at call time against ctx.container?.running.
 
     // Reject non-internal requests when the container is not running.
     // This prevents WebSocket reconnect attempts from waking a hibernated
@@ -456,11 +577,17 @@ export class container extends Container<Env> {
       // old one would let an unrelated request out of a previous lifecycle
       // authenticate against the new container.
       await this.ctx.storage.delete('containerAuthToken');
+      // REQ-VAULT-008 AC1: wipe the vault key so deletion is
+      // forward-secret. The browser's IDB ciphertext (if not yet
+      // cleaned by the frontend lifecycle hook) becomes permanently
+      // unrecoverable once this delete commits.
+      await this.ctx.storage.delete('vaultKey');
       this._bucketName = null;
       this._sessionId = null;
       this._r2AccessKeyId = null;
       this._r2SecretAccessKey = null;
       this._containerAuthToken = null;
+      this._vaultKey = null;
       this._openaiApiKey = null;
       this._geminiApiKey = null;
       this._githubToken = null;
@@ -474,21 +601,34 @@ export class container extends Container<Env> {
     }
 
     if (this.ctx.container?.running) {
-      // 75s = 60s budget for the entrypoint's final bisync (set in
+      // 135s = 120s budget for the entrypoint's final bisync (set in
       // entrypoint.sh:shutdown_handler) plus a 15s buffer for clean
-      // process exit. Was 25_000 originally; raised to 75_000 alongside
-      // the vault rollout because vault edits in the last seconds
-      // before shutdown were silently truncated when the SDK SIGKILLed
-      // mid-bisync, leaving R2 in a partial state that the next
-      // session loaded as stale.
+      // process exit. Budget history: 25_000 (original) -> 75_000
+      // (vault rollout: vault edits in the last seconds were silently
+      // truncated when the SDK SIGKILLed mid-bisync) -> 135_000 (this
+      // change, alongside the 15-min cadence). Under the 15-min
+      // cadence (AD56) a single final bisync can accumulate more
+      // changes than under the old 60s cadence, so the watchdog at
+      // the entrypoint layer needed 120s; the DO budget tracks that
+      // plus the same 15s clean-exit buffer. See AD57.
       this._shutdownStartedAt = Date.now();
-      const timeoutMs = 75_000;
+      const timeoutMs = 135_000;
+      const warnThresholdMs = 110_000;
       const pollMs = 250;
       const start = this._shutdownStartedAt;
+      let warned = false;
       try {
         await this.stop('SIGTERM');
         while (this.ctx.container?.running && Date.now() - start < timeoutMs) {
           await new Promise((resolve) => setTimeout(resolve, pollMs));
+          if (!warned && Date.now() - start >= warnThresholdMs) {
+            warned = true;
+            this.logger.warn('Shutdown approaching budget ceiling', {
+              elapsedMs: Date.now() - start,
+              budgetMs: timeoutMs,
+              warnThresholdMs,
+            });
+          }
         }
         const elapsed = Date.now() - start;
         if (this.ctx.container?.running) {

@@ -18,6 +18,30 @@ import { createLogger } from '../lib/logger';
 
 const logger = createLogger('preferences');
 
+/**
+ * REQ-MEM-001 AC9: validate an IANA timezone string for the
+ * `PATCH /api/preferences` `userTimezone` field. (AC3 covers how the
+ * capture agent uses `$USER_TIMEZONE` at capture time; AC9 is the
+ * preference-endpoint contract that gets the value there.) Browsers
+ * throw RangeError on unsupported zones; valid zones round-trip
+ * cleanly. This avoids shipping a 400+ entry static zone list while
+ * still catching typos and non-existent zones like "Mars/Olympus".
+ */
+function isValidIanaTz(tz: string): boolean {
+  if (!tz) return false;
+  try {
+    // V8's Intl is case-insensitive (`europe/zurich` resolves), but the
+    // container's downstream `TZ="$USER_TIMEZONE" date` on musl is case-
+    // sensitive and silently falls back to UTC for non-canonical casing.
+    // Round-trip via resolvedOptions().timeZone to require the canonical
+    // IANA form so the validator and the consumer agree (code-reviewer M3).
+    const resolved = new Intl.DateTimeFormat('en-US', { timeZone: tz }).resolvedOptions().timeZone;
+    return resolved === tz;
+  } catch {
+    return false;
+  }
+}
+
 const UpdatePreferencesBody = z.object({
   lastAgentType: AgentTypeSchema.optional(),
   lastPresetId: z.string().max(100).optional(),
@@ -25,6 +49,9 @@ const UpdatePreferencesBody = z.object({
   fastStartEnabled: z.boolean().optional(),
   sessionMode: SessionModeSchema.optional(),
   sleepAfter: z.enum(SleepAfterOptions as unknown as [string, ...string[]]).optional(),
+  userTimezone: z.string().min(1).max(64).refine(isValidIanaTz, {
+    message: 'Invalid IANA timezone',
+  }).optional(),
 }).strict();
 
 const preferencesPatchRateLimiter = createRateLimiter({

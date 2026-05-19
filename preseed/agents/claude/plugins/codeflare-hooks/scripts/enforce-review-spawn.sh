@@ -197,7 +197,7 @@ SINCE_PUSH=$(tail -n +"$PUSH_LINE" "$TRANSCRIPT" 2>/dev/null)
 # escaped quotes within their own quote class (`cd "/a\"b/c"`) are NOT
 # supported - graphify-verified that no codeflare path has this shape.
 # ---------------------------------------------------------------------------
-PUSH_RECORD=$(sed -n "${PUSH_LINE}p" "$TRANSCRIPT" 2>/dev/null)
+PUSH_RECORD=$(awk -v L="$PUSH_LINE" 'NR==L { print; exit }' "$TRANSCRIPT" 2>/dev/null)
 ENVELOPE_CWD=$(echo "$PUSH_RECORD" | jq -r '.cwd // empty' 2>/dev/null)
 # jq -r decodes the JSON-encoded command/code string back to its raw
 # shell form (handles `&&`, `\"`, etc.). The `..` recursive
@@ -346,6 +346,16 @@ CURRENT=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
 LAST_ACK_PR_HEAD=""
 if [ -f "$ACK_FILE" ]; then
   LAST_ACK_PR_HEAD=$(cat "$ACK_FILE" 2>/dev/null)
+  # SHA-shape guard: only accept a 40-char lower-hex string. A corrupt or
+  # accidentally-touched ACK file (truncated, contains a stray newline, or
+  # holds non-SHA bytes) used to silently load and force the authoritative
+  # gh round-trip via the !match path below; this explicit validation
+  # makes the self-heal visible in audit and prevents the unlikely future
+  # case of a partially-valid prefix matching by accident.
+  case "$LAST_ACK_PR_HEAD" in
+    *[!0-9a-f]* | "" ) LAST_ACK_PR_HEAD="" ;;
+    *) [ "${#LAST_ACK_PR_HEAD}" -eq 40 ] || LAST_ACK_PR_HEAD="" ;;
+  esac
 fi
 
 if [ -n "$LAST_ACK_PR_HEAD" ]; then
@@ -397,9 +407,10 @@ fi
 # pipeline. Feature → develop defers until the develop → main PR.
 #
 # Empty BASE_REF (transient gh / jq failure between successful state
-# parse and base parse — rare but possible) is treated as fail-open:
-# enforcement still runs. Better to over-block when truth is uncertain
-# than to silently let an unreviewed PR-to-main slip through.
+# parse and base parse — rare but possible) is treated as fail-CLOSED:
+# enforcement still runs (the safe direction). Better to over-block
+# when truth is uncertain than to silently let an unreviewed PR-to-main
+# slip through.
 case "$BASE_REF" in
   main|master|"") ;;
   *) exit 0 ;;
@@ -421,8 +432,18 @@ fi
 
 spawned_after_push() {
   local agent="$1"
+  # Anchor on `"type":"tool_use"` AND `"name":"Agent"` on the same line so
+  # the substring match only fires on actual Agent tool_use envelopes, not
+  # on prose / tool_result text / ctx_execute output that happens to quote
+  # the literal `"subagent_type":"<name>"` bytes (e.g. a diagnostic script
+  # printing hook JSON to the transcript). The JSONL transcript serialises
+  # each tool_use envelope on a single line, so this triple-condition match
+  # is reliable.
   awk -v p="$PUSH_LINE" -v a="$agent" '
-    NR > p && index($0, "\"subagent_type\":\"" a "\"") { found = 1; exit }
+    NR > p \
+      && index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"" a "\"") { found = 1; exit }
     END { exit !found }
   ' "$TRANSCRIPT"
 }
@@ -479,48 +500,290 @@ emit_block() {
 }
 
 # ---------------------------------------------------------------------------
-# Check 1: code-reviewer + spec-reviewer must be spawned after the push
+# Lane gating (v6) — only require lanes whose surface the push actually
+# touches. Skip lanes that were clean last cycle and are not affected by
+# the new diff. The previous version always demanded code+spec+doc on
+# every push, burning tokens on lanes that returned 0 findings the round
+# before. See task #58 for rationale.
+#
+# Classification rules:
+#   - sdd/**                           -> spec-reviewer lane
+#                                         (also pulls in doc-updater so
+#                                         new ACs get doc backlinks)
+#   - documentation/**, README.md,     -> doc-updater lane
+#     CHANGELOG.md
+#   - anything else                    -> behavioral; all three lanes
+#                                         (e.g. src/, host/, web-ui/,
+#                                         entrypoint.sh, schemas, configs)
+#
+# Initial state (no LAST_ACK) or unresolvable git diff -> conservative
+# fall-through requiring all three lanes, matching the v5 behaviour.
+# ---------------------------------------------------------------------------
+
+compute_required_lanes() {
+  local last_ack="$1" current="$2"
+
+  # Initial baseline (no prior ack at all): require everything.
+  if [ -z "$last_ack" ]; then
+    echo "code-reviewer spec-reviewer doc-updater"
+    return
+  fi
+
+  # Same SHA already acked: nothing required. Caller treats this as a
+  # short-circuit advance.
+  if [ "$last_ack" = "$current" ]; then
+    return
+  fi
+
+  # Force-push / rebase safety: only trust the diff when last_ack is
+  # actually an ancestor of current. If history was rewritten (force-
+  # push, rebase, hard reset) such that last_ack is no longer reachable
+  # OR sits on a divergent branch, `git diff last_ack current` can still
+  # produce a file list across unrelated trees that mis-classifies the
+  # push. merge-base failing OR not equalling last_ack -> fall back to
+  # the conservative all-three-lanes posture.
+  local mb
+  mb=$(git merge-base "$last_ack" "$current" 2>/dev/null)
+  if [ -z "$mb" ] || [ "$mb" != "$last_ack" ]; then
+    echo "code-reviewer spec-reviewer doc-updater"
+    return
+  fi
+
+  # Get the changed file list between the last acked SHA and the
+  # current PR HEAD. Fail-safe: an empty result OR a git error means
+  # we cannot prove the diff is benign, so we conservatively require
+  # all three lanes.
+  #
+  # --no-renames is REQUIRED for adversarial safety. With default rename
+  # detection (modern git's default), a rename from src/foo.ts ->
+  # documentation/foo.md emits ONLY the new path, classifying the change
+  # as docs-only and skipping code-reviewer + spec-reviewer entirely.
+  # --no-renames forces both old and new paths into the list, so the
+  # source path triggers the behavioral fall-through.
+  #
+  # -z emits NUL-terminated filenames so paths containing literal
+  # newlines (legal in POSIX) are not split across iterations and
+  # mis-classified.
+  #
+  # CRITICAL: feed the git output to the read loop via process
+  # substitution (`< <(...)`), NOT via command substitution
+  # (`changed=$(git diff -z ...)` + `<<< "$changed"`). Bash strips NUL
+  # bytes from `$(...)` captures (emitting the warning "ignored null
+  # byte in input") -- which destroys the delimiter the read loop
+  # waits for, so `read -d ''` blocks until EOF, returns failure, and
+  # the loop body NEVER executes. has_behavioral / touches_sdd /
+  # touches_docs all stay 0 -> compute_required_lanes returns empty
+  # string -> the caller's "no lanes required" branch silently acks
+  # the checkpoint for an unreviewed behavioral push. Process
+  # substitution streams the bytes through a pipe with NULs intact.
+  #
+  # Defense in depth: if the diff was non-empty (we saw files) but
+  # classification produced no signal, force all three lanes. This
+  # guards against any future NUL-handling regression or unexpected
+  # git output.
+  local has_behavioral=0 touches_sdd=0 touches_docs=0 file_count=0
+  while IFS= read -r -d '' file; do
+    [ -z "$file" ] && continue
+    file_count=$((file_count + 1))
+    case "$file" in
+      sdd/*)
+        touches_sdd=1
+        ;;
+      documentation/*|README.md|CHANGELOG.md|CONTRIBUTING.md|SECURITY.md|LICENSE)
+        touches_docs=1
+        ;;
+      *)
+        # Any file outside sdd/ and the doc-surface set counts as
+        # behavioural and forces all three lanes. This catches source
+        # code, tests (which can shift code semantics via fixture
+        # changes), scripts, configs, schemas, sub-package READMEs,
+        # CI workflows, and the preseed tree.
+        has_behavioral=1
+        ;;
+    esac
+  done < <(git diff -z --name-only --no-renames "$last_ack" "$current" 2>/dev/null)
+
+  # Empty diff -> caller saw no file changes between ACK and HEAD.
+  # Conservative: require all three lanes rather than silently ack.
+  if [ "$file_count" = "0" ]; then
+    echo "code-reviewer spec-reviewer doc-updater"
+    return
+  fi
+
+  if [ "$has_behavioral" = "1" ]; then
+    echo "code-reviewer spec-reviewer doc-updater"
+    return
+  fi
+
+  # Non-behavioural path: only the lanes whose surface the diff actually
+  # touched. A pure documentation push runs only doc-updater. A pure
+  # spec push runs spec-reviewer + doc-updater (the doc-updater follow
+  # picks up missing REQ backlinks, table-of-contents drift, etc.).
+  local lanes=""
+  if [ "$touches_sdd" = "1" ]; then
+    lanes="spec-reviewer doc-updater"
+  fi
+  if [ "$touches_docs" = "1" ]; then
+    case " $lanes " in
+      *" doc-updater "*) ;;
+      *) lanes="$lanes doc-updater" ;;
+    esac
+  fi
+  # Trim leading/trailing whitespace. Empty lanes here is structurally
+  # impossible (file_count > 0 AND no classification matched would only
+  # happen if a file was simultaneously NOT in sdd/, NOT in the doc-surface
+  # set, and NOT behavioral, which the catch-all `*` arm forbids).
+  echo "$lanes" | awk '{$1=$1; print}'
+}
+
+REQUIRED_LANES=$(compute_required_lanes "$LAST_ACK_PR_HEAD" "$CURRENT_PR_HEAD")
+
+# No lanes required -> already-clean PR HEAD for this diff shape. Ack
+# the checkpoint and exit silently so the next Stop event short-circuits
+# on the cheap path.
+if [ -z "$REQUIRED_LANES" ]; then
+  echo "$CURRENT_PR_HEAD" > "$ACK_FILE" 2>/dev/null || true
+  clear_counter
+  exit 0
+fi
+
+# Helpers shared by the parallel and sequential checks below.
+requires_lane() {
+  case " $REQUIRED_LANES " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Parallel block: code-reviewer + spec-reviewer can be spawned together.
+# Only the ones present in REQUIRED_LANES are demanded.
 # ---------------------------------------------------------------------------
 MISSING=""
-spawned_after_push "code-reviewer" || MISSING="$MISSING code-reviewer"
-spawned_after_push "spec-reviewer" || MISSING="$MISSING spec-reviewer"
+if requires_lane "code-reviewer" && ! spawned_after_push "code-reviewer"; then
+  MISSING="$MISSING code-reviewer"
+fi
+if requires_lane "spec-reviewer" && ! spawned_after_push "spec-reviewer"; then
+  MISSING="$MISSING spec-reviewer"
+fi
 
 if [ -n "$MISSING" ]; then
-  REASON="PR #$CURRENT (head ${CURRENT_PR_HEAD:0:7}) needs SDD review. Spawn missing:$MISSING in parallel via Agent tool. USER bypass: 'skip review' or 'touch /tmp/review-bypass'."
+  REASON="PR #$CURRENT (head ${CURRENT_PR_HEAD:0:7}) needs SDD review. Spawn missing:$MISSING in parallel via Agent tool. Lanes required for this push: $REQUIRED_LANES. USER bypass: 'skip review' or 'touch /tmp/review-bypass'."
   emit_block "$REASON"
 fi
 
 # ---------------------------------------------------------------------------
-# Check 2: spec-reviewer completion → doc-updater must follow
+# Doc-updater check. Two modes:
+#
+#   - Sequential (spec-reviewer ALSO required): doc-updater must follow
+#     spec-reviewer's completion to avoid racing on sdd/ files. This is
+#     the legacy behaviour and the path the spec-discipline rule relies
+#     on for the AC-backlink follow-up.
+#
+#   - Independent (spec-reviewer NOT required): doc-updater can be
+#     spawned any time after the push. This is the pure-documentation
+#     push case that motivated task #58.
 # ---------------------------------------------------------------------------
-SPEC_SPAWN_LINE=$(awk -v p="$PUSH_LINE" '
-  NR > p && /"subagent_type":"spec-reviewer"/ { print NR }
-' "$TRANSCRIPT" | tail -1)
-
 PIPELINE_COMPLETE=0
-if [ -n "$SPEC_SPAWN_LINE" ]; then
-  SPEC_LINE_CONTENT=$(sed -n "${SPEC_SPAWN_LINE}p" "$TRANSCRIPT")
-  SPEC_TOOL_USE_ID=$(echo "$SPEC_LINE_CONTENT" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+DOC_REQUIRED=0
+requires_lane "doc-updater" && DOC_REQUIRED=1
+SPEC_REQUIRED=0
+requires_lane "spec-reviewer" && SPEC_REQUIRED=1
 
-  if [ -n "$SPEC_TOOL_USE_ID" ]; then
-    SINCE_SPEC=$(tail -n +"$SPEC_SPAWN_LINE" "$TRANSCRIPT" 2>/dev/null)
-    SPEC_DONE_LINE=$(echo "$SINCE_SPEC" | grep -nF "tool-use-id>${SPEC_TOOL_USE_ID}<" | grep -F 'completed</status>' | tail -1 | cut -d: -f1)
+if [ "$DOC_REQUIRED" = "1" ] && [ "$SPEC_REQUIRED" = "1" ]; then
+  # Sequential gating: wait for spec-reviewer's tool-use to mark
+  # completed</status>, then require doc-updater to follow.
+  # Anchor each subagent_type match on `"type":"tool_use"` AND
+  # `"name":"Agent"` so prose / tool_result text quoting the bytes
+  # cannot false-positive (see spawned_after_push comment above).
+  SPEC_SPAWN_LINE=$(awk -v p="$PUSH_LINE" '
+    NR > p \
+      && index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"spec-reviewer\"") { print NR }
+  ' "$TRANSCRIPT" | tail -1)
 
-    if [ -n "$SPEC_DONE_LINE" ]; then
-      SINCE_SPEC_DONE=$(echo "$SINCE_SPEC" | tail -n +"$SPEC_DONE_LINE")
-      if ! echo "$SINCE_SPEC_DONE" | grep -q '"subagent_type"[[:space:]]*:[[:space:]]*"doc-updater"'; then
-        REASON="spec-reviewer done; doc-updater missing. Spawn doc-updater via Agent tool (sequential — shared filesystem). USER bypass: 'skip review' or 'touch /tmp/review-bypass'."
-        emit_block "$REASON"
+  if [ -n "$SPEC_SPAWN_LINE" ]; then
+    SPEC_LINE_CONTENT=$(awk -v L="$SPEC_SPAWN_LINE" 'NR==L { print; exit }' "$TRANSCRIPT")
+    SPEC_TOOL_USE_ID=$(echo "$SPEC_LINE_CONTENT" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+
+    if [ -n "$SPEC_TOOL_USE_ID" ]; then
+      SINCE_SPEC=$(tail -n +"$SPEC_SPAWN_LINE" "$TRANSCRIPT" 2>/dev/null)
+      SPEC_DONE_LINE=$(echo "$SINCE_SPEC" | grep -nF "tool-use-id>${SPEC_TOOL_USE_ID}<" | grep -F 'completed</status>' | tail -1 | cut -d: -f1)
+
+      if [ -n "$SPEC_DONE_LINE" ]; then
+        SINCE_SPEC_DONE=$(echo "$SINCE_SPEC" | tail -n +"$SPEC_DONE_LINE")
+        # Same precision anchor for the doc-updater follow-up scan.
+        if ! echo "$SINCE_SPEC_DONE" | awk '
+          index($0, "\"type\":\"tool_use\"") \
+            && index($0, "\"name\":\"Agent\"") \
+            && index($0, "\"subagent_type\":\"doc-updater\"") { found=1; exit }
+          END { exit !found }
+        '; then
+          REASON="spec-reviewer done; doc-updater missing. Spawn doc-updater via Agent tool (sequential -- shared filesystem). Lanes required for this push: $REQUIRED_LANES. USER bypass: 'skip review' or 'touch /tmp/review-bypass'."
+          emit_block "$REASON"
+        fi
+        PIPELINE_COMPLETE=1
       fi
-      PIPELINE_COMPLETE=1
+    fi
+  fi
+elif [ "$DOC_REQUIRED" = "1" ]; then
+  # Independent doc-updater (spec-reviewer not required this round).
+  # No completion-marker dependency: must just be spawned later in the
+  # transcript than the push. PIPELINE_COMPLETE only flips once we see
+  # the doc-updater tool-use envelope; we cannot ack a SHA we never
+  # verified.
+  if ! spawned_after_push "doc-updater"; then
+    REASON="PR #$CURRENT (head ${CURRENT_PR_HEAD:0:7}) needs doc-updater (lane required: documentation surface touched, spec/code clean). Spawn via Agent tool. USER bypass: 'skip review' or 'touch /tmp/review-bypass'."
+    emit_block "$REASON"
+  fi
+  PIPELINE_COMPLETE=1
+elif [ "$SPEC_REQUIRED" = "1" ]; then
+  # Spec-reviewer was required but doc-updater was not (would only
+  # happen if the classification table changes; today every sdd/ touch
+  # also pulls doc-updater). Ack once spec-reviewer's tool-use is
+  # marked completed.
+  SPEC_SPAWN_LINE=$(awk -v p="$PUSH_LINE" '
+    NR > p \
+      && index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"spec-reviewer\"") { print NR }
+  ' "$TRANSCRIPT" | tail -1)
+  if [ -n "$SPEC_SPAWN_LINE" ]; then
+    SPEC_LINE_CONTENT=$(awk -v L="$SPEC_SPAWN_LINE" 'NR==L { print; exit }' "$TRANSCRIPT")
+    SPEC_TOOL_USE_ID=$(echo "$SPEC_LINE_CONTENT" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+    if [ -n "$SPEC_TOOL_USE_ID" ]; then
+      SINCE_SPEC=$(tail -n +"$SPEC_SPAWN_LINE" "$TRANSCRIPT" 2>/dev/null)
+      if echo "$SINCE_SPEC" | grep -F "tool-use-id>${SPEC_TOOL_USE_ID}<" | grep -qF 'completed</status>'; then
+        PIPELINE_COMPLETE=1
+      fi
+    fi
+  fi
+else
+  # Only code-reviewer required (no spec, no docs). Ack once
+  # code-reviewer's tool-use is marked completed.
+  CODE_SPAWN_LINE=$(awk -v p="$PUSH_LINE" '
+    NR > p \
+      && index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"code-reviewer\"") { print NR }
+  ' "$TRANSCRIPT" | tail -1)
+  if [ -n "$CODE_SPAWN_LINE" ]; then
+    CODE_LINE_CONTENT=$(awk -v L="$CODE_SPAWN_LINE" 'NR==L { print; exit }' "$TRANSCRIPT")
+    CODE_TOOL_USE_ID=$(echo "$CODE_LINE_CONTENT" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+    if [ -n "$CODE_TOOL_USE_ID" ]; then
+      SINCE_CODE=$(tail -n +"$CODE_SPAWN_LINE" "$TRANSCRIPT" 2>/dev/null)
+      if echo "$SINCE_CODE" | grep -F "tool-use-id>${CODE_TOOL_USE_ID}<" | grep -qF 'completed</status>'; then
+        PIPELINE_COMPLETE=1
+      fi
     fi
   fi
 fi
 
 # ---------------------------------------------------------------------------
 # Advance checkpoint only when the FULL pipeline completed for this PR HEAD.
-# Conservative: if spec is still running, exit 0 without ack and the next
-# Stop re-evaluates.
+# Conservative: if any required lane is still running, exit 0 without ack
+# and the next Stop re-evaluates.
 # ---------------------------------------------------------------------------
 if [ "$PIPELINE_COMPLETE" = "1" ]; then
   echo "$CURRENT_PR_HEAD" > "$ACK_FILE" 2>/dev/null || true

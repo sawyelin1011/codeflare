@@ -1,7 +1,7 @@
 
 # Architecture Decisions
 
-Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as AD1-AD55 throughout the codebase and documentation. 41 ADRs carry active content (AD38 superseded by AD48; AD45 and AD50 superseded by AD51); 11 anchors are redirects (6 merged 2026-05-03, 5 reclassified 2026-05-09 per the documentation-discipline "What is NOT an ADR" rule).
+Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as AD1-AD59 throughout the codebase and documentation. 44 ADRs carry active content (AD4 superseded by AD56 + AD57; AD38 superseded by AD48; AD45 and AD50 superseded by AD51); 11 anchors are redirects (6 merged 2026-05-03, 5 reclassified 2026-05-09 per the documentation-discipline "What is NOT an ADR" rule).
 
 **Audience:** Developers
 
@@ -14,7 +14,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD1](#ad1-one-container-per-session) | One container per session | Architecture |
 | [AD2](#ad2-container-id-format) | Container ID format | Architecture |
 | [AD3](#ad3-per-user-r2-buckets) | Per-user R2 buckets | Architecture |
-| [AD4](#ad4-periodic-rclone-bisync) | Periodic rclone bisync | Architecture |
+| [AD4](#ad4-periodic-rclone-bisync) | _superseded by AD56 (cadence) + AD57 (shutdown budget)_ | (superseded) |
 | [AD5](#ad5-login-shell-autostart) | Login shell autostart | Architecture |
 | [AD6](#ad6-kv-read-modify-write-races-and-collectmetrics-atomicity) | KV read-modify-write races and `collectMetrics` atomicity | Architecture |
 | [AD7](#ad7-merged-into-ad10) | _merged into AD10 — pre-setup public endpoints_ | Security |
@@ -66,6 +66,10 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD53](#ad53-graphify-hot-reload-wrapper-with-multi-repo-sentinel-tracking) | Graphify hot-reload wrapper with multi-repo sentinel tracking | Architecture |
 | [AD54](#ad54-vault-directory-must-use-a-non-hidden-basename) | Vault directory must use a non-hidden basename | Storage |
 | [AD55](#ad55-codeflare-brands-the-vault-editor-via-preseed-managed-stylesmd) | Codeflare brands the vault editor via preseed-managed STYLES.md | Architecture |
+| [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) | 15-minute bisync cadence with manual triggers (fan-out safe under newer-mtime-wins) | Storage |
+| [AD57](#ad57-135-second-shutdown-budget-for-final-bisync) | 135-second shutdown budget for final bisync | Storage |
+| [AD58](#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad) | Sonnet (not haiku) for memory capture, plus jq-prefilter and chunked-scratchpad pipeline | Memory |
+| [AD59](#ad59-zero-ui-vault-encryption-with-per-session-do-storage-key) | Zero-UI vault encryption with per-session DO-storage key | Security |
 
 ---
 
@@ -97,9 +101,12 @@ Isolation boundary: each user's files live in their own bucket. Simplifies delet
 
 ### AD4: Periodic rclone bisync
 
-**Decision:** Background daemon every 60s + final sync on shutdown.
+**Category:** Architecture
+**Status:** Superseded by AD56 (cadence rationale) and AD57 (shutdown budget).
 
-Local disk for all file operations (fast I/O). Bisync daemon runs in background, syncing changes bidirectionally. SIGINT/SIGTERM trap runs final bisync before exit. Alternative (s3fs FUSE) was fragile and slow -- see Lessons Learned #1.
+**Decision:** Background daemon every 60s + final sync on shutdown. Superseded cadence rationale: see AD56 (now 15min). Superseded shutdown budget rationale: see AD57 (now 120s watchdog within a 135s DO destroy budget).
+
+Local disk for all file operations (fast I/O). Bisync daemon runs in background, syncing changes bidirectionally; manual triggers via SIGUSR1 (storage panel Sync-now button). SIGINT/SIGTERM trap runs final bisync before exit. Alternative (s3fs FUSE) was fragile and slow -- see Lessons Learned #1.
 
 ---
 
@@ -923,6 +930,148 @@ The initial implementation defined only `--cf-*`-namespaced custom properties on
 **Alternative considered:** Use SilverBullet's `theme:` setting in `.silverbullet/config.yaml` instead of a separate `STYLES.md` page. Rejected: the bootstrap `config.yaml` carries only the runtime essentials (indexPage, defaultMode); a 200-line CSS payload belongs in a markdown page where the `#meta/styles` tag is SilverBullet's canonical extension point.
 
 **Related REQ:** REQ-VAULT-001 (AC7 lists the four preseed-authoritative pages including STYLES.md).
+
+---
+
+### AD56: 15-minute bisync cadence with manual triggers
+
+**Category:** Storage
+
+**Status:** Active (2026-05-18)
+
+**Context:** The periodic rclone bisync daemon ran every 60 seconds, producing ~1440 invocations per session per day even on idle sessions. Each invocation does at minimum one LIST on each side plus N HEADs across both encrypted and unencrypted configs; for users with multiple active sessions the R2 operation count scaled into terabytes/month of metadata traffic and Class A operations. The dominant cost was not transferred bytes but listing overhead on idle sessions.
+
+Three options were considered: (a) keep 60s, (b) inotify-driven local-flush plus a 15-minute ceiling, (c) pure 15-minute cadence with explicit user-driven triggers. Option (b) was initially recommended for its sub-minute convergence on active sessions, but the Claude-projects directory writes session transcripts continuously and would trigger the inotify wake on every keystroke; restricting inotify to specific folders added complexity without clearly winning over option (c). Option (c) was chosen for simplicity.
+
+**Decision:** The periodic bisync runs every 15 minutes. Three trigger points cover the gap:
+
+1. **15-minute wall clock** -- the daemon's `sleep` is interruptible by SIGUSR1, otherwise wakes after 900 seconds.
+2. **Manual UI trigger** -- the storage panel's Sync-now button posts to `POST /api/sessions/sync`, which fans out per-session triggers across all the authenticated user's running sessions.
+3. **Final sync at shutdown** -- the entrypoint's SIGTERM trap runs `bisync_with_r2` inside the 120-second watchdog before the Container DO destroys (REQ-STOR-005, AD57).
+
+An earlier draft of this ADR included a fourth trigger ("upload-side auto-trigger" -- fire-and-forget fan-out on every R2 PUT through the storage panel). It was removed: a single 20-file drag-drop produced 20 separate KV-enumeration + fan-out RPCs, blowing Worker subrequest budget for a feature the Sync-now button + 15-minute cadence already cover at lower cost. The container-side SIGUSR1 trap coalesces to at most one in-flight + one queued bisync regardless, so the only thing the upload-side trigger ever gave us was Worker-layer waste.
+
+The daemon's SIGUSR1 trap is coalescing: signals received during a running bisync set a rerun-requested flag rather than queueing, so N signals during one cycle produce exactly one rerun after the current cycle completes.
+
+**Why fan-out across sessions is safe (and serial would not be better):**
+
+- bisync uses `--conflict-resolve newer`. Newest-mtime-wins is commutative and associative on absolute mtime: for any file with versions across N sessions, the final R2 state is always `max(mtime_1, ..., mtime_N)` regardless of order.
+- The system already runs in this concurrent mode every 60 seconds today for any user with multiple active sessions -- the existing `--check-sync=false / --resilient / --recover / --ignore-checksum / --max-delete 100` flag set was added precisely to harden bisync against listing divergence from concurrent writers. Manual fan-out introduces no new concurrency model.
+- R2 (S3-compatible) guarantees atomic per-object writes. Concurrent LISTs from different sessions see slightly different snapshots, but each individual file is either fully old or fully new -- never partial.
+- Serial fan-out would be ~Nx slower with no different outcome. Worse, the "winner" under serial would depend on which session the Worker happened to schedule first, replacing a mathematically deterministic max-mtime outcome with an arbitrary one.
+
+**Consequences:**
+- Estimated ~14x reduction in R2 ops on idle sessions (96 cycles/day vs 1440).
+- Ungraceful exit (OOM, container eviction, kernel panic) can lose up to 15 minutes of work. Graceful exit (idle stop, explicit delete, SIGTERM) remains safe via the final-bisync trap (AD57).
+- Multi-tab convergence latency widens from <=60s to <=15min unless the user clicks Sync-now.
+- Storage-panel-after-terminal-write freshness widens to <=15min unless the user clicks Sync-now.
+- Tier-uniform: free, standard, advanced, max, and custom paid tiers all run on the same cadence.
+
+**Alternative considered:** inotify-driven local-flush with a 15-minute ceiling. Rejected: requires either watching the whole filesystem (Claude-projects flooding) or per-folder include lists (complexity that pure 15-min plus Sync-now avoids). The simplicity win outweighed the sub-minute convergence loss for active sessions.
+
+**Alternative considered:** Activity-gated 60s plus 15-min idle fallback. Rejected: same complexity floor as inotify without the upside; misses out-of-band writes (vault editor on host).
+
+**Related REQ:** REQ-STOR-003 (rewritten in this change), REQ-STOR-015 (manual trigger surface).
+
+---
+
+### AD57: 135-second shutdown budget for final bisync
+
+**Category:** Storage
+
+**Status:** Active (2026-05-18)
+
+**Context:** The pre-existing Container DO `destroy()` budget was 75 seconds (vault rollout had already raised it from 25s -> 75s when vault edits in the last seconds before shutdown were silently truncated by the SDK's SIGKILL mid-bisync). The entrypoint shutdown handler's watchdog was 60 seconds (50s SIGTERM + 10s SIGKILL), nested cleanly inside the 75s DO budget with 15s buffer for clean process exit.
+
+Under the new 15-minute cadence (AD56), any single bisync run can accumulate more changes than under the old 60s cadence -- in the worst case, up to ~15 minutes of writes since the last sync. The 60s shutdown watchdog is therefore too tight: large vault edits or workspace deletes accumulated over a long idle window can routinely exceed 60s on the final bisync, triggering the watchdog's SIGKILL mid-write and leaving R2 in a partial state.
+
+**Decision:** Raise the shutdown chain by 60 seconds at both layers:
+
+- **entrypoint shutdown_handler watchdog**: 50s SIGTERM + 10s SIGKILL -> 108s SIGTERM + 12s SIGKILL (120 seconds total).
+- **Container DO `destroy()` timeout**: 75_000ms -> 135_000ms (120s bisync + 15s clean-exit buffer, preserving the existing 15s margin between the entrypoint giving up and the SDK SIGKILL).
+
+The DO's `_shutdownStartedAt` telemetry already logs `shutdownElapsedMs` on `onStop()`. Augment with a `logger.warn` at 110 seconds elapsed so any session approaching the new budget surfaces in logs and we can bump again if real-world bisyncs routinely exceed 110s.
+
+**Consequences:**
+- Final bisync has headroom for the worst-case 15-minute accumulation.
+- Session-delete UX shows a "Saving final changes to storage..." spinner up to ~130 seconds before reporting success. The session-delete handler at `src/routes/session/crud.ts:194-220` already awaits `container.destroy()` end-to-end, so no fire-and-forget fix is required.
+- The 2-minute SIGKILL is the user-accepted floor: anything still running at 120 seconds is hard-killed and the last writes accepted as potentially lost.
+- If telemetry shows shutdownElapsedMs P95 exceeds 110 seconds in production, the budget can be raised again to 150s/165s without architectural change -- the warn threshold gives early signal.
+
+**Alternative considered:** Telemetry-first canary -- ship the 15-min cadence behind an env var, gather shutdownElapsedMs P95/P99 for one week, then commit to the budget. Rejected by the user: the 2-minute budget plus SIGKILL is the explicit floor; if it is not enough, the warn threshold and post-merge telemetry will tell us within 24 hours.
+
+**Alternative considered:** Block container destruction on an explicit "prepare-shutdown" RPC that runs the final bisync synchronously and only returns on completion. Rejected: the existing trap-driven shutdown already runs the final bisync; adding a separate RPC adds a second code path with the same semantics. The simpler change is to extend the existing budget.
+
+**Related REQ:** REQ-STOR-005 (AC4 + AC5 codify the new budget).
+
+---
+
+### AD58: Sonnet for memory capture, with prefilter and scratchpad
+
+**Category:** Memory
+
+**Status:** Active (2026-05-18)
+
+**Context:** REQ-MEM-001's capture pipeline ran haiku as the background subagent and read raw transcript JSONL directly. Two problems emerged in production:
+
+1. **Recency bias.** A 1466-line transcript is ~3.8 MB of JSONL; ~99% of those bytes are `tool_use` and `tool_result` records. Haiku reading the raw stream burned its working memory on tool I/O and produced a capture summarising only the most recent topic. Bench: a session that ran 6 hours of R2-bisync design work yielded a 1431-byte note covering just the final 15 minutes' stop-hook mechanics; the substantive arc was lost.
+2. **Confabulated citations.** Even after prefilter+chunking removed the recency bias, haiku invented adjacent ADR numbers in benchmarking (`AD58`, `AD59` cited in a note where the actual references were `AD56` + `AD57`). For a memory subsystem whose value is "queryable cross-session truth," false citations are worse than missing ones — they pollute the unified graph and mislead future agents that match on the wrong ID.
+
+**Decision:** Three coupled changes that ship as one PR:
+
+- **Prefilter pipeline.** New `prefilter-transcript.sh` runs a `jq` filter that drops tool_use/tool_result/thinking blocks, slash-command wrappers, task-notifications, hook feedback, resume markers, and meta records. Output is NDJSON of `{role, text, ts}` per kept entry. On the benchmark transcript: 3.8 MB raw → 50 KB clean (76× reduction).
+- **Chunked scratchpad.** The capture agent splits the clean NDJSON into chunks of ~20 entries (`chunk-aa.md`, `chunk-ab.md`, ...), processes each chunk in turn, and appends per-chunk observations to a scratchpad file before synthesising the final note. The scratchpad becomes working memory; recency bias is structurally prevented because each chunk gets equal attention.
+- **Model: sonnet, not haiku.** The capture agent runs at sonnet tier. Same-input bench against haiku: sonnet produced 52 bullets vs 30, cited 15 commit SHAs verbatim (haiku cited 0), and invented zero IDs vs haiku's 2. The model is bound at the agent-file level via frontmatter in `preseed/agents/claude/agents/memory-capture.md` (and `vault-extract.md` for the vault path); hook directives instruct the main agent not to pass a model override to the Task tool, so the pin cannot be silently downgraded by a caller.
+
+Three smaller decisions bundled in:
+
+- **Timezone for capture filenames** is resolved at capture time from `$USER_TIMEZONE` env var, then `$TZ`, then `/etc/timezone`, falling back to UTC. No hardcoded zone -- codeflare is forkable and users live everywhere. The container clock is typically UTC; the Dashboard auto-syncs the browser's IANA timezone to the `userTimezone` preference on mount (REQ-SESSION-016 AC5), so captures record the user's actual wall-clock time (filenames like `2026-05-18T14-22-15+0200-...md`) on the next session start after first login.
+- **Prefilter script joins the manifest.** Adding `plugins/codeflare-memory/scripts/prefilter-transcript.sh` to `preseed/agents/claude/manifest.json` so it ships through the standard agent-seed pipeline. Otherwise the capture agent would call a script that does not exist in production.
+- **Marker filter** explicitly excludes string content beginning with `<` (slash-command + task-notification wrappers), `Stop hook` (stop-hook feedback synthetic injection), `This session is being continued` (resume header), and `[Request interrupted` (interrupt notice). These were all leaking into the haiku's view of "real user prompts" before this pass.
+
+**Consequences:**
+- Capture cost rises ~3x per fire (haiku → sonnet pricing). The capture fires at most once per 15 real user prompts, so a typical long session triggers it 1-5 times. Absolute cost is cents per session — well worth the fidelity gain.
+- Capture latency rises modestly: chunked-scratchpad introduces N+1 LLM round-trips per fire (one per chunk plus the synthesis pass). On the benchmark the haiku run took ~88 s end-to-end; sonnet with the new pipeline ~228 s. The agent runs in the background via `executionCtx.waitUntil`, so user-facing latency is unchanged.
+- Vault notes are denser (5-10 KB typical vs 1-2 KB before). SilverBullet renders all of them fine; the unified graph picks up more concept nodes per capture, which improves cross-session retrieval recall.
+- Stale `Raw/Sessions/` files written by the old pipeline are not migrated. They remain as historical record; future captures use the new format.
+
+**Alternative considered:** Keep haiku and ratchet the prompt harder ("only cite IDs verbatim"). Rejected because haiku's confabulation is a model-level behaviour, not a prompt-comprehension issue; tightening the prompt reduces inventions on the margin but does not eliminate them, and the false-citation cost dominates the haiku cost saving.
+
+**Alternative considered:** Prefilter only (keep haiku). Rejected as a half-measure: prefilter fixes recency bias, but the citation-accuracy gap (haiku invents IDs; sonnet doesn't) remains uncovered.
+
+**Alternative considered:** Capture model gated by env var (default haiku, advanced users override to sonnet). Rejected as unnecessary mechanism — capture quality is a system-wide property, and the cost difference at the actual capture cadence is negligible. Per-user opt-out can be added later if cost telemetry shows it matters.
+
+**Related REQ:** REQ-MEM-001 (capture pipeline contract), REQ-MEM-008 (preseed manifest includes the new script).
+
+---
+
+### AD59: Zero-UI vault encryption with per-session DO-storage key
+
+**Category:** Security
+**Status:** Active (2026-05-18)
+
+**Context:** SilverBullet's IndexedDB cache stores every vault file as plaintext on the user's browser profile. Three concerns are coupled: (1) SB cold-start is ~30s on every new session because the per-`:sid` URL produces a new IDB hash every time; (2) plaintext IDB exposes vault content to anyone with read access to the user's browser profile (backup leak, profile theft, ransomware scan); (3) deleted sessions leave orphan IDBs that grow monotonically against the per-origin quota. The team wanted encryption-at-rest without adding a passphrase UI (it would create a "forgotten passphrase" support load and the vault is already coupled to the codeflare login).
+
+**Decision:** Each session's Container DO mints a 32-byte random key on first boot, persists in `ctx.storage`, and exposes it via an RPC method `ensureVaultKey()`. The Worker `/.config` proxy fetches the key via RPC and injects it into SilverBullet's BootConfig. A Worker-side `<script>` injection into the shell HTML exposes `window.__codeflareVaultBoot` carrying the key, raised sync concurrency, and lazy-path prefixes for the SB client to consume. The frontend nukes the per-session IDB on session DELETE and runs an orphan-sweep on Dashboard mount.
+
+**Threat model (BitLocker-grade, not Bitwarden-grade):**
+- DEFEATS: offline disk attacks - recovered/stolen browser profile, leaked filesystem backup, ransomware filesystem scan, forensic IDB extraction from a powered-off machine.
+- DOES NOT DEFEAT: anyone with an authenticated browser tab on the codeflare origin (they can read `window.__codeflareVaultBoot` directly from page JS); the codeflare Worker operator (the key crosses the Worker on every request); a compromised Cloudflare edge.
+
+**Consequences:**
+- Vault contents in IndexedDB become AES ciphertext rather than plaintext markdown - a recovered profile no longer leaks notes.
+- The encryption is forward-secret: `container.destroy()` (session DELETE) wipes both the DO key and the browser IDB, so deletion is unrecoverable even by the user.
+- The key MUST NOT rotate mid-session - rotation would orphan all existing IDB ciphertext and force re-sync on every container restart, defeating the cold-start optimisation.
+- The key is per-session, so cross-session reads remain isolated (each `:sid` has its own IDB hash).
+- Worker-side script injection is fragile: a future SB upstream change to the shell HTML template could break the `</head>` insertion point. The fail-safe is "return HTML unchanged" so a missed injection degrades to a passphrase prompt rather than a white screen.
+
+**Alternative considered:** Per-user passphrase derived via PBKDF2 from the codeflare password. Rejected - adds a "forgotten passphrase" recovery flow that requires the user to re-enter their vault password on every fresh device, defeating the always-on coupling to the codeflare session.
+
+**Alternative considered:** Build SilverBullet from source with native encryption support baked in. Rejected - Deno toolchain in the image adds ~400MB and locks codeflare to a fork rather than tracking SB upstream. Runtime injection through the already-text-rewriting Worker proxy is the lowest-overhead option.
+
+**Alternative considered:** Server-side encryption only (rclone bisync to R2 SSE-C, leave IDB plaintext). Rejected - R2 SSE-C already covers at-rest on R2; the gap is the browser cache, which is where the new requirement lives.
+
+**Related REQ:** REQ-VAULT-008 (zero-UI vault encryption + cold-start payload + IDB lifecycle), REQ-VAULT-005 (Worker proxy exposes vault editor).
 
 ---
 

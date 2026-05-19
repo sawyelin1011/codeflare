@@ -14,6 +14,16 @@
       "advanced"
     ]
   },
+  "agents/memory-capture.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "agents/vault-extract.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "agents/deep-reviewer.md": {
     "modes": [
       "advanced"
@@ -79,6 +89,11 @@
       "advanced"
     ]
   },
+  "plugins/codeflare-hooks/scripts/block-local-builds.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "plugins/codeflare-hooks/scripts/enforce-review-spawn.sh": {
     "modes": [
       "advanced"
@@ -105,6 +120,11 @@
     ]
   },
   "plugins/codeflare-memory/scripts/memory-capture.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-memory/scripts/prefilter-transcript.sh": {
     "modes": [
       "advanced"
     ]
@@ -199,11 +219,6 @@
       "advanced"
     ]
   },
-  "rules/common/security.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
   "rules/documentation-discipline.md": {
     "modes": [
       "advanced"
@@ -236,6 +251,11 @@
     ]
   },
   "rules/graph-first.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "rules/karpathy.md": {
     "modes": [
       "advanced"
     ]
@@ -322,11 +342,6 @@
     ]
   },
   "rules/vault-note-capture.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
-  "rules/vault.md": {
     "modes": [
       "advanced"
     ]
@@ -443,6 +458,16 @@
       "advanced"
     ]
   },
+  "skills/sdd-clean/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/sdd-init/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "skills/search-first/SKILL.md": {
     "modes": [
       "advanced"
@@ -479,11 +504,6 @@
     ]
   },
   "skills/spec-driven-development/references/templates/documentation-readme.md": {
-    "modes": [
-      "advanced"
-    ]
-  },
-  "skills/spec-driven-development/references/templates/gitignore-additions.txt": {
     "modes": [
       "advanced"
     ]
@@ -539,6 +559,11 @@
     ]
   },
   "skills/vault-note-capture/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/vault-operations/SKILL.md": {
     "modes": [
       "advanced"
     ]

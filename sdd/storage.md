@@ -7,7 +7,7 @@ R2 persistence, rclone bisync, quotas, and file browser.
 | Concept | Definition |
 |---------|-----------|
 | R2 Bucket | Per-user Cloudflare R2 storage bucket, named deterministically from user email, providing isolated durable file storage |
-| Bisync | Bidirectional rclone sync that reconciles local filesystem and R2 every 60 seconds, using newest-file-wins conflict resolution |
+| Bisync | Bidirectional rclone sync that reconciles local filesystem and R2 every 15 minutes (plus on user-initiated triggers and at shutdown), using newest-file-wins conflict resolution |
 | Sync Mode | User-configurable scope of what gets synced: `none` (configs only), `full` (entire workspace), or `metadata` (agent configs per repo) |
 | Storage Quota | Per-tier limit on total R2 usage (`maxStorageBytes`), enforced at session start, cached in KV with 60-second TTL |
 
@@ -15,7 +15,8 @@ R2 persistence, rclone bisync, quotas, and file browser.
 
 - **Version history** -- R2 stores current file state only. No file versioning, rollback to previous revisions, or change tracking within storage.
 - **File collaboration** -- Storage is single-user. No shared buckets, shared folders, or multi-user access to the same R2 prefix.
-- **Real-time file sync** -- Bisync runs on a 60-second interval. Sub-second or event-driven sync between browser and container is not supported.
+- **Real-time file sync** -- Bisync runs on a 15-minute cadence with one user-driven trigger (Sync-now button) and a final sync at container shutdown. R2-side changes and multi-tab convergence wait up to the 15-minute ceiling unless the user clicks Sync-now. R2 uploads do not auto-fan-out to running containers. Sub-second or event-driven sync between browser and container is not supported.
+- **Corrupted R2 self-healing via nuke** -- Automatic detection and deletion of corrupted or encryption-mismatched R2 objects via a full-bucket scan was considered but not implemented. Transient file errors are handled by the vanishing-file recovery mechanism; encryption mismatches are handled by `--resilient`/`--recover` flags and the resync fallback in the bisync daemon.
 
 ### Domain Dependencies
 
@@ -71,16 +72,17 @@ R2 persistence, rclone bisync, quotas, and file browser.
 
 ---
 
-## REQ-STOR-003: Bidirectional Sync Every 60 Seconds
+## REQ-STOR-003: Bidirectional Sync Every 15 Minutes (with Manual Triggers)
 
-**Intent:** Changes made locally (by the agent or user) and changes in R2 (from the file browser or another session's sync) must converge within a bounded interval.
+**Intent:** Changes made locally (by the agent or user) and changes in R2 (from the file browser or another session's sync) must converge within a bounded interval, balanced against R2 operation cost. The 15-minute cadence is supplemented by explicit user-driven triggers (REQ-STOR-015) so the user is never blocked waiting for a cycle when they want fresh state.
 
 **Acceptance Criteria:**
-1. After bisync baseline is established, a periodic rclone bisync runs every 60 seconds.
-2. Conflict resolution uses newest-file-wins (`--conflict-resolve newer`).
-3. The daemon retries on transient failure and continues the 60-second cycle.
-4. On bisync failure, the daemon attempts vanishing-file recovery (parse error output, exclude transient files, clear locks, retry) before counting the failure.
-5. After 3 consecutive unrecoverable failures (each with 3 internal retries), the daemon falls back to a `--resync` baseline to re-establish clean state.
+1. After bisync baseline is established, a periodic rclone bisync runs every 15 minutes.
+2. The daemon's periodic sleep is interruptible by an external signal: a signal wakes the daemon and skips the remaining sleep, producing an immediate bisync. Signals delivered while a bisync is mid-flight coalesce into exactly one rerun after the current cycle completes (see REQ-STOR-015 AC5).
+3. Conflict resolution uses newest-file-wins (`--conflict-resolve newer`).
+4. The daemon retries on transient failure and continues the 15-minute cycle.
+5. On bisync failure, the daemon attempts vanishing-file recovery (parse error output, exclude transient files, clear locks, retry) before counting the failure.
+6. After 3 consecutive unrecoverable failures (each with 3 internal retries), the daemon falls back to a `--resync` baseline to re-establish clean state.
 
 **Constraints:**
 - All bisync commands must use `--ignore-checksum` to prevent false hash-mismatch aborts from files changing mid-transfer.
@@ -109,12 +111,8 @@ R2 persistence, rclone bisync, quotas, and file browser.
 5. If the initial baseline fails due to a vanishing file (file listed but deleted before copy), the system parses the error output, adds the file to a session-scoped recovery filter (`/tmp/rclone-recovery-filters.txt`), and retries (max 3 attempts). Only non-workspace files are auto-excluded; workspace files trigger a plain retry.
 6. Known ephemeral files (`.claude/mcp-*.json`) are statically excluded from all sync operations.
 7. The bisync daemon starts unconditionally after baseline — even if all baseline attempts fail. A dead daemon means zero sync for the entire session; the daemon has its own recovery (vanishing-file recovery + consecutive failure → resync fallback).
-8. The terminal server's tab-1 PTY pre-warm is gated on an init-complete flag file (`/tmp/codeflare-init-complete`) written by the entrypoint after initial sync, file modifications, and tab autostart configuration complete; this preserves the readiness contract while letting port 8080 bind before Cloudflare's container port-wait timeout.
-9. The host terminal server rejects `/terminal` WebSocket upgrades with close code 1013 (reason `container-warming-up`) until both the init-complete flag is observed AND the pre-warm session is registered in the session map; this is the host-side guard against reconnects landing before `.bashrc` autostart is in place.
 
 **Constraints:**
-- The terminal server must bind port 8080 within Cloudflare's container port-wait window; slow initialization (R2 sync, MCP config merges) must not block the port bind.
-- Container must not signal readiness (PTY pre-warm complete) until the initial sync either succeeds or times out.
 - The bisync-initialized flag (`/tmp/.bisync-initialized`) must be set even on the timeout path to prevent the shutdown trap from skipping the final sync.
 
 **Applies To:** User
@@ -134,9 +132,11 @@ R2 persistence, rclone bisync, quotas, and file browser.
 1. A SIGINT/SIGTERM handler triggers a final bisync before exit.
 2. The final bisync only runs if the bisync-initialized flag is set.
 3. Files created during the session are available in R2 after shutdown completes.
+4. The final bisync runs under a 120-second hard watchdog. If it has not completed within 120 seconds, the process is force-killed and the user accepts that the last writes may not have synced.
+5. The container orchestrator's destroy budget is 135 seconds (120s for the final bisync plus 15s for clean process exit) before the SDK tears down the container.
 
 **Constraints:**
-- The shutdown handler must complete within the container runtime's grace period.
+- The shutdown handler must complete within 120 seconds; the DO destroy() budget is 135 seconds.
 - Final bisync uses the same flags as periodic bisync (`--ignore-checksum`, `--max-delete 100`, `--check-sync=false`).
 
 **Applies To:** User
@@ -282,7 +282,7 @@ R2 persistence, rclone bisync, quotas, and file browser.
 1. `SYNC_MODE=none` (default): only settings and config directories are synced; `~/workspace/` is excluded entirely.
 2. `SYNC_MODE=full`: entire `~/workspace/` is synced (minus `node_modules/`).
 3. `SYNC_MODE=metadata`: only agent config files (`.claude/` and `CLAUDE.md`) per repo are synced.
-4. All modes exclude: package manager caches, rclone caches, agent session logs, ephemeral agent data, and build artifacts.
+4. All modes exclude these categories (per-path inventory is delegated to the sync daemon and storage-and-sync documentation; the spec governs the categories so future filter changes have something to be verified against): package-manager caches, rclone caches, agent session logs, ephemeral agent data, build artifacts, regenerable XDG tool state (e.g. wrangler state, generic dotfile user-app caches), and vendor credential caches that the agent regenerates on demand.
 
 **Constraints:**
 - All rclone commands must use `--filter` flags (not `--include`/`--exclude`).
@@ -320,30 +320,6 @@ R2 persistence, rclone bisync, quotas, and file browser.
 
 ---
 
-## REQ-STOR-013: Self-Healing Corrupted R2 Files
-
-**Intent:** When bisync is blocked by corrupted or incompatible R2 objects, the system must automatically detect and remove the problematic files to restore sync functionality.
-
-**Acceptance Criteria:**
-1. When resync fails after 3 daemon retries, `nuke_corrupted_r2_files` runs automatically.
-2. Strategy 1: parse sync.log for any file path causing a bisync error (encryption mismatch, size mismatch, corrupted transfer, copy failure, hash mismatch, listing conflicts) and delete from both R2 and local.
-3. Strategy 2: if no error files found in logs, perform full R2 scan -- list all objects with unencrypted config, HEAD each with encrypted config, delete any returning 400 (unencrypted orphans).
-4. After nuking, bisync state is cleared and resync retried immediately.
-5. Self-healing runs both at startup (if initial baseline fails) and in the daemon (if resync fallback fails).
-
-**Constraints:**
-- Losing one problematic file is acceptable; losing all sync is not.
-- Files are deleted from R2 using both encrypted and unencrypted configs.
-
-**Applies To:** User
-**Priority:** P1
-**Dependencies:** REQ-STOR-003, REQ-STOR-004
-**Verification:** Integration test
-
-**Status:** Deprecated -- The `nuke_corrupted_r2_files` function was never implemented. Self-healing for transient file errors is now handled by the vanishing-file recovery mechanism (REQ-STOR-004 AC5, REQ-STOR-003 AC4). Corruption from encryption mismatches is handled by `--resilient` + `--recover` flags and the resync fallback in the daemon.
-
----
-
 ## REQ-STOR-014: R2 Storage Stats Caching
 
 **Intent:** Storage statistics must be available quickly without paginating all R2 objects on every request.
@@ -360,7 +336,32 @@ R2 persistence, rclone bisync, quotas, and file browser.
 
 **Applies To:** User
 **Priority:** P1
-**Dependencies:** REQ-STOR-001, REQ-STOR-006
+**Dependencies:** REQ-STOR-001
 **Verification:** Automated test
 
 **Status:** Implemented
+
+---
+
+## REQ-STOR-015: Explicit Sync Trigger from UI
+
+**Intent:** Because the periodic bisync cadence is 15 minutes (REQ-STOR-003), users must have explicit ways to force convergence between the container filesystem and R2 without waiting for the next cycle.
+
+**Acceptance Criteria:**
+1. `POST /api/sessions/sync` fans out a sync trigger to every running session belonging to the authenticated user. Stopped sessions are skipped client-side using `batch-status` output before fan-out.
+2. Fan-out runs in parallel with a concurrency cap of 8; remaining sessions are queued.
+3. Per-session failures are isolated -- one session's bisync failure does not prevent other sessions from completing. The response shape returns the per-session sync status.
+4. `POST /api/sessions/sync` is rate-limited at 6 requests per minute per user (matches the destructive-action rate-limiter pattern).
+5. The trigger is idempotent: a SIGUSR1 sent to the bisync daemon while a bisync is already in flight causes exactly one rerun after the current cycle completes (N concurrent signals coalesce to one rerun, not N).
+6. The frontend Sync-now button is disabled while any of the user's sessions reports `sync.status === 'syncing'` and re-enables once all sessions transition out.
+
+**Constraints:**
+- Three triggers only: 15-minute cadence (REQ-STOR-003), Sync-now button (this REQ), and the final shutdown bisync (REQ-STOR-005). R2 uploads do not auto-fan-out to running containers — users click Sync-now to propagate freshly uploaded files immediately, or wait for the next 15-minute cycle. Removing the upload-side auto-trigger avoids bursting Worker subrequest budget on multi-file uploads (each file otherwise enumerates KV and fan-outs to every running session).
+- Multi-session fan-out is safe under the existing `--conflict-resolve newer` bisync semantics: the merge operation is commutative and associative under absolute mtime, so parallel and serial fan-out produce the same final R2 state per file. The same concurrent mode already runs every 15 minutes when a user has multiple sessions (per REQ-STOR-003); manual triggers introduce no new failure mode.
+
+**Applies To:** User
+**Priority:** P1
+**Dependencies:** REQ-STOR-003, REQ-STOR-007, REQ-STOR-011
+**Verification:** Automated test (`src/__tests__/lib/sync-fanout.test.ts` for AC1-AC4 fan-out + concurrency + isolation + rate-limit). AC5 (SIGUSR1 coalesce/rerun) and AC6 (Sync-now button disabled-while-syncing) are pending — see `sdd/pending.md`.
+
+**Status:** Partial

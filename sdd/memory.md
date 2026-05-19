@@ -6,9 +6,9 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 
 ### Key Concepts
 
-- **Vault** -- `/home/user/Vault/`. Single source of truth for cross-session memory. Holds agent-written session captures (`Raw/Sessions/`) and user-curated notes (`Notes/`, `Raw/Pasted/`). Rclone-bisynced to R2.
+- **Vault** -- `/home/user/Vault/`. Single source of truth for cross-session memory. Holds agent-written session captures (`Raw/Sessions/`) and user-curated content under `Notes/`, `Inbox/`, `Journal/`. SilverBullet writes attachments next to the note that referenced them. Rclone-bisynced to R2.
 - **Unified Graph** -- `~/.graphify/global-graph.json`. Hash-keyed merge of the vault's graph and every active repo's per-repo graph. Queried via `mcp__graphify__*`.
-- **Capture** -- A background agent (haiku) runs every 15 user messages, extracts decisions/observations/references from the recent transcript, and writes them as a markdown file in `Raw/Sessions/`, then merges into the unified graph under `flock /tmp/graphify-global.lock`.
+- **Capture** -- A background agent (sonnet) runs every 15 real user messages, prefilters the transcript to strip tool I/O, chunks the remainder, accumulates per-chunk observations into a scratchpad, synthesises a markdown capture file in `Raw/Sessions/`, and merges it into the unified graph under `flock -w 5 /tmp/graphify-global.lock`.
 - **Session Mode** -- Advanced (Pro) mode enables R2 sync of the vault and capture hooks. Default (Standard) mode runs the in-session capture flow but the vault is not preserved across container recreations.
 
 ### Out of Scope
@@ -31,23 +31,25 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 
 **Intent:** Important conversation context (decisions, debugging insights, observations) must be extracted from the transcript and persisted to the vault without manual intervention.
 
+**Applies To:** User
+
 **Acceptance Criteria:**
 1. The `memory-capture.sh` script runs as a `UserPromptSubmit` hook, injecting a short instruction into the main agent's context via `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"..."}}` + `exit 0`.
 2. The hook counts real user messages in the JSONL transcript using a two-layer grep filter that excludes tool-result wrappers (content is an array, not a string) and synthetic messages (slash commands, task notifications -- content starts with `<`).
-3. When triggered, the main agent spawns a background haiku agent that reads the recent transcript and writes a markdown capture file into `/home/user/Vault/Raw/Sessions/{ISO_TS}-{SID_SHORT}.md`.
+3. When triggered, a background sonnet agent runs the three-stage capture pipeline (prefilter transcript noise, chunk and accumulate per-chunk observations into a scratchpad, synthesise the final note) and writes the capture file to `/home/user/Vault/Raw/Sessions/{ISO_TS}-{SID_SHORT}.md`. The agent is sonnet per AD58 (pinned at the subagent-definition level so the dispatching parent cannot silently downgrade the model). Timestamps reflect the user's local timezone, resolved per AC9 below.
 4. The capture file uses a YAML frontmatter template with `session_id`, `captured_at`, and `captured_from_range` fields followed by Context / Decisions / Observations / References sections.
-5. The capture agent runs `graphify extract --file <file>` and `graphify global add ... --as user_vault` under `flock /tmp/graphify-global.lock` so the new content is queryable on the same turn it is written.
+5. The capture agent extracts chunk nodes/edges from the rendered markdown via inline graph construction (sonnet itself emits the chunk JSON matching graphify's schema, then a short Python step calls `graphify.build` / `graphify.cluster` / `graphify.export.to_json` to materialise the per-extraction graph), then runs `graphify global add ... --as user_vault` under `flock -w 5 /tmp/graphify-global.lock` so the new content is queryable on the same turn it is written. The headless `graphify extract` CLI is intentionally bypassed: codeflare ships no LLM provider key for graphify, and the capture agent IS the LLM, so re-invoking the CLI would duplicate inference cost with no benefit.
 6. The hook handles tilde expansion in `transcript_path` (Claude Code may send tilde-prefixed paths).
 7. All variables (transcript path, line offset, date, counts, counter file path) are written to a `.vars` JSON file to keep the context string short.
 8. On the first message of a session (no counter file exists), the hook injects a `mcp__graphify__query_graph` directive into `additionalContext` instructing the agent to query the unified graph before responding.
+9. The hook resolves the capture timestamp from `$USER_TIMEZONE`, falling back to `$TZ`, then `/etc/timezone`, then UTC. The endpoint and persistence contract that puts a value into `$USER_TIMEZONE` are specified by REQ-SESSION-016.
 
 **Constraints:**
 - The hook runs in approximately 150ms (lightweight shell script, no heavy processing).
 - Memory capture requires advanced session mode (the hook, plugin, and memory rule are only preseeded in advanced mode).
 
-**Applies To:** User
 **Priority:** P0
-**Dependencies:** REQ-MEM-006, REQ-VAULT-002
+**Dependencies:** REQ-MEM-006, REQ-VAULT-002, REQ-SESSION-016
 **Verification:** Integration test (E2E verifies a capture file appears under `Raw/Sessions/` after 15 messages and its nodes show up in `mcp__graphify__query_graph`).
 
 **Status:** Implemented
@@ -87,9 +89,9 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 1. In advanced mode, `/home/user/Vault/` is included in rclone bisync via a `+` filter that precedes the global `**/graphify-out/**` exclude so vault graphify output still rides along.
 2. On container boot, rclone pulls the vault from R2 before the vault skeleton init runs, so returning sessions inherit their persisted content untouched.
 3. The vault skeleton init (`init_user_vault`) is idempotent and only creates subdirectories / config files when absent.
-4. rclone bisync syncs changes back to R2 every 60s and on shutdown.
+4. rclone bisync syncs changes back to R2 on three triggers: the 15-minute cadence, manual SIGUSR1 from the Sync-now button (REQ-STOR-015), and the final shutdown bisync (REQ-STOR-005).
 5. The ephemeral global-graph layer (`~/.graphify/`) is explicitly excluded from sync (rebuilt locally on every container boot from per-source graphs).
-6. The shutdown handler watchdog allows the final bisync up to 60s to drain pending writes before SIGKILL.
+6. The shutdown handler watchdog allows the final bisync up to 120s to drain pending writes before SIGKILL.
 
 **Constraints:**
 - Rclone config uses `disable_checksum = true` to skip `X-Amz-Meta-Md5chksum` metadata on multipart uploads.
@@ -112,7 +114,7 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 **Acceptance Criteria:**
 1. In default mode, the vault directory is not preserved across container recreations (sync filters limit cross-session persistence to advanced-mode sessions).
 2. In default mode, the capture hook still runs the in-session counter logic but vault writes are local-only.
-3. The memory plugin, memory rule (`rules/memory.md`), vault plugin, and vault rule (`rules/vault.md`) are preseeded only in advanced mode.
+3. The memory plugin, memory rule (`rules/memory.md`, which carries the folded vault trigger/route content), vault plugin, and `rules/vault-note-capture.md` are preseeded only in advanced mode.
 4. Pro mode seeds a strict superset of Standard's preseed files; the memory and vault plugins/rules are part of the Pro-only delta.
 5. `entrypoint.sh` merges hook registrations (PreToolUse and UserPromptSubmit) into `settings.json` only in advanced mode. Default mode gets only `skipDangerousModePermissionPrompt`.
 6. `sessionMode` is stored as `'default' | 'advanced'` in `UserPreferences` (KV). Undefined defaults to `'default'` via `resolveSessionMode()`.
@@ -138,8 +140,8 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 **Intent:** Memory capture prompt files must be deployed alongside the rest of the preseed content through the standard manifest pipeline.
 
 **Acceptance Criteria:**
-1. The capture prompt lives in `~/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md` (haiku capture).
-2. The codeflare-memory plugin includes three files in the manifest: `plugin.json`, `memory-capture.sh`, `memory-agent-prompt.md`.
+1. The capture prompt lives in `~/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md`.
+2. The codeflare-memory plugin includes four files in the manifest: `plugin.json`, `memory-capture.sh`, `memory-agent-prompt.md`, `prefilter-transcript.sh`. The capture **subagent definition** (`preseed/agents/claude/agents/memory-capture.md` -- frontmatter pins `model: sonnet` per AD58) is registered under the manifest's top-level `agents/` section, not inside the plugin; it is seeded by the same reconcileAgentConfigs pipeline (REQ-AGENT-008) that delivers the other named subagents (architect, code-reviewer, ...).
 3. All plugin files are marked as advanced-only in the manifest (`"modes": ["advanced"]`).
 4. The hook script (`memory-capture.sh`) is delivered via the plugin but registered via `settings.json` merge (not the plugin system).
 5. The manifest pipeline source files are in `preseed/agents/claude/plugins/`.
@@ -155,4 +157,26 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 **Dependencies:** REQ-AGENT-003
 **Verification:** Automated test (`generate-agent-seed.mjs` output includes memory plugin files).
 
+**Status:** Implemented
+
+---
+
+## REQ-MEM-009: Vault graph accumulates monotonically across extractions
+
+**Intent:** Each vault-monitor extraction must add new nodes to the `user_vault` subgraph in the unified global graph without destroying nodes from prior extractions. Previously the agent called `graphify global add ... --as user_vault` after building a chunk graph from only the newly-changed files; `--as <tag>` replaces the entire repo-tag contribution, so every vault edit wiped all prior vault knowledge from the global graph (observed: 17 nodes -> 2 nodes after the agent ran on 2 newly-created stub `.md` files).
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+1. The vault-extract agent maintains a persistent vault graph at `/home/user/Vault/graphify-out/vault-graph.json`, loaded at the start of each pass and re-written at the end.
+2. Each extraction merges the new chunk's nodes/edges into the persistent graph using a hash-keyed union (existing IDs dedupe, new IDs append).
+3. The persistent vault graph is what `graphify global add ... --as user_vault` consumes, so the global graph's `user_vault` repo tag always reflects the cumulative vault content rather than only the most recent extraction.
+4. If the persistent vault graph file is missing or unreadable, the pass starts a fresh one (rather than crashing) and writes it at the end of the run.
+5. The merge step runs under `flock -w 5 /tmp/graphify-global.lock` so it serialises with capture-pipeline writes and active-repo hooks; the 5s timeout prevents indefinite block if the lock holder crashes, matching REQ-MEM-001 AC5.
+
+**Constraints:** None.
+
+**Priority:** P0
+**Dependencies:** REQ-MEM-001 (capture pipeline contract), REQ-VAULT-002 (vault is always-on in the global graph)
+**Verification:** Automated test (`host/__tests__/vault-extract-merge.test.js` patterns the prompt for load + merge + persist + flock; integration smoke via running the vault-extract agent twice in a row and confirming the global graph's user_vault node count grows monotonically).
 **Status:** Implemented

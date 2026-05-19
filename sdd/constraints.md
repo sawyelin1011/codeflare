@@ -14,7 +14,7 @@ Architectural and technology decisions that apply across all domains.
 | Storage | Cloudflare R2 | S3-compatible object storage, per-user buckets, SSE-C encryption |
 | Containers | Cloudflare Containers | Isolated compute per session, SDK-managed lifecycle |
 | State | Durable Objects | Per-session (`container`) and per-user (`timekeeper`) stateful coordination |
-| Sync | rclone bisync v1.73.2 | Bidirectional file sync between container and R2 every 60s |
+| Sync | rclone bisync v1.73.2 | Bidirectional file sync between container and R2 every 15 minutes, plus SIGUSR1-driven manual triggers and a final sync on shutdown |
 | Billing | Stripe | Payment processing, subscription management, webhook-driven tier changes |
 | Email | Resend | Transactional notifications (waitlist, access requests, tier changes) |
 | Build | Vite | Frontend bundler, SPA output served as static assets |
@@ -58,6 +58,7 @@ HSTS, CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions
 | Session ID validation | `/^[a-z0-9]{8,24}$/` enforced before any DO interaction |
 | Path traversal prevention | `decodeURIComponent` before `..` check; catches `%2E%2E` and double-encoded variants |
 | Supply chain | CodeQL, OSSF Scorecard, `npm audit`, dependency review, Dependabot, Trivy container scanning |
+| Deploy gate | `deploy.yml` `workflow_run` trigger requires `event == 'push'` and `head_repository.full_name == github.repository` so a fork PR cannot trigger a deploy by naming its head branch `main` (defeats Scorecard DangerousWorkflowID pwn-request pattern). |
 | Penetration testing | Weekly automated external pentest (auth gate, headers, TLS, injection, info disclosure) |
 | Secret scanning | GitHub secret scanning with push protection enabled |
 | Credential masking | `maskSecret()` shows only last 4 chars in all API responses |
@@ -68,8 +69,8 @@ HSTS, CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions
 Frontend polls session list every 5s (`SESSION_LIST_POLL_INTERVAL_MS`). Backend metrics push every 60s via Container DO alarm loop.
 **Applies To:** User (dashboard), System (metrics)
 
-### CON-PERF-002: Bisync interval 60 seconds
-R2 bisync runs every 60s via daemon plus a final sync on shutdown. Initial sync timeout 120s (`SYNC_TIMEOUT`). Baseline establishment timeout 600s (10 min).
+### CON-PERF-002: Bisync interval 15 minutes (with manual triggers)
+R2 bisync runs every 15 minutes via the daemon, plus one manual trigger (UI Sync-now button) that wakes the daemon via SIGUSR1, plus a final sync on shutdown under the 120 s watchdog. Initial sync timeout 120 s (`SYNC_TIMEOUT`). Baseline establishment timeout 600 s (10 min). See AD56 for the cost-vs-staleness rationale.
 **Applies To:** System (sync daemon)
 
 ### CON-PERF-003: Tier config cache TTL 60 seconds

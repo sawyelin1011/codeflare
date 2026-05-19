@@ -48,6 +48,10 @@ TRANSCRIPT="${TRANSCRIPT/#\~/$USER_HOME}"
 # `[^<]` filter already excludes them. No second-pass isMeta subtraction
 # needed; an earlier draft of this fix tried it with the wrong field
 # order and produced 0 anyway.
+# DO NOT drop the `|| CURRENT_COUNT=0` tail. `set -e` is active (line 5) and
+# `grep -c` exits 1 when the pattern has zero matches (legitimate on a fresh
+# transcript). Without the fallback the hook crashes silently inside Claude
+# Code with no user-visible error.
 CURRENT_COUNT=$(grep -c '"role":"user","content":"[^<]' "$TRANSCRIPT") || CURRENT_COUNT=0
 
 COUNTER_FILE="$COUNTER_DIR/${SESSION_ID}"
@@ -96,7 +100,7 @@ jq -n \
 printf '%s\n%s\n' "$CURRENT_COUNT" "$TOTAL_LINES" > "$COUNTER_FILE"
 
 # UserPromptSubmit: exit 0 with additionalContext (no blocking)
-CONTEXT="Check if ${VARS_FILE} exists. If it does, spawn a background haiku agent to read ${USER_HOME}/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md and ${VARS_FILE}, then execute. If the file does not exist, do nothing - capture was already completed."
+CONTEXT="Check if ${VARS_FILE} exists. If it does, spawn the **memory-capture** subagent (Task tool with subagent_type=\"memory-capture\") in the background. Pass PROMPT_FILE=${USER_HOME}/.claude/plugins/codeflare-memory/scripts/memory-agent-prompt.md and VARS_FILE=${VARS_FILE}; the subagent reads both and executes the contract documented in the prompt file. The subagent's frontmatter pins the model to sonnet (AD58); do not pass a model override. If the .vars file does not exist, do nothing - capture was already completed."
 
 # Append memory scan directive if set (first message)
 if [[ -n "$MEMORY_SCAN" ]]; then
