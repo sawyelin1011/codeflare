@@ -454,6 +454,115 @@ describe('container DO class', () => {
       expect(response.status).toBe(400);
     });
 
+    // REQ-MEM-001 AC3 / REQ-SESSION-016: the previous regression coverage
+    // exercised applyBucketName and applyPrefsOnRestart in isolation with
+    // userTimezone already in the input arg, which would stay green even if
+    // the handleSetBucketName destructure were reverted to the PR #390 bug
+    // shape (silently dropping userTimezone from the Worker JSON body).
+    // These two tests post to /_internal/setBucketName end-to-end and assert
+    // the env var actually surfaces, so removing the destructure makes them
+    // red.
+    it('setBucketName reads userTimezone from JSON body and emits USER_TIMEZONE env var', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return null;
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      const request = new Request('http://container/_internal/setBucketName', {
+        method: 'POST',
+        body: JSON.stringify({ bucketName: 'new-bucket', userTimezone: 'Europe/Zurich' }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const response = await instance.fetch(request);
+      expect(response.status).toBe(200);
+
+      expect(mockStorage.put).toHaveBeenCalledWith('userTimezone', 'Europe/Zurich');
+      expect(instance.envVars?.USER_TIMEZONE).toBe('Europe/Zurich');
+    });
+
+    it('setBucketName updates USER_TIMEZONE on restart (bucket already set, prefs change path)', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'existing-bucket';
+        if (key === 'userTimezone') return 'Europe/Zurich';
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      const request = new Request('http://container/_internal/setBucketName', {
+        method: 'POST',
+        body: JSON.stringify({ bucketName: 'existing-bucket', userTimezone: 'America/New_York' }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const response = await instance.fetch(request);
+      expect(response.status).toBe(409);
+
+      expect(mockStorage.put).toHaveBeenCalledWith('userTimezone', 'America/New_York');
+      expect(instance.envVars?.USER_TIMEZONE).toBe('America/New_York');
+    });
+
+    // REQ-MEM-001 AC3: malformed IANA shapes (path traversal, junk) must
+    // not reach storage or the env var. entrypoint.sh uses USER_TIMEZONE
+    // to build the /etc/localtime symlink target, so a value like
+    // '../../etc/shadow' would otherwise be an unbounded-path injection vector.
+    it('setBucketName rejects malformed userTimezone shape (first-time path)', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return null;
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      const request = new Request('http://container/_internal/setBucketName', {
+        method: 'POST',
+        body: JSON.stringify({ bucketName: 'new-bucket', userTimezone: '../../etc/shadow' }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      // 200 is intentional: malformed values are silently dropped per the
+      // sticky-once-set semantics in applyBucketName, not surfaced as a 400.
+      const response = await instance.fetch(request);
+      expect(response.status).toBe(200);
+
+      const putCalls = mockStorage.put.mock.calls.map((c: unknown[]) => c[0] as string);
+      expect(putCalls).not.toContain('userTimezone');
+      expect(instance.envVars?.USER_TIMEZONE).toBeUndefined();
+    });
+
+    // Mirror of the first-time-path test for the restart branch in
+    // applyPrefsOnRestart. A revert of normalizeIanaTz on the restart
+    // branch (container-env.ts applyPrefsOnRestart) would otherwise slip
+    // past CI because the only HTTP malformed-shape assertion lives on
+    // the first-time path.
+    it('setBucketName rejects malformed userTimezone shape (restart path, bucket already set)', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'existing-bucket';
+        if (key === 'userTimezone') return 'Europe/Zurich';
+        return null;
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+
+      const request = new Request('http://container/_internal/setBucketName', {
+        method: 'POST',
+        body: JSON.stringify({ bucketName: 'existing-bucket', userTimezone: '../../etc/shadow' }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      const response = await instance.fetch(request);
+      expect(response.status).toBe(409);
+
+      const putCalls = mockStorage.put.mock.calls
+        .filter((c: unknown[]) => c[0] === 'userTimezone')
+        .map((c: unknown[]) => c[1] as string);
+      expect(putCalls).not.toContain('../../etc/shadow');
+      expect(instance.envVars?.USER_TIMEZONE).toBe('Europe/Zurich');
+    });
+
     it('proxies unknown routes via super.fetch when container is running', async () => {
       mockContainerRuntime.running = true;
       mockStorage.get.mockImplementation(async (key: string) => {

@@ -731,6 +731,84 @@ describe('enforce-review-spawn.sh — MCP shell tool input shapes (issue #319)',
     assert.equal(r.status, 0);
     assert.match(r.stdout, /"decision"\s*:\s*"block"/);
   });
+
+  // REQ-AGENT-021 AC7: gh pr merge must be recognised as a PUSH_LINE
+  // trigger across all three tool surfaces. Server-side merges into
+  // develop advance the develop->main PR HEAD without producing a local
+  // git push line; without these matches the review pipeline silently
+  // fails to arm. Spec-reviewer flagged the missing coverage as MEDIUM
+  // because the named-incident behaviour was unverified by CI.
+  const bashGhMerge = (
+    ts = '2026-05-03T12:00:00.000Z',
+    command = 'gh pr merge 394 --merge',
+  ) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Bash',
+            input: { command },
+          },
+        ],
+      },
+      timestamp: ts,
+    });
+
+  it('blocks on Bash gh pr merge', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [bashGhMerge()]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'Bash gh pr merge must trigger PUSH_LINE detection');
+  });
+
+  it('blocks on ctx_execute(language=shell) with gh pr merge', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [
+      ctxExecPush('2026-05-03T12:00:00.000Z', 'gh pr merge 394 --merge'),
+    ]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'ctx_execute shell gh pr merge must trigger PUSH_LINE detection');
+  });
+
+  it('blocks on ctx_batch_execute with gh pr merge in commands array', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [
+      ctxBatchPush('2026-05-03T12:00:00.000Z', [
+        { label: 'merge', command: 'gh pr merge 394 --merge' },
+      ]),
+    ]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'ctx_batch_execute gh pr merge must trigger PUSH_LINE detection');
+  });
+
+  it('detects chained gh pr merge inside ctx_execute shell code', () => {
+    const cwd = makeFixture();
+    withSdd(cwd);
+    const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+    const t = writeTranscript(cwd, [
+      ctxExecPush(
+        '2026-05-03T12:00:00.000Z',
+        'git fetch origin && gh pr merge 394 --merge',
+      ),
+    ]);
+    const r = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+  });
 });
 
 describe('enforce-review-spawn.sh - SDD transition gate (REQ-AGENT-022)', () => {
@@ -1245,5 +1323,58 @@ describe('enforce-review-spawn.sh — lane gating (task #58)', () => {
     const ack = readFileSync(join(cwd, gcd, 'sdd-last-ack-pr-head'), 'utf-8').trim();
     assert.equal(ack, tip,
       'checkpoint must advance to current PR HEAD on docs-only pipeline completion');
+  });
+
+  // Regression guard for the HIGH-1 fail-safe direction fix shipped in
+  // commit d6b3c39. Before the fix the Stop hook did `. lib/lane-classifier.sh
+  // || exit 0`, so a partially-deployed install with a present gate hook
+  // but a missing helper would silently bypass enforcement entirely. After
+  // the fix REQUIRED_LANES is pre-seeded to the legacy all-three set and
+  // the `if . source; then ...; fi` block only overrides it on successful
+  // load. This test copies the hook to an isolated tmpdir whose lib/
+  // contains gh-pr-state.sh (the hook also needs that helper) but NOT
+  // lane-classifier.sh, then asserts the hook STILL blocks. Reverting the
+  // change to `|| exit 0` would make this test see an empty stdout.
+  it('fail-closed: missing lane-classifier.sh still blocks with all-three lanes', () => {
+    const { cwd, baseSha } = makeLaneFixture();
+    ackBase(cwd, baseSha);
+    const tip = advanceWith(cwd, () => {
+      // Diff is documentation-only - if the classifier loaded, it would
+      // return only `doc-updater`. With the classifier missing, the
+      // fail-closed fallback must demand all three lanes regardless.
+      writeFileSync(join(cwd, 'documentation/architecture.md'), 'changed\n');
+    });
+
+    const isolatedDir = mkdtempSync(join(tmpdir(), 'enforce-spawn-no-classifier-'));
+    const isolatedHook = join(isolatedDir, 'enforce-review-spawn.sh');
+    const isolatedLib = join(isolatedDir, 'lib');
+    mkdirSync(isolatedLib, { recursive: true });
+    writeFileSync(isolatedHook, readFileSync(HOOK, 'utf-8'));
+    chmodSync(isolatedHook, 0o755);
+    // gh-pr-state.sh is required by the hook for the gh round-trip;
+    // lane-classifier.sh is deliberately omitted to simulate a stale
+    // install where the classifier file failed to deploy.
+    const ghPrStateSrc = join(dirname(HOOK), 'lib/gh-pr-state.sh');
+    writeFileSync(join(isolatedLib, 'gh-pr-state.sh'), readFileSync(ghPrStateSrc, 'utf-8'));
+
+    const binDir = fakeGh(cwd, ghReturning('OPEN', tip, 'main'));
+    const t = writeTranscript(cwd, [PUSH_LINE()]);
+    const env = { ...process.env, PATH: `${binDir}:${process.env.PATH}` };
+    const r = spawnSync('bash', [isolatedHook], {
+      cwd,
+      input: JSON.stringify({ hook_event_name: 'Stop', transcript_path: t }),
+      encoding: 'utf-8',
+      env,
+    });
+
+    assert.equal(r.status, 0);
+    assert.match(r.stdout, /"decision"\s*:\s*"block"/,
+      'fail-closed: a missing lane-classifier.sh must still block, not silently exit 0');
+    assert.match(r.stdout, /code-reviewer/,
+      'fail-closed fallback must demand code-reviewer (all-three default)');
+    assert.match(r.stdout, /spec-reviewer/,
+      'fail-closed fallback must demand spec-reviewer');
+    assert.match(r.stdout, /doc-updater/,
+      'fail-closed fallback must demand doc-updater');
   });
 });

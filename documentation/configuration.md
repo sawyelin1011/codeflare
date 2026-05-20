@@ -43,8 +43,8 @@ Environment variables, secrets, CORS configuration, and API token permissions.
 | `R2_ACCOUNT_ID` / `R2_ENDPOINT` | rclone endpoint | Worker -> DO or `getR2Config()` fallback |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 compatibility | Mirrors R2 keys |
 | `TERMINAL_PORT` | Always 8080 | TBD | no | Hardcoded | TBD |
-| `SYNC_MODE` | Sync strategy (`none`, `full`, or `metadata`) | TBD | no | Worker -> DO | TBD |
-| `WORKSPACE_SYNC_ENABLED` | Whether workspace sync is enabled (`'true'`/`'false'`) | TBD | no | Worker via `setBucketName` | TBD |
+| `SYNC_MODE` | Sync strategy (`none`, `full`, or `metadata`). Derived from `workspaceSyncEnabled`: `false` -> `none`, `true` -> `full`. `metadata` is a legacy value not currently selectable from the UI. | `none` | no | Worker -> DO | [REQ-STOR-003](../sdd/storage.md#req-stor-003) |
+| `WORKSPACE_SYNC_ENABLED` | Whether workspace sync is enabled (`'true'`/`'false'`). User-toggleable in Settings; opt-in because syncing `~/workspace/` slows every bisync cycle. | `'false'` | no | Worker via `setBucketName` | [REQ-STOR-003](../sdd/storage.md#req-stor-003) |
 | `TAB_CONFIG` | JSON array of terminal tab configurations | TBD | no | Worker -> DO | TBD |
 | `TERMINAL_ID` | Unique ID for this terminal instance | TBD | no | Host terminal server | TBD |
 | `CONTAINER_AUTH_TOKEN` | Auth token for container API calls, scoped to one DO lifecycle. See [security.md](./security.md#container-auth-token-req-sec-012). | TBD | no | Worker -> DO | TBD |
@@ -57,7 +57,7 @@ Environment variables, secrets, CORS configuration, and API token permissions.
 | `NODE_COMPILE_CACHE` | V8 compile cache dir for faster Node.js CLI startup | TBD | no | Dockerfile ENV (`/root/.cache/node-compile-cache`) | TBD |
 | `BROWSER` | Points to `open-url` shim that exits 1 | TBD | no | Dockerfile ENV (`/usr/local/bin/open-url`) | TBD |
 | `SB_INDEX_PAGE` | Landing page when SilverBullet opens (case-sensitive page name, no `.md`). SB Go server defaults to `"index"` (lowercase); set to `Index` so the Codeflare dashboard loads on Vault button click. See [vault.md](./vault.md#silverbullet-editor-req-vault-005) (REQ-VAULT-005 AC9). | `Index` | no | `entrypoint.sh` `start_silverbullet_supervisor` | REQ-VAULT-005 |
-| `USER_TIMEZONE` | IANA timezone string (e.g. `Europe/Zurich`) forwarded from the `userTimezone` preference. Controls timestamps in memory-capture filenames (`Raw/Sessions/{ISO_TS}-{SID_SHORT}.md`). Falls back to `$TZ`, then `/etc/timezone`, then UTC when absent. | (absent = UTC fallback) | no | Worker -> DO via `setBucketName`; read by `entrypoint.sh` memory-capture pipeline | REQ-SESSION-016, REQ-MEM-001 AC9 |
+| `USER_TIMEZONE` | IANA timezone string (e.g. `Europe/Zurich`) forwarded from the `userTimezone` preference. Controls timestamps in memory-capture filenames (`Raw/Sessions/{ISO_TS}-{SID_SHORT}.md`). Falls back to `$TZ`, then `/etc/timezone`, then UTC when absent. Malformed values (non-IANA shape, path-traversal strings) are silently dropped at the DO boundary by `normalizeIanaTz`; the variable is not emitted and the UTC fallback applies, so an operator debugging an unexpected UTC timestamp should check the source `userTimezone` preference value against the IANA shape (`^[A-Za-z][A-Za-z0-9+_/-]{0,63}$`). The primary validation lives at `PATCH /api/preferences` (Zod refine + `Intl.DateTimeFormat` round-trip, returns `ValidationError` on failure); the DO check is defence-in-depth. | (absent = UTC fallback) | no | Worker -> DO via `setBucketName`; read by `entrypoint.sh` memory-capture pipeline | REQ-SESSION-016, REQ-MEM-001 AC3 / AC9 |
 
 ---
 
