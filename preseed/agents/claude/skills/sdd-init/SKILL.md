@@ -1,7 +1,7 @@
 ---
 name: sdd-init
-description: Workflow for /sdd init bootstrap. Covers greenfield (lean two-confirm flow), Import Mode (two-output: REQs + triage), Resume Mode (drain triage queue), the Phase 5 enrichment pass (graphify-backed cross-link / ADR-seed / glossary-seed), and dependency version resolution. Invoked when /sdd init runs. Requires the spec-driven-development skill for REQ format, Status semantics, and templates.
-version: 1.0.0
+description: Workflow for /sdd init bootstrap. Covers greenfield (lean two-confirm flow), Import Mode (two-output: REQs + triage), Resume Mode (drain triage queue), Phase 4 behavioral enumeration (deterministic source-surface walk that drives Phase 5d), Phase 5 enrichment pass (graphify-backed cross-link / ADR-seed / glossary-seed), Phase 7a source-anchor verification, Phase 7b enumeration-coverage verification, and dependency version resolution. Invoked when /sdd init runs. Requires the spec-driven-development skill for REQ format, Status semantics, and templates.
+version: 1.1.0
 ---
 
 # /sdd init — bootstrapping a project
@@ -19,7 +19,7 @@ Detect via source-file count (greenfield-vs-import) and presence of open triage 
 Compresses the old 10-15-turn back-and-forth into two decisions.
 
 1. **Ask for vision** (one free-form question if `$ARGUMENTS` is empty). Confirm what you heard in one sentence.
-2. **Draft the entire spec in memory** without further questions. Derive:
+2. **Draft the entire spec in memory** without further questions. In Import Mode, drafting MUST iterate over the Phase 4 behavioral-enumeration table (see § "Behavioral enumeration (Phase 4)" below): every enumerated item MUST resolve to exactly one of (a) a drafted AC carrying an `@impl` anchor, (b) a triage entry in `.init-triage.md` with Context + Recommendation, or (c) an explicit one-line entry in the domain README's "Out of Scope" section. In greenfield this constraint is trivially satisfied because the drafted REQs ARE the enumeration; see Phase 4 for the greenfield carve-out. Items silently dropped from the draft on Import Mode are detected by the Phase 7b verifier (step 8) and block commit. Derive:
    - Actors (typically 2-3; User, Admin defaults; never "System")
    - Design principles (3-7 specific to this product, not generic)
    - Domains (5-12 with one-line summary + priority)
@@ -41,7 +41,7 @@ Compresses the old 10-15-turn back-and-forth into two decisions.
    - Empty `tests/` directory
 
    **Emit only files in the canonical layout** (defined in `spec-driven-development` § "Spec structure"). Anything outside that layout — including `sdd/spec/README.md` or `documentation/lanes/README.md` — is a HIGH `layout-violation` caught by `doc-enforce-lanes` § Layout conformance on the next review. The single comprehensive index lives in `sdd/README.md` (Domains table linking to `spec/{file}.md`) and `documentation/README.md` (Jump-TOC linking to lanes + decisions).
-6. **Run Phase 6 — documentation lane emission and audit.** Conditional per-lane emission driven by source evidence (see § Phase 6 below). Emit each template VERBATIM — the `documentation-readme.md` template includes Jump-TOC, Lane ownership table, REQ backlinks section, Synonym glossary, Reading order, and Related links; abbreviated emission that strips any of those sections is a HIGH `scaffold-template-stripped` finding caught by step 7's iterate-to-clean (the audit verifies all template section headings are present in the emitted output). Outputs:
+6. **Run Phase 6 — documentation lane emission and audit.** Conditional per-lane emission driven by source evidence (see § Phase 6 below). Emit each template VERBATIM — the `documentation-readme.md` template includes Jump-TOC, Lane ownership table, REQ backlinks section, Synonym glossary, Reading order, and Related links; abbreviated emission that strips any of those sections is a HIGH `scaffold-template-stripped` finding caught by step 9's iterate-to-clean (the audit verifies all template section headings are present in the emitted output). Outputs:
    - `documentation-readme.md` → `documentation/README.md` (full template, all sections intact)
    - `documentation-architecture.md` → `documentation/lanes/architecture.md` (universal)
    - `documentation-api-reference.md` → `documentation/lanes/api-reference.md` (only when source has HTTP routes)
@@ -51,7 +51,7 @@ Compresses the old 10-15-turn back-and-forth into two decisions.
    - `documentation-decisions-readme.md` → `documentation/decisions/README.md` (founding ADRs from Phase 5c, each `Context:` carries `<!-- @impl: ... -->` anchor)
 7. **Phase 7a — Programmatic source-anchor verification (CRITICAL, evidence-gated, non-skippable).**
 
-   This step is the load-bearing Truth gate. It runs BEFORE the broader iterate-to-clean enforcement (step 8). Failures here BLOCK the commit. The agent does NOT "check by reading"; the agent RUNS the verifier and copies its output verbatim into the commit body.
+   This step is the load-bearing Truth gate. It runs BEFORE the Phase 7b enumeration gate (step 8) and the broader iterate-to-clean enforcement (step 9). Failures here BLOCK the commit. The agent does NOT "check by reading"; the agent RUNS the verifier and copies its output verbatim into the commit body.
 
    **Invocation:**
 
@@ -71,11 +71,11 @@ Compresses the old 10-15-turn back-and-forth into two decisions.
    - "The verifier path didn't exist on disk, so I skipped it" is **CRITICAL `phase-7a-tooling-bypass`**. The verifier ships inside this skill (`references/verify-source-anchors.py`); if the install path doesn't resolve, install or copy it before proceeding.
 
    **On `exit_code = 1`:**
-   - For each entry in `failures[]`, append a `.review-queue.md` (greenfield) or `.init-triage.md` (Import Mode) entry with Context = `failures[i].file:line :: failures[i].path::failures[i].symbol — failures[i].reason` and Recommendation = best-guess corrected anchor OR "abandon claim and re-derive from source".
+   - For each entry in `failures[]`, append an entry to the layout-appropriate triage file (nested: `sdd/spec/.review-queue.md` greenfield or `sdd/spec/.init-triage.md` Import Mode; flat-layout legacy: `sdd/.review-needed.md` greenfield or `sdd/.init-triage.md` Import Mode) with Context = `failures[i].file:line :: failures[i].path::failures[i].symbol — failures[i].reason` and Recommendation = best-guess corrected anchor OR "abandon claim and re-derive from source".
    - **BLOCK COMMIT** until every failure is either fixed (anchor edited or source corrected) OR escalated to triage with concrete Context + Recommendation.
    - Re-run the verifier after every fix. Commit proceeds only when `exit_code = 0` OR every remaining failure has a triage entry.
 
-   **Commit body inclusion (BINDING).** Step 9 commit body MUST contain a verbatim line:
+   **Commit body inclusion (BINDING).** The step-10 commit body MUST contain a verbatim line:
 
    ```
    Phase 7a verifier: parsed=N resolved=N orphaned=N drifted=N malformed=N unreadable=N exit_code=0|1
@@ -83,28 +83,70 @@ Compresses the old 10-15-turn back-and-forth into two decisions.
 
    The line is the cheap-to-verify proof Phase 7a ran. Absence is **CRITICAL `phase-7a-evidence-missing`** caught by the next PR-boundary review and by `spec-enforce` row 16 reading the most recent `[sdd-init]` commit body.
 
-8. **Iterate-to-clean (BINDING — non-skippable).** Broader validation against the freshly-written content, downstream of the Phase 7a anchor gate. Skipping is itself a HIGH `enforcement-skill-not-invoked` finding caught by the next PR-boundary review.
+8. **Phase 7b — Programmatic enumeration-coverage verification (CRITICAL, evidence-gated, non-skippable).**
+
+   This is the symmetric counterpart to Phase 7a. Phase 7a verifies that every claim the agent wrote is anchored; Phase 7b verifies that the agent did not silently drop entire source files from the enumeration. **Validation-Equals-Generation failure mode:** the cheap path is to use anchorability as the *generation* predicate — draft ACs only around symbols that grep cleanly, never produce the broader claim set Phase 5d expects as input, end up with a clean Phase 7a + an empty triage queue + a spec that elides every ambiguity. Phase 7b is the gate that detects this. Both gates must pass.
+
+   **Invocation:**
+
+   ```bash
+   python3 ~/.claude/skills/sdd-init/references/verify-enumeration-coverage.py \
+       --root . \
+       --json-out .phase-7b.json 2>&1
+   echo "exit=$?"
+   ```
+
+   The `2>&1` is load-bearing: the verifier prints the JSON report to stdout and the one-line summary (`Phase 7b enum verifier: enumerated=N ...`) to stderr; the agent MUST capture both so the summary line is visible to copy verbatim into the commit body.
+
+   The verifier walks the working tree, identifies "load-bearing source files" (under `services/`, `handlers/`, `controllers/`, `providers/`, `models/`, `domain/`, `core/`, `commands/`, `usecases/`, `workers/` — OR source-line-count ≥ 100), and checks each file's repo-relative path against (a) the `<path>` portion of every `<!-- @impl: <path>::<symbol> -->` anchor in `sdd/**/*.md` + `documentation/**/*.md`, AND (b) literal mentions in the triage queue (nested: `sdd/spec/.init-triage.md` + `sdd/spec/.review-queue.md`; flat-layout legacy: `sdd/.init-triage.md` + `sdd/.review-needed.md`). Output JSON: `{ enumerated, accounted, unaccounted, coverage_pct, accounted_via, unaccounted_entries, exit_code }`. **Exit code is the authoritative signal — 0 = clean, 1 = elision detected.**
+
+   **Per-project waiver mechanism.** `sdd/spec/.phase-7b-waiver.txt` (one repo-relative path per line, `#` comment lines allowed) excludes specific files from the coverage check. Intended for genuinely-no-behavioral-contract framework boilerplate (a `main.dart` that only wires the runtime; a `service_locator.dart` whose role is described entirely by other anchors that point AT it). Default: empty. Adding entries requires a one-line justification next to each path.
+
+   **Anti-substitution clauses (CRITICAL severity, symmetric with Phase 7a):**
+   - Agent self-attestation ("I covered the important files") without the verifier output in the commit body is itself **CRITICAL `phase-7b-self-attestation`**, caught by the next PR-boundary review.
+   - "spec-enforce / CQ-SOURCE will catch this" is wrong — spec-enforce reads what was written, not what wasn't. Phase 7b is the only mechanism that detects silently-dropped source files. Running spec-enforce first without Phase 7b is **CRITICAL `phase-7b-pipeline-inversion`**.
+   - Sampling ("I spot-checked the services") is not Phase 7b. The verifier walks 100% of qualifying files. **CRITICAL `phase-7b-incomplete-coverage`**.
+   - "Empty triage queue is the right outcome" is permitted ONLY when the verifier reports `coverage_pct = 100` AND the agent justifies the absence of ambiguity verbatim in `sdd/spec/changes.md`. Without both, empty triage on Import Mode is **CRITICAL `import-mode-narrowed-scope`** — the agent drafted from the cleanly-anchorable subset rather than enumerating exhaustively, producing a sanitized spec that hides every uncertainty from the user. See also the complementary § Phase 4 finding `import-mode-empty-triage-implausible`, which fires at enumeration-review time (item-count threshold) where this one fires at commit-gate time (coverage-percentage threshold); the two trigger conditions are intentionally different so both states are caught.
+   - "Phase 4 enumeration was skipped because Drafted-In-Memory" — drafting in memory does NOT exempt Phase 4. The enumeration table is the input to drafting, not a side artifact. Skipping is **CRITICAL `phase-4-enumeration-skipped`**.
+
+   **On `exit_code = 1`:**
+   - For each entry in `unaccounted_entries[]`, append an entry to the layout-appropriate triage file (nested: `sdd/spec/.init-triage.md`; flat-layout legacy: `sdd/.init-triage.md`) with Context = `entry.path (reason=entry.reason, line_count=entry.line_count) — never appeared in any drafted AC or ADR` and Recommendation = best-guess role / "drop as dead code if confirmed by user" / "fold into REQ-X-NNN if the file implements that AC".
+   - **BLOCK COMMIT** until every unaccounted file is either (i) drafted into an AC by re-running Phase 5d on the file, (ii) escalated to triage with concrete Context + Recommendation, or (iii) added to `sdd/spec/.phase-7b-waiver.txt` with a one-line justification.
+   - Re-run the verifier after every fix. Commit proceeds only when `exit_code = 0`.
+
+   **Commit body inclusion (BINDING).** The step-10 commit body MUST contain a verbatim line, paired with Phase 7a's:
+
+   ```
+   Phase 7b enum verifier: enumerated=N accounted=N unaccounted=N coverage_pct=P exit_code=0|1
+   ```
+
+   Absence is **CRITICAL `phase-7b-evidence-missing`** caught by the next PR-boundary review and by `spec-enforce` row 16 reading the most recent `[sdd-init]` commit body alongside the Phase 7a line.
+
+   **Phase 7b is advisory for greenfield.** A greenfield project has no source files to enumerate; `enumerated=0` and `coverage_pct=100.0` is the expected outcome. The verifier still runs (the commit body line is still required) so the audit-trail format stays uniform across modes.
+
+9. **Iterate-to-clean (BINDING — non-skippable).** Broader validation against the freshly-written content, downstream of the Phase 7a anchor gate AND the Phase 7b enumeration gate. Skipping is itself a HIGH `enforcement-skill-not-invoked` finding caught by the next PR-boundary review.
 
    **Anti-substitution rule.** A structural sanity check (file existence + REQ-ID uniqueness + template-field presence) is NOT iterate-to-clean. It is necessary but not sufficient. The "Execute Full Plan" user-memory directive is about not pausing between phases for confirmation — it is NOT authority to skip protocol-required enforcement passes. Conflating the two is itself a HIGH finding.
 
    **Required invocations (every /sdd init run, every mode):**
    1. **Invoke `spec-enforce` skill with `scope=all`.** Run the full 19-row execution manifest against `sdd/spec/`. CQ-SOURCE (row 16) consumes the Phase 7a verifier JSON output (`.verify-anchors.json`) rather than re-running anchor resolution; CQ-1/2/3 (row 17) runs independently. CQ-SOURCE is ALWAYS RUN — never gated by `enforce_tdd` or by transition state.
    2. **Invoke `doc-enforce` skill with `scope=all`.** Run the full 15-row execution manifest against `documentation/`. Pass 15 (doc source-anchor truth-check) ALSO consumes the Phase 7a verifier JSON (the verifier walks `documentation/**/*.md` too) rather than re-deriving; Pass 8/9/10/11 run independently. Pass 15 is ALWAYS RUN — never gated.
-   3. **Template-verbatim + layout audit (step-8 owned).** Walk each `references/templates/*.md` that was emitted; for each, extract the level-2 (`##`) section headings and verify every one appears in the emitted file. Missing heading = HIGH `scaffold-template-stripped` listing the template, the emitted path, and the missing section. Layout conformance (any file outside `spec-driven-development` § "Spec structure") is caught by `doc-enforce-lanes` § Layout conformance — no separate check needed here. Finally verify `sdd/README.md`'s Domains table lists every domain file actually present under `sdd/spec/*.md` (excluding glossary, constraints, changes, .review-queue, .init-triage, config); missing rows = HIGH `scaffold-domain-table-incomplete`.
+   3. **Template-verbatim + layout audit (step-9 owned).** Walk each `references/templates/*.md` that was emitted; for each, extract the level-2 (`##`) section headings and verify every one appears in the emitted file. Missing heading = HIGH `scaffold-template-stripped` listing the template, the emitted path, and the missing section. Layout conformance (any file outside `spec-driven-development` § "Spec structure") is caught by `doc-enforce-lanes` § Layout conformance — no separate check needed here. Finally verify `sdd/README.md`'s Domains table lists every domain file actually present under `sdd/spec/*.md` (excluding glossary, constraints, changes, .review-queue, .init-triage, config); missing rows = HIGH `scaffold-domain-table-incomplete`.
 
    **Mode-dependent action on findings:**
    - Mechanical findings (template field missing, lane violation pattern, REQ-backlink missing, shape inconsistency): auto-fix in `auto`/`unleashed`, prompt in `interactive`.
-   - Truth-check findings (CQ-SOURCE, Pass 15) — these are Phase 7a `failures[]` entries surfaced upstream; NEVER silently rewrite. Escalation to `sdd/spec/.review-queue.md` (or `.init-triage.md` during Import Mode) already happened in Phase 7a; step 8 verifies the triage entries are well-formed.
+   - Truth-check findings (CQ-SOURCE, Pass 15) — these are Phase 7a `failures[]` entries surfaced upstream; NEVER silently rewrite. Escalation to `sdd/spec/.review-queue.md` (or `.init-triage.md` during Import Mode) already happened in Phase 7a; step 9 verifies the triage entries are well-formed.
    - Block-emit at /sdd init time: HIGH non-Truth findings block the file write. Source-scan for plausible anchors, regenerate the section, attempt emit again. On second-pass failure, the section becomes a triage entry rather than committed prose. (Same rule as `doc-enforce-truth` § Block-emit at /sdd init time.)
 
    **Exit criteria:** zero CRITICAL/HIGH findings remain (either fixed or escalated to triage with concrete Context + Recommendation). Re-run both skills until findings stabilize (typically 1-2 cycles).
 
-   **Commit gate:** step 9 is FORBIDDEN until BOTH (a) Phase 7a `exit_code = 0` OR every failure escalated to triage, AND (b) step 8 enforcement skills have actually been invoked (not substituted with a structural check). The commit body MUST include:
+   **Commit gate:** step 10 is FORBIDDEN until ALL of (a) Phase 7a `exit_code = 0` OR every failure escalated to triage, (b) Phase 7b `exit_code = 0` OR every unaccounted file escalated to triage / waivered, AND (c) step 9 enforcement skills have actually been invoked (not substituted with a structural check). The commit body MUST include:
    - the Phase 7a verifier line (mandatory, see step 7 above)
+   - the Phase 7b verifier line (mandatory, see step 8 above)
    - `spec-enforce: ran (N REQs, M anchors verified, V drift, O orphaned) — auto-fixed F, escalated E`
    - the equivalent for `doc-enforce`
-9. **Commit the scaffold** as one commit with subject `[sdd-init] initial spec scaffold`. The `[sdd-init]` prefix is excluded from the spec-reviewer round counter. Commit body MUST include the Phase 7a verifier line AND the step-8 audit log per skill (see Commit gate above); absence is itself a HIGH `enforcement-skill-not-invoked` finding on the next PR-boundary review.
-10. **Report next steps** to the user.
+10. **Commit the scaffold** as one commit with subject `[sdd-init] initial spec scaffold`. The `[sdd-init]` prefix is excluded from the spec-reviewer round counter. Commit body MUST include the Phase 7a verifier line, the Phase 7b verifier line, AND the step-9 audit log per skill (see Commit gate above); absence is itself a HIGH `enforcement-skill-not-invoked` finding on the next PR-boundary review.
+11. **Report next steps** to the user.
 
 All templates live in the `spec-driven-development` skill's `references/templates/`, bundled with the agent seed and resolved locally.
 
@@ -169,6 +211,44 @@ Two surfaces — plain Bash and context-mode MCP. Every phase below MUST work on
 - **File writes always use Write/Edit** — both surfaces accept these natively. Never construct file contents inside `ctx_execute` shell heredocs.
 - **Scaffold-only lockfile carveout** (`npm install --package-lock-only --ignore-scripts --no-audit --no-fund` and equivalents) runs through `ctx_execute` in context-mode — output exceeds 20 lines. The `no-local-builds` rule permits this single resolution-only call at scaffold time.
 
+## Behavioral enumeration (Phase 4)
+
+> Section name uses "Phase 4" parenthetically rather than as a heading prefix so it does not collide with the numbered step "4" in the greenfield flow above (which runs Phase 5 enrichment). Phase numbers and step numbers are independent: the greenfield flow has 11 numbered steps; Phase numbers (4, 5, 6, 7a, 7b) name conceptual stages that may span multiple steps.
+
+**Binding for Import Mode, advisory for greenfield.**
+
+
+**The Validation-Equals-Generation failure mode.** The downstream source-evidence pass (Phase 5d) triages claims that cannot be anchored. The cheap path: the agent uses anchorability as the *generation* predicate — drafts ACs only around symbols it can grep cleanly, never produces the broader claim set Phase 5d expects as input, and ends up with an empty triage queue + a spec that looks clean but elides every ambiguity. The triage queue is supposed to be the *visible* surface of the agent's uncertainty; an empty queue on Import Mode is the surface lying. Phase 4 + Phase 7b together make this failure mode mechanically detectable.
+
+Phase 4 is the explicit enumeration step. The agent walks a deterministic source surface and produces the list of behaviors that MUST be accounted for. Drafting in step 2 then iterates over this list; Phase 5d resolves each item; Phase 7b verifies that every enumerated item was either drafted, triaged, or waivered.
+
+**Inputs (Import Mode — binding):**
+
+1. `mcp__graphify__god_nodes(top_n=50)` — top-N most-connected nodes (typically class / service / function names).
+2. Filesystem walk: every file under `(lib|src|app)/(services|providers|handlers|controllers|models|domain|core|commands|usecases|workers)/` matching the project's source extensions.
+3. Filesystem walk: every source file with ≥ 100 source lines (comments + blanks excluded), outside test / build / generated directories.
+4. `git log --grep='fix:\|incident\|bug:\|TODO' --pretty=%s` for the last 6 months — issues and bug fixes likely to encode load-bearing behavior.
+5. `grep -rE 'TODO|FIXME|HACK|XXX' lib src app` — inline known-unknowns the original author flagged but did not resolve.
+6. `gh pr list --state closed --limit 50` + `gh issue list --state all --limit 50` (when a GitHub remote is reachable) — closed PR / issue threads often encode the intent behind a decision the code itself does not record.
+
+**Output:** an in-memory enumeration table that the agent walks during step 2 drafting. Each entry has:
+
+- `source`: the file or thread the behavior originates from (e.g. `lib/services/foo_service.dart`, `PR #142`).
+- `brief`: a one-sentence behavioral statement.
+- `candidate_status`: one of `ac` (drafted into a REQ AC with `@impl` anchor), `triage` (filed in `.init-triage.md` with Context + Recommendation), `oos` (added to `sdd/README.md` § Out of Scope with a one-line justification).
+
+The agent persists the table to `.phase-4-enumeration.json` (working-tree intermediate, gitignored) so Phase 7b can cross-reference if needed; the source of truth for coverage remains the verifier's filesystem walk in step 8.
+
+**Candidate-status assignment rule:**
+
+- `ac`: the behavior has a clear behavioral predicate AND a plausible source anchor — will become a drafted AC.
+- `triage`: the behavior exists but has ambiguity (orphan code, undocumented magic number, missing intent, retry policy without rationale, two-of-something files with overlapping purpose, closed-but-not-merged PRs that hint at intent) — will become a triage entry. **The default for any item without a clear behavioral predicate is `triage`, not `oos`.**
+- `oos`: the behavior is genuinely out of scope — vestigial file the user later confirms is dead, an experimental branch left in source, a third-party adapter included for future use. Use sparingly; `oos` requires the agent to be confident it will not surprise the user.
+
+**Triage-queue plausibility (Import Mode only):** an empty `.init-triage.md` on a codebase with ≥ 10 enumerated items and no explicit `oos` waivers is **CRITICAL `import-mode-empty-triage-implausible`** (this fires at enumeration-review time, based on item count). The complementary Phase 7b clause `import-mode-narrowed-scope` (see step 8) fires independently at commit-gate time, based on coverage percentage rather than item count, so an empty triage on a codebase with 9 enumerated items still trips Phase 7b even when this clause does not. The Import Mode contract assumes ambiguity in legacy code; zero ambiguity is almost always evidence that the agent narrowed scope rather than enumerated exhaustively. Either every enumerated item has a clear behavioral predicate AND a verifiable source anchor (and the agent justifies this verbatim in the `sdd/spec/changes.md` import entry), or some items are in `triage`. The agent is allowed to surface "this codebase has no ambiguity worth triaging" only when it explicitly says so in changes.md.
+
+**Phase 4 is advisory for greenfield.** A greenfield project has no source to enumerate against; the drafted REQs ARE the enumeration. Greenfield skips the `.phase-4-enumeration.json` artifact emission. The Phase 7b verifier still runs (and trivially passes with `enumerated=0`, `coverage_pct=100.0`) so the audit-trail format stays uniform across modes.
+
 ## Enrichment pass (Phase 5 — binding for greenfield and Import Mode)
 
 **Pre-condition: a graphify graph at `graphify-out/graph.json` is the load-bearing source of truth for this phase.** Per REQ-AGENT-025, the post-clone PostToolUse hook prompts the user to build one immediately after `git clone`. If missing at `/sdd init` time, prompt the user ONCE: "No graphify graph found. Build one now via `/graphify cluster-only` (AST-only, free, ~30s)? Or proceed with in-memory enrichment (less reliable cross-link density)?". On accept: dispatch `/graphify cluster-only` and wait. On decline: fallback (below).
@@ -181,14 +261,14 @@ After the draft exists in memory, run four passes in one cycle before writing fi
 
 **c. Glossary-seed pass.** Query the graph for concept-tagged nodes (`mcp__graphify__query_graph` with concept filter; graphify emits these with `source_file: null` when they represent vocabulary). Each becomes a one-line glossary entry in `sdd/spec/glossary.md`. For nodes appearing under multiple labels in the graph (clustering identifies synonyms), record both in the synonym glossary slot of `documentation/README.md`.
 
-**d. Source-evidence pass (binding for Truth guarantee).** For every drafted AC bullet AND every founding ADR `Context:` block:
+**d. Source-evidence pass (binding for Truth guarantee).** Iterate over the Phase 4 behavioral-enumeration table (Import Mode) or the drafted-AC set (greenfield). Drafting in step 2 was supposed to fold every Phase 4 item into one of {AC, triage, oos}; this pass is the per-item resolution. For every item in `candidate_status=ac` AND every founding ADR `Context:` block:
 
 1. Identify the implementing symbol via the community/path map built during step 2 (or `mcp__graphify__query_graph` against the AC's named verb-phrase).
 2. Call `mcp__graphify__get_node(<symbol>)` to obtain the symbol's source file and node body. Fall back to `Grep` against the inferred path when graphify cannot resolve.
 3. For AC bullets asserting a concrete value (numbers, thresholds, retry counts, storage targets): grep the symbol body for the literal value pattern. On match: emit the AC with `<!-- @impl: <relative-path>::<symbol> = <value-pattern> -->`. On miss: the AC content becomes a triage entry rather than emitted as AC.
 4. For AC bullets asserting behaviour without a specific value: emit `<!-- @impl: <relative-path>::<symbol> -->`. The validator later confirms ≥3 AC-token overlap with the symbol body; the agent does its own overlap check now to avoid emitting an AC whose symbol body doesn't match.
 5. For ADR `Context:` blocks: emit `<!-- @impl: <relative-path>::<symbol> -->` naming the chosen-path implementation site. No site → ADR becomes triage entry.
-6. **Never fabricate.** When source evidence cannot be established for a claim, the claim becomes a triage entry (`sdd/spec/.review-queue.md` for greenfield, `sdd/spec/.init-triage.md` for Import Mode). The triage entry carries the agent's Context (what was searched, where, what was expected) and Recommendation (best guess, marked as such). The user resolves via interactive Q&A in Resume Mode.
+6. **Never fabricate, never silently narrow.** When source evidence cannot be established for a claim, the claim becomes a triage entry (`sdd/spec/.review-queue.md` for greenfield, `sdd/spec/.init-triage.md` for Import Mode). The triage entry carries the agent's Context (what was searched, where, what was expected) and Recommendation (best guess, marked as such). The user resolves via interactive Q&A in Resume Mode. Dropping a Phase 4 enumeration item from the draft without producing either a triage entry or an explicit Out-of-Scope line is the Validation-Equals-Generation failure mode (detected by Phase 7b — see step 8).
 
 The four passes run in one in-memory cycle. The user already accepted the full draft in step 3; enrichment does not re-prompt.
 
@@ -252,7 +332,7 @@ Domain with zero backlinks in any expected lane → emit MEDIUM finding to `sdd/
 
 ### Phase 7a + Iterate-to-clean against enforcement skills (binding)
 
-This section is the operational detail of greenfield-flow steps 7 (Phase 7a verifier) and 8 (iterate-to-clean). It is BINDING — every `/sdd init` run, every mode, every project. Skipping either is itself a finding: skipping Phase 7a = CRITICAL `phase-7a-*` (see step 7); skipping step 8 = HIGH `enforcement-skill-not-invoked`.
+This section is the operational detail of greenfield-flow steps 7 (Phase 7a verifier), 8 (Phase 7b enumeration-coverage verifier), and 9 (iterate-to-clean). It is BINDING — every `/sdd init` run, every mode, every project. Skipping any of them is itself a finding: skipping Phase 7a = CRITICAL `phase-7a-*` (see step 7); skipping Phase 7b = CRITICAL `phase-7b-*` (see step 8); skipping step 9 = HIGH `enforcement-skill-not-invoked`.
 
 **Anti-substitution rule (repeated for emphasis).** A structural sanity check (file existence + REQ-ID uniqueness + template-field presence) is necessary but NOT sufficient. The actual truth-check is the programmatic Phase 7a verifier — `references/verify-source-anchors.py` walks every `<!-- @impl: path::symbol -->` anchor and produces a machine-readable JSON report with `parsed`, `resolved`, `orphaned`, `drifted` counts. **The agent does not "verify by reading" or "spot-check the load-bearing anchors" — the agent runs the verifier and copies its output into the commit body.** Substituting a structural check or an agent self-attestation for the verifier output is itself a CRITICAL finding (`phase-7a-self-attestation` / `phase-7a-incomplete-coverage` / `phase-7a-pipeline-inversion` / `phase-7a-tooling-bypass` — see step 7 catalogue). The "Execute Full Plan" user-memory directive is about not pausing between phases for confirmation — it is NOT authority to drop the verifier or substitute it with reading.
 
@@ -279,12 +359,13 @@ This section is the operational detail of greenfield-flow steps 7 (Phase 7a veri
 
 **Exit criteria.** Zero CRITICAL/HIGH findings remain (every truth-check anchor either resolves OR escalates to triage with concrete Context + Recommendation). Re-run both skills until findings stabilize (typically 1-2 cycles).
 
-**Visible audit trail (binding).** Step 9 commit body MUST include three lines (in order):
+**Visible audit trail (binding).** The step-10 commit body MUST include four lines (in order):
 - `Phase 7a verifier: parsed=N resolved=N orphaned=N drifted=N malformed=N unreadable=N exit_code=0|1` (CRITICAL — see step 7)
+- `Phase 7b enum verifier: enumerated=N accounted=N unaccounted=N coverage_pct=P exit_code=0|1` (CRITICAL — see step 8)
 - `spec-enforce: ran (N REQs, M anchors verified, V drift, O orphaned) — auto-fixed F, escalated E`
 - `doc-enforce: ran (D docs, A anchors verified, V drift, O orphaned, U unanchored) — auto-fixed F, escalated E`
 
-Absence of any line is itself a finding on the next PR-boundary review (CRITICAL for the Phase 7a line, HIGH `enforcement-skill-not-invoked` for the other two). The lines are the cheap-to-verify proof that steps 7 and 8 actually ran rather than being substituted with reading or a structural check.
+Absence of any line is itself a finding on the next PR-boundary review (CRITICAL for the Phase 7a / Phase 7b lines, HIGH `enforcement-skill-not-invoked` for the other two). The lines are the cheap-to-verify proof that steps 7, 8, and 9 actually ran rather than being substituted with reading or a structural check.
 
 The iterate-to-clean loop is the depth-floor mechanism: every mandatory field that doc-enforce-shape Pass 5/6/7 demands either has a source-anchored value (real content) or becomes a triage entry (visible to the user as a question). The output cannot be vacuously thin AND structurally complete.
 
