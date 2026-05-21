@@ -14,6 +14,14 @@ This skill enforces the rules that police HOW canonical lane files are rendered:
 - `scope`: `all` | `diff`
 - `mode`: `interactive` | `auto` | `unleashed`
 - `files`: list of canonical lane files in diff (when scope=diff)
+- `layout`: `nested` | `flat` (auto-detected by parent `doc-enforce` via `test -d documentation/lanes`)
+
+**Layout-awareness.** Canonical lane file resolution is layout-aware:
+- Nested: `documentation/lanes/{architecture,api-reference*,configuration,deployment,security,observability,troubleshooting}.md`
+- Flat: `documentation/{architecture,api-reference*,configuration,deployment,security,observability,troubleshooting}.md`
+- ADR ledger: `documentation/decisions/README.md` in both layouts.
+
+Per-lane format templates and the binding endpoint template apply identically across layouts; only the file globs change.
 
 ## Output
 
@@ -186,6 +194,6 @@ Pass 7 validates the binding shape, not just field presence. A section with `**A
 
 ## Severity application
 
-All shape findings are MEDIUM. Cumulative findings on one file may push file-level total over the soft budget; that escalates via the spine's Pass 2.
+All shape findings are MEDIUM. (Pass 2 file-budget escalation removed; per-element caps in the spine's Pass 1 remain authoritative.)
 
 Mode-dependent action mirrors the spine.

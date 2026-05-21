@@ -14,6 +14,13 @@ This skill enforces the rules that police what content belongs in which `documen
 - `scope`: `all` | `diff`
 - `mode`: `interactive` | `auto` | `unleashed`
 - `files`: list of changed doc files in diff (when scope=diff)
+- `layout`: `nested` | `flat` (auto-detected by parent `doc-enforce`)
+
+**Layout-awareness.** Lane-violation auto-fix proposals resolve the target lane file path per the detected layout:
+- Nested: target lane = `documentation/lanes/{file}.md`
+- Flat: target lane = `documentation/{file}.md`
+
+The lane signatures (the WHAT) are layout-invariant; only the WHERE-it-goes path changes.
 
 ## Output
 
@@ -70,13 +77,13 @@ Detection: two `## Decision` headings in one file; phrases like "this was later 
 
 Fix: the original ADR is immutable. Write a new ADR `Supersedes: <original-adr>.md`. Mark the original `Status: Superseded by <new-adr>.md`. Never edit the original's decision or consequences sections.
 
-Severity: HIGH `dual-narrative-adr`. No mechanical auto-fix; the supersedure decision is JUDGMENT (the user decides which decision is the current one). Escalate to `documentation/.review-needed.md` with both narratives quoted.
+Severity: HIGH `dual-narrative-adr`. No mechanical auto-fix; the supersedure decision is JUDGMENT (the user decides which decision is the current one). Escalate to `documentation/.doc-coverage.md` with both narratives quoted.
 
 ## Severity application
 
 - Pass 3 implementation-prose with matching REQ: MEDIUM (auto-fix: rewrite to backlink).
 - Pass 3 implementation-prose with NO matching REQ: HIGH (spec gap; escalate, do not auto-rewrite).
-- Pass 4 lane violations: MEDIUM each; cumulative file may push file-budget over cap, which then escalates via Pass 2.
+- Pass 4 lane violations: MEDIUM each. (Pass 2 file-budget escalation removed; codeflare-scale projects intentionally exceed Zipline-scale page counts. Per-element caps in Pass 1 remain authoritative.)
 - Big-O jargon: MEDIUM.
 - Dual-narrative ADR: HIGH.
 
