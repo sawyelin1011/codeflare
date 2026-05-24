@@ -129,7 +129,17 @@
       "advanced"
     ]
   },
+  "plugins/codeflare-memory/scripts/memory-capture-block.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "plugins/codeflare-memory/scripts/prefilter-transcript.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-memory/scripts/assert-iso-ts.sh": {
     "modes": [
       "advanced"
     ]
@@ -145,6 +155,11 @@
     ]
   },
   "plugins/codeflare-vault/scripts/vault-monitor-hook.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/codeflare-vault/scripts/merge-vault-graph.py": {
     "modes": [
       "advanced"
     ]
@@ -203,6 +218,11 @@
     ]
   },
   "plugins/graphify/scripts/graphify-session-start.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "plugins/graphify/scripts/safe-graphify-update.sh": {
     "modes": [
       "advanced"
     ]
@@ -519,6 +539,11 @@
     ]
   },
   "skills/spec-driven-development/references/templates/documentation-readme.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/spec-driven-development/references/templates/req-shape-example.md": {
     "modes": [
       "advanced"
     ]

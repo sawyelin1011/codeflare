@@ -20,23 +20,15 @@ can query it via `mcp__graphify__*` tools.
 You will also derive:
 
 - `SESSION_ID`: the segment of `COUNTER_FILE` after the last `/`
-  (the file is `~/.memory/counter/{SESSION_ID}`)
+  (the file is `/tmp/.memory-counter/{SESSION_ID}`)
 - `SID_SHORT`: first 8 characters of `SESSION_ID`
-- `ISO_TS`: current local time formatted as `YYYY-MM-DDTHH-MM-SS%z`
-  (colons replaced with hyphens so the filename is safe on all
-  filesystems). Resolve the timezone in this order, picking the first
-  non-empty value:
-  1. `$USER_TIMEZONE` if exported on the container (Worker is expected
-     to forward the browser's `Intl.DateTimeFormat().resolvedOptions().timeZone`
-     at session start once that wiring lands).
-  2. `$TZ` if already set on the process (standard POSIX).
-  3. `/etc/timezone` if present (Debian/Ubuntu convention).
-  4. Fallback to `UTC`.
-  Then run: `TZ="$RESOLVED" date '+%Y-%m-%dT%H-%M-%S%z'`.
-  The host clock is typically UTC; capture files should record wall-
-  clock time the user actually experienced so SilverBullet timestamps
-  match. Never hardcode a specific zone -- codeflare is forkable and
-  users live everywhere.
+- `ISO_TS`: derived in **Step 1.5** below by the mandatory Bash block.
+  Do NOT construct this string yourself, do NOT reuse `TODAY` with a
+  suffix, do NOT guess a clock component. The exact bytes printed by
+  `date` in Step 1.5 are the only acceptable source for `ISO_TS`.
+  Past failures (issue #416) traced to the agent confabulating
+  `T00-00-00+0000`, `T12-00-00+0000`, or `T23-30-00+0000` instead of
+  executing `date`.
 - `WORK_DIR`: a temp dir at `/tmp/memory-capture-{SID_SHORT}`
 
 ## Steps
@@ -54,6 +46,46 @@ rm -f {VARS_FILE}
 ```
 
 The hook (`memory-capture.sh`) already advanced the counter at `{COUNTER_FILE}` before emitting this directive, so do not rewrite it here — a stale rewrite under concurrent 15-message batches would move the counter backwards and cause the next hook to over-count.
+
+### 1.5. Derive ISO_TS via Bash (MANDATORY - do not skip, do not improvise)
+
+This step exists because issue #416 caught the agent silently fabricating
+the timestamp string instead of running `date`. Run the helper script
+EXACTLY as written via the Bash tool. The captured stdout is the ONLY
+acceptable value for `ISO_TS` everywhere it appears in later steps
+(filename, frontmatter `captured_at`, anywhere else). Do not edit it,
+do not reformat it, do not regenerate it from `TODAY`.
+
+```bash
+bash /home/user/.claude/plugins/codeflare-memory/scripts/assert-iso-ts.sh
+```
+
+The script resolves the user's timezone from `$USER_TIMEZONE` -> `$TZ` ->
+`/etc/timezone` -> UTC, calls `date` once, then asserts that the result
+(a) ends with a four-digit `[+-]NNNN` offset, (b) the offset matches what
+`TZ="$RESOLVED" date '+%z'` produces (catches dropped-TZ-wrapper bugs
+like #416 without false-positiving legitimately-UTC hosts), and (c) the
+reconstructed epoch is within 30s of the wall clock (catches LLM
+fabrication, which typically drifts hours). Assertion failure exits
+non-zero with `ISO_TS_ASSERTION_FAILED: ...` on stderr.
+
+On success, stdout looks like:
+
+```
+ISO_TS=2026-05-23T22-11-09+0200
+RESOLVED_TZ=Europe/Zurich
+```
+
+Take everything after the `=` on the `ISO_TS=...` line as your `{ISO_TS}`
+value for the rest of this prompt. If the script errored (assertion
+failed), re-run it once verbatim; if it still errors, halt with a brief
+explanation rather than guessing a value.
+
+Rationale: the host clock is typically UTC, but capture files must
+record the wall-clock time the user actually experienced so SilverBullet
+timestamps match. Resolving via `$USER_TIMEZONE` (forwarded from the
+browser by the Worker) -> `$TZ` -> `/etc/timezone` -> `UTC` keeps
+codeflare forkable for users in any zone. Never hardcode a region.
 
 ### 2. Prefilter and chunk the transcript
 
@@ -125,7 +157,11 @@ Now Read `{WORK_DIR}/scratchpad.md` (which is your own per-chunk notes,
 small and dense) and produce the final capture file. The scratchpad is
 your working memory; the final note is the publishable artifact.
 
-Compute the target path:
+Compute the target path. `{ISO_TS}` here MUST be the exact string
+captured from step 1.5's Bash stdout. Do not regenerate it, do not
+substitute `{TODAY}T00-00-00+0000`, do not round to a half-hour. The
+filename and the `captured_at` frontmatter field below MUST contain
+identical bytes.
 
 ```bash
 TARGET=/home/user/Vault/Raw/Sessions/{ISO_TS}-{SID_SHORT}.md

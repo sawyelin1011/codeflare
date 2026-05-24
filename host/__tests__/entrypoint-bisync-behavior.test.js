@@ -61,6 +61,7 @@ function buildHarness({
   bisyncBehavior = 'success',
   recoveryReturns = 1, // default: no vanished-file recovery
   resyncBehavior = 'success',
+  blockReleaseFile, // for bisyncBehavior='block-until-released'
 }) {
   // Patch the daemon body: shrink cadence so tests finish in <2s.
   const patched = daemonBody
@@ -78,8 +79,10 @@ function buildHarness({
   // Stub bodies, indexed by behavior selector.
   const bisyncStub =
     bisyncBehavior === 'success'
-      ? `bisync_with_r2() {
-          echo "BISYNC_CALLED args=$*" >> "${logFile}"
+      ? `BISYNC_CALL_COUNT=0
+         bisync_with_r2() {
+          BISYNC_CALL_COUNT=$((BISYNC_CALL_COUNT + 1))
+          echo "BISYNC_CALLED n=$BISYNC_CALL_COUNT args=$*" >> "${logFile}"
           return 0
         }`
       : bisyncBehavior === 'failure'
@@ -87,13 +90,41 @@ function buildHarness({
             echo "BISYNC_CALLED args=$*" >> "${logFile}"
             return 7
           }`
-        : // recover-then-success: first call fails (vanished file), second succeeds
-          `BISYNC_CALL_COUNT=0
-           bisync_with_r2() {
-            BISYNC_CALL_COUNT=$((BISYNC_CALL_COUNT + 1))
-            echo "BISYNC_CALLED n=$BISYNC_CALL_COUNT args=$*" >> "${logFile}"
-            if [ $BISYNC_CALL_COUNT -eq 1 ]; then return 7; else return 0; fi
-          }`;
+        : bisyncBehavior === 'block-until-released'
+          ? // First call blocks on a sentinel file until the test
+            // writes it, so SIGUSR1 has time to land while
+            // BISYNC_IN_FLIGHT=1 (the RERUN_REQUESTED branch). All
+            // subsequent calls return immediately so the rerun cycle
+            // visibly completes.
+            `BISYNC_CALL_COUNT=0
+             bisync_with_r2() {
+              BISYNC_CALL_COUNT=$((BISYNC_CALL_COUNT + 1))
+              echo "BISYNC_CALLED n=$BISYNC_CALL_COUNT args=$*" >> "${logFile}"
+              if [ $BISYNC_CALL_COUNT -eq 1 ]; then
+                # Block until the test creates the release sentinel.
+                # Upper-bound the poll so a forgotten release file fails
+                # fast with a clear log line instead of hanging until the
+                # harness's outer timeout fires (code-reviewer flagged
+                # the unbounded poll as a flake/debug-time risk).
+                BISYNC_WAIT_COUNT=0
+                while [ ! -f "${blockReleaseFile}" ]; do
+                  sleep 0.05
+                  BISYNC_WAIT_COUNT=$((BISYNC_WAIT_COUNT + 1))
+                  if [ $BISYNC_WAIT_COUNT -gt 200 ]; then
+                    echo "BISYNC_RELEASE_TIMEOUT after ~10s waiting on ${blockReleaseFile}" >> "${logFile}"
+                    break
+                  fi
+                done
+              fi
+              return 0
+            }`
+          : // recover-then-success: first call fails (vanished file), second succeeds
+            `BISYNC_CALL_COUNT=0
+             bisync_with_r2() {
+              BISYNC_CALL_COUNT=$((BISYNC_CALL_COUNT + 1))
+              echo "BISYNC_CALLED n=$BISYNC_CALL_COUNT args=$*" >> "${logFile}"
+              if [ $BISYNC_CALL_COUNT -eq 1 ]; then return 7; else return 0; fi
+            }`;
 
   const resyncStub =
     resyncBehavior === 'success'
@@ -197,8 +228,12 @@ function killHarness(child, daemonPid) {
 
 const daemonBody = extractDaemonBody();
 
-describe('entrypoint.sh bisync daemon behavior (real)', () => {
-  it('runs bisync within one cadence tick of starting (REQ-STOR-003 AC1)', async () => {
+describe('entrypoint.sh bisync daemon behavior (real) / REQ-STOR-002 (file persistence) / REQ-STOR-004 (initial sync) / REQ-STOR-005 (graceful shutdown final sync) / REQ-SESSION-003 AC3 (entrypoint initial rclone sync) + AC4 (bisync daemon + SIGUSR1) / REQ-SESSION-011 (graceful shutdown with final sync) / REQ-VAULT-006 (shutdown bisync vault writes) / REQ-OPS-010 (graceful container shutdown) / REQ-MEM-004 (memory dirs in bisync filter)', () => {
+  // REQ-MEM-004 AC4: bisync fires on three triggers - cadence (this test),
+  // SIGUSR1 from Sync-now button (next test), and final shutdown bisync
+  // (REQ-STOR-005 / REQ-VAULT-006, covered in entrypoint-vault.audit.js).
+  it('runs bisync within one cadence tick of starting (REQ-STOR-003 AC1 / REQ-STOR-002 AC1 / REQ-MEM-004 AC4: cadence trigger)', async () => {
+    // REQ-STOR-003 AC1: periodic rclone bisync runs within the cadence window
     const h = spawnHarness({ daemonBody, bisyncBehavior: 'success' });
     const pid = await readDaemonPid(h.child);
     try {
@@ -212,7 +247,9 @@ describe('entrypoint.sh bisync daemon behavior (real)', () => {
     }
   });
 
-  it('SIGUSR1 interrupts the cadence sleep and triggers bisync immediately (REQ-STOR-015 AC5)', async () => {
+  // REQ-MEM-004 AC4: SIGUSR1 trigger (Sync-now button).
+  it('SIGUSR1 interrupts the cadence sleep and triggers bisync immediately (REQ-STOR-003 AC2 / REQ-STOR-015 AC5 / REQ-MEM-004 AC4: SIGUSR1 trigger)', async () => {
+    // REQ-STOR-003 AC2: sleep is interruptible by an external signal
     // Use sleep 10 in the patched daemon to make the test deterministic:
     // without SIGUSR1, bisync would not fire for 10s; with SIGUSR1, the
     // `wait $SYNC_SLEEP_PID` returns >128 within ~50ms.
@@ -227,6 +264,92 @@ describe('entrypoint.sh bisync daemon behavior (real)', () => {
       const log = await waitFor(h.logFile, (s) => /BISYNC_CALLED/.test(s), 3000);
       assert.match(log, /BISYNC_CALLED/,
         'SIGUSR1 must interrupt the 10s sleep and fire bisync within ~1s');
+    } finally {
+      killHarness(h.child, pid);
+    }
+  });
+
+  it('N SIGUSR1s arriving mid-flight coalesce into exactly one rerun (REQ-STOR-003 AC2 / REQ-STOR-015 AC5: in-flight coalesce branch)', async () => {
+    // REQ-STOR-003 AC2: signals delivered while a bisync is mid-flight coalesce into exactly one rerun
+    // The spec wording for AC5 is: "a SIGUSR1 sent to the bisync daemon
+    // while a bisync is already in flight causes exactly one rerun
+    // after the current cycle completes (N concurrent signals coalesce
+    // to one rerun, not N)." The sleep-interrupt test above only
+    // covers the BISYNC_REQUESTED=1 branch; this test covers the
+    // BISYNC_RERUN_REQUESTED=1 branch (entrypoint.sh:646 trap, with
+    // BISYNC_IN_FLIGHT=1 active).
+    //
+    // Mechanism: bisync_with_r2 blocks on a sentinel file the test
+    // controls. Daemon enters the in-flight state. Test fires 5
+    // SIGUSR1s while bisync is blocked. Test releases the block.
+    // The daemon must run EXACTLY ONE additional bisync (n=2), not 5.
+    const releaseFile = join(tmpdir(), `bisync-release-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const h = spawnHarness({
+      daemonBody,
+      bisyncBehavior: 'block-until-released',
+      blockReleaseFile: releaseFile,
+    });
+    const pid = await readDaemonPid(h.child);
+    try {
+      // Wait until the daemon enters the first bisync (now blocked).
+      await waitFor(h.logFile, (s) => /BISYNC_CALLED n=1/.test(s), 4000);
+      // Fire 5 SIGUSR1s mid-flight. BISYNC_IN_FLIGHT=1, so each trap
+      // call sets BISYNC_RERUN_REQUESTED=1 (idempotent — N signals
+      // collapse to one rerun, not N).
+      for (let i = 0; i < 5; i++) {
+        process.kill(pid, 'SIGUSR1');
+      }
+      // Release the in-flight bisync. The daemon now finishes cycle 1,
+      // sees BISYNC_RERUN_REQUESTED=1, runs ONE rerun (cycle 2), then
+      // continues to the next sleep.
+      writeFileSync(releaseFile, '');
+      // Wait for the rerun (n=2) to appear.
+      await waitFor(h.logFile, (s) => /BISYNC_CALLED n=2/.test(s), 5000);
+      // Sleep long enough to be sure no n=3 ever appears. With patched
+      // 1s cadence, 3 full cycles is the smallest window that catches a
+      // runaway rerun while staying within CI's per-test budget. Tuned up
+      // from 2s after code-reviewer flagged the original as flake-prone
+      // on the 1-vCPU CI runner.
+      await new Promise((r) => setTimeout(r, 3500));
+      const finalLog = readFileSync(h.logFile, 'utf8');
+      const matches = finalLog.match(/BISYNC_CALLED n=\d+/g) || [];
+      // Count distinct n=1, n=2 occurrences. The bisync stub increments
+      // its counter once per invocation, so n=3 appearing means 5
+      // SIGUSR1s produced 4 reruns instead of 1.
+      const ns = matches.map((m) => m.match(/n=(\d+)/)[1]);
+      assert.equal(ns.includes('1'), true, 'cycle 1 must be logged');
+      assert.equal(ns.includes('2'), true, 'cycle 2 (the rerun) must be logged');
+      assert.equal(ns.includes('3'), false,
+        `5 SIGUSR1s mid-flight must coalesce into exactly one rerun, not multiple. Saw ns=[${ns.join(',')}]`);
+    } finally {
+      // Make sure the daemon never hangs the test cleanup.
+      try { writeFileSync(releaseFile, ''); } catch { /* ignore */ }
+      killHarness(h.child, pid);
+    }
+  });
+
+  it('daemon retries after transient failure and continues the cycle (REQ-STOR-003 AC4)', async () => {
+    // REQ-STOR-003 AC4: the daemon retries on transient failure and continues the 15-minute cycle.
+    // A single failure (recover_vanished_files returns non-zero = nothing recovered) must NOT
+    // stop the daemon - it must increment CONSECUTIVE_FAILURES and loop to the next cadence sleep.
+    const h = spawnHarness({
+      daemonBody,
+      bisyncBehavior: 'failure',
+      recoveryReturns: 1, // nothing to recover -> CONSECUTIVE_FAILURES increments
+      resyncBehavior: 'success',
+    });
+    const pid = await readDaemonPid(h.child);
+    try {
+      // Wait for at least two BISYNC_CALLED entries to confirm the daemon
+      // looped rather than exiting after the first failure.
+      const log = await waitFor(h.logFile, (s) => (s.match(/BISYNC_CALLED args=/g) || []).length >= 2, 6000);
+      const callCount = (log.match(/BISYNC_CALLED args=/g) || []).length;
+      assert.ok(
+        callCount >= 2,
+        `daemon must continue the cycle after transient failure; got ${callCount} bisync call(s)`
+      );
+      // Status must have been updated to "failed" (not "success") on the failed cycle
+      assert.match(log, /STATUS status=failed/, 'failure path must call update_sync_status with "failed"');
     } finally {
       killHarness(h.child, pid);
     }
@@ -251,7 +374,8 @@ describe('entrypoint.sh bisync daemon behavior (real)', () => {
     }
   });
 
-  it('three consecutive failures trigger --resync fallback (REQ-STOR-003 AC6)', async () => {
+  it('three consecutive failures trigger --resync fallback (REQ-STOR-003 AC6 / REQ-STOR-002 AC1: resync re-establishes baseline so next sync can persist files)', async () => {
+    // REQ-STOR-003 AC6: after 3 consecutive unrecoverable failures, daemon falls back to --resync
     // bisync always fails (return 7), recover_vanished_files returns 1
     // (no recovery), so CONSECUTIVE_FAILURES accumulates and the resync
     // fallback fires on the third iteration.

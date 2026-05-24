@@ -20,6 +20,33 @@ echo "[entrypoint] pwd: $(pwd)"
 echo "[entrypoint] HOME: $HOME"
 echo "[entrypoint] node version: $(node --version)"
 
+# Ensure /dev/shm exists and is mounted as tmpfs.
+#
+# Python's multiprocessing.Lock (used by concurrent.futures.ProcessPoolExecutor
+# inside graphify's AST extractor, the memory-capture hook's chunker, and
+# the vault-extract subagent's writer) needs POSIX shared memory at
+# /dev/shm to allocate semaphores. Without it, even a 1-worker
+# ProcessPool fails at startup with `[Errno 2] No such file or directory`
+# from multiprocessing/synchronize.py:57 (SemLock.__init__ -> sem_open).
+#
+# On a cold Firecracker microVM boot, the rootfs ships without the
+# /dev/shm mountpoint directory; the kernel does carry the mount in its
+# table but userspace cannot reach it until a directory exists at the
+# expected path. Create the directory if missing, then mount tmpfs if
+# nothing is mounted there yet. Idempotent — re-runs on warm boots are
+# silent no-ops because mkdir -p and the mountpoint check both succeed.
+if [ ! -d /dev/shm ] || ! mountpoint -q /dev/shm 2>/dev/null; then
+    mkdir -p /dev/shm 2>/dev/null || true
+    if ! mountpoint -q /dev/shm 2>/dev/null; then
+        if mount -t tmpfs tmpfs /dev/shm 2>/dev/null; then
+            echo "[entrypoint] /dev/shm: mounted tmpfs (Python multiprocessing now functional)"
+        else
+            echo "[entrypoint] /dev/shm: mount failed - Python multiprocessing tools (graphify, memory-capture, vault-extract) will fail; aborting container boot" >&2
+            exit 1
+        fi
+    fi
+fi
+
 # Check R2 environment variables (configured/missing status only)
 echo "[entrypoint] === R2 ENV STATUS ===" | tee /tmp/sync.log
 echo "R2_BUCKET_NAME: ${R2_BUCKET_NAME:+configured}" | tee -a /tmp/sync.log
@@ -249,6 +276,13 @@ RCLONE_FILTERS_COMMON=(
     # Claude Code native installer artifacts (removed from build, but exclude leftover data)
     --filter "- .local/share/claude/**"      # native installer version binaries (228MB)
 
+    # uv tool venvs — regenerable; baked into the image at /root/.local/share/uv,
+    # so a user-side mirror under /home/user/.local/share/uv/ is duplicate cruft.
+    # graphifyy alone is ~275MB (Python venv with numpy + httpx + mcp + uvicorn).
+    --filter "- .local/share/uv/**"          # uv tool venvs (graphifyy: ~275MB)
+    --filter "- .local/bin/uv"               # uv binary itself (regenerable)
+    --filter "- .local/bin/uvx"              # uvx binary (regenerable)
+
     # Copilot — auto-update binary, session logs, and ephemeral state
     --filter "- .copilot/logs/**"            # session logs
     --filter "- .copilot/pkg/**"             # auto-update binary download (~35MB)
@@ -269,6 +303,13 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .claude/stats-cache.json"    # regenerated usage stats
     --filter "- .claude/mcp-*.json"            # MCP auth cache (transient, created/deleted in ms — causes bisync fatal error if listed then deleted before copy)
     --filter "- .claude.json.backup.*"       # auto-generated backups, accumulate endlessly
+
+    # Claude Code — context-mode plugin FTS5 store. `content/` is the
+    # indexed source-of-truth body (regenerable from scratch by re-indexing
+    # whatever the next session reads), `sessions/` is per-session SQLite
+    # DBs + WAL/SHM (ephemeral, corrupt on restore). 255MB+ on a working
+    # session; pure cache, no codeflare-managed state.
+    --filter "- .claude/context-mode/**"
 
     # Claude Code — subagent transcripts (results captured in main transcript, never re-read)
     --filter "- .claude/projects/**/subagents/**"
@@ -292,13 +333,10 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .codex/.tmp/**"              # plugin clones + sync temp files (17MB+, regenerated)
     --filter "- .codex/version.json"         # version check cache
 
-    # Memory capture - exclude all counter files (ephemeral per-session).
-    # ~/.memory/ as a whole survived the MCP-memory removal because the
-    # capture-hook gate (memory-capture.sh) still writes counter + .vars
-    # files there. No session-*.jsonl files are written any more; legacy
-    # ones from pre-vault sessions sit on R2 unread until the user
-    # deletes them.
-    --filter "- .memory/counter/**"
+    # Memory capture - counter files now live under /tmp/.memory-counter/
+    # (ephemeral by Cloudflare Containers contract; see REQ-MEM-002 AC6).
+    # /tmp is not synced in the first place, so no filter needed; the
+    # ~/.memory/ tree is no longer written to by the capture hook.
 
     # Perl CPAN cache — created by Perl module installs during build, regenerated
     --filter "- .cpan/**"
@@ -1494,11 +1532,9 @@ fi
 echo "[entrypoint] Claude Code bypass permissions consent pre-accepted"
 
 # Counter directory used by the memory-capture UserPromptSubmit hook
-# (the hook fires every N prompts to trigger vault capture; the MCP memory server
-# itself was removed — vault is now the persistent memory store).
-if [ -n "${SESSION_ID:-}" ]; then
-    mkdir -p "$USER_HOME/.memory/counter"
-fi
+# now lives at /tmp/.memory-counter/ (ephemeral by Cloudflare Containers
+# contract; see REQ-MEM-002 AC6). The hook script mkdir -p's it on first
+# fire - no boot-time provisioning needed.
 
 # Configure consult-llm-mcp MCP server when LLM API keys are present
 if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; then
@@ -1698,7 +1734,7 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     #     ctx_execute. Closes the silent-bypass discovered in ai-news-digest
     #     PR #247 and the matching bug-class flagged by issue #319 in the
     #     enforce-review-spawn Stop hook.
-    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_execute_file|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-vault/scripts/vault-monitor-hook.sh"}]}]}}'
+    SETTINGS_CONFIG='{"skipDangerousModePermissionPrompt":true,"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture-block.sh"}]},{"matcher":"Bash","hooks":[{"if":"Bash(git *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"if":"Bash(gh *)","type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-attributed-commits.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_execute_file|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/block-local-builds.sh"}]}],"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]},{"matcher":"mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/git-push-review-reminder.sh"}]}],"Stop":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-hooks/scripts/enforce-review-spawn.sh"}]}],"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-memory/scripts/memory-capture.sh"},{"type":"command","command":"bash '"$PLUGIN_DIR"'/codeflare-vault/scripts/vault-monitor-hook.sh"}]}]}}'
     # context-mode hooks (Custom tier only, gated on plugin manifest presence).
     # Implements REQ-AGENT-005. Same four hooks the upstream context-mode
     # plugin would self-register via hooks.json — we wire them through

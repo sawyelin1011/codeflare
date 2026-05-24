@@ -28,7 +28,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD15](#ad15-tabconfigschema-allows-arbitrary-command-strings) | TabConfigSchema allows arbitrary command strings | UI/Frontend |
 | [AD16](#ad16-entrypointsh-1090-lines-complexity) | entrypoint.sh ~1090 lines complexity | Architecture |
 | [AD17](#ad17-merged-into-ad6) | _merged into AD6 — `collectMetrics` atomicity_ | Architecture |
-| [AD18](#ad18-vendored-creative-webgl-code-uses-untyped-patterns) | Vendored creative/WebGL code uses untyped patterns | UI/Frontend |
+| [AD18](#ad18-vendored-creativewebgl-code-uses-untyped-patterns) | Vendored creative/WebGL code uses untyped patterns | UI/Frontend |
 | [AD19](#ad19-merged-into-ad18) | _merged into AD18 — splash-cursor-logic.ts `as any` casts_ | UI/Frontend |
 | [AD20](#ad20-toctou-in-containerlifecyclets) | TOCTOU in container/lifecycle.ts | Architecture |
 | [AD21](#ad21-inconsistent-function-signatures) | Inconsistent function signatures | Architecture |
@@ -47,7 +47,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD34](#ad34-websocket-auth-bypass-of-hono-middleware) | WebSocket auth bypass of Hono middleware | Security |
 | [AD35](#ad35-merged-into-ad18) | _merged into AD18 — splash-cursor-logic.ts old-style constructor_ | UI/Frontend |
 | [AD36](#ad36-websocket-origin-check-is-optional-for-non-browser-clients) | WebSocket Origin check is optional for non-browser clients | Security |
-| [AD37](#ad37-kv-as-billing-read-cache--signal-and-sync-cf-015) | KV as billing read cache -- Signal and Sync (CF-015) | Billing |
+| [AD37](#ad37-kv-as-billing-read-cache----signal-and-sync-cf-015) | KV as billing read cache -- Signal and Sync (CF-015) | Billing |
 | [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) | GitHub OIDC replaces CF Access in SaaS mode | Billing |
 | [AD39](#ad39-max-users-capacity-cap-counts-paid-slots-only) | Max users capacity cap counts paid slots only | Billing |
 | [AD40](#ad40-webhook-route-order-publicstripe-before-public) | Webhook route order (`/public/stripe` before `/public`) | Billing |
@@ -146,7 +146,7 @@ Root needed for rclone mount. Container auth token (random UUID per DO lifecycle
 
 ### AD9: RESSOURCE_TIER spelling
 
-**Status:** Reclassified on 2026-05-09. Naming/spelling preserved for backward compatibility is not an architectural decision; documentation lives at [configuration.md "Container Specs"](../configuration.md#container-specs) with a do-not-rename note. Inbound `AD9` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Reclassified on 2026-05-09. Naming/spelling preserved for backward compatibility is not an architectural decision; documentation lives at [configuration.md "Container Specs"](../lanes/configuration.md#container-specs) with a do-not-rename note. Inbound `AD9` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
@@ -260,7 +260,7 @@ Handles Alpine->Debian migration, PTY pre-warm, rclone sync orchestration, tab a
 
 ### AD19: Merged into AD18
 
-**Status:** Merged into [AD18](#ad18-vendored-creative-webgl-code-uses-untyped-patterns) on 2026-05-03. The `splash-cursor-logic.ts` `as any` rationale is now part of the consolidated vendored-creative-code ADR. Inbound `AD19` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Merged into [AD18](#ad18-vendored-creativewebgl-code-uses-untyped-patterns) on 2026-05-03. The `splash-cursor-logic.ts` `as any` rationale is now part of the consolidated vendored-creative-code ADR. Inbound `AD19` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
@@ -290,19 +290,19 @@ The 30-second JWKS cache in `jwt.ts` means a rotated key might not be recognized
 
 ### AD23: CORS origin pattern validation
 
-**Status:** Reclassified on 2026-05-09. Static-analyzer false positive accepted with admin-trust rationale; documented inline at `src/lib/cors-cache.ts` (the `isAllowedOrigin` docstring) and summarized in [security.md "Static-Analyzer False Positives"](../security.md#static-analyzer-false-positives). Inbound `AD23` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Reclassified on 2026-05-09. Static-analyzer false positive accepted with admin-trust rationale; documented inline at `src/lib/cors-cache.ts` (the `isAllowedOrigin` docstring) and summarized in [security.md "Static-Analyzer False Positives"](../lanes/security.md#static-analyzer-false-positives). Inbound `AD23` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
 ### AD24: Predictable session IDs
 
-**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (analyzer treats session IDs as auth tokens, but they are KV namespace keys; JWT is the auth gate); documented inline at `src/lib/constants.ts:6` and summarized in [security.md "Session ID Validation"](../security.md#session-id-validation). Inbound `AD24` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (analyzer treats session IDs as auth tokens, but they are KV namespace keys; JWT is the auth gate); documented inline at `src/lib/constants.ts:6` and summarized in [security.md "Session ID Validation"](../lanes/security.md#session-id-validation). Inbound `AD24` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
 ### AD25: E2E service email hardcoded
 
-**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (test fixture flagged as hardcoded credential); documented inline at `src/lib/access.ts:166` and summarized in [security.md "Static-Analyzer False Positives"](../security.md#static-analyzer-false-positives). Inbound `AD25` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (test fixture flagged as hardcoded credential); documented inline at `src/lib/access.ts:166` and summarized in [security.md "Static-Analyzer False Positives"](../lanes/security.md#static-analyzer-false-positives). Inbound `AD25` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
@@ -348,7 +348,7 @@ Worker name derived from Host header for `.workers.dev` subdomains during first-
 
 ### AD31: Root container is intentional
 
-**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (missing `USER` directive flagged as privilege issue) accepted with network-isolation rationale; documented inline in `Dockerfile` (search `SAST-false-positive`) and summarized in [security.md "Static-Analyzer False Positives"](../security.md#static-analyzer-false-positives). Inbound `AD31` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Reclassified on 2026-05-09. Static-analyzer false positive (missing `USER` directive flagged as privilege issue) accepted with network-isolation rationale; documented inline in `Dockerfile` (search `SAST-false-positive`) and summarized in [security.md "Static-Analyzer False Positives"](../lanes/security.md#static-analyzer-false-positives). Inbound `AD31` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
@@ -376,7 +376,7 @@ WebSocket upgrades must be intercepted before the Hono middleware chain (documen
 
 ### AD35: Merged into AD18
 
-**Status:** Merged into [AD18](#ad18-vendored-creative-webgl-code-uses-untyped-patterns) on 2026-05-03. The old-style-constructor `this: any` rationale is now part of the consolidated vendored-creative-code ADR. Inbound `AD35` references in the codebase remain valid; this entry preserves the anchor.
+**Status:** Merged into [AD18](#ad18-vendored-creativewebgl-code-uses-untyped-patterns) on 2026-05-03. The old-style-constructor `this: any` rationale is now part of the consolidated vendored-creative-code ADR. Inbound `AD35` references in the codebase remain valid; this entry preserves the anchor.
 
 ---
 
@@ -780,7 +780,7 @@ A future contributor who adds a SessionStart-style ctx_* nudge, a context-mode s
 - Worker-side tier gate: `src/routes/container/lifecycle.ts` (`contextModeEnabled = effectiveTier === 'unlimited' && sessionMode === 'advanced'`)
 - Worker-side reconcile call sites: `src/routes/preferences.ts`, `src/routes/storage/seed.ts`, `src/routes/stripe-webhook.ts`
 - Container-side detection: `entrypoint.sh` (`CONTEXT_MODE_MANIFEST` existence check; conditional `mcpServers["context-mode"]` jq merge; conditional `enabledPlugins["context-mode"]: true`)
-- Tests: `src/__tests__/lib/r2-seed-context-mode.test.ts`, `host/__tests__/entrypoint-context-mode.test.js`
+- Tests: `src/__tests__/lib/r2-seed-context-mode.test.ts`, `host/__tests__/entrypoint-context-mode.test.js`, `host/__tests__/context-mode-version-pin.test.js`
 
 ### AD50: Unified ADR file with structural doc-allow-large exemption
 
@@ -891,7 +891,7 @@ Tier-gating is not part of the decision: graphify ships uniformly across standar
 
 **Decision:** The vault directory is renamed to `/home/user/Vault/` (non-hidden basename). All references in entrypoint.sh, bisync filters, preseed scripts, agent rules, Worker route, audits, and tests are updated in the same commit. The internal identifier `init_user_vault()` and the `--as user_vault` global-graph tag are preserved (no manifest migration needed). R2 is a clean cutover for the single existing user; prior `.user_vault/` content in R2 is abandoned rather than migrated.
 
-**Constraint (permanent):** The vault directory must never be renamed to a dot-prefixed basename. Any future relocation of the vault must preserve a non-hidden basename or the SilverBullet disk walker will silently return an empty file list. This constraint is documented in `documentation/vault.md#directory-layout` and enforced by the `host/__audits__/entrypoint-vault.audit.js` structural audit (checks that the supervisor command references `$HOME/Vault`, not `$HOME/.user_vault` or any other hidden path).
+**Constraint (permanent):** The vault directory must never be renamed to a dot-prefixed basename. Any future relocation of the vault must preserve a non-hidden basename or the SilverBullet disk walker will silently return an empty file list. This constraint is documented in `documentation/lanes/vault.md#directory-layout` and enforced by the `host/__audits__/entrypoint-vault.audit.js` structural audit (checks that the supervisor command references `$HOME/Vault`, not `$HOME/.user_vault` or any other hidden path).
 
 **Consequences:**
 - SilverBullet correctly walks and indexes all vault files after rename.
@@ -922,8 +922,8 @@ The initial implementation defined only `--cf-*`-namespaced custom properties on
 - The vault editor reflects codeflare branding consistently across users and sessions; switching between codeflare UI and SilverBullet feels native rather than grafted.
 - Users who want custom styling cannot achieve it without forking the project or opening a PR to `preseed/silverbullet/STYLES.md`. This is the explicit trade-off: brand consistency over per-user theming.
 - Preseed theme updates propagate to all users on next session boot with no per-user migration.
-- The always-overwrite contract is documented in `documentation/vault.md` (three-tier durability) and in the in-vault `README.md` so users discover the constraint before hand-editing.
-- The variable-namespace lesson is preserved in-source as a header comment in `STYLES.md` so future maintainers do not regress to a `--cf-*`-only theme; visual-regression smoke is documented in `documentation/vault.md` First-session Expectations (zinc base, blue accent, Inter body, JetBrains Mono code).
+- The always-overwrite contract is documented in `documentation/lanes/vault.md` (three-tier durability) and in the in-vault `README.md` so users discover the constraint before hand-editing.
+- The variable-namespace lesson is preserved in-source as a header comment in `STYLES.md` so future maintainers do not regress to a `--cf-*`-only theme; visual-regression smoke is documented in `documentation/lanes/vault.md` First-session Expectations (zinc base, blue accent, Inter body, JetBrains Mono code).
 
 **Alternative considered:** Ship `STYLES.md` as recreate-if-missing only, preserving user edits. Rejected: the same user who deletes `index.md` or `CONFIG.md` and expects automatic recovery (the always-overwrite contract for those files) would not expect `STYLES.md` to behave differently. Mixing tiers within the same set of preseed pages was deemed more confusing than the cost of disallowing in-place theme edits.
 
@@ -1077,9 +1077,9 @@ Three smaller decisions bundled in:
 
 ## Related Documentation
 
-- [Architecture — System Components](../architecture.md#system-components) - Component overview
-- [Architecture — Design Rationale](../architecture.md#design-rationale) - Architectural principles
-- [Security — Authentication Gate](../security.md#authentication-gate) - Security model
-- [Authentication — Auth Modes](../authentication.md#authentication-modes) - CF Access vs Direct GitHub OAuth
-- [Mobile — Scroll Stability](../mobile.md#scroll-stability) - Mobile terminal design decisions
-- [Vault — Directory Layout](../vault.md#directory-layout) - Vault path, hidden-root constraint, special folders
+- [Architecture — System Components](../lanes/architecture.md#system-components) - Component overview
+- [Architecture — Design Rationale](../lanes/architecture.md#design-rationale) - Architectural principles
+- [Security — Authentication Gate](../lanes/security.md#authentication-gate) - Security model
+- [Authentication — Auth Modes](../lanes/authentication.md#authentication-modes) - CF Access vs Direct GitHub OAuth
+- [Mobile — Scroll Stability](../lanes/mobile.md#scroll-stability) - Mobile terminal design decisions
+- [Vault — Directory Layout](../lanes/vault.md#directory-layout) - Vault path, hidden-root constraint, special folders

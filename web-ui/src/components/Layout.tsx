@@ -13,6 +13,7 @@ import { logger } from '../lib/logger';
 import { loadSettings, applyAccentColor } from '../lib/settings';
 import type { TileLayout, AgentType, TabConfig } from '../types';
 import { VIEW_TRANSITION_DURATION_MS, DASHBOARD_WS_DISCONNECT_DELAY_MS } from '../lib/constants';
+import { startVaultReadinessProbe } from '../lib/vault-readiness';
 
 type ViewState = 'dashboard' | 'expanding' | 'terminal' | 'collapsing';
 
@@ -52,21 +53,14 @@ const Layout: Component<LayoutProps> = (props) => {
   // network error) means "not yet". The `.fs/*` API path returns 405 on
   // HEAD so we probe root instead. Keyed per session so a switch resets it.
   //
-  // Lifecycle: warm-up phase probes every 3s up to WARMUP_MAX_ATTEMPTS
-  // (~3 min total) to catch the cold-boot race; after first success we
-  // switch to a 60s slow-cadence re-probe to catch SB crashing mid-session
-  // (container still "running", but proxy now returns 502). A failed
-  // re-probe clears the latch so the button disables itself.
-  const WARMUP_INTERVAL_MS = 3000;
-  const WARMUP_MAX_ATTEMPTS = 60; // 3 min ceiling, then user must restart
+  // Lifecycle: warm-up probes every WARMUP_INTERVAL_MS forever until the
+  // first success (REQ-VAULT-012 AC5). After first success we switch to a
+  // steady re-probe to catch SB crashing mid-session (container still
+  // "running", proxy returns 502); a failed re-probe clears the latch so
+  // the button disables itself and the warmup chain restarts.
+  const WARMUP_INTERVAL_MS = 5000;
   const STEADY_INTERVAL_MS = 60000; // post-ready slow re-probe cadence
   const [vaultReadyBySession, setVaultReadyBySession] = createSignal<Record<string, boolean>>({});
-  // Attempts persisted per session across effect re-runs. The effect tracks
-  // sessionStore.sessions[*].status, which can re-fire while the warmup loop
-  // is in flight (status polling produces new array refs); a per-effect-run
-  // counter would reset each time and the WARMUP_MAX_ATTEMPTS cap would
-  // never be reached. Persisting here makes the cap session-lifetime-bound.
-  const attemptsBySession: Record<string, number> = {};
   // Memoize the running-flag so the effect only re-runs when running-ness
   // actually flips, not on every metrics/ptyActive churn from session
   // polling. Without this the probe chain restarts on every status tick.
@@ -82,79 +76,43 @@ const Layout: Component<LayoutProps> = (props) => {
       // No active running session: drop any latch for the previously active
       // sid so a restart under the same id re-probes from scratch.
       const prevSid = untrack(() => sessionStore.activeSessionId);
-      if (prevSid) {
-        delete attemptsBySession[prevSid];
-        if (untrack(vaultReadyBySession)[prevSid]) {
-          setVaultReadyBySession((prev) => {
-            const next = { ...prev };
-            delete next[prevSid];
-            return next;
-          });
-        }
+      if (prevSid && untrack(vaultReadyBySession)[prevSid]) {
+        setVaultReadyBySession((prev) => {
+          const next = { ...prev };
+          delete next[prevSid];
+          return next;
+        });
       }
       return;
     }
 
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const probeOnce = async (): Promise<boolean> => {
-      try {
-        const res = await fetch(`/api/vault/${sid}/`, {
-          method: 'HEAD',
-          cache: 'no-store',
-          signal: AbortSignal.timeout(5000),
-        });
-        return res.ok;
-      } catch {
-        return false;
-      }
-    };
-    const warmup = async () => {
-      if (cancelled) return;
-      attemptsBySession[sid] = (attemptsBySession[sid] ?? 0) + 1;
-      const ok = await probeOnce();
-      if (cancelled) return;
-      if (ok) {
-        attemptsBySession[sid] = 0; // success resets the budget
-        setVaultReadyBySession((prev) => ({ ...prev, [sid]: true }));
-        timer = setTimeout(steady, STEADY_INTERVAL_MS);
-        return;
-      }
-      if (attemptsBySession[sid] >= WARMUP_MAX_ATTEMPTS) return; // give up
-      timer = setTimeout(warmup, WARMUP_INTERVAL_MS);
-    };
-    const steady = async () => {
-      if (cancelled) return;
-      const ok = await probeOnce();
-      if (cancelled) return;
-      if (!ok) {
-        // SB likely crashed mid-session. Clear the latch (button disables
-        // itself) and restart the warmup chain in-place. Reading the latch
-        // via untrack prevents this write from re-running the effect, so
-        // there is exactly one warmup chain at any time.
-        setVaultReadyBySession((prev) => {
-          const next = { ...prev };
-          delete next[sid];
-          return next;
-        });
-        attemptsBySession[sid] = 0;
-        timer = setTimeout(warmup, WARMUP_INTERVAL_MS);
-        return;
-      }
-      timer = setTimeout(steady, STEADY_INTERVAL_MS);
-    };
-    // `untrack` so the latch read does not subscribe the effect to its own
+    // `untrack` so the latch reads do not subscribe the effect to its own
     // writes (steady() clears the latch on crash; tracking would spawn a
     // parallel warmup chain via effect re-run).
-    if (untrack(vaultReadyBySession)[sid]) {
-      timer = setTimeout(steady, STEADY_INTERVAL_MS);
-    } else {
-      warmup();
-    }
-    onCleanup(() => {
-      cancelled = true;
-      if (timer !== null) clearTimeout(timer);
+    const cancel = startVaultReadinessProbe({
+      probe: async () => {
+        try {
+          const res = await fetch(`/api/vault/${sid}/`, {
+            method: 'HEAD',
+            cache: 'no-store',
+            signal: AbortSignal.timeout(5000),
+          });
+          return res.ok;
+        } catch {
+          return false;
+        }
+      },
+      setLatch: () => setVaultReadyBySession((prev) => ({ ...prev, [sid]: true })),
+      clearLatch: () => setVaultReadyBySession((prev) => {
+        const next = { ...prev };
+        delete next[sid];
+        return next;
+      }),
+      initiallyReady: () => untrack(vaultReadyBySession)[sid] === true,
+      warmupIntervalMs: WARMUP_INTERVAL_MS,
+      steadyIntervalMs: STEADY_INTERVAL_MS,
     });
+    onCleanup(cancel);
   });
   const vaultReady = createMemo(() => {
     const sid = sessionStore.activeSessionId;

@@ -69,6 +69,12 @@ Codeflare is built for Cloudflare. Not adapted, not ported - built on it, for it
 - Configurable auto-sleep - containers stop after a period of inactivity (no terminal input). Choose 5m, 15m, 30m, 1h, or 2h in Settings. Free tier is locked to 15m. Sleep is input-aware: the timer only resets when you actually type something, not on WebSocket reconnects or background polls.
 - CPU cost scales to zero when idle. You pay for what you use. Nothing when you don't.
 
+### For your agent (Pro mode)
+
+- **SilverBullet vault** - every Pro session ships a browser-native note editor at `~/Vault/`. Notes, decisions, journal, raw transcripts - bisync'd to R2 (covered by the operator-set `ENCRYPTION_KEY` when configured) and editor-side IndexedDB encrypted at rest with a zero-UI per-session key (no passphrase, no key management - the Container DO generates and stores it). The editor is codeflare-themed; the directory is yours.
+- **Cross-session memory** - your agent auto-captures conversation context every 15 prompts into the vault. The next session opens with full recall of prior decisions, debugging insights, and observations - even on a different device.
+- **Knowledge graph** - a queryable semantic graph (Graphify) over both project source and vault content. Agents reach for it via `mcp__graphify__*` to ask "what depends on X" or "how does Y connect to Z" without grepping the world.
+
 ## Architecture
 
 ![Codeflare IDE](documentation/images/hero-ide-fullscreen.png)
@@ -272,14 +278,14 @@ Create one OAuth App per environment (integration vs production) with the matchi
 - Rate limiting: KV-backed, per-user limits on session creation, container starts, and WebSocket connections. Returns 429 with `Retry-After` header when exceeded.
 - Input validation: Zod schemas, 64 KiB body limit.
 - Supply chain: CodeQL (with Copilot Autofix), OSSF Scorecard, `npm audit`, dependency review, Dependabot, Trivy container scanning.
-- Automated penetration testing: weekly CI workflow validates auth gate, security headers, TLS configuration, injection resistance, and information disclosure. See [PENTEST.md](documentation/PENTEST.md) for the latest report.
+- Automated penetration testing: weekly CI workflow validates auth gate, security headers, TLS configuration, injection resistance, and information disclosure. See [PENTEST.md](documentation/lanes/PENTEST.md) for the latest report.
 - GitHub security: secret scanning, push protection, private vulnerability reporting, dependency graph.
-- Optional encryption at rest (set `ENCRYPTION_KEY`): KV credentials (API keys, deploy tokens, scoped R2 tokens) are encrypted with AES-256-GCM before storage using per-value random IVs, authenticated with AAD binding to the KV key name, decrypted on read, and masked in all API responses. R2 workspace files are encrypted via SSE-C (S3 Server-Side Encryption with Customer-Provided Keys) on all upload, download, copy, and seed operations. Rclone bisync inside containers uses the same key for transparent encrypt/decrypt. Existing plaintext KV entries are transparently migrated to encrypted format on first read (fire-and-forget write-back, no downtime). See [Security — Credential Encryption at Rest](documentation/security.md#credential-encryption-at-rest) for implementation details, migration guide, and key pipeline.
+- Optional encryption at rest (set `ENCRYPTION_KEY`): KV credentials (API keys, deploy tokens, scoped R2 tokens) are encrypted with AES-256-GCM before storage using per-value random IVs, authenticated with AAD binding to the KV key name, decrypted on read, and masked in all API responses. R2 workspace files are encrypted via SSE-C (S3 Server-Side Encryption with Customer-Provided Keys) on all upload, download, copy, and seed operations. Rclone bisync inside containers uses the same key for transparent encrypt/decrypt. Existing plaintext KV entries are transparently migrated to encrypted format on first read (fire-and-forget write-back, no downtime). The SilverBullet vault subtree gets its own zero-UI per-session key (DO-storage backed); operators never see it, users never type it. See [Security — Credential Encryption at Rest](documentation/lanes/security.md#credential-encryption-at-rest) for implementation details, migration guide, and key pipeline.
 - For vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
 ## Testing
 
-See [CI/CD & Testing](documentation/ci-cd.md#testing) for test suite details, counts, and configuration.
+See [CI/CD & Testing](documentation/lanes/ci-cd.md#testing) for test suite details, counts, and configuration.
 
 ```bash
 npm test                           # Backend tests
@@ -291,7 +297,7 @@ npm run test:e2e:ui-desktop        # E2E UI desktop (alias)
 npm run test:e2e:ui-mobile         # E2E UI mobile
 ```
 
-E2E tests require a deployed worker and service credentials (CF Access service tokens, or `OAUTH_E2E_TEST_SECRET` when SaaS mode uses GitHub OAuth). See [CI/CD & Testing](documentation/ci-cd.md#e2e-service-token-setup) for setup details.
+E2E tests require a deployed worker and service credentials (CF Access service tokens, or `OAUTH_E2E_TEST_SECRET` when SaaS mode uses GitHub OAuth). See [CI/CD & Testing](documentation/lanes/ci-cd.md#e2e-service-token-setup) for setup details.
 
 ## CI/CD
 
@@ -308,11 +314,11 @@ Eight GitHub Actions workflows:
 | `pentest.yml` | Weekly (Monday 5am UTC), manual | Automated external penetration testing |
 | `stress-test.yml` | Manual | k6 load testing against integration worker |
 
-See [CI/CD & Testing](documentation/ci-cd.md) for full CI/CD documentation.
+See [CI/CD & Testing](documentation/lanes/ci-cd.md) for full CI/CD documentation.
 
 ## Docs
 
-- `documentation/` - [architecture](documentation/architecture.md), [API reference](documentation/api-reference.md), [security](documentation/security.md), [configuration](documentation/configuration.md), and [more](documentation/README.md)
+- `documentation/` - [architecture](documentation/lanes/architecture.md), [API reference](documentation/lanes/api-reference.md), [security](documentation/lanes/security.md), [configuration](documentation/lanes/configuration.md), [billing](documentation/lanes/billing.md), and [more](documentation/README.md)
 - `preseed/tutorials/Getting Started.md` - what you can do and why you should want to. Tabs, tiling, file persistence, and three paths forward depending on how much hand-holding you need.
 - `preseed/tutorials/Examples/` - spec-driven project examples from Hello World to full blog platform. Hand one to your agent and go do something more interesting.
 
