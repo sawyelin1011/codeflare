@@ -66,7 +66,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-STOR-002](storage.md#req-stor-002-file-persistence-across-sessions) (file persistence across sessions), [REQ-STOR-003](storage.md#req-stor-003-bidirectional-sync-every-15-minutes-with-manual-triggers) (15-min bisync), [REQ-STOR-004](storage.md#req-stor-004-initial-sync-restores-files-on-container-start) (initial sync restores files on container start)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -101,7 +101,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -136,7 +136,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -172,7 +172,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -202,9 +202,11 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-003](#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s)
 
-**Verification:** Integration test
+**Verification:** Manual check
 
-**Status:** Implemented
+**Status:** Partial
+
+<!-- coverage-gap: PDF error-path ingestion (AC4 - corrupt/password-protected/unsupported-encoding read failures emitting bare node + high-water marker advance) has no dedicated automated test -->
 
 ---
 
@@ -236,7 +238,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions), [REQ-VAULT-002](#req-vault-002-conversation-captures-land-in-the-vault-as-markdown), [REQ-VAULT-003](#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -272,7 +274,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
 
 **Status:** Implemented
 
@@ -306,7 +308,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../web-ui/src/__tests__/lib/vault-readiness.test.ts)
 
 **Status:** Implemented
 
@@ -315,9 +317,11 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 ### REQ-VAULT-013: SilverBullet subpath adapter
 
 <!-- @impl: src/routes/vault.ts::handleVaultRequest -->
-<!-- @test: src/__tests__/routes/vault.test.ts (base-href rewrite + service-worker shortcut describe → AC1-AC7) -->
+<!-- @impl: src/routes/vault.ts::rewriteVaultBaseHref -->
+<!-- @impl: src/routes/vault.ts::rewriteVaultHtmlResponse -->
+<!-- @test: src/__tests__/routes/vault.test.ts (rewriteVaultBaseHref / rewriteVaultHtmlResponse (REQ-VAULT-013 AC1-AC4) + isServiceWorkerRegistration / REQ-VAULT-013 (SilverBullet subpath adapter) → AC1-AC7) -->
 
-**Intent:** SilverBullet ships an SPA shell with `<base href="/" />` and assumes it owns its origin; under the `/api/vault/:sid/` per-session proxy, every relative asset request would otherwise resolve against the Worker root and 404. The Worker injects a per-session base href on every text/html response and short-circuits Service Worker registration so Chrome's credentialless SW fetch does not return 401.
+**Intent:** SilverBullet ships an SPA shell with `<base href="/" />` and assumes it owns its origin; under the `/api/vault/:sid/` per-session proxy, every relative asset request would otherwise resolve against the Worker root and 404. The Worker injects a per-session base href on every text/html response and short-circuits Service Worker registration so the browser's SW fetch does not return 401.
 
 **Applies To:** User
 
@@ -328,19 +332,19 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 3. When the body is rewritten, both the content-length and content-encoding headers are dropped because the rewrite path auto-decompresses upstream compression, and the original headers would otherwise trigger a browser decoding failure.
 4. When the rewrite runs but the body did not contain the expected base-href substring (no-op rewrite), a warning is logged so a future editor-template change surfaces as a logged signal instead of a silent white-screen regression.
 5. Browser-initiated Service Worker registration GETs for the editor's service-worker script short-circuit the auth chain and receive a key-shim service worker from the Worker (see [REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5 for the key-delivery contract).
-6. The short-circuit selector requires all of: GET method, exact path match for the service-worker script, the browser-only Service-Worker request header (a Fetch-spec forbidden header name not settable from page JavaScript), and no Cookie header.
-7. The key-shim service-worker script body is identical across sessions; the per-session vault encryption key is delivered to the shim via postMessage from the bootstrap-hop page (REQ-VAULT-008 AC5), not baked into the script. The cookie-absent gate is defense-in-depth so any future browser path that carries credentials falls through to the normal auth chain instead of the shortcut.
+6. The short-circuit selector requires all of: GET method, exact path match for the service-worker script, and the browser-only Service-Worker request header (a Fetch-spec forbidden header name not settable from page JavaScript). Cookie presence is intentionally not checked because Samsung Internet and other Chromium forks may send cookies on SW registration fetches; rejecting those requests would serve the editor's real SW whose cache.addAll() install fails and hangs the bootstrap page.
+7. The key-shim service-worker script body is identical across sessions; the per-session vault encryption key is delivered to the shim via postMessage from the bootstrap-hop page (REQ-VAULT-008 AC5), not baked into the script.
 
 **Constraints:**
 
 - The editor honors a URL-prefix environment variable for rendering the base tag, but the prefix is per-session (the Worker knows the session ID, the container does not); baking it in at supervisor start is not viable, so the per-response Worker rewrite is the per-session adapter.
-- Modern Chrome omits credentials on service-worker script fetches even for same-origin same-site URLs, so the normal cookie-auth path would return 401 and service-worker registration would fail permanently without this short-circuit.
+- Browsers omit credentials on service-worker script fetches (Chrome 76+ per spec, Samsung Internet and other Chromium forks may not), so the normal cookie-auth path would return 401 and service-worker registration would fail permanently without this short-circuit. The selector is browser-agnostic: it works regardless of whether cookies are present.
 
 **Priority:** P0
 
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
 
 **Status:** Implemented
 
@@ -371,7 +375,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-004](#req-vault-004-unified-global-graph-merges-vault-and-active-repos)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -405,7 +409,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-SESSION-009](session-lifecycle.md#req-session-009-container-destroy-wipes-session-state) (container destroy wipes session state), [REQ-SESSION-011](session-lifecycle.md#req-session-011-graceful-shutdown-with-final-sync) (graceful shutdown with final sync), [REQ-STOR-005](storage.md#req-stor-005-graceful-shutdown-performs-final-sync) (graceful shutdown performs final sync)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/container/index.test.ts)
 
 **Status:** Implemented
 
@@ -439,7 +443,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-AGENT-006](agents.md#req-agent-006-preseed-configs-generated-from-single-source-of-truth) (preseed configs from single source), [REQ-AGENT-008](agents.md#req-agent-008-preseed-deployed-to-container-on-start) (preseed deployed to container on start), [REQ-AGENT-014](agents.md#req-agent-014-manifest-driven-preseed-pipeline) (manifest-driven preseed pipeline)
 
-**Verification:** Structural audit
+**Verification:** [Structural audit](../../host/__audits__/entrypoint-vault.audit.js)
 
 **Status:** Implemented
 
@@ -452,10 +456,12 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 <!-- @impl: src/routes/vault.ts::injectVaultBootstrapHopHtml -->
 <!-- @impl: src/routes/vault.ts::injectVaultIdbRecorder -->
 <!-- @impl: src/routes/vault.ts::VAULT_BOOTSTRAP_COOKIE -->
+<!-- @impl: src/routes/vault.ts::VAULT_SW_ACTIVATION_TIMEOUT_MS -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::cleanupSessionVaultCache -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::sweepOrphanVaultCaches -->
 <!-- @test: src/__tests__/container/index.test.ts (ensureVaultKey persistence + idempotency describe → AC1/AC2) -->
 <!-- @test: src/__tests__/routes/vault.test.ts (injectVaultEncryptionConfig + injectVaultBootScript + injectVaultBootstrapHopHtml + hasVaultBootstrapCookie describes → AC3/AC5/AC6) -->
+<!-- coverage-gap: AC4 (SilverBullet encrypted-KV wrapper usage) is a runtime/IDB behavioral property; no dedicated test describe block -->
 
 **Intent:** SilverBullet's IndexedDB caches every vault file as raw bytes. This REQ covers encryption-at-rest with a per-session key generated and stored by the Container DO (no user passphrase prompt); IDB lifecycle cleanup on session DELETE and dashboard-mount sweeping lives in [REQ-VAULT-015](#req-vault-015-vault-idb-lifecycle-and-listing-filters). The threat model is BitLocker-grade: defeats offline disk attacks (profile theft, backup leak, ransomware scan), does NOT defeat anyone with an authenticated browser tab. The key dies with `container.destroy()` so deletion is forward-secret.
 
@@ -467,7 +473,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 2. The key is never rotated; it is wiped only when the container is destroyed (session delete).
 3. The Worker's vault-config proxy fetches the vault key via DO RPC and merges it (plus the enable-encryption flag) into the editor's runtime boot config.
 4. The editor uses the vault key to symmetrically encrypt its per-vault IndexedDB store via its built-in encrypted-KV wrapper.
-5. The Worker delivers the key through a one-time bootstrap-hop page that registers a key-shim service worker, posts the key to it, persists an enable-encryption flag in the browser, and sets a bootstrap-completed cookie before redirecting back to the shell.
+5. The Worker delivers the key through a one-time bootstrap-hop page that registers a key-shim service worker, posts the key to it, persists an enable-encryption flag in the browser, and sets a bootstrap-completed cookie before redirecting back to the shell. The bootstrap-hop redirect is issued only for GET requests; HEAD and other methods fall through to the SB proxy so the readiness probe returns 200 only when SB is genuinely serving. The hop page guards against missing `navigator.serviceWorker`, uses a 10-second timeout on SW activation (instead of the indefinite `navigator.serviceWorker.ready`), and detects the "redundant" SW state as an explicit error. On any failure the hop shows a user-visible error message and aborts without setting the cookie or flag.
 6. Subsequent shell-path requests bypass the bootstrap hop via the cookie, and no passphrase prompt is shown to the user.
 
 **Constraints:**
@@ -481,9 +487,9 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor) (Worker proxy exposes vault editor), [REQ-VAULT-001](#req-vault-001-persistent-vault-directory-survives-across-sessions) (vault directory survives sessions), [REQ-MEM-006](memory.md#req-mem-006-memory-available-only-in-pro-advanced-mode) (Pro mode gating)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
 
-**Status:** Implemented
+**Status:** Partial
 
 ---
 
@@ -518,7 +524,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption), [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
 
 **Status:** Implemented
 
@@ -549,7 +555,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor) (Worker proxy exposes vault editor)
 
-**Verification:** Automated test
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
 
 **Status:** Implemented
 

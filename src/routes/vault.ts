@@ -161,22 +161,22 @@ export const VAULT_KEY_SHIM_SERVICE_WORKER_JS =
  * forge it via `fetch()`. The path-suffix check pins the SilverBullet-
  * served SW URL; any other path falls through to the normal auth chain.
  *
- * Defence-in-depth: also require the request to have no `Cookie` header.
- * The bypass exists only because Chrome's SW spec compliance strips
- * cookies on the registration fetch; if a cookie is somehow present
- * (different browser, different bypass-route, future spec change), let
- * the normal auth chain handle it - that path returns the real upstream
- * SW for authenticated users or 401 for unauthenticated ones, which is
- * the original (correct) behaviour rather than this static-noop shortcut.
- * If the forbidden-header status of `Service-Worker` ever changes and a
- * cookieless GET becomes page-JS-spoofable, the attacker still only
- * gets back the static no-op JS string with no user data leakage.
+ * Cookie header is intentionally NOT checked. Chrome 76+ strips cookies
+ * on SW registration fetches per spec, but Samsung Internet and other
+ * Chromium forks may not. When cookies are present and this function
+ * returns false, the request falls through to the proxy chain which
+ * serves SilverBullet's real 97KB SW instead of the key-shim. That SW
+ * runs cache.addAll() during install, which fetches the vault root
+ * without the bootstrap cookie and gets a 302 redirect, causing the
+ * install to fail and navigator.serviceWorker.ready to hang forever.
+ * The service-worker header alone is sufficient security (forbidden
+ * header, not forgeable by page JS) and the response is a static JS
+ * string with no user data.
  */
 export function isServiceWorkerRegistration(request: Request, remainingPath: string | undefined): boolean {
   if (request.method !== 'GET') return false;
   if (remainingPath !== '/service_worker.js') return false;
   if (request.headers.get('service-worker') !== 'script') return false;
-  if (request.headers.get('Cookie')) return false;
   return true;
 }
 
@@ -359,6 +359,7 @@ export function injectVaultIdbRecorder(html: string): string {
  * Implements REQ-VAULT-008 AC5.
  */
 export const VAULT_BOOTSTRAP_COOKIE = 'codeflare_vault_bootstrap';
+export const VAULT_SW_ACTIVATION_TIMEOUT_MS = 10_000;
 
 export function injectVaultBootstrapHopHtml(sessionId: string, vaultEncryptionKey: string): string {
   if (!vaultEncryptionKey) {
@@ -395,30 +396,38 @@ export function injectVaultBootstrapHopHtml(sessionId: string, vaultEncryptionKe
     'var key = ' + escapedKey + ';' +
     'var cookieName = ' + escapedCookie + ';' +
     'var scope = "/api/vault/" + sid + "/";' +
-    'function fail(msg) {' +
     'var el = document.getElementById("status");' +
+    'function fail(msg) {' +
     'if (el) el.textContent = "Vault could not start encryption: " + msg + ". Reload to retry.";' +
     'console.warn("Codeflare vault bootstrap:", msg);' +
     '}' +
-    // Order of side-effects (load-bearing): SW registration + key handoff' +
-    // MUST complete before we touch localStorage["enableEncryption"]. The' +
-    // earlier "set-first, roll-back-on-throw" pattern had a window where a' +
-    // tab close between setItem and the await resolving left the flag' +
-    // durably true with no SW key — if the bootstrap then failed on the' +
-    // next attempt too, SB would boot expecting encrypted IDB it could not' +
-    // read. Set the flag only after the post-handoff success branch.' +
+    'function step(msg) { if (el) el.textContent = msg; console.log("vault-hop:", msg); }' +
+    'if (!navigator.serviceWorker) { fail("browser does not support service workers"); return; }' +
     'try {' +
-    'await navigator.serviceWorker.register(scope + "service_worker.js", { scope: scope });' +
-    'var reg = await navigator.serviceWorker.ready;' +
+    'step("Registering service worker...");' +
+    'var reg = await navigator.serviceWorker.register(scope + "service_worker.js", { scope: scope });' +
+    'step("Registered. SW state: " + (reg.active ? "active" : reg.installing ? "installing" : reg.waiting ? "waiting" : "none"));' +
     'var sw = reg.active || reg.installing || reg.waiting;' +
-    'if (!sw) { fail("service worker not active"); return; }' +
+    'if (!sw) { fail("no service worker instance after registration"); return; }' +
+    'if (sw.state !== "activated") {' +
+    'step("Waiting for activation (state: " + sw.state + ")...");' +
+    'await new Promise(function (resolve, reject) {' +
+    'var timer = setTimeout(function () { sw.removeEventListener("statechange", check); reject(new Error("activation timed out after " + (' + VAULT_SW_ACTIVATION_TIMEOUT_MS + ' / 1000) + " s (state: " + sw.state + ")")); }, ' + VAULT_SW_ACTIVATION_TIMEOUT_MS + ');' +
+    'function check() {' +
+    'if (sw.state === "activated") { clearTimeout(timer); sw.removeEventListener("statechange", check); resolve(); return; }' +
+    'if (sw.state === "redundant") { clearTimeout(timer); sw.removeEventListener("statechange", check); reject(new Error("service worker became redundant")); return; }' +
+    '}' +
+    'sw.addEventListener("statechange", check);' +
+    'check();' +
+    '});' +
+    '}' +
+    'step("Posting encryption key...");' +
     'sw.postMessage({ type: "set-encryption-key", key: key });' +
+    'step("Redirecting...");' +
     '} catch (e) {' +
-    'fail("service worker registration failed (" + (e && e.message ? e.message : e) + ")");' +
+    'fail(e && e.message ? e.message : String(e));' +
     'return;' +
     '}' +
-    '// SW is active and has the key; only now safe to mark the flag,' +
-    '// set the bootstrap cookie, and redirect into SB.' +
     'try { localStorage.setItem("enableEncryption", "true"); } catch (_) {}' +
     'document.cookie = cookieName + "=1; Path=" + scope + "; SameSite=Lax; Secure";' +
     'location.replace(scope);' +
@@ -512,6 +521,54 @@ export function inferOriginValidated(request: Request): boolean {
   // reachable from those.
   const method = request.method.toUpperCase();
   return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+}
+
+export interface RewriteResult {
+  readonly rewritten: string;
+  readonly wasNoOp: boolean;
+}
+
+export function rewriteVaultBaseHref(html: string, sessionId: string): RewriteResult {
+  const prefix = `/api/vault/${sessionId}`;
+  const rewritten = html.replace(
+    /<base\s+href="\/"\s*\/?>/gi,
+    `<base href="${prefix}/" />`,
+  );
+  return { rewritten, wasNoOp: rewritten === html };
+}
+
+export async function rewriteVaultHtmlResponse(
+  response: Response,
+  sessionId: string,
+  remainingPath: string,
+  pathname: string,
+  contentType: string,
+  logger: { warn: (msg: string, meta?: Record<string, unknown>) => void },
+): Promise<Response> {
+  const body = await response.text();
+  const { rewritten: baseRewritten, wasNoOp } = rewriteVaultBaseHref(body, sessionId);
+  let rewritten = baseRewritten;
+
+  const isShellPath = remainingPath === '/' || remainingPath === '/index.html';
+  if (response.status === 200 && isShellPath) {
+    try {
+      rewritten = injectVaultBootScript(rewritten, { sessionId });
+      rewritten = injectVaultIdbRecorder(rewritten);
+    } catch (err) {
+      logger.warn('vault boot-script injection skipped', { error: toErrorMessage(err) });
+    }
+  }
+  if (wasNoOp && response.status === 200 && isShellPath) {
+    logger.warn('vault base-href rewrite no-op', { pathname, contentType });
+  }
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+  return new Response(rewritten, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export function validateVaultRoute(request: Request): VaultRouteResult {
@@ -772,7 +829,7 @@ export async function handleVaultRequest(
     // unencrypted -- the exact regression REQ-VAULT-008 AC5 forbids.
     const isShellPathPre =
       remainingPath === '/' || remainingPath === '/index.html';
-    if (isShellPathPre && !isWebSocket && !hasVaultBootstrapCookie(request)) {
+    if (isShellPathPre && !isWebSocket && request.method === 'GET' && !hasVaultBootstrapCookie(request)) {
       return new Response(null, {
         status: 302,
         headers: {
@@ -911,48 +968,7 @@ export async function handleVaultRequest(
     }
 
     if (contentType.includes('text/html')) {
-      const prefix = `/api/vault/${sessionId}`;
-      const body = await response.text();
-      let rewritten = body.replace(
-        /<base\s+href="\/"\s*\/?>/gi,
-        `<base href="${prefix}/" />`,
-      );
-
-      // REQ-VAULT-015 AC3: on the 200 shell paths, inject the boot
-      // script (exposes sessionId on window) and the IDB-name recorder
-      // (records every sb_* IDB SilverBullet opens into localStorage so
-      // dashboard cleanup can delete them). Error pages and non-shell
-      // text/html responses are skipped by the marker idempotency guards
-      // inside the helpers.
-      const isShellPath =
-        remainingPath === '/' || remainingPath === '/index.html';
-      if (response.status === 200 && isShellPath) {
-        try {
-          rewritten = injectVaultBootScript(rewritten, { sessionId });
-          rewritten = injectVaultIdbRecorder(rewritten);
-        } catch (err) {
-          logger.warn('vault boot-script injection skipped', { error: toErrorMessage(err) });
-        }
-      }
-      // Only warn on the shell paths where the rewrite is load-bearing
-      // (`/` and `/index.html`). On any other text/html path - error
-      // pages, 404 HTML, future plug-served HTML - a no-op rewrite is
-      // expected, not a signal. Logging unconditionally fills prod logs
-      // with false positives on every non-shell error response.
-      if (rewritten === body && response.status === 200 && isShellPath) {
-        logger.warn('vault base-href rewrite no-op', {
-          pathname: vaultUrl.pathname,
-          contentType,
-        });
-      }
-      const headers = new Headers(response.headers);
-      headers.delete('content-length');
-      headers.delete('content-encoding');
-      return new Response(rewritten, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
-      });
+      return rewriteVaultHtmlResponse(response, sessionId, remainingPath, vaultUrl.pathname, contentType, logger);
     }
     return response;
   } catch (err) {
