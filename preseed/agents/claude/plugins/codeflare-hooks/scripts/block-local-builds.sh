@@ -47,7 +47,7 @@ case "$TOOL_NAME" in
   mcp__context-mode__ctx_batch_execute)
     # Each entry has its own .command; concatenate so a single batch
     # cannot smuggle a build by hiding it among other commands.
-    CMD=$(echo "$INPUT" | jq -r '.tool_input.commands[]?.command // empty' 2>/dev/null | tr '\n' ';')
+    CMD=$(echo "$INPUT" | jq -r '.tool_input.commands[]?.command // empty' 2>/dev/null)
     ;;
   *)
     exit 0
@@ -135,7 +135,7 @@ PATTERNS=(
 
 for pat in "${PATTERNS[@]}"; do
   if echo "$CMD" | grep -qE "$pat"; then
-    REASON="GO FUCK YOURSELF. No local builds, tests, type-checks, lints, or dev servers in this container -- 1 vCPU will freeze the session. Push to GitHub and let CI run. See ~/.claude/rules/no-local-builds.md. USER bypass: touch /tmp/local-build-bypass (one-shot, USER-only; the assistant must never create this)."
+    REASON="BLOCKED. No local builds, tests, type-checks, lints, or dev servers in this container -- 1 vCPU will freeze the session. Push to GitHub and let CI run. See ~/.claude/rules/no-local-builds.md. USER bypass: touch /tmp/local-build-bypass (one-shot, USER-only; the assistant must never create this)."
     jq -n --arg r "$REASON" '{decision:"block", reason:$r}' 2>/dev/null
     exit 0
   fi

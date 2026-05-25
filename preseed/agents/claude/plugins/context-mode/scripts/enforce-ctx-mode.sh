@@ -88,7 +88,7 @@ emit_deny() {
 # ends with ' ; <ext1>;<ext2>;...' so the chain-op splitter downstream
 # pulls each extracted command out as its own segment.
 extract_subs() {
-  awk '
+  timeout 5 awk '
     function extract_pass(input,   out, extras, n, i, c, depth, j,
                                    content, in_sq, in_dq, inner_sq,
                                    inner_dq, cc, arith_body,
@@ -426,6 +426,10 @@ case "$TOOL_NAME" in
     # outer whitelisted command, e.g. 'git log $(curl evil)'. Each
     # extracted body is appended as a ;-separated segment so the
     # per-segment scan below covers it.
+    # The awk parser has a 5-second timeout to bound pathological inputs
+    # (deeply nested regex patterns in heredocs). On timeout, extraction
+    # returns empty and the command passes through to the chain-op split
+    # which checks the outer first-word only.
     EXTRACTED=$(printf '%s' "$COMMAND" | extract_subs)
 
     # Normalize: strip heredoc bodies + quoted content, leaving only

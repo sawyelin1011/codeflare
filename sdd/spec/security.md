@@ -17,6 +17,7 @@ Security requirements for authentication enforcement, credential isolation, encr
 - WAF rules and DDoS protection (handled by Cloudflare's edge network)
 - Penetration testing automation (pentest.yml is a lightweight probe suite, not a full pentest tool)
 - Certificate management (handled by Cloudflare's edge TLS termination)
+- R2 bulk-nuke workflow for SSE-C encryption migration (removed; vault bootstrap-hop handles per-session key setup without bulk wipe)
 
 ### Domain Dependencies
 
@@ -705,35 +706,5 @@ Security requirements for authentication enforcement, credential isolation, encr
 **Dependencies:** [REQ-AUTH-010](authentication.md#req-auth-010-auth-bypass-prevention)
 
 **Verification:** [Automated test](../../src/__tests__/security/access-security.test.ts)
-
-**Status:** Implemented
-
----
-
-### REQ-SEC-017: R2 bucket nuke workflow for encryption migration
-
-<!-- @impl: .github/workflows/deploy.yml::r2-nuke -->
-<!-- @test: host/__tests__/req-sec-017-r2-nuke-workflow.test.js (REQ-SEC-017 describes -> AC1 workflow_dispatch + r2-nuke job parses cleanly + discovers buckets + DELETE-loops every object + AC2 r2_nuke_confirmation input + DELETE-ALL-R2-OBJECTS gate + gate-before-destruction ordering) -->
-
-**Intent:** When enabling R2 SSE-C encryption, existing unencrypted files must be purged because they become unreadable with SSE-C enabled.
-
-**Applies To:** Admin
-
-**Acceptance Criteria:**
-
-1. A manually-dispatched workflow deletes all objects in all R2 buckets for an environment.
-2. The workflow requires explicit confirmation.
-3. The workflow must be run before enabling operator encryption for SSE-C, or existing files become inaccessible.
-4. The workflow is documented as a one-time migration step.
-
-**Constraints:**
-
-None.
-
-**Priority:** P1
-
-**Dependencies:** [REQ-SEC-005](#req-sec-005-r2-files-encrypted-at-rest-with-sse-c-when-operator-configures-an-encryption-key)
-
-**Verification:** Manual check
 
 **Status:** Implemented

@@ -457,11 +457,13 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 <!-- @impl: src/routes/vault.ts::injectVaultIdbRecorder -->
 <!-- @impl: src/routes/vault.ts::VAULT_BOOTSTRAP_COOKIE -->
 <!-- @impl: src/routes/vault.ts::VAULT_SW_ACTIVATION_TIMEOUT_MS -->
+<!-- @impl: src/routes/vault.ts::handleVaultRequest (.vault-key sub-path) -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::cleanupSessionVaultCache -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::sweepOrphanVaultCaches -->
 <!-- @test: src/__tests__/container/index.test.ts (ensureVaultKey persistence + idempotency describe → AC1/AC2) -->
-<!-- @test: src/__tests__/routes/vault.test.ts (injectVaultEncryptionConfig + injectVaultBootScript + injectVaultBootstrapHopHtml + hasVaultBootstrapCookie describes → AC3/AC5/AC6) -->
+<!-- @test: src/__tests__/routes/vault.test.ts (injectVaultEncryptionConfig + injectVaultBootScript + injectVaultBootstrapHopHtml + hasVaultBootstrapCookie describes → AC3/AC5/AC6; VAULT_KEY_SHIM_SERVICE_WORKER_JS SW lifecycle describe → AC7 activate/recoverKey path) -->
 <!-- coverage-gap: AC4 (SilverBullet encrypted-KV wrapper usage) is a runtime/IDB behavioral property; no dedicated test describe block -->
+<!-- coverage-gap: AC7 fetch-on-activate exercised in Node.js SW shim (ok:false mock); real browser idle-termination cycle with live .vault-key endpoint not covered by automated tests -->
 
 **Intent:** SilverBullet's IndexedDB caches every vault file as raw bytes. This REQ covers encryption-at-rest with a per-session key generated and stored by the Container DO (no user passphrase prompt); IDB lifecycle cleanup on session DELETE and dashboard-mount sweeping lives in [REQ-VAULT-015](#req-vault-015-vault-idb-lifecycle-and-listing-filters). The threat model is BitLocker-grade: defeats offline disk attacks (profile theft, backup leak, ransomware scan), does NOT defeat anyone with an authenticated browser tab. The key dies with `container.destroy()` so deletion is forward-secret.
 
@@ -475,6 +477,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 4. The editor uses the vault key to symmetrically encrypt its per-vault IndexedDB store via its built-in encrypted-KV wrapper.
 5. The Worker delivers the key through a one-time bootstrap-hop page that registers a key-shim service worker, posts the key to it, persists an enable-encryption flag in the browser, and sets a bootstrap-completed cookie before redirecting back to the shell. The bootstrap-hop redirect is issued only for GET requests; HEAD and other methods fall through to the SB proxy so the readiness probe returns 200 only when SB is genuinely serving. The hop page guards against missing `navigator.serviceWorker`, uses a 10-second timeout on SW activation (instead of the indefinite `navigator.serviceWorker.ready`), and detects the "redundant" SW state as an explicit error. On any failure the hop shows a user-visible error message and aborts without setting the cookie or flag.
 6. Subsequent shell-path requests bypass the bootstrap hop via the cookie, and no passphrase prompt is shown to the user.
+7. The key-shim service worker recovers its encryption key from the Worker when the browser terminates and re-activates the SW after idle. The Worker exposes an auth-gated endpoint that returns the key; the SW fetches it on activate and as a fallback when a get-encryption-key message arrives with no key in memory.
 
 **Constraints:**
 

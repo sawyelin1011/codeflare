@@ -304,7 +304,11 @@ describe('validateVaultRoute / REQ-VAULT-005 (Worker proxy exposes in-container 
         skipWaiting,
         clients: { claim: clientsClaim },
         location: { origin: 'https://codeflare.test' },
+        registration: { scope: 'https://codeflare.test/api/vault/abc/' },
       };
+      // recoverKey() calls fetch on activate when encryptionKey is undefined
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false } as Response));
       // eslint-disable-next-line @typescript-eslint/no-implied-eval
       const runShim = new Function('self', VAULT_KEY_SHIM_SERVICE_WORKER_JS);
       runShim(self);
@@ -313,11 +317,12 @@ describe('validateVaultRoute / REQ-VAULT-005 (Worker proxy exposes in-container 
       listeners.install?.({});
       expect(skipWaiting).toHaveBeenCalled();
 
-      // activate -> clients.claim (wrapped in waitUntil)
+      // activate -> recoverKey() then clients.claim (wrapped in waitUntil)
       const waitUntilArgs: unknown[] = [];
       listeners.activate?.({ waitUntil: (p: unknown) => waitUntilArgs.push(p) });
-      expect(clientsClaim).toHaveBeenCalled();
       expect(waitUntilArgs).toHaveLength(1);
+      await waitUntilArgs[0];
+      expect(clientsClaim).toHaveBeenCalled();
 
       // Same-origin client builder
       const sameOrigin = (replies: unknown[]) => ({
@@ -339,24 +344,28 @@ describe('validateVaultRoute / REQ-VAULT-005 (Worker proxy exposes in-container 
       });
       expect(replies).toEqual([{ type: 'encryption-key', key: 'KEY-AAAA' }]);
 
-      // get-encryption-key before any set returns undefined (fresh SW)
+      // get-encryption-key before any set triggers recoverKey fallback (fresh SW)
       const replies2: Array<{ type: string; key: string | undefined }> = [];
+      const freshListeners: Record<string, (e: unknown) => void> = {};
       const fresh = {
         addEventListener: (type: string, fn: (e: unknown) => void) => {
-          listeners[type] = fn;
+          freshListeners[type] = fn;
         },
         skipWaiting,
-        clients: { claim: clientsClaim },
+        clients: { claim: vi.fn(() => Promise.resolve()) },
         location: { origin: 'https://codeflare.test' },
+        registration: { scope: 'https://codeflare.test/api/vault/xyz/' },
       };
       // eslint-disable-next-line @typescript-eslint/no-implied-eval
       const runShim2 = new Function('self', VAULT_KEY_SHIM_SERVICE_WORKER_JS);
       runShim2(fresh);
-      listeners.message?.({
+      freshListeners.message?.({
         data: { type: 'get-encryption-key' },
         source: sameOrigin(replies2),
       });
-      expect(replies2).toEqual([{ type: 'encryption-key', key: undefined }]);
+      await vi.waitFor(() => expect(replies2).toHaveLength(1));
+      expect(replies2).toEqual([{ type: 'encryption-key', key: null }]);
+      globalThis.fetch = origFetch;
 
       // Unknown message types are ignored (no throw, no reply)
       const replies3: unknown[] = [];

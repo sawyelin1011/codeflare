@@ -110,7 +110,7 @@ deep-reviewer agents) and `--verify-high` (Phase 7 external-LLM
 second-opinion); invoking it with no arguments prints a CLI help
 screen and exits without running.
 
-**Skills (29 SKILL.md files, 44 manifest entries including
+**Skills (29 SKILL.md files, 46 manifest entries including
 reference files)**: `cloudflare-stack`, `github-cloudflare-ship`
 (+ 2 reference files), `consult-llm`, `api-design`,
 `backend-patterns`, `content-hash-cache-pattern`,
@@ -185,7 +185,7 @@ All preseed content is deployed via the manifest pipeline:
    (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`,
    `~/.config/opencode/`)
 
-**Manifest structure (112 total entries)**:
+**Manifest structure (120 total entries)**:
 - `rules/` (27): core (3 default+advanced: cloudflare-environment,
   no-local-builds, git-workflow; + 7 advanced-only top-level: memory,
   spec-discipline, documentation-discipline, tdd-discipline,
@@ -198,7 +198,7 @@ All preseed content is deployed via the manifest pipeline:
   (advanced only)
 - `commands/` (5): brainstorm, debug, deploy, review, sdd
   (advanced only)
-- `skills/` (44): cloudflare-stack, github-cloudflare-ship (+2
+- `skills/` (46): cloudflare-stack, github-cloudflare-ship (+2
   refs), ci-monitoring, pr-workflow, deploy-credentials (the five
   default+advanced skills), consult-llm, api-design,
   backend-patterns, content-hash-cache-pattern, database-migrations,
@@ -209,11 +209,13 @@ All preseed content is deployed via the manifest pipeline:
   spec-enforce-ac, spec-enforce-truth, doc-enforce, doc-enforce-lanes,
   doc-enforce-shape, doc-enforce-truth, tdd-enforce,
   git-review-pipeline, graphify
-- `plugins/` (25): known_marketplaces.json (default+advanced),
-  codeflare-memory plugin (4 files, advanced only: plugin.json,
-  memory-capture.sh, memory-agent-prompt.md, prefilter-transcript.sh),
-  codeflare-vault plugin (3 files, advanced only: plugin.json,
-  vault-monitor-hook.sh, vault-extract-prompt.md), codeflare-hooks
+- `plugins/` (31): known_marketplaces.json (default+advanced),
+  codeflare-memory plugin (7 files, advanced only: plugin.json,
+  memory-capture.sh, memory-capture-block.sh, memory-agent-prompt.md,
+  prefilter-transcript.sh, assert-iso-ts.sh, memory-context-inject.sh),
+  codeflare-vault plugin (4 files, advanced only: plugin.json,
+  vault-monitor-hook.sh, vault-extract-prompt.md, merge-vault-graph.py),
+  codeflare-hooks
   plugin (7 files, advanced only: plugin.json,
   block-attributed-commits.sh, block-local-builds.sh,
   git-push-review-reminder.sh, enforce-review-spawn.sh,
@@ -224,10 +226,10 @@ All preseed content is deployed via the manifest pipeline:
   context-mode plugin (3 files, advanced only: plugin.json,
   README.md, scripts/enforce-ctx-mode.sh - admin-only Custom-tier
   routing enforcement, see Third-party plugin section below),
-  graphify plugin (8 files, default+advanced for plugin.json + README
+  graphify plugin (9 files, default+advanced for plugin.json + README
   + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
   graphify-session-start.sh, graphify-clone-prompt.sh,
-  graph-first-nudge.sh, enforce-graphify.sh)
+  graph-first-nudge.sh, enforce-graphify.sh, safe-graphify-update.sh)
 
 ## Multi-Agent Preseed
 
@@ -343,8 +345,13 @@ in default mode, the plugins simply don't load. Plugins are used for
 file organization and delivery via R2 sync only -- hook registration
 is done via `settings.json` (see above).
 
-- **codeflare-memory**: Scripts for memory capture (hook registered
-  in settings.json, scripts delivered via plugin)
+- **codeflare-memory**: Two UserPromptSubmit hooks registered in
+  settings.json, scripts delivered via plugin.
+  `memory-context-inject.sh` fires on the first prompt of each
+  session: extracts keywords, queries the unified graphify graph,
+  and injects matched nodes as additionalContext before the agent
+  responds ([REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt)).
+  `memory-capture.sh` handles the ongoing 15-prompt capture cadence
 - **codeflare-hooks**: Scripts for commit attribution blocking,
   git-push review reminders, and SDD review-agent sequential
   enforcement - `spec-reviewer` runs first, then `doc-updater`
@@ -396,6 +403,16 @@ The integration is sized to stay within ELv2's permitted-use envelope.
 See [AD49](../decisions/README.md#ad49-context-mode-delivered-as-preseed-plugin-not-runtime-install) for the full design + license analysis.
 
 ## Graphify
+
+### SessionStart context injection ([REQ-AGENT-024](../../sdd/spec/agents.md#req-agent-024-advanced-session-mode-graph-first-discipline) AC1)
+
+In advanced session mode, `graphify-session-start.sh` injects structural context from the knowledge graph as `additionalContext` on session start. Three-tier fallback:
+
+1. **Tier 1 (god-nodes):** If `graphify-out/graph.json` exists and `python3` is available, computes the 15 highest-degree nodes directly from the graph JSON and injects them with degree counts. The agent sees the architectural spine before its first tool call.
+2. **Tier 2 (report preamble):** If the god-nodes query fails (e.g., empty graph), falls back to the first 80 lines of `GRAPH_REPORT.md`.
+3. **Tier 3 (build suggestion):** If no graph exists but the cwd contains code files, injects a suggestion to build one via `/graphify`.
+
+All tiers append tool guidance (pointing at `mcp__graphify__query_graph`, `mcp__graphify__get_node`, etc.). The hook never auto-builds a graph.
 
 ### Hard-block PreToolUse hook ([REQ-AGENT-042](../../sdd/spec/agents.md#req-agent-042-graphify-hard-block-enforcement))
 
@@ -524,6 +541,7 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 - [REQ-AGENT-044](../../sdd/spec/agents.md#req-agent-044-review-agent-discipline-enforcement) - Review-Agent Discipline Enforcement
 - [REQ-AGENT-047](../../sdd/spec/agents.md#req-agent-047-resume-mode-closure-and-review-pipeline-gate) - Resume Mode closure and review-pipeline gate
 - [REQ-AGENT-048](../../sdd/spec/agents.md#req-agent-048-audit-accumulator-surfaces) - Audit accumulator surfaces
+- [REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt) - Proactive memory injection on first prompt
 
 ---
 

@@ -24,11 +24,11 @@ Container image contents, startup sequence, AI tool integration, auto-sleep conf
 | Category | Packages |
 |----------|----------|
 | Sync | rclone |
-| Version Control | git, github-cli (gh), lazygit (v0.60.0) |
+| Version Control | git, github-cli (gh), lazygit (v0.61.1) |
 | Editors | vim (symlinked to neovim), neovim, nano |
 | Network | curl, openssh-client |
 | Process | procps (ps, pgrep) |
-| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.1.22), fzf, zoxide, bat |
+| Utilities | jq, ripgrep, fd, tree, htop, tmux, yazi (v26.5.6), fzf, zoxide, bat |
 
 ### Global NPM Packages
 
@@ -43,7 +43,7 @@ AI CLI packages install with `@latest` -- each deploy pulls the newest versions 
 | `@google/gemini-cli` | 0.30.0 | `gemini` command |
 | `opencode-ai` | 1.2.15 | `opencode` command |
 | `@github/copilot` | 0.0.418 | `copilot` command |
-| `bun` | 1.3.13 (pinned) | JS/TS subprocess runtime. context-mode autodetects Bun for `ctx_execute` / `ctx_batch_execute`. |
+| `bun` | 1.3.14 (pinned) | JS/TS subprocess runtime. context-mode autodetects Bun for `ctx_execute` / `ctx_batch_execute`. |
 
 ### V8 Compile Cache Warm-Up
 
@@ -215,6 +215,8 @@ Optional feature that lets users connect GitHub and Cloudflare accounts once in 
 **Frontend:** `web-ui/src/components/settings/DeployKeysSection.tsx` — self-contained component with connect/disconnect flows for both providers, multi-account Cloudflare dropdown, and token masking.
 
 **Preseed rule:** `preseed/agents/claude/rules/deploy-credentials.md` — comprehensive capability reference telling agents what commands are available with each token.
+
+**Docker Hub fallback:** When the primary Cloudflare-managed registry drops connections mid-upload, `deploy-dockerhub.yml` provides a fallback deploy path via Docker Hub. See [CI/CD](ci-cd.md) for workflow details.
 
 **Known gotchas:**
 - `printf '%s' "$SECRET" | gh secret set` can store empty values — use file redirect (`< tmpfile`) instead.

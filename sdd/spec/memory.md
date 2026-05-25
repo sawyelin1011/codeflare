@@ -344,3 +344,39 @@ Vault-based cross-session memory, automatic capture, hook delivery, and session-
 **Verification:** [Automated test](../../host/__tests__/memory-capture-block.test.js)
 
 **Status:** Implemented
+
+---
+
+### REQ-MEM-013: Proactive memory injection on first prompt
+
+<!-- @impl: preseed/agents/claude/plugins/codeflare-memory/scripts/memory-context-inject.sh -->
+<!-- @impl: preseed/agents/claude/manifest.json -->
+<!-- @impl: entrypoint.sh::SETTINGS_CONFIG (UserPromptSubmit memory-context-inject hook registration) -->
+<!-- @test: host/__tests__/memory-context-inject.test.js (memory-context-inject.sh describe -> AC1 keyword match injection, AC2 budget cap, AC3 sentinel once-only, AC4 short prompt skip) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (codeflare-memory plugin files are advanced-only -> Constraints mode-gate) -->
+
+**Intent:** The agent receives relevant prior context (vault notes, code concepts, past decisions) automatically on the first user message of each session, without requiring an explicit tool call. Keywords are extracted from the user's prompt and matched against the unified graphify graph; matched nodes are injected as additionalContext in the hook response so the agent sees them before responding.
+
+**Applies To:** Agent
+
+**Acceptance Criteria:**
+
+1. On the first user message of a session, the hook extracts keywords from the prompt and queries the unified graph for matching nodes.
+2. Matched nodes (up to 10, ~1000 tokens) are injected as additionalContext in the UserPromptSubmit hook response.
+3. The hook fires at most once per session (gated by its own atomic mkdir sentinel, claimed only after a successful graph query; independent of the memory-capture counter).
+4. Prompts shorter than 20 characters are skipped (insufficient signal for keyword extraction).
+
+**Constraints:**
+
+- The hook plugin is advanced-session-only by manifest declaration (`preseed/agents/claude/manifest.json`); standard sessions never receive the plugin.
+- The hook reads the graph JSON directly (no MCP round-trip) because the MCP server may not be ready on the first prompt.
+- The hook is fail-safe: any error exits silently with no output. A failed injection must never block the session.
+- Keyword extraction strips all non-alphanumeric characters and filters to words of 4+ characters to avoid noise.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-MEM-006](#req-mem-006-memory-available-only-in-pro-advanced-mode), [REQ-VAULT-004](vault.md#req-vault-004-unified-global-graph-merges-vault-and-active-repos)
+
+**Verification:** [Automated test](../../host/__tests__/memory-context-inject.test.js)
+
+**Status:** Implemented
