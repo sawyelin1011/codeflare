@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 // Agent type enum
-export const AgentTypeSchema = z.enum(['claude-code', 'codex', 'copilot', 'gemini', 'opencode', 'bash']);
+export const AgentTypeSchema = z.enum(['claude-code', 'codex', 'copilot', 'gemini', 'opencode', 'pi', 'bash']);
 
 // Tab config schema (mirrors backend src/lib/schemas.ts constraints)
 const TabConfigSchema = z.object({
@@ -166,6 +166,7 @@ export const BatchSessionStatusResponseSchema = z.object({
     monthlyQuotaSeconds: z.number().nullable(),
     tier: z.string(),
   }).optional(),
+  preseedNeedsUpgrade: z.boolean().optional(),
 });
 
 // Setup API schemas — moved from client.ts (strict versions)

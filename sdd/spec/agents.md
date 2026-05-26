@@ -41,10 +41,10 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. Six agent types are defined: `claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `bash`.
+1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `pi`, `bash`.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
-4. Node.js-based agent CLIs (Codex, Gemini, Copilot) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode) are natively compiled.
+4. Node.js-based agent CLIs (Codex, Gemini, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode) are natively compiled.
 
 **Constraints:**
 
@@ -61,7 +61,7 @@ Multi-agent support, preseed system, and session modes.
 
 ---
 
-<!-- @test: src/__tests__/routes/session-agent-type.test.ts (REQ-AGENT-002 describe -> POST /api/sessions accepts/persists agentType + Zod rejects invalid + all 6 valid types + lastAgentType via PATCH /preferences + default claude-code -> AC1..AC5) -->
+<!-- @test: src/__tests__/routes/session-agent-type.test.ts (REQ-AGENT-002 describe -> POST /api/sessions accepts/persists agentType + Zod rejects invalid + all 7 valid types + lastAgentType via PATCH /preferences + default claude-code -> AC1..AC5) -->
 ### REQ-AGENT-002: Agent Selection at Session Creation
 
 <!-- @impl: src/routes/session/crud.ts -->
@@ -380,7 +380,7 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: src/routes/storage/seed.ts -->
 <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
-<!-- @test: src/__tests__/routes/storage-seed.test.ts (Agent Config Seed Routes describe -> AC1/AC3 recreate endpoint + storage-stats KV cache invalidation) + src/__tests__/lib/r2-seed-mode-req-coverage.test.ts (REQ-AGENT-004 reconcileAgentConfigs describe -> AC2/AC4/AC5 overwrite-and-cleanup with user-file preservation) -->
+<!-- @test: src/__tests__/routes/storage-seed.test.ts (Agent Config Seed Routes describe → AC1/AC3/AC6/AC7 recreate endpoint + rate limit + storage-stats KV cache invalidation) + src/__tests__/lib/r2-seed-mode-req-coverage.test.ts (REQ-AGENT-011 reconcileAgentConfigs describe → AC2/AC4/AC5 overwrite-and-cleanup with user-file preservation) -->
 
 **Intent:** Users must be able to reset their agent skills and rules to the platform defaults at any time, recovering from accidental deletion or corruption.
 
@@ -407,7 +407,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth), [REQ-STOR-010](storage.md#req-stor-010-agent-configs-auto-seeded-based-on-session-mode)
 
-**Verification:** Manual check
+**Verification:** [storage-seed.test.ts](../../src/__tests__/routes/storage-seed.test.ts) (AC1/AC3/AC6/AC7), [r2-seed-mode-req-coverage.test.ts](../../src/__tests__/lib/r2-seed-mode-req-coverage.test.ts) (AC2/AC4/AC5)
 
 **Status:** Implemented
 
@@ -440,7 +440,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** [REQ-AGENT-003](#req-agent-003-agent-cli-auto-started-in-tab-1)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../src/__tests__/routes/preferences.test.ts)
 
 **Status:** Implemented
 
@@ -471,7 +471,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** [REQ-AGENT-001](#req-agent-001-support-multiple-ai-coding-agents)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../src/__tests__/lib/r2-seed-mode-req-coverage.test.ts)
 
 **Status:** Implemented
 
@@ -539,7 +539,7 @@ None.
 
 **Dependencies:** None.
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/entrypoint-hooks-merge.test.js)
 
 **Status:** Implemented
 
@@ -660,7 +660,7 @@ None.
 
 **Dependencies:** None.
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../src/__tests__/routes/llm-keys.test.ts)
 
 **Status:** Implemented
 
@@ -724,7 +724,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-005](#req-agent-005-pro-mode-includes-additional-skills-rules-agents-and-mcp-servers), [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth), [REQ-AGENT-007](#req-agent-007-multi-agent-adaptation-pipeline), [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-025](#req-agent-025-post-clone-graph-triage)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../src/__tests__/lib/agent-seed-ecc-rules.test.ts)
 
 **Status:** Implemented
 
@@ -756,7 +756,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability), [REQ-AGENT-034](#req-agent-034-sdd-init-enrichment-pass-with-graphify), [REQ-AGENT-035](#req-agent-035-sdd-init-phase-7a-source-anchor-verifier-gate), [REQ-AGENT-039](#req-agent-039-sdd-init-phase-7b-enumeration-coverage-verifier-gate)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
 
@@ -783,9 +783,41 @@ None.
 
 **Dependencies:** [REQ-AGENT-033](#req-agent-033-sdd-init-scaffolding-and-canonical-render), [REQ-AGENT-037](#req-agent-037-sdd-clean-rescue-and-autonomy-modes)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
+
+---
+
+### REQ-AGENT-049: Auto-upgrade preseed on release
+
+<!-- @impl: scripts/generate-agent-seed.mjs, src/routes/session/lifecycle.ts, src/routes/storage/seed.ts, web-ui/src/stores/session.ts -->
+<!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) -->
+
+**Intent:** When a new codeflare release ships changed preseed content (agent skills, rules, plugins), the user's R2 bucket should be reconciled automatically on first dashboard load - no manual "Recreate Agent Skills & Rules" click required. Session creation and stopped-session access are prevented in the UI during the brief upgrade.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. The preseed generation script computes a deterministic SHA-256 content hash over all preseed documents (sorted by key) and emits it as a build-time constant accessible to the runtime.
+2. After a successful reconcile (manual or auto), the applied hash is persisted in the user's preferences store.
+3. On initial dashboard load, the backend compares the stored hash against the build-time constant and returns whether an upgrade is needed. This check is omitted from periodic polling to avoid overhead.
+4. On initial dashboard load, if an upgrade is needed, the frontend triggers the reconcile in the background.
+5. While the upgrade is in progress, the "+ New Session" button is disabled and displays "Upgrading..." (both Dashboard and SessionDropdown).
+6. Stopped session cards are visually dimmed (reduced opacity) and click-disabled during upgrade.
+7. If the auto-upgrade fails, the error is logged but the dashboard remains fully usable. A page refresh retries the check.
+8. The reconcile respects the user's current session mode and tier (standard/pro/unlimited) - identical behavior to the manual "Recreate" button.
+
+**Constraints:** None.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-011](#req-agent-011-manual-recreate-agent-skills-from-settings), [REQ-AGENT-014](#req-agent-014-manifest-driven-preseed-pipeline)
+
+**Verification:** [Backend route tests](../../src/__tests__/routes/session-batch-status.test.ts), [Seed hash persistence](../../src/__tests__/routes/storage-seed.test.ts), [Store upgrade flow](../../web-ui/src/__tests__/stores/session.test.ts), [Dashboard UI](../../web-ui/src/__tests__/components/Dashboard.test.tsx). ACs without automated test coverage: AC1 (hash determinism in generate-agent-seed.mjs), AC5-partial (SessionDropdown button disabled/Upgrading - untested, Dashboard button covered), AC6 (stopped card dimmed/click-disabled), AC7 (failure path - error logged + dashboard remains usable), AC8 (mode/tier propagation to reconcile). These gaps keep Status: Partial.
+
+**Status:** Partial
 
 ---
 
@@ -816,7 +848,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-033](#req-agent-033-sdd-init-scaffolding-and-canonical-render), [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-025](#req-agent-025-post-clone-graph-triage)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
 
@@ -849,7 +881,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-033](#req-agent-033-sdd-init-scaffolding-and-canonical-render), [REQ-AGENT-034](#req-agent-034-sdd-init-enrichment-pass-with-graphify)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/sdd-init-phase-7a-verifier.test.js)
 
 **Status:** Implemented
 
@@ -882,7 +914,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-035](#req-agent-035-sdd-init-phase-7a-source-anchor-verifier-gate)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/sdd-init-phase-7b-verifier.test.js)
 
 **Status:** Implemented
 
@@ -916,7 +948,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/git-push-review-reminder.test.js)
 
 **Status:** Implemented
 
@@ -949,7 +981,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/lane-classifier.test.js)
 
 **Status:** Implemented
 
@@ -979,7 +1011,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/enforce-review-spawn.test.js)
 
 **Status:** Implemented
 
@@ -1013,7 +1045,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability), [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-clean-contract.test.js)
 
 **Status:** Implemented
 
@@ -1047,7 +1079,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-037](#req-agent-037-sdd-clean-rescue-and-autonomy-modes), [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/enforce-review-spawn.test.js)
 
 **Status:** Implemented
 
@@ -1079,7 +1111,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/enforce-review-spawn.test.js)
 
 **Status:** Implemented
 
@@ -1115,7 +1147,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-022](#req-agent-022-legacy-codebase-import-mode-discovery)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
 
@@ -1153,7 +1185,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-022](#req-agent-022-legacy-codebase-import-mode-discovery)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
 
@@ -1181,7 +1213,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-038](#req-agent-038-resume-mode-drain-workflow)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
 **Status:** Implemented
 
@@ -1458,7 +1490,7 @@ None.
 
 **Dependencies:** [REQ-STOR-009](storage.md#req-stor-009-getting-started-docs-auto-seeded-on-first-session)
 
-**Verification:** Manual check
+**Verification:** [Automated test](../../src/__tests__/routes/storage-seed.test.ts)
 
 **Status:** Implemented
 
@@ -1559,7 +1591,7 @@ None.
 
 <!-- @impl: web-ui/src/lib/token-scopes.ts -->
 <!-- @impl: web-ui/src/components/settings/ProviderRow.tsx -->
-<!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (GITHUB_TIERS + getGithubTokenUrl + CLOUDFLARE_TOKEN_PAGE describes -> AC1 three-tier scope selector with correct scope prefills per tier + AC2 Cloudflare token page targeting) -->
+<!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (GITHUB_TIERS + getGithubTokenUrl describes -> AC1 three-tier GitHub scope selector; CLOUDFLARE_TIERS + getCloudflareTokenUrl describes -> AC2 three-tier Cloudflare scope selector with 7/10/22 scope counts) -->
 
 **Intent:** Token creation for GitHub and Cloudflare must guide users through scope selection so they create the smallest token that still unlocks the features they need, without copy-pasting raw scope strings.
 
@@ -1568,18 +1600,18 @@ None.
 **Acceptance Criteria:**
 
 1. GitHub token creation offers three scope tiers (Minimal, Recommended, Advanced) via a selector in the connect flow, with Recommended pre-selected and the URL pre-filling the correct scopes per tier.
-2. Cloudflare token creation directs users to use the "Edit Cloudflare Workers" template with account and zone selection. No scope pre-fill (Cloudflare template URLs are broken).
+2. Cloudflare token creation offers three scope tiers (Minimal, Recommended, Advanced) via the same selector pattern, with Recommended pre-selected and the URL pre-filling the correct permission group keys per tier.
 3. A documentation page lists all scopes per tier with explanations of why each is needed, linked from the UI via "See all scopes".
 
 **Constraints:**
 
 - GitHub Minimal: 1 scope (contents). Recommended: 6 scopes (contents, PRs, actions, workflows, administration, secrets). Advanced: all 19 scopes including Copilot.
-- Cloudflare: "Edit Cloudflare Workers" template covers Workers, KV, R2, Pages, Containers, Routes. Users add extra scopes (D1, DNS, Access, Turnstile) when their agent requests them.
+- Cloudflare Minimal: 7 scopes (Workers Scripts, KV, R2, D1, Routes, Account Settings read, Zone read). Recommended: 10 scopes (Minimal + DNS, Access Apps+Policies, Access Orgs+IdPs). Advanced: 22 scopes (Recommended + Pages, Containers, API Tokens, Queues, AI read+write, Vectorize, Turnstile, Builds, Observability, R2 Data Catalog, Agents).
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-010](#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-019](#req-agent-019-branded-settings-ui)
 
-**Verification:** Manual check
+**Verification:** [Token scope tests](../../web-ui/src/__tests__/lib/token-scopes.test.ts)
 
 **Status:** Implemented

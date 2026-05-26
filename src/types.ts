@@ -138,7 +138,7 @@ export interface Session {
 /**
  * Supported agent types for multi-agent sessions
  */
-export const AgentTypeSchema = z.enum(['claude-code', 'codex', 'copilot', 'gemini', 'opencode', 'bash']);
+export const AgentTypeSchema = z.enum(['claude-code', 'codex', 'copilot', 'gemini', 'opencode', 'pi', 'bash']);
 export type AgentType = z.infer<typeof AgentTypeSchema>;
 
 export const SessionModeSchema = z.enum(['default', 'advanced']);
@@ -237,6 +237,8 @@ export interface UserPreferences {
   sleepAfter?: SleepAfterOption;
   /** REQ-MEM-001 AC4: user's IANA timezone, captured from the browser. */
   userTimezone?: string;
+  /** REQ-AGENT-049: hash of last applied preseed content, for auto-upgrade detection. */
+  lastPreseedHash?: string;
 }
 
 /**
