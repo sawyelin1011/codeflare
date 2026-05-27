@@ -198,9 +198,9 @@ All preseed content is deployed via the manifest pipeline:
    [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release)
 7. Bisync pulls from R2 to container config directories
    (`~/.claude/`, `~/.codex/`, `~/.gemini/`, `~/.copilot/`,
-   `~/.config/opencode/`)
+   `~/.config/opencode/`, `~/.pi/agent/`)
 
-**Manifest structure (120 total entries)**:
+**Manifest structure (131 total source entries: 120 Claude + 11 Pi-native)**:
 - `rules/` (27): core (3 default+advanced: cloudflare-environment,
   no-local-builds, git-workflow; + 7 advanced-only top-level: memory,
   spec-discipline, documentation-discipline, tdd-discipline,
@@ -245,6 +245,19 @@ All preseed content is deployed via the manifest pipeline:
   + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
   graphify-session-start.sh, graphify-clone-prompt.sh,
   graph-first-nudge.sh, enforce-graphify.sh, safe-graphify-update.sh)
+- Pi-native runtime assets (11): package config, package lock, MCP config, six extension files, one native graphify skill override ([REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch) AC7), and one Pi graphify wrapper script.
+
+  These assets adapt runtime behavior to Pi primitives while rules and
+  skills still come from the Claude source tree. `/review` is deliberately
+  separate from PR-boundary enforcement: the command reviews a requested
+  scope, while `review-enforcement.ts` watches PR HEADs, resolves the
+  active repo from native GitHub workflow commands, and requires review
+  subagent completion for SDD PRs targeting `main`/`master`.
+  Pi subagents are provided by `@gotgenes/pi-subagents`; the generator
+  adapts Claude agent definitions into `.pi/agent/agents/*.md`.
+  The container image preinstalls Pi extension npm dependencies into an
+  image-local cache, and entrypoint copies that cache into `~/.pi/agent/npm`
+  after R2 restore so Pi does not run npm install on first launch.
 
 ## Multi-Agent Preseed
 
@@ -261,46 +274,62 @@ files exist on disk.
 | Gemini | `~/.gemini/GEMINI.md` (single file) | `~/.gemini/skills/<name>/SKILL.md` | `~/.gemini/agents/*.md` |
 | Copilot | `~/.copilot/copilot-instructions.md` (single file) | N/A | `~/.copilot/agents/<name>.agent.md` |
 | OpenCode | `~/.config/opencode/AGENTS.md` (single file) | `~/.config/opencode/skills/<name>/SKILL.md` | `~/.config/opencode/agents/*.md` |
+| Pi | `~/.pi/agent/AGENTS.md` (single file) | `~/.pi/agent/skills/<name>/SKILL.md` | `~/.pi/agent/agents/*.md` |
 
 **Tool name mapping** (adapted in agent definition frontmatter):
 
-| CC | Codex | Gemini | Copilot | OpenCode |
-|--------|-------|--------|---------|----------|
-| Read | read | read_file | read | read |
-| Write | write | write_file | editFiles | write |
-| Edit | edit | replace | editFiles | edit |
-| Bash | shell | run_shell_command | execute | bash |
-| Grep | grep | search_file_content | search | search |
-| Glob | glob | glob | search | glob |
+| CC | Codex | Gemini | Copilot | OpenCode | Pi |
+|--------|-------|--------|---------|----------|----|
+| Read | read | read_file | read | read | read |
+| Write | write | write_file | editFiles | write | write |
+| Edit | edit | replace | editFiles | edit | edit |
+| Bash | shell | run_shell_command | execute | bash | bash |
+| Grep | grep | search_file_content | search | search | grep |
+| Glob | glob | glob | search | glob | find |
 
 **What each agent gets:**
 
 | Agent | Total Documents |
 |-------|-----------------|
-| CC | 91 |
-| Codex | 40 |
-| Gemini | 49 |
-| Copilot | 11 |
-| OpenCode | 49 |
-| **Total** | **240** |
+| CC | 120 |
+| Codex | 47 |
+| Gemini | 58 |
+| Copilot | 13 |
+| OpenCode | 58 |
+| Pi | 68 |
+| **Total** | **364** |
 
-**Excluded from non-CC agents**: hooks (CC hook system), commands (CC
-slash commands), plugins (CC plugin system, including
+**Excluded from non-CC transformed assets**: hooks (CC hook system),
+commands (CC slash commands), plugins (CC plugin system, including
 codeflare-memory and codeflare-vault), `preseed/agents/claude/rules/memory.md` (references
 CC-specific `mcp__graphify__*` tools and the vault hook system; the
 vault trigger/route content lives in that preseed rule as folded subsections,
 not a separate rules/vault.md), `consult-llm` skill (depends on
-CC-specific MCP tool).
+CC-specific MCP tool). Pi receives native TypeScript extensions for the
+runtime behaviors that cannot be represented as transformed prose:
+`/sdd`, `/graphify`, `/vault`, `/note`, graphify
+active-repo/global-graph maintenance and clone triage, automatic memory capture,
+Vault graph extraction/global-graph merge, local-build blocking,
+and AI-attribution blocking. Pi receives a dedicated native graphify skill
+that uses local AST extraction plus Pi `Agent` subagents instead of the
+Claude/MCP-specific transformed skill. Pi receives a separate
+`review-command.ts` for the user-invoked `/review` UX and
+`review-enforcement.ts` for PR-boundary review enforcement.
 
 **Adaptation pipeline**: For each non-CC agent, the generator: (1)
 concatenates applicable rules into a single instructions file, (2)
 remaps tool names in agent definition frontmatter, (3) removes
-`model` field from frontmatter, (4) replaces `~/.claude/` path
+`model` field from frontmatter for runtimes that do not support it while preserving Pi subagent model pins, (4) replaces `~/.claude/` path
 references with agent-specific config paths, (5) uses correct file
-extensions (e.g., `.agent.md` for Copilot agents).
+extensions (e.g., `.agent.md` for Copilot agents). Pi additionally
+loads `preseed/agents/pi/manifest.json`, emits native runtime files
+to `.pi/agent/extensions/`, `.pi/agent/scripts/`, `.pi/agent/mcp.json`,
+`.pi/agent/npm/package.json`, `.pi/agent/npm/package-lock.json`, and
+native Pi skill overrides under `~/.pi/agent/skills/`, and adapts Claude agent definitions into
+`.pi/agent/agents/*.md` for `@gotgenes/pi-subagents`.
 
-**Per-mode counts**: Default mode seeds 36 files, advanced mode
-seeds 236 files. Total array size is 240 (includes variant-per-mode
+**Per-mode counts**: Default mode seeds 52 files, advanced mode
+seeds 359 files. Total array size is 364 (includes variant-per-mode
 duplicates for instructions files).
 
 **Variant-per-mode keys**: Instructions files appear twice in the
@@ -446,7 +475,7 @@ The hook surfaces blocks as `hookSpecificOutput.permissionDecision: deny` with a
 
 ### Build model choice ([REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch))
 
-The `/graphify` skill dispatches semantic-extraction subagents for non-code files (docs, papers, images) when the user chooses Full mode. Each subagent reads a chunk of files and emits structured JSON matching graphify's node/edge schema.
+The Claude `/graphify` skill and the dedicated Pi graphify skill both dispatch semantic-extraction subagents for non-code files (docs, papers, images) when the user chooses Full mode. The Pi skill deliberately avoids headless `graphify extract --backend deepseek`; AST extraction uses local `graphify update`, and semantic extraction uses Pi `Agent` subagents from the running session. Each subagent reads a chunk of files and emits structured JSON matching graphify's node/edge schema.
 
 Subagents run on **Sonnet** (`model: "sonnet"`). Haiku was the original choice (cost-matching with vault-extract economics) but produced 57% malformed nodes on the codeflare corpus - missing `id` fields, numeric IDs instead of strings, missing `source_file`. The extraction prompt requires reliable schema compliance across complex document types (spec files with REQ anchors, skill instructions with cross-references, ADR ledgers). Sonnet at ~3x per-agent cost with near-zero malformation is cheaper per valid node. Opus is never used from this skill.
 
@@ -510,18 +539,19 @@ Full SDD discipline applies on the next push; autonomous agentic development is 
 
 - **Stop hook spawns all three review agents even on a doc-only push (partially-deployed install)**: `enforce-review-spawn.sh` and `git-push-review-reminder.sh` both source `scripts/lib/lane-classifier.sh` (path is relative to the hooks plugin root; in source it lives at `preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh`) to determine which lanes a diff requires. If the helper is missing or fails to source, both hooks fail-closed to the legacy all-three-lanes posture (`code-reviewer spec-reviewer doc-updater`) rather than skipping enforcement, so a partially-synced plugin set never disables review. To diagnose, check `ls ~/.claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh`; if absent, re-run `entrypoint.sh` or trigger a full R2 sync to restore the complete plugin payload.
 
-### Resetting the Review-Spawn Checkpoint
+### Resetting Review-Spawn Checkpoints
 
 The `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode when `sdd/` and `sdd/README.md` are present. It triggers at PR-boundary events: `gh pr create` runs in the session, OR a push lands on a branch that already has an open PR (the hook calls `gh pr view` to check). Enforcement only fires when the open PR targets `main` or `master`. PRs into intermediate branches (`develop`, `staging`) are silently deferred until that branch's own PR-to-`main` opens.
 
-The hook tracks the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Acknowledgment advances only when the full pipeline (code-reviewer + spec-reviewer + doc-updater) is observed for the current PR HEAD.
+The Claude hook and Pi native enforcement both track the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Pi also persists in-flight lane state in `.git/sdd-review-pending.json`. Acknowledgment advances only when the full required pipeline (code-reviewer + spec-reviewer + doc-updater, or the reduced lane set for doc/spec-only changes) is observed for the current PR HEAD.
 
 Three USER-ONLY bypass methods exist (the agent must never invoke these autonomously): the user runs `touch /tmp/review-bypass` (one-shot sentinel; per-session, not committed, auto-deleted on use), the user says "skip review" in a message, or the user waits for the 3-strike circuit breaker to clear after 3 blocks on the same un-acknowledged PR HEAD.
 
-If enforcement fires spuriously after a legitimate pipeline completed, reset both checkpoints:
+If enforcement fires spuriously after a legitimate pipeline completed and local `HEAD` is the current PR head, preserve the acknowledgement and clear only transient runtime state:
 
 ```bash
-rm .git/sdd-last-ack-pr-head .git/sdd-review-block-count
+git rev-parse HEAD > .git/sdd-last-ack-pr-head
+rm -f .git/sdd-review-block-count .git/sdd-review-pending.json
 ```
 
 The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior install) is auto-deleted on the first v5 invocation, so no manual cleanup is needed for the v4 to v5 migration path.
@@ -530,6 +560,7 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 
 ## Specification Coverage
 
+- [REQ-AGENT-006](../../sdd/spec/agents.md#req-agent-006-preseed-configs-generated-from-single-source-of-truth) - Preseed Configs Generated from Single Source of Truth
 - [REQ-AGENT-007](../../sdd/spec/agents.md#req-agent-007-multi-agent-adaptation-pipeline) - Multi-Agent Adaptation Pipeline
 - [REQ-AGENT-014](../../sdd/spec/agents.md#req-agent-014-manifest-driven-preseed-pipeline) - Manifest-Driven Preseed Pipeline
 - [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release) - Auto-upgrade preseed on release
@@ -567,5 +598,7 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
   capture hook chain
 - [Container](container.md#claude-code-integration) - Claude Code
   configuration
+- [Container](container.md#pi-extension-npm-cache) - Pi extension npm
+  warm-up
 - [Storage & Sync](storage-and-sync.md) - R2 sync internals
 - [Decisions](../decisions/README.md) - Architecture decisions

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { AGENTS_SEEDED_CONFIGS } from '../../lib/agent-seed.generated';
+import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
+import contextModeExtension, { bashDenialReason, commandFromEvent } from '../../../preseed/agents/pi/extensions/context-mode-enforcement';
+import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution } from '../../../preseed/agents/pi/extensions/graphify-helpers';
+import { classifyReviewFiles, isCurrentReviewHead, isFailedToolExecution, isPrBoundaryCommand, isReviewCompletionForLane } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isResumedSession, MEMORY_EVERY_N_PROMPTS, sessionId, shouldCapture, stableId, titleFor } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
 
 /**
  * Validates invariants of the generated agent seed configs.
@@ -11,7 +15,7 @@ import { AGENTS_SEEDED_CONFIGS } from '../../lib/agent-seed.generated';
  * isn't available in the Workers vitest pool).
  */
 
-const VALID_KEY_PREFIXES = ['.claude/', '.codex/', '.gemini/', '.copilot/', '.config/opencode/', '.pi/agent/', '.agents/'];
+const VALID_KEY_PREFIXES = ['.claude/', '.codex/', '.gemini/', '.copilot/', '.config/opencode/', '.pi/agent/'];
 
 function stripPrefix(key: string): string {
   for (const prefix of VALID_KEY_PREFIXES) {
@@ -158,12 +162,153 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     }
   });
 
-  it('Pi has skills but no agent definitions', () => {
-    const piDocs = AGENTS_SEEDED_CONFIGS.filter((d) => d.key.startsWith('.pi/agent/') || d.key.startsWith('.agents/'));
-    const skills = piDocs.filter((d) => d.key.startsWith('.agents/skills/'));
-    const agents = piDocs.filter((d) => d.key.includes('/agents/') && !d.key.startsWith('.agents/skills/') && !d.key.endsWith('AGENTS.md'));
+  it('Pi has skills, native runtime extensions, and subagent definitions', () => {
+    const piDocs = AGENTS_SEEDED_CONFIGS.filter((d) => d.key.startsWith('.pi/agent/'));
+    const skills = piDocs.filter((d) => d.key.startsWith('.pi/agent/skills/'));
+    const agents = piDocs.filter((d) => d.key.startsWith('.pi/agent/agents/') && !d.key.endsWith('AGENTS.md'));
+    const extensions = piDocs.filter((d) => d.key.startsWith('.pi/agent/extensions/'));
+    const scripts = piDocs.filter((d) => d.key.startsWith('.pi/agent/scripts/'));
     expect(skills.length).toBeGreaterThan(0);
-    expect(agents.length).toBe(0);
+    expect(extensions.map((d) => d.key).sort()).toEqual([
+      '.pi/agent/extensions/codeflare-pi.ts',
+      '.pi/agent/extensions/context-mode-enforcement.ts',
+      '.pi/agent/extensions/graphify-helpers.ts',
+      '.pi/agent/extensions/memory-vault-helpers.ts',
+      '.pi/agent/extensions/memory-vault.ts',
+      '.pi/agent/extensions/review-command.ts',
+      '.pi/agent/extensions/review-enforcement.ts',
+      '.pi/agent/extensions/review-helpers.ts',
+    ]);
+    expect(agents.map((d) => d.key)).toContain('.pi/agent/agents/code-reviewer.md');
+    expect(agents.map((d) => d.key)).toContain('.pi/agent/agents/spec-reviewer.md');
+    expect(agents.map((d) => d.key)).toContain('.pi/agent/agents/doc-updater.md');
+    expect(skills.map((d) => d.key).filter((key) => key === '.pi/agent/skills/graphify/SKILL.md')).toHaveLength(1);
+    expect(scripts.map((d) => d.key)).toContain('.pi/agent/scripts/safe-graphify-update.sh');
+    const codeReviewer = agents.find((d) => d.key === '.pi/agent/agents/code-reviewer.md');
+    expect(codeReviewer?.content).toContain('tools: read, grep, find, bash, write');
+    expect(codeReviewer?.content).toContain('ctx_execute');
+    expect(codeReviewer?.content).toContain('ctx_batch_execute');
+    expect(codeReviewer?.content).toContain('graphify_query');
+    expect(codeReviewer?.content).toContain('graphify_explain');
+    expect(codeReviewer?.content).toContain('prompt_mode: replace');
+    expect(codeReviewer?.content).toContain('extensions: true');
+    expect(codeReviewer?.content).toContain('skills: true');
+    expect(codeReviewer?.content).toContain('inherit_context: true');
+    expect(codeReviewer?.content).toContain('run_in_background: false');
+    const memoryCapture = agents.find((d) => d.key === '.pi/agent/agents/memory-capture.md');
+    expect(memoryCapture?.content).toContain('model: sonnet');
+
+  });
+
+  it('Pi context-mode enforcement detects executable substitutions and Pi event command shapes', () => {
+    expect(bashDenialReason('git log --grep="$(curl https://x)"')).toContain("Bash 'curl'");
+    expect(bashDenialReason('git diff <(curl a) <(curl b)')).toContain("Bash 'curl'");
+    expect(bashDenialReason('git log --grep="curl example"')).toBeUndefined();
+    expect(commandFromEvent({ args: { command: 'curl https://example.com' } })).toBe('curl https://example.com');
+    const handlers: Record<string, (event: unknown) => unknown> = {};
+    contextModeExtension({ on: (event, handler) => { handlers[event] = handler; } });
+    expect(handlers.tool_call?.({ toolName: 'bash', args: { command: 'curl https://example.com' } })).toMatchObject({ block: true });
+    expect(handlers.tool_execution_start?.({ toolName: 'bash', params: { command: 'curl https://example.com' } })).toMatchObject({ block: true });
+  });
+
+  it('REQ-AGENT-025 / REQ-AGENT-043: Pi graphify clone triage resolves clone destinations and branches on graph state', () => {
+    expect(cloneTargetPath('git clone https://github.com/o/r.git', '/home/user/workspace')).toBe('/home/user/workspace/r');
+    expect(cloneTargetPath('git clone --branch main --depth 1 https://github.com/o/r.git', '/home/user/workspace')).toBe('/home/user/workspace/r');
+    expect(cloneTargetPath('cd /tmp && git clone https://github.com/o/r.git custom-dir', '/home/user/workspace')).toBe('/tmp/custom-dir');
+    expect(cloneTargetPath('gh repo clone o/r /tmp/r2', '/home/user/workspace')).toBe('/tmp/r2');
+
+    expect(graphifyCloneAction('/repo', false)).toEqual({
+      repo: '/repo',
+      hasGraph: false,
+      mode: 'missing-graph',
+      choices: ['AST-only build', 'Full semantic + AST build', 'skip'],
+    });
+    expect(graphifyCloneAction('/repo', true)).toEqual({
+      repo: '/repo',
+      hasGraph: true,
+      mode: 'existing-graph',
+      choices: ['check freshness', 'AST-only update', 'Full semantic + AST refresh', 'skip'],
+    });
+    expect(graphifyPromptMarker('/home/user/workspace/r', 'session-1')).toBe('/tmp/codeflare-graphify-prompted-session-1_home_user_workspace_r');
+    expect(isFailedGraphifyToolExecution({ status: 'error' })).toBe(true);
+    expect(isFailedGraphifyToolExecution({ isError: false })).toBe(false);
+
+    const decision = graphifyClonePromptDecision({
+      command: 'git clone https://github.com/o/r.git',
+      cwd: '/home/user/workspace',
+      sessionId: 'session-1',
+      failed: false,
+      findGitRoot: (path) => `${path}/.git-root`,
+      hasGraph: (repo) => repo.endsWith('.git-root'),
+    });
+    expect(decision).toEqual({
+      repo: '/home/user/workspace/r/.git-root',
+      marker: '/tmp/codeflare-graphify-prompted-session-1_home_user_workspace_r_.git-root',
+      action: {
+        repo: '/home/user/workspace/r/.git-root',
+        hasGraph: true,
+        mode: 'existing-graph',
+        choices: ['check freshness', 'AST-only update', 'Full semantic + AST refresh', 'skip'],
+      },
+    });
+    expect(graphifyClonePromptDecision({
+      command: 'git clone https://github.com/o/r.git',
+      cwd: '/home/user/workspace',
+      sessionId: 'session-1',
+      failed: true,
+      findGitRoot: () => undefined,
+      hasGraph: () => false,
+    })).toBeUndefined();
+  });
+
+  it('REQ-AGENT-036: Pi review enforcement ignores failed PR-boundary tool results and tolerates GitHub PR-head lag', () => {
+    expect(isFailedToolExecution({ isError: true })).toBe(true);
+    expect(isFailedToolExecution({ status: 'error' })).toBe(true);
+    expect(isFailedToolExecution({ isError: false, status: 'success' })).toBe(false);
+    expect(isCurrentReviewHead('new-local-head', 'old-github-head', 'new-local-head')).toBe(true);
+    expect(isCurrentReviewHead('reviewed-pr-head', 'reviewed-pr-head', 'new-local-commit')).toBe(true);
+    expect(isCurrentReviewHead('stale-head', 'current-pr-head', 'new-local-commit')).toBe(false);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement accepts only completions for the pending head and spawned agent id', () => {
+    const state = {
+      head: 'abc123',
+      lanes: ['code-reviewer', 'doc-updater'],
+      spawned: true,
+      spawnedIds: { 'code-reviewer': 'spawned-code' },
+      fallbackLanes: ['doc-updater'],
+    };
+
+    expect(isReviewCompletionForLane(state, 'code-reviewer', 'other-code')).toBe(false);
+    expect(isReviewCompletionForLane(state, 'code-reviewer', 'spawned-code')).toBe(true);
+    expect(isReviewCompletionForLane(state, 'doc-updater')).toBe(false);
+    expect(isReviewCompletionForLane(state, 'doc-updater', undefined, 'Review head abc123')).toBe(true);
+    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head abc123')).toBe(true);
+    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head stale')).toBe(false);
+    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater')).toBe(false);
+    expect(isReviewCompletionForLane(state, 'spec-reviewer', 'spawned-spec')).toBe(false);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement classifies lanes by changed file surface', () => {
+    expect(classifyReviewFiles(['documentation/lanes/preseed.md'])).toEqual(['doc-updater']);
+    expect(classifyReviewFiles(['sdd/spec/agents.md'])).toEqual(['spec-reviewer', 'doc-updater']);
+    expect(classifyReviewFiles(['preseed/agents/pi/extensions/review-enforcement.ts'])).toEqual(['code-reviewer', 'spec-reviewer', 'doc-updater']);
+    expect(classifyReviewFiles(undefined)).toEqual(['code-reviewer', 'spec-reviewer', 'doc-updater']);
+    expect(isPrBoundaryCommand('git push origin develop')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr create --base main')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr merge 12')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr view --json number')).toBe(false);
+  });
+
+  it('REQ-AGENT-023: Pi native runtime assets include graphify package, MCP config, and skill override', () => {
+    const keys = new Set(AGENTS_SEEDED_CONFIGS.map((doc) => doc.key));
+    expect(keys.has('.pi/agent/mcp.json')).toBe(true);
+    expect(keys.has('.pi/agent/npm/package.json')).toBe(true);
+    expect(keys.has('.pi/agent/npm/package-lock.json')).toBe(true);
+    expect(keys.has('.pi/agent/skills/graphify/SKILL.md')).toBe(true);
+    expect(keys.has('.pi/agent/scripts/safe-graphify-update.sh')).toBe(true);
+    const piPackage = AGENTS_SEEDED_CONFIGS.find((doc) => doc.key === '.pi/agent/npm/package.json');
+    expect(piPackage?.content).toContain('"@gaodes/pi-graphify": "0.2.2"');
   });
 
   it('consult-llm skill is excluded from all non-Claude agents', () => {
@@ -210,10 +355,11 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(memoryHooks).toHaveLength(0);
   });
 
-  it('non-Claude agent definitions have no model field in frontmatter', () => {
+  it('non-Claude agent definitions without model support have no model field in frontmatter', () => {
     const nonClaudeAgents = AGENTS_SEEDED_CONFIGS.filter(
       (d) =>
         !d.key.startsWith('.claude/') &&
+        !d.key.startsWith('.pi/agent/agents/') &&
         d.key.includes('/agents/') &&
         !d.key.endsWith('AGENTS.md') &&
         !d.key.endsWith('GEMINI.md') &&
@@ -241,5 +387,123 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     for (const doc of nonClaude) {
       expect(doc.content).not.toContain('~/.claude/');
     }
+  });
+
+  it('Pi context-mode-enforcement.ts is in manifest and generated seed (REQ-AGENT-023 deployment)', () => {
+    const keys = new Set(AGENTS_SEEDED_CONFIGS.map((d) => d.key));
+    expect(keys.has('.pi/agent/extensions/context-mode-enforcement.ts')).toBe(true);
+  });
+});
+
+describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/004)', () => {
+  it('REQ-MEM-001 AC4: captureTimestamp produces ISO-shaped timestamp with timezone', () => {
+    const ts = captureTimestamp();
+    expect(ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/);
+    const tsUtc = captureTimestamp('UTC');
+    expect(tsUtc).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/);
+  });
+
+  it('REQ-MEM-001 AC4: captureFilename includes session ID and timestamp', () => {
+    const fn = captureFilename('test-session');
+    expect(fn).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-test-session\.md$/);
+  });
+
+  it('REQ-MEM-001: sessionId sanitizes special characters to underscores', () => {
+    expect(sessionId({ sessionManager: { getSessionId: () => 'abc-123' } })).toBe('abc-123');
+    expect(sessionId({ sessionManager: { getSessionId: () => 'a/b:c d' } })).toBe('a_b_c_d');
+    expect(sessionId({})).toMatch(/^\d+$/);
+  });
+
+  it('REQ-MEM-001: compactMessages extracts role and content from conversation', () => {
+    const result = compactMessages([
+      { role: 'user', content: 'hello' },
+      { role: 'assistant', content: 'world' },
+    ]);
+    expect(result).toContain('## user');
+    expect(result).toContain('hello');
+    expect(result).toContain('## assistant');
+    expect(result).toContain('world');
+  });
+
+  it('REQ-MEM-001: compactMessages handles nested message shapes and truncates large content', () => {
+    expect(compactMessages([{ message: { role: 'user', content: 'nested' } }])).toContain('## user');
+    const large = compactMessages([{ role: 'user', content: { data: 'x'.repeat(10000) } }]);
+    expect(large.length).toBeLessThan(7000);
+  });
+
+  it('REQ-MEM-001 AC7: memory-vault.ts uses flock for global graph merge', () => {
+    const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
+    expect(mv?.content).toContain('flock');
+    expect(mv?.content).toContain('graphify-global.lock');
+    expect(mv?.content).toContain('user_vault');
+  });
+
+  it('REQ-MEM-010 AC5: shouldCapture fires at exact 15-message intervals from source constant', () => {
+    expect(MEMORY_EVERY_N_PROMPTS).toBe(15);
+    expect(shouldCapture(14)).toBe(false);
+    expect(shouldCapture(15)).toBe(true);
+    expect(shouldCapture(16)).toBe(false);
+    expect(shouldCapture(30)).toBe(true);
+    expect(shouldCapture(0)).toBe(false);
+  });
+
+  it('REQ-MEM-002 AC2: isFirstMessage detects brand-new session (no counter, count=1)', () => {
+    expect(isFirstMessage(false, 1)).toBe(true);
+    expect(isFirstMessage(true, 1)).toBe(false);
+    expect(isFirstMessage(false, 5)).toBe(false);
+  });
+
+  it('REQ-MEM-002 AC6: isResumedSession detects resumed session (no counter, count>1)', () => {
+    expect(isResumedSession(false, 5)).toBe(true);
+    expect(isResumedSession(false, 1)).toBe(false);
+    expect(isResumedSession(true, 5)).toBe(false);
+  });
+
+  it('REQ-VAULT-003: stableId produces deterministic SHA-256 vault IDs', () => {
+    const a = stableId('test/path.md');
+    expect(a).toBe(stableId('test/path.md'));
+    expect(a).not.toBe(stableId('other/path.md'));
+    expect(a).toMatch(/^vault:[0-9a-f]{24}$/);
+  });
+
+  it('REQ-VAULT-003: memory-vault.ts has in-flight sentinel to prevent double extraction', () => {
+    const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
+    expect(mv?.content).toContain('VAULT_INFLIGHT');
+    expect(mv?.content).toContain('vault-extract.inflight');
+  });
+
+  it('REQ-VAULT-004: titleFor extracts first heading or falls back to filename', () => {
+    expect(titleFor('/vault/Notes/test.md', '# My Title\nsome content')).toBe('My Title');
+    expect(titleFor('/vault/Notes/test.md', 'no heading here')).toBe('test.md');
+    expect(titleFor('/vault/Docs/report.pdf', '')).toBe('report.pdf');
+  });
+
+  it('REQ-VAULT-004: memory-vault.ts extracts wikilink concept nodes and PDF document nodes', () => {
+    const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
+    expect(mv?.content).toContain('concept:');
+    expect(mv?.content).toContain('mentions');
+    expect(mv?.content).toContain('"document"');
+    expect(mv?.content).toContain('.pdf');
+  });
+
+  it('REQ-AGENT-023 AC4: codeflare-pi.ts tolerates missing graph and reports present graph', () => {
+    const cp = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/codeflare-pi.ts');
+    expect(cp?.content).toContain('graphSummary');
+    expect(cp?.content).toContain('Graphify graph available');
+    expect(cp?.content).toContain('graphify-out');
+  });
+
+  it('REQ-AGENT-023: Pi safe-graphify-update.sh includes RLIMIT_AS memory cap', () => {
+    const script = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/scripts/safe-graphify-update.sh');
+    expect(script?.content).toContain('ulimit -v');
+    expect(script?.content).toContain('GRAPHIFY_SAFE_RLIMIT_KB');
+  });
+
+  it('REQ-AGENT-049 AC1: PRESEED_CONTENT_HASH is a deterministic 16-char hex string', () => {
+    expect(PRESEED_CONTENT_HASH).toMatch(/^[0-9a-f]{16}$/);
+    const { createHash } = require('node:crypto');
+    const sorted = [...AGENTS_SEEDED_CONFIGS].sort((a, b) => a.key.localeCompare(b.key));
+    const recomputed = createHash('sha256').update(JSON.stringify(sorted)).digest('hex').slice(0, 16);
+    expect(PRESEED_CONTENT_HASH).toBe(recomputed);
   });
 });

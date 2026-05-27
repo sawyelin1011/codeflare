@@ -63,12 +63,14 @@ export TERM
 # === Fast Start: control auto-update behavior ===
 if [ "${FAST_CLI_START:-true}" = "false" ]; then
     # Unset Dockerfile-level vars so tools CAN auto-update
-    unset DISABLE_AUTOUPDATER OPENCODE_DISABLE_AUTOUPDATE DISABLE_INSTALLATION_CHECKS
+    unset DISABLE_AUTOUPDATER OPENCODE_DISABLE_AUTOUPDATE DISABLE_INSTALLATION_CHECKS PI_OFFLINE PI_SKIP_VERSION_CHECK
 else
     # Ensure all disable vars are set (use bundled versions)
     export DISABLE_AUTOUPDATER=1
     export OPENCODE_DISABLE_AUTOUPDATE=1
     export COPILOT_AUTO_UPDATE=false
+    export PI_OFFLINE=1
+    export PI_SKIP_VERSION_CHECK=1
 fi
 
 # User directories (local disk)
@@ -322,6 +324,13 @@ RCLONE_FILTERS_COMMON=(
     --filter "- .claude/backups/**"          # settings backups (settings.json itself is synced)
     --filter "- .claude/tasks/**"            # task state (ephemeral per session)
     --filter "- .claude/sessions/**"         # session metadata
+    --filter "- .claude/daemon/**"           # daemon lock/log/status (ephemeral)
+    --filter "- .claude/daemon.*"            # daemon state files at root
+    --filter "- .claude/paste-cache/**"      # ephemeral paste buffer
+    --filter "- .claude/jobs/**"             # ephemeral job state
+    --filter "- .claude/*.bak.*"             # backup tarballs (agents/commands/plugins/rules/skills)
+    --filter "- .claude/settings.json.bak*"  # settings backup files
+    --filter "- .claude/skills.bak.*/**"     # stale skills backup directories
     --filter "- .claude/history.jsonl"       # command history (nice-to-have, not critical)
 
     # Codex — ephemeral session data and caches
@@ -337,6 +346,13 @@ RCLONE_FILTERS_COMMON=(
     # (ephemeral by Cloudflare Containers contract; see REQ-MEM-002 AC6).
     # /tmp is not synced in the first place, so no filter needed; the
     # ~/.memory/ tree is no longer written to by the capture hook.
+
+    # Pi — subagent task logs within sessions (equivalent to .claude/projects/**/subagents/**)
+    # Main session JSONL transcripts ARE synced for --resume; only task subdirs are excluded.
+    --filter "- .pi/agent/sessions/**/tasks/**"
+
+    # Pi — context-mode FTS5 store (equivalent to .claude/context-mode/**)
+    --filter "- .pi/context-mode/**"
 
     # Perl CPAN cache — created by Perl module installs during build, regenerated
     --filter "- .cpan/**"
@@ -649,6 +665,40 @@ cleanup_old_transcripts() {
     fi
 }
 
+cleanup_old_pi_transcripts() {
+    local SESSIONS_DIR="$USER_HOME/.pi/agent/sessions"
+    local KEEP_COUNT=5
+
+    [ -d "$SESSIONS_DIR" ] || return 0
+
+    local ALL_TRANSCRIPTS
+    ALL_TRANSCRIPTS=$(find "$SESSIONS_DIR" -maxdepth 2 -name "*.jsonl" -not -path "*/tasks/*" 2>/dev/null) || true
+    local COUNT
+    COUNT=$(echo "$ALL_TRANSCRIPTS" | grep -c . 2>/dev/null) || COUNT=0
+
+    if [ "$COUNT" -le "$KEEP_COUNT" ]; then
+        return 0
+    fi
+
+    local TO_DELETE
+    TO_DELETE=$(echo "$ALL_TRANSCRIPTS" | xargs ls -t 2>/dev/null | tail -n +$((KEEP_COUNT + 1))) || true
+
+    [ -z "$TO_DELETE" ] && return 0
+
+    local DELETED=0
+    for transcript in $TO_DELETE; do
+        [ -f "$transcript" ] || continue
+        local TASK_DIR="${transcript%.jsonl}"
+        [ -d "$TASK_DIR/tasks" ] && rm -rf "$TASK_DIR/tasks"
+        rm -f "$transcript"
+        DELETED=$((DELETED + 1))
+    done
+
+    if [ "$DELETED" -gt 0 ]; then
+        echo "[sync-daemon] Cleaned up $DELETED old Pi session transcript(s), kept newest $KEEP_COUNT" | tee -a /tmp/sync.log
+    fi
+}
+
 # ============================================================================
 # Background sync daemon - bisync every 60 seconds, SIGUSR1-interruptible
 #
@@ -723,6 +773,7 @@ start_sync_daemon() {
         # Cleanup old session transcripts before sync (sequential — no race with bisync).
         # Run in subshell to prevent set -e from killing the daemon on cleanup failure.
         (cleanup_old_transcripts) || true
+        (cleanup_old_pi_transcripts) || true
 
         echo "[sync-daemon] $(date '+%Y-%m-%d %H:%M:%S') Running periodic bisync..." | tee -a /tmp/sync.log
 
@@ -1516,6 +1567,78 @@ else
     update_sync_status "skipped" "$SYNC_ERROR"
 fi
 
+warm_pi_npm_dependencies() {
+    local pi_npm_preseed="${PI_NPM_PRESEED:-/opt/codeflare/pi-agent/npm}"
+    local pi_npm_dir="${PI_NPM_DIR:-$USER_HOME/.pi/agent/npm}"
+    if [ ! -d "$pi_npm_preseed/node_modules" ]; then
+        return 0
+    fi
+    mkdir -p "$pi_npm_dir"
+    if [ ! -f "$pi_npm_dir/package.json" ] && [ -f "$pi_npm_preseed/package.json" ]; then
+        cp "$pi_npm_preseed/package.json" "$pi_npm_dir/package.json"
+    fi
+    if [ ! -f "$pi_npm_dir/package-lock.json" ] && [ -f "$pi_npm_preseed/package-lock.json" ]; then
+        cp "$pi_npm_preseed/package-lock.json" "$pi_npm_dir/package-lock.json"
+    fi
+    # Symlink node_modules to the image-local preseed cache instead of copying
+    # 433MB on every boot. The symlink is instant; PI_OFFLINE=1 prevents Pi
+    # from writing to it. R2 excludes **/node_modules/** so the symlink is
+    # recreated on each container start.
+    if [ -L "$pi_npm_dir/node_modules" ]; then
+        echo "[entrypoint] Pi extension npm dependencies symlinked (already present)"
+    elif [ -d "$pi_npm_dir/node_modules" ]; then
+        rm -rf "$pi_npm_dir/node_modules"
+        ln -s "$pi_npm_preseed/node_modules" "$pi_npm_dir/node_modules"
+        echo "[entrypoint] Pi extension npm dependencies symlinked (replaced stale copy)"
+    else
+        ln -s "$pi_npm_preseed/node_modules" "$pi_npm_dir/node_modules"
+        echo "[entrypoint] Pi extension npm dependencies symlinked"
+    fi
+
+    local pi_settings="${PI_SETTINGS_FILE:-$USER_HOME/.pi/agent/settings.json}"
+    mkdir -p "$(dirname "$pi_settings")"
+    node - "$pi_settings" <<'NODE'
+const fs = require('fs');
+const path = process.argv[2];
+const required = [
+  'npm:@gotgenes/pi-subagents@7.8.1',
+  'npm:@gaodes/pi-graphify@0.2.2',
+  'npm:context-mode@1.0.151',
+];
+let settings = {};
+try { settings = JSON.parse(fs.readFileSync(path, 'utf8')); } catch { settings = {}; }
+const existing = Array.isArray(settings.packages) ? settings.packages : [];
+const byName = new Map();
+for (const spec of existing) byName.set(spec.replace(/@[^/@]+$/, ''), spec);
+for (const spec of required) byName.set(spec.replace(/@[^/@]+$/, ''), spec);
+fs.writeFileSync(path, JSON.stringify({ ...settings, packages: [...byName.values()] }, null, 2) + '\n');
+NODE
+}
+
+update_pi_when_fast_start_disabled() {
+    if [ "${FAST_CLI_START:-true}" != "false" ]; then
+        return 0
+    fi
+    if ! command -v pi >/dev/null 2>&1; then
+        echo "[entrypoint] Pi CLI not found; skipping Pi auto-update"
+        return 0
+    fi
+    echo "[entrypoint] Fast Start disabled; updating Pi and Pi packages"
+    PI_OFFLINE= PI_SKIP_VERSION_CHECK= pi update || \
+        echo "[entrypoint] WARNING: Pi update failed; continuing startup"
+}
+
+# Warm Pi extension npm dependencies from the image-local seed cache.
+# R2 excludes **/node_modules/** by design, so restored ~/.pi/agent/npm has
+# package.json but no installed packages. Copying the image cache prevents Pi
+# from running a slow npm install on first launch.
+warm_pi_npm_dependencies
+update_pi_when_fast_start_disabled
+
+# Purge npm cache - regenerated on demand, 200MB+ of dead weight from
+# runtime npm install calls (Pi packages, context-mode, etc.)
+rm -rf "$USER_HOME/.npm" 2>/dev/null
+
 # Pre-accept Claude Code's bypass permissions consent
 # Claude Code stores this in ~/.claude.json (bypassPermissionsModeAccepted field)
 # This prevents the interactive "WARNING: Claude Code running in Bypass Permissions mode" prompt
@@ -1932,6 +2055,17 @@ if [ "${FAST_CLI_START:-true}" != "false" ]; then
     # Codex: dismiss version notification (excluded from rclone sync)
     mkdir -p "$USER_HOME/.codex"
     echo '{"dismissed_version":"999.0.0"}' > "$USER_HOME/.codex/version.json"
+else
+    # Fast Start OFF: remove Codeflare's settings-file suppressors so tools can
+    # run their normal update path. Keep unrelated Gemini settings intact.
+    if [ -f "$USER_HOME/.gemini/settings.json" ]; then
+        jq 'del(.general.enableAutoUpdate, .general.enableAutoUpdateNotification)' \
+            "$USER_HOME/.gemini/settings.json" > /tmp/gemini-settings.json 2>/dev/null && \
+            mv /tmp/gemini-settings.json "$USER_HOME/.gemini/settings.json"
+    fi
+    if [ -f "$USER_HOME/.codex/version.json" ] && grep -q '"dismissed_version"[[:space:]]*:[[:space:]]*"999\.0\.0"' "$USER_HOME/.codex/version.json"; then
+        rm -f "$USER_HOME/.codex/version.json"
+    fi
 fi
 
 # Configure tab auto-start

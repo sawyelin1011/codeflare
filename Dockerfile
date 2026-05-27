@@ -73,7 +73,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     && ln -s "$(which fdfind)" /usr/local/bin/fd \
     && ln -s "$(which batcat)" /usr/local/bin/bat \
     # Symlink vim → neovim so both `vim` and `nvim` commands work
-    && ln -s "$(which nvim)" /usr/local/bin/vim
+    && ln -s "$(which nvim)" /usr/local/bin/vim \
+    # Remove yarn shipped by Node base image (unused, 5MB)
+    && rm -rf /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
 # Install rclone (pinned version — unpinned install.sh broke bisync, see documentation/storage-and-sync.md)
 RUN curl -fsSL https://downloads.rclone.org/v1.73.5/rclone-v1.73.5-linux-amd64.deb -o /tmp/rclone.deb \
@@ -105,8 +107,8 @@ RUN YAZI_VERSION="26.5.6" && \
     mv /tmp/yazi/yazi-x86_64-unknown-linux-musl/yazi /usr/local/bin/yazi && \
     chmod +x /usr/local/bin/yazi && \
     rm -rf /tmp/yazi /tmp/yazi.zip
-RUN LAZYGIT_VERSION="0.61.1" && \
-    LAZYGIT_SHA256="1b91e660700f2332696726b635202576b543e2bc49b639830dccd26bc5160d5d" && \
+RUN LAZYGIT_VERSION="0.62.0" && \
+    LAZYGIT_SHA256="c57dd766436a42c2da52c3138034f55ca6d8bb935983ee8ae272f0d0386aca6a" && \
     curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_linux_x86_64.tar.gz" -o /tmp/lazygit.tar.gz && \
     echo "${LAZYGIT_SHA256}  /tmp/lazygit.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/lazygit.tar.gz -C /usr/local/bin lazygit && \
@@ -163,8 +165,21 @@ RUN claude --version
 RUN npm install -g @openai/codex@latest @google/gemini-cli@latest opencode-ai@latest @github/copilot@latest @earendil-works/pi-coding-agent@latest && \
     cd /usr/local/lib/node_modules/opencode-ai/node_modules && \
     find . -maxdepth 1 -name 'opencode-*' ! -name 'opencode-linux-x64' -type d -exec rm -rf {} + && \
+    cd /usr/local/lib/node_modules/@github/copilot && \
+    find prebuilds/ -maxdepth 1 -type d ! -name 'prebuilds' ! -name 'linux-x64' -exec rm -rf {} + && \
+    rm -rf mxc-bin/arm64 ripgrep/ clipboard/node_modules pvrecorder/node_modules sharp/node_modules && \
     npm cache clean --force && \
     rm -rf /tmp/* /root/.npm
+
+# Preinstall Pi extension npm dependencies into an image-local seed cache.
+# ~/.pi/agent/npm/node_modules is excluded from R2 sync, so without this Pi
+# would run a slow npm install on first launch (~90s on mobile). Entrypoint
+# symlinks node_modules to this cache (instant, zero-copy).
+COPY preseed/agents/pi/package.json preseed/agents/pi/package-lock.json /opt/codeflare/pi-agent/npm/
+RUN cd /opt/codeflare/pi-agent/npm && \
+    npm ci --omit=dev --no-audit --no-fund && \
+    npm cache clean --force && \
+    rm -rf /root/.npm
 
 # Install Bun for faster context-mode ctx_execute / ctx_batch_execute subprocess
 # starts. Bun is faster than Node for short-lived JS subprocess starts; the
@@ -186,6 +201,9 @@ RUN npm install -g @openai/codex@latest @google/gemini-cli@latest opencode-ai@la
 # this version deliberately after smoke-testing a new release.
 RUN npm install -g bun@1.3.14 && \
     bun --version && \
+    # Strip 258MB of non-linux platform binaries shipped in bun's npm package.
+    # Only the linux-x64 binary (bun.exe / bunx.exe hardlinked in bin/) is needed.
+    rm -rf /usr/local/lib/node_modules/bun/node_modules && \
     npm cache clean --force && rm -rf /root/.npm
 
 # Install context-mode globally and patch the esbuild ESM bundles.

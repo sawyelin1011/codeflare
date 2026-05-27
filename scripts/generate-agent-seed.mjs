@@ -9,6 +9,7 @@ const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
 const claudeDir = path.join(rootDir, 'preseed/agents/claude');
+const piDir = path.join(rootDir, 'preseed/agents/pi');
 const outputFile = path.join(rootDir, 'src/lib/agent-seed.generated.ts');
 
 // ---------------------------------------------------------------------------
@@ -46,9 +47,9 @@ const AGENT_CONFIGS = {
   },
   pi: {
     instructionsKey: '.pi/agent/AGENTS.md',
-    skillsPrefix: '.agents/skills',
-    agentsPrefix: null,
-    agentExtension: null,
+    skillsPrefix: '.pi/agent/skills',
+    agentsPrefix: '.pi/agent/agents',
+    agentExtension: '.md',
     homePath: '~/.pi/agent',
   },
 };
@@ -58,7 +59,21 @@ const TOOL_MAP = {
   gemini: { Read: 'read_file', Write: 'write_file', Edit: 'replace', Bash: 'run_shell_command', Grep: 'search_file_content', Glob: 'glob' },
   copilot: { Read: 'read', Write: 'editFiles', Edit: 'editFiles', Bash: 'execute', Grep: 'search', Glob: 'search' },
   opencode: { Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash', Grep: 'search', Glob: 'glob' },
-  pi: { Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash', Grep: 'grep', Glob: 'find' },
+  pi: {
+    Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash', Grep: 'grep', Glob: 'find',
+    'mcp__context-mode__ctx_search': 'ctx_search',
+    'mcp__context-mode__ctx_batch_execute': 'ctx_batch_execute',
+    'mcp__context-mode__ctx_execute': 'ctx_execute',
+    'mcp__context-mode__ctx_execute_file': 'ctx_execute_file',
+    'mcp__context-mode__ctx_fetch_and_index': 'ctx_fetch_and_index',
+    'mcp__graphify__query_graph': 'graphify_query',
+    'mcp__graphify__get_node': 'graphify_explain',
+    'mcp__graphify__get_neighbors': 'graphify_explain',
+    'mcp__graphify__get_community': 'graphify_query',
+    'mcp__graphify__god_nodes': 'graphify_query',
+    'mcp__graphify__shortest_path': 'graphify_path',
+    'mcp__graphify__graph_stats': 'graphify_query',
+  },
 };
 
 const CLAUDE_ONLY_CATEGORIES = new Set(['hook', 'command', 'plugin']);
@@ -112,6 +127,8 @@ function inferContentType(filePath) {
       return 'image/svg+xml';
     case '.sh':
       return 'application/x-shellscript; charset=utf-8';
+    case '.ts':
+      return 'text/typescript; charset=utf-8';
     default:
       return 'application/octet-stream';
   }
@@ -135,7 +152,7 @@ function remapTools(toolsArray, agentId) {
 }
 
 /**
- * Adapt an agent definition's frontmatter: remap tools, remove model field.
+ * Adapt an agent definition's frontmatter: remap tools, remove model field unless the target supports model frontmatter.
  * Body content gets path adaptation only.
  */
 function adaptAgentFrontmatter(content, agentId) {
@@ -145,21 +162,36 @@ function adaptAgentFrontmatter(content, agentId) {
   const [, frontmatter, body] = match;
   const lines = frontmatter.split('\n');
   const newLines = [];
+  let sawTools = false;
 
   for (const line of lines) {
-    if (line.startsWith('model:')) continue;
+    if (line.startsWith('model:') && agentId !== 'pi') continue;
 
     if (line.startsWith('tools:')) {
+      sawTools = true;
       const toolsMatch = line.match(/tools:\s*(\[.*\])/);
       if (toolsMatch) {
         const tools = JSON.parse(toolsMatch[1]);
         const remapped = remapTools(tools, agentId);
-        // OpenCode expects tools as a record {name: true}, not an array
+        // OpenCode expects tools as a record {name: true}, not an array.
         if (agentId === 'opencode') {
           const record = Object.fromEntries(remapped.map((t) => [t, true]));
           newLines.push(`tools: ${JSON.stringify(record)}`);
+        } else if (agentId === 'pi') {
+          const allowed = [
+            'read', 'grep', 'find', 'ls', 'bash', 'edit', 'write',
+            'ctx_search', 'ctx_batch_execute', 'ctx_execute', 'ctx_execute_file', 'ctx_fetch_and_index',
+            'graphify_query', 'graphify_path', 'graphify_explain',
+          ];
+          const piTools = [...new Set(remapped.filter((t) => allowed.includes(t)))];
+          const dropped = remapped.filter((t) => !allowed.includes(t));
+          if (dropped.length > 0) {
+            console.warn(`[generate:agent-seed] Pi agent: dropped tools not in allowlist: ${dropped.join(', ')}`);
+          }
+          newLines.push(`tools: ${piTools.length > 0 ? piTools.join(', ') : 'none'}`);
         } else {
-          newLines.push(`tools: ${JSON.stringify(remapped)}`);
+          const cleaned = remapped.filter((t) => !t.startsWith('mcp__'));
+          newLines.push(`tools: ${JSON.stringify(cleaned)}`);
         }
       } else {
         newLines.push(line);
@@ -168,6 +200,15 @@ function adaptAgentFrontmatter(content, agentId) {
     }
 
     newLines.push(line);
+  }
+
+  if (agentId === 'pi') {
+    if (!sawTools) newLines.push('tools: read, grep, find, ls, bash, edit, write');
+    newLines.push('prompt_mode: replace');
+    newLines.push('extensions: true');
+    newLines.push('skills: true');
+    newLines.push('inherit_context: true');
+    newLines.push('run_in_background: false');
   }
 
   return `---\n${newLines.join('\n')}\n---\n${adaptPaths(body, agentId)}`;
@@ -198,6 +239,32 @@ function validateManifestPath(p) {
   if (p.startsWith('/')) throw new Error(`Leading slash in manifest path: ${p}`);
   if (p.startsWith('.')) throw new Error(`Leading dot in manifest path: ${p}`);
   if (p.includes('\\')) throw new Error(`Backslash in manifest path: ${p}`);
+}
+
+function validateModes(manifest, label) {
+  for (const manifestKey of Object.keys(manifest)) {
+    validateManifestPath(manifestKey);
+    const entry = manifest[manifestKey];
+    if (!Array.isArray(entry.modes) || entry.modes.length === 0) {
+      throw new Error(`${label} manifest entry "${manifestKey}" has empty or missing modes`);
+    }
+    for (const mode of entry.modes) {
+      if (mode !== 'default' && mode !== 'advanced') {
+        throw new Error(`Invalid mode "${mode}" in ${label} manifest entry "${manifestKey}"`);
+      }
+    }
+  }
+}
+
+function piNativeKey(withinPi) {
+  if (withinPi.startsWith('extensions/')) return `.pi/agent/${withinPi}`;
+  if (withinPi.startsWith('skills/')) return `.pi/agent/${withinPi}`;
+  if (withinPi.startsWith('scripts/')) return `.pi/agent/${withinPi}`;
+  if (withinPi === 'package.json') return '.pi/agent/npm/package.json';
+  if (withinPi === 'package-lock.json') return '.pi/agent/npm/package-lock.json';
+  if (withinPi === 'mcp.json') return '.pi/agent/mcp.json';
+  if (withinPi === 'settings.json') return '.pi/agent/settings.json';
+  throw new Error(`Cannot map Pi native preseed file: ${withinPi}`);
 }
 
 /** Ensure no duplicate (key, mode) pairs across all documents. */
@@ -256,18 +323,7 @@ async function generate() {
   const manifestPath = path.join(claudeDir, 'manifest.json');
   const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
 
-  for (const manifestKey of Object.keys(manifest)) {
-    validateManifestPath(manifestKey);
-    const entry = manifest[manifestKey];
-    if (!Array.isArray(entry.modes) || entry.modes.length === 0) {
-      throw new Error(`Manifest entry "${manifestKey}" has empty or missing modes`);
-    }
-    for (const mode of entry.modes) {
-      if (mode !== 'default' && mode !== 'advanced') {
-        throw new Error(`Invalid mode "${mode}" in manifest entry "${manifestKey}"`);
-      }
-    }
-  }
+  validateModes(manifest, 'Claude');
 
   // Read all manifest-listed files (manifest-driven, not filesystem-driven,
   // so non-manifest files like plugins/cache/** are safely ignored)
@@ -294,6 +350,36 @@ async function generate() {
       content: file.content,
       modes: file.modes,
     });
+  }
+
+  // --- Pi native runtime assets (extensions, MCP config, npm package metadata) ---
+  const piManifestPath = path.join(piDir, 'manifest.json');
+  let piNativeCount = 0;
+  const piNativeSkillKeys = new Set();
+  try {
+    const piManifest = JSON.parse(await fs.readFile(piManifestPath, 'utf8'));
+    validateModes(piManifest, 'Pi');
+    for (const withinPi of Object.keys(piManifest)) {
+      if (withinPi.startsWith('skills/')) piNativeSkillKeys.add(withinPi.slice('skills/'.length));
+    }
+    for (const [withinPi, entry] of Object.entries(piManifest)) {
+      const absolutePath = path.join(piDir, withinPi);
+      let content;
+      try {
+        content = await fs.readFile(absolutePath, 'utf8');
+      } catch {
+        throw new Error(`Pi manifest references "${withinPi}" but file does not exist`);
+      }
+      documents.push({
+        key: piNativeKey(withinPi),
+        contentType: inferContentType(withinPi),
+        content,
+        modes: entry.modes,
+      });
+      piNativeCount++;
+    }
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error;
   }
 
   // --- Non-Claude agent documents ---
@@ -323,6 +409,7 @@ async function generate() {
         if (isClaudeOnlySkill(file.withinClaude)) continue;
 
         const relPath = file.withinClaude.slice('skills/'.length);
+        if (agentId === 'pi' && piNativeSkillKeys.has(relPath)) continue;
         const key = `${config.skillsPrefix}/${relPath}`;
 
         documents.push({
@@ -363,10 +450,10 @@ async function generate() {
   // Summary
   const relativeOutputPath = path.relative(rootDir, outputFile);
   const claudeCount = sourceFiles.length;
-  const nonClaudeCount = documents.length - claudeCount;
+  const nonClaudeCount = documents.length - claudeCount - piNativeCount;
   console.log(
     `[generate:agent-seed] Wrote ${documents.length} document(s) to ${relativeOutputPath}` +
-      ` (${claudeCount} Claude + ${nonClaudeCount} non-Claude)`
+      ` (${claudeCount} Claude + ${piNativeCount} Pi native + ${nonClaudeCount} transformed)`
   );
 }
 

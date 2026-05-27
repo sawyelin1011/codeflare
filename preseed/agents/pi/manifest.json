@@ -1,0 +1,73 @@
+{
+  "extensions/codeflare-pi.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "package.json": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "mcp.json": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "extensions/context-mode-enforcement.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "extensions/graphify-helpers.ts": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "extensions/memory-vault.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "extensions/memory-vault-helpers.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/graphify/SKILL.md": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "scripts/safe-graphify-update.sh": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
+  "extensions/review-command.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "extensions/review-enforcement.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "extensions/review-helpers.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "package-lock.json": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  }
+}

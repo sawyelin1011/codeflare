@@ -6,14 +6,14 @@ Multi-agent support, preseed system, and session modes.
 
 | Concept | Definition |
 |---------|-----------|
-| Agent | One of six supported AI coding tools (`claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
+| Agent | One of seven supported AI coding tools (`claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `pi`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
 | Preseed | A set of configuration files (rules, skills, agents, commands, plugins) generated from a single Claude Code source of truth and deployed to each user's R2 bucket |
 | Session Mode | Either Standard (`default`) or Pro (`advanced`) controlling the scope of agent enhancements seeded to a user's storage |
 | Manifest | The declarative `manifest.json` file that maps each preseed source file to its applicable modes and drives the code generation pipeline |
 
 ### Out of Scope
 
-- **Custom agent creation by users** -- Users cannot define their own agent types or register third-party CLI tools as agents. The six supported agents are hardcoded.
+- **Custom agent creation by users** -- Users cannot define their own agent types or register third-party CLI tools as agents. The seven supported agents are hardcoded.
 - **Agent marketplace** -- No mechanism for browsing, installing, or sharing community-contributed agent configurations or plugins.
 - **Runtime agent switching** -- Agent type is immutable after session creation. Switching requires creating a new session.
 
@@ -31,9 +31,10 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-001: Support Multiple AI Coding Agents
 
 <!-- @impl: Dockerfile -->
+<!-- @impl: entrypoint.sh -->
 <!-- @impl: src/lib/schemas.ts -->
 <!-- @test: src/__tests__/lib/agent-config.test.ts (AGENT_COMMANDS exhaustiveness describe → AC1/AC2) -->
-<!-- @test: host/__tests__/dockerfile-graphify.test.js (npm install + V8 warm-up → AC3/AC4) -->
+<!-- @test: host/__tests__/dockerfile-graphify.test.js (npm install + V8 warm-up + Pi npm warm-cache behavior → AC3/AC4/AC5) -->
 
 **Intent:** The platform must support multiple AI coding agents so users can choose the tool that fits their workflow.
 
@@ -45,6 +46,7 @@ Multi-agent support, preseed system, and session modes.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
 4. Node.js-based agent CLIs (Codex, Gemini, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode) are natively compiled.
+5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install.
 
 **Constraints:**
 
@@ -55,7 +57,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** None.
 
-**Verification:** [Automated test](../../src/__tests__/lib/agent-config.test.ts)
+**Verification:** [Automated test](../../src/__tests__/lib/agent-config.test.ts), [Dockerfile test](../../host/__tests__/dockerfile-graphify.test.js)
 
 **Status:** Implemented
 
@@ -219,7 +221,7 @@ Multi-agent support, preseed system, and session modes.
 3. A build-time seed generator reads the manifest and source files, producing the runtime payload the Worker ships to the container.
 4. The generator is manifest-driven; files not in the manifest are ignored.
 5. No duplicate preseed source files exist on disk.
-6. The generator produces output for all supported agents (Claude Code as the source-of-truth lane plus adapted lanes for Codex, Gemini, Copilot, OpenCode).
+6. The generator produces output for all supported agents (Claude Code as the source-of-truth lane plus adapted lanes for Codex, Gemini, Copilot, OpenCode, and Pi).
 
 **Constraints:**
 
@@ -247,16 +249,16 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. Adapted configs are generated for all 5 supported agents from the Claude Code source.
-2. Tool names are remapped per agent (e.g., `Read` -> `read_file` for Gemini, `Read` -> `read` for Codex).
-3. Instructions are concatenated into a single file for agents that use monolithic config (Codex: `AGENTS.md`, Gemini: `GEMINI.md`, Copilot: `copilot-instructions.md`, OpenCode: `AGENTS.md`).
-4. Claude Code keeps individual rule files in `~/.claude/rules/`.
+1. Adapted configs are generated for all supported non-Claude agents from the Claude Code source.
+2. Tool names are remapped per agent (e.g., `Read` -> `read_file` for Gemini, `Read` -> `read` for Codex and Pi).
+3. Instructions are concatenated into a single file for agents that use monolithic config (Codex: `AGENTS.md`, Gemini: `GEMINI.md`, Copilot: `copilot-instructions.md`, OpenCode: `AGENTS.md`, Pi: `AGENTS.md`).
+4. Claude Code keeps individual rule files in `~/.claude/rules/`, and Pi receives native runtime-adapter assets for Pi extension/package/MCP/subagent surfaces.
 
 **Constraints:**
 
-- Hooks, commands, and plugins are excluded from non-CC agents (they are CC-specific features).
+- Hooks, commands, and plugins are excluded from generic transformed agents because they are Claude-specific surfaces; Pi is the native-runtime exception and receives Pi extension/package/MCP/subagent adapters instead of copied Claude hooks.
 - `rules/memory.md` and `consult-llm` skill are excluded from non-CC agents (they depend on CC-specific MCP).
-- Each non-CC agent gets a strictly-smaller config than Claude Code, since CC is the source-of-truth lane and other agents drop CC-specific content (hooks, slash commands, plugins, MCP-dependent rules/skills).
+- Generic non-CC agents get a strictly-smaller config than Claude Code, since CC is the source-of-truth lane and those agents drop CC-specific content. Pi may receive additional Pi-native runtime adapters when equivalent Pi primitives exist.
 - The per-agent format transforms (frontmatter shape, removed fields, path rewrites, file extensions) live in [REQ-AGENT-030](#req-agent-030-multi-agent-format-transforms).
 
 **Priority:** P1
@@ -417,7 +419,7 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: entrypoint.sh -->
 <!-- @impl: src/container/container-env.ts -->
-<!-- @test: src/__tests__/routes/preferences.test.ts (fastStartEnabled preference describe -> AC1/AC5 settings toggle + KV persistence) + src/__tests__/container/container-env.test.ts (buildEnvVars describe -> AC1 fast-start propagation to container runtime env) + src/__tests__/routes/container-restart-prefs.test.ts (REQ-SESSION-008 AC5 describe -> AC4 fast-start applied on restart) -->
+<!-- @test: src/__tests__/routes/preferences.test.ts (fastStartEnabled preference describe -> AC1/AC5 settings toggle + KV persistence) + src/__tests__/container/container-env.test.ts (buildEnvVars describe -> AC1 fast-start propagation to container runtime env) + src/__tests__/routes/container-restart-prefs.test.ts (REQ-SESSION-008 AC5 describe -> AC4 fast-start applied on restart) + host/__tests__/dockerfile-graphify.test.js (REQ-AGENT-012 Fast Start controls Pi update checks + Fast Start OFF removes settings-file update suppressors -> AC2/AC3/AC4) -->
 
 **Intent:** Agent CLIs must start quickly by default, with an option for users who want automatic updates.
 
@@ -426,21 +428,22 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. A fast-start preference (default: enabled) controls whether agent CLIs skip auto-update checks at launch, and the user's choice is propagated into the container's runtime environment.
-2. When enabled, auto-update checks are disabled for all 5 AI tools, eliminating 5-30s startup delay.
+2. When enabled, auto-update checks are disabled for all supported agent CLIs, eliminating 5-30s startup delay.
 3. Every supported agent CLI has a corresponding disable mechanism: each tool's native auto-update path is suppressed by the channel that tool exposes (environment variable for tools that expose one, on-disk settings file for tools that don't). For settings-file tools, user customizations are preserved across container restarts.
-4. When the fast-start preference is disabled, the suppression channels are not applied and each CLI runs its normal update check on launch.
+4. When the fast-start preference is disabled, the suppression channels are not applied, Codeflare-managed settings-file suppressors are removed, and each CLI runs its normal update or package-reconciliation path before the session starts.
 5. Users can toggle the preference from the session defaults area of the application settings.
 
 **Constraints:**
 
 - Gemini settings file is synced via rclone, so jq merge must preserve user customizations.
 - Codex `~/.codex/` directory is excluded from sync, so `version.json` is safe to recreate on every start.
+- Restored user-added Pi packages outside the Codeflare image cache may require Fast Start OFF once so Pi can reconcile package state.
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-003](#req-agent-003-agent-cli-auto-started-in-tab-1)
 
-**Verification:** [Automated test](../../src/__tests__/routes/preferences.test.ts)
+**Verification:** [Automated test](../../src/__tests__/routes/preferences.test.ts), [Fast Start runtime test](../../host/__tests__/dockerfile-graphify.test.js)
 
 **Status:** Implemented
 
@@ -704,6 +707,7 @@ None.
 <!-- @impl: preseed/agents/claude/rules/spec-discipline.md -->
 <!-- @impl: preseed/agents/claude/rules/documentation-discipline.md -->
 <!-- @impl: preseed/agents/claude/rules/tdd-discipline.md -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @test: src/__tests__/lib/agent-seed-ecc-rules.test.ts (spec-discipline + documentation-discipline + tdd-discipline + graph-first advanced-only describes -> AC1 Pro-mode rule preseed) -->
 
 **Intent:** Pro users need the spec-driven-development workflow available out of the box, with every sub-command working identically across Bash and context-mode MCP tool surfaces so the workflow does not silently behave differently across container environments.
@@ -734,6 +738,7 @@ None.
 
 <!-- @impl: preseed/agents/claude/skills/sdd-init -->
 <!-- @impl: preseed/agents/claude/commands/sdd.md -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @test: host/__tests__/skill-sdd-init-contract.test.js (REQ-AGENT-033 describes -> AC1/AC2 Greenfield + Import Mode procedures + AC3/AC4 dep-version resolution with --ignore-scripts + AC5 lean two-confirm flow + AC6 canonical REQ render + AC7 .review-queue.md placeholder pre-creation) -->
 
 **Intent:** `/sdd init` must bootstrap a working spec in a single coherent flow whether the project is greenfield or import-mode, with every drafted REQ rendered in the canonical shape and the supporting scaffold (lockfile, review queue file) created in the same pass.
@@ -792,7 +797,7 @@ None.
 ### REQ-AGENT-049: Auto-upgrade preseed on release
 
 <!-- @impl: scripts/generate-agent-seed.mjs, src/routes/session/lifecycle.ts, src/routes/storage/seed.ts, web-ui/src/stores/session.ts -->
-<!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) -->
+<!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence + AC8 mode/tier propagation) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle + AC7 failure path) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) + web-ui/src/__tests__/components/SessionDropdown.test.tsx (REQ-AGENT-049 AC5 -> SessionDropdown disabled during upgrade) + web-ui/src/__tests__/components/SessionStatCard.test.tsx (REQ-AGENT-049 AC6 -> stopped card dimmed/click-disabled) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-049 AC1 -> PRESEED_CONTENT_HASH determinism) -->
 
 **Intent:** When a new codeflare release ships changed preseed content (agent skills, rules, plugins), the user's R2 bucket should be reconciled automatically on first dashboard load - no manual "Recreate Agent Skills & Rules" click required. Session creation and stopped-session access are prevented in the UI during the brief upgrade.
 
@@ -815,9 +820,9 @@ None.
 
 **Dependencies:** [REQ-AGENT-011](#req-agent-011-manual-recreate-agent-skills-from-settings), [REQ-AGENT-014](#req-agent-014-manifest-driven-preseed-pipeline)
 
-**Verification:** [Backend route tests](../../src/__tests__/routes/session-batch-status.test.ts), [Seed hash persistence](../../src/__tests__/routes/storage-seed.test.ts), [Store upgrade flow](../../web-ui/src/__tests__/stores/session.test.ts), [Dashboard UI](../../web-ui/src/__tests__/components/Dashboard.test.tsx). ACs without automated test coverage: AC1 (hash determinism in generate-agent-seed.mjs), AC5-partial (SessionDropdown button disabled/Upgrading - untested, Dashboard button covered), AC6 (stopped card dimmed/click-disabled), AC7 (failure path - error logged + dashboard remains usable), AC8 (mode/tier propagation to reconcile). These gaps keep Status: Partial.
+**Verification:** [Backend route tests](../../src/__tests__/routes/session-batch-status.test.ts), [Seed hash persistence + AC8 mode/tier propagation](../../src/__tests__/routes/storage-seed.test.ts), [Store upgrade flow + AC7 failure path](../../web-ui/src/__tests__/stores/session.test.ts), [Dashboard UI AC5](../../web-ui/src/__tests__/components/Dashboard.test.tsx), [SessionDropdown AC5](../../web-ui/src/__tests__/components/SessionDropdown.test.tsx), [SessionStatCard AC6](../../web-ui/src/__tests__/components/SessionStatCard.test.tsx), [AC1 hash determinism](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
-**Status:** Partial
+**Status:** Implemented
 
 ---
 
@@ -924,7 +929,8 @@ None.
 
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh — PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC3 intermediate branches deferred + git-push-review-reminder.sh — MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh — PR state gating describe -> AC1/AC6 PR-state HEAD check + AC4 no-PR push no-op + enforce-review-spawn.sh — vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh — MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh — PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC3 intermediate branches deferred + git-push-review-reminder.sh — MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh — PR state gating describe -> AC1/AC6 PR-state HEAD check + AC4 no-PR push no-op + enforce-review-spawn.sh — vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh — MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts trigger/ctx-surface markers -> AC2) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -937,7 +943,7 @@ None.
 3. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed.
 4. A plain push to a branch with no open PR does NOT trigger reviews.
 5. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge); the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks.
-6. Layer 2 false-positive filtering compares the candidate push's HEAD SHA against `gh pr view`'s reported HEAD before any agent is spawned.
+6. Layer 2 false-positive filtering validates that the candidate push belongs to the currently open PR; same-session pushes may use local HEAD as the candidate SHA while GitHub's PR API catches up, with every directive carrying a freshness gate for the exact head.
 7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
 
 **Constraints:**
@@ -959,7 +965,8 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC4 sequential spec-reviewer then doc-updater + AC5 fix-push cascade ack-pointer advancement) -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC4 sequential spec-reviewer then doc-updater + AC5 fix-push cascade ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts lane-classifier/pending-state markers -> AC1/AC2/AC5) -->
 
 **Intent:** Once a PR-boundary trigger fires (REQ-AGENT-036), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
@@ -967,10 +974,10 @@ None.
 
 **Acceptance Criteria:**
 
-1. Layer 1 lane classification uses a single shared helper so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
+1. Layer 1 lane classification uses one internally shared classifier per runtime surface so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
 2. Lane mapping: docs-only (no sdd, no source) → `doc-updater`; `sdd/` touched without source (with or without docs) → `spec-reviewer` then `doc-updater`; any source touch → all three agents.
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
-4. On trigger, `spec-reviewer` runs first then `doc-updater` (sequential, never parallel) on any project containing `sdd/`.
+4. On trigger, `code-reviewer` may run in parallel with `spec-reviewer`; `doc-updater` starts only after `spec-reviewer` completes on any project containing `sdd/`.
 5. In a fix-push cascade (multiple pushes inside one turn), the gate advances the ack pointer through each push whose review window completed all lanes required by that push's diff; bypassed pushes (no spawns in window, per REQ-AGENT-041) are absorbed into the next complete window's cumulative review.
 
 **Constraints:**
@@ -990,6 +997,7 @@ None.
 ### REQ-AGENT-041: PR-Boundary Review Bypass Surfaces
 
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 <!-- @test: host/__tests__/enforce-review-spawn.test.js (bypass 1: sentinel file + bypass 2: magic phrase + 3-strike circuit breaker describes -> AC1/AC2/AC3 user-only escape hatches with sticky-until-SHA-changes circuit) -->
 
 **Intent:** The user needs a small set of explicit, user-only escape hatches when a turn-end review gate would otherwise block legitimate work (hermetic tests, deliberate skip, repeated false-block). The assistant MUST NEVER trip these surfaces in its own output.
@@ -1020,6 +1028,7 @@ None.
 ### REQ-AGENT-037: `/sdd clean` Rescue and Autonomy Modes
 
 <!-- @impl: preseed/agents/claude/skills/sdd-clean -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @impl: preseed/agents/claude/rules/spec-discipline.md -->
 <!-- @test: host/__tests__/skill-sdd-clean-contract.test.js (REQ-AGENT-037 describes -> AC1 three autonomy modes + layout-resolved config.yml + AC2 unleashed JUDGMENT distinction + AC3 safety nets across modes + AC4 layout migration + AC5 per-category mechanics) + host/__tests__/enforce-review-spawn.test.js (3-strike circuit breaker describe -> AC6 2-fix-round limit per agent per commit cycle) -->
 
@@ -1225,6 +1234,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-mcp-lazy.py -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-active-repo.sh -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/safe-graphify-update.sh -->
+<!-- @impl: preseed/agents/pi/scripts/safe-graphify-update.sh -->
 <!-- @impl: Dockerfile -->
 <!-- @impl: entrypoint.sh -->
 <!-- @test: host/__tests__/entrypoint-graphify-mcp.test.js (MCP server registration in ~/.claude.json → AC2) -->
@@ -1234,6 +1244,8 @@ None.
 <!-- @test: host/__tests__/safe-graphify-update.test.js -->
 <!-- @test: host/__tests__/entrypoint-devshm-prereq.test.js (REQ-AGENT-023 prereq: /dev/shm tmpfs mount in entrypoint.sh describe -> /dev/shm mountpoint after entrypoint runs + Python multiprocessing.Lock allocates + idempotent on warm boot -> AC1 graphify Python multiprocessing prerequisite) -->
 <!-- @test: host/__tests__/context-mode-version-pin.test.js (context-mode plugin.json version pin describe -> at least v1.0.151 -> regression sentinel for issue #671 fix surface; REQ-AGENT-005 AC4/AC5 context-mode version floor) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-023 Pi native runtime assets include graphify npm package, MCP config, and graphify skill override -> AC2 Pi-equivalent native graphify surface) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-023 AC4: codeflare-pi.ts tolerates missing graph and reports present graph -> AC4 Pi missing-graph tolerance and post-clone prompting) -->
 
 **Intent:** Every container ships the graphify code-knowledge-graph capability as ambient infrastructure, so any session (default or advanced session mode) can query an existing graph or build a new one without per-tier provisioning.
 
@@ -1242,11 +1254,11 @@ None.
 **Acceptance Criteria:**
 
 1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep.
-2. The graphify MCP server is registered as a session-level capability in every session (default and advanced modes) and exposes the standard graphify tool surface for querying nodes, neighbours, communities, paths, and aggregate stats.
+2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package and native graphify skill override; MCP parity in Pi is optional and not required for the Pi graphify workflow.
 3. AC1 and AC2 hold across all paid tiers; the capability functions in sessions without context-mode preseeded because the agent-orchestrated `/graphify` skill keeps the main agent's context bounded via subagent chunking.
-4. The MCP server tolerates a missing graph artefact at startup, presents an empty graph initially, and rebinds within a short polling interval after a graph appears or changes on disk; sessions that clone a repo mid-session do not require a restart.
-5. In advanced session mode only, the user's current active repository is tracked so the MCP server scopes its bind to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact.
-6. When the active-repo signal is absent or stale, the MCP server falls back to the most recently updated graph artefact in the user's workspace.
+4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while Pi prompts for AST-only or Full graph creation after clone and queries once `graphify-out/graph.json` exists.
+5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact.
+6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
 
 **Constraints:**
 
@@ -1312,7 +1324,9 @@ None.
 ### REQ-AGENT-042: Graphify Hard-Block Enforcement
 
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/enforce-graphify.sh -->
+<!-- @impl: preseed/agents/pi/extensions/context-mode-enforcement.ts -->
 <!-- @test: host/__tests__/enforce-graphify.test.js (3-call threshold + bypass surfaces + sentinel resolution → AC1-AC7) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi context-mode enforcement: bashDenialReason, commandFromEvent, tool_call/tool_execution_start blocking) -->
 
 **Intent:** The graph-first soft-nudge in REQ-AGENT-024 informs but never blocks. When an agent ignores it across multiple calls, a hard-block hook denies further structural searches until a graph query is made, with explicit user-only bypass surfaces for legitimate edge cases.
 
@@ -1345,9 +1359,10 @@ None.
 ### REQ-AGENT-043: Graphify Build Mode Dispatch
 
 <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md -->
-<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC4-AC5) -->
+<!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md -->
+<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC4-AC5) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-043 Pi graphify skill override avoids headless DeepSeek and routes Full mode to Pi Agent subagents -> AC7) -->
 
-**Intent:** Before a `/graphify` build dispatches semantic-extraction subagents, the user must explicitly choose between a free AST-only build and a full build that costs LLM tokens. The dispatched subagents run on Sonnet by default for reliable schema compliance.
+**Intent:** Before a `/graphify` build dispatches semantic-extraction subagents, the user must explicitly choose between a free AST-only build and a full build that costs LLM tokens. In Pi, this must use local AST extraction plus running-session Pi `Agent` subagents rather than headless DeepSeek extraction. The dispatched subagents run on Sonnet by default for reliable schema compliance.
 
 **Applies To:** Agent
 
@@ -1359,6 +1374,7 @@ None.
 4. In advanced session mode only, Part B semantic subagents use a model capable of reliable structured-output schema compliance so that the resulting graph nodes are well-formed.
 5. Opus is never used from this skill.
 6. The Part C merge step preserves all data structures produced by Part B subagents - including hyperedges - in the merged output; no field present in the semantic extraction result is silently dropped.
+7. Pi's native graphify skill does not instruct the agent to run headless `graphify extract --backend deepseek` for the interactive workflow; AST-only mode uses the Pi-owned bounded graphify update wrapper, and Full mode uses Pi `Agent` subagents.
 
 **Constraints:**
 
@@ -1372,14 +1388,16 @@ None.
 
 **Status:** Partial
 
-<!-- coverage-gap: AC1-AC3 and AC6 are runtime behavioral checks not covered by the static SKILL.md content test. AC4-AC5 are verified by content test. -->
+<!-- coverage-gap: AC1-AC3 and AC6 are runtime behavioral checks not covered by the static SKILL.md content test. AC4-AC5 are verified by content test; AC7 is covered by the Pi seed/skill invariant test. -->
 
 ---
 
 ### REQ-AGENT-025: Post-Clone Graph Triage
 
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-clone-prompt.sh -->
-<!-- @test: host/__tests__/graphify-clone-prompt.test.js (clone-detect + graph-present/absent branch + idempotency marker → AC1-AC3) -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
+<!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts -->
+<!-- @test: host/__tests__/graphify-clone-prompt.test.js (clone-detect + graph-present/absent branch + idempotency marker → AC1-AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi graphify clone triage helper -> AC2) -->
 
 **Intent:** After the agent clones a repo, it must triage whether to build (or refresh) a knowledge graph for it before doing other work, so users on unfamiliar repos do not start cold.
 
@@ -1387,13 +1405,13 @@ None.
 
 **Acceptance Criteria:**
 
-1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects `git clone` and `gh repo clone` invocations (anchored token regex, not substring; rejects echoed false positives) and injects a directive.
-2. The directive branches on whether `<cloned-dir>/graphify-out/graph.json` already exists: if absent, the directive instructs the agent to prompt the user via `AskUserQuestion` and run a full `/graphify` build on confirmation; if present, the directive tells the agent to skip the prompt and run `graphify update .` (AST-only incremental refresh).
-3. The hook is idempotent per cloned directory per session via a marker file under `/tmp/codeflare-graphify-prompted-<session_id>/`. The marker dir is session-scoped via `session_id` from the hook envelope (fallback `ppid-$PPID`) so a fresh session re-triages the same clone and stale markers do not persist across container restarts.
+1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects `git clone` and `gh repo clone` invocations (anchored token regex, not substring; rejects echoed false positives) and injects a directive. Pi implements the same behavior with native tool lifecycle events and Pi follow-up messages.
+2. The directive branches on whether `<cloned-dir>/graphify-out/graph.json` already exists: if absent, the directive instructs the agent to prompt the user to choose AST-only (free/local) or Full semantic+AST; if present, the directive tells the agent to check freshness and offer AST-only update or Full refresh when stale.
+3. The hook is idempotent per cloned directory per session via a marker key that includes both the session identifier and cloned repository path. A fresh session re-triages the same clone and stale markers do not persist across container restarts.
 
 **Constraints:**
 
-- The hook never invokes graphify directly. It only injects a directive instructing the agent to prompt the user via AskUserQuestion (or to run `graphify update` for the graph-present branch).
+- The hook never invokes graphify directly. It only injects a directive instructing the agent to prompt the user via AskUserQuestion (or to run the bounded graphify update wrapper for the graph-present branch).
 
 **Priority:** P1
 
@@ -1401,7 +1419,9 @@ None.
 
 **Verification:** [Automated test](../../host/__tests__/graphify-clone-prompt.test.js)
 
-**Status:** Implemented
+**Status:** Partial
+
+<!-- coverage-gap: Claude post-clone hook path is implemented and covered. Pi native codeflare-pi.ts implements clone triage through lifecycle events, but Pi-specific tool_execution_end arg-correlation, follow-up emission, same-session idempotency, and failed-clone suppression need dedicated behavioral coverage. -->
 
 ---
 
@@ -1529,7 +1549,7 @@ None.
 ### REQ-AGENT-030: Multi-Agent Format Transforms
 
 <!-- @impl: scripts/generate-agent-seed.mjs -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (multi-agent documents describe → per-agent frontmatter + model removal + path rewrites + .agent.md → AC1-AC4) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (multi-agent documents describe → per-agent frontmatter + model removal + path rewrites + .agent.md → AC1-AC5) -->
 
 **Intent:** Each non-Claude agent has its own config-file conventions (frontmatter shape, model-field presence, path layout, file extensions). The generator must apply the right per-agent transform so the adapted config is valid for the consumer.
 
@@ -1537,10 +1557,11 @@ None.
 
 **Acceptance Criteria:**
 
-1. Agent definitions use correct frontmatter format per agent (e.g., `tools` as record `{read: true}` for OpenCode, as array for others).
-2. `model` field is removed from frontmatter for non-CC agents.
-3. Path references (e.g., `~/.claude/`) are replaced with agent-specific config paths.
-4. File extensions match agent conventions (e.g., `.agent.md` for Copilot agents).
+1. Agent definitions use correct frontmatter format per agent (e.g., `tools` as record `{read: true}` for OpenCode, as array or comma-separated names according to the target schema).
+2. `model` field is removed from frontmatter for non-CC agents where the target runtime resolves model selection independently.
+3. Path references (e.g., `~/.claude/`) are replaced with agent-specific config paths, including Pi's `.pi/agent/agents/` subagent path.
+4. File extensions match agent conventions (e.g., `.agent.md` for Copilot agents and `.md` for Pi subagents).
+5. Pi subagent transforms emit Pi-compatible frontmatter for tools, prompt mode, extension/skill inheritance, context inheritance, and background defaults.
 
 **Constraints:**
 

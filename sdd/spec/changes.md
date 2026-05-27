@@ -2,9 +2,18 @@
 
 Semantic changes to the specification. Git history captures diffs; this file captures intent.
 
+## 2026-05-27
+
+- REQ-AGENT-001 updated: Pi extension npm dependencies are preinstalled into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant), avoiding Pi's first-launch npm install delay.
+- REQ-AGENT-012 updated: Fast Start now suppresses Pi startup network/update checks, while disabling Fast Start restores Pi update paths alongside the other CLI agents.
+- REQ-AGENT-023 / REQ-AGENT-025 / REQ-AGENT-043 updated: Pi receives a native graphify package and skill override, post-clone graph triage through Pi lifecycle events, and an interactive build-mode split where AST-only uses the bounded graphify wrapper and Full mode uses Pi Agent semantic subagents instead of headless DeepSeek extraction. REQ-AGENT-023 remains Implemented after adding Pi AC4 behavioral coverage for missing-graph tolerance and post-clone prompting. REQ-AGENT-025 AC3 idempotency wording abstracted from concrete marker path to marker key.
+- Review scope fix: review agents now receive incremental diff scope (last-ack to current head) instead of the full PR diff against the base branch. Affects both Pi (review-enforcement.ts reviewBase field) and Claude (git-push-review-reminder.sh LAST_ACK_PR_HEAD check). Review bypass text clarified as USER-ONLY to prevent agent self-bypass.
+- REQ-MEM-001 / REQ-MEM-002 / REQ-MEM-010 / REQ-VAULT-003 / REQ-VAULT-004 updated: Pi receives native lifecycle automation for per-15-prompt memory capture, Vault edit extraction, and best-effort Vault/repo graph merges into the unified global graph. Pi behavioral gaps closed: captureTimestamp with timezone, isFirstMessage/isResumedSession for first-run/resume detection, shouldCapture for 15-message cadence, VAULT_INFLIGHT sentinel, flock-based global merge. All promoted to Implemented with behavioral tests in agent-seed-manifest.test.ts importing from memory-vault-helpers.ts.
+
 ## 2026-05-26
 
-- REQ-AGENT-001 updated: seven agent types (added `pi`). Pi Coding Agent (`@earendil-works/pi-coding-agent`) installed in Dockerfile alongside existing agents, V8 compile cache pre-warmed at build time. UI registers Pi with icon and "beta" badge.
+- REQ-AGENT-006 / REQ-AGENT-007 / REQ-AGENT-030 / REQ-AGENT-036 / REQ-AGENT-040 / REQ-AGENT-041 updated: Pi is now a first-class preseed runtime target. The generator emits Pi-native extension/package/MCP assets and adapts Claude agent definitions into Pi subagent files, with Pi-specific frontmatter/path conventions, PR-boundary review sequencing, smart lane classification, bypass handling, and completion acknowledgement.
+- REQ-AGENT-001 updated: seven agent types (added `pi`). Pi Coding Agent (`@earendil-works/pi-coding-agent`) installed in Dockerfile alongside existing agents, V8 compile cache pre-warmed at build time.
 - REQ-AGENT-049 added: preseed content is now reconciled automatically on first dashboard load when a release ships updated agent skills, rules, or plugins. Build-time SHA-256 hash piggybacked on batch-status initial load; hash stored in UserPreferences KV. UI prevents session creation during the brief upgrade. No manual "Recreate" click required.
 - REQ-AGENT-028 AC2 updated: Cloudflare token creation now uses three-tier scope selector (Minimal 7 / Recommended 10 / Advanced 22 scopes) with prefilled template URLs, matching the existing GitHub pattern. Replaces the plain API tokens page link that was a workaround after Cloudflare broke the old template URL syntax.
 
