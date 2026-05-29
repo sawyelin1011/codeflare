@@ -10,12 +10,24 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync,
 import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { graphifyClonePromptDecision, isFailedToolExecution, renderGraphifyCloneDirective } from "./graphify-helpers";
+import { sddCommandDecision, type SddRepoState, SDD_HELP_TEXT } from "./sdd-helpers";
 
 const CACHE_DIR = "/home/user/.cache/codeflare-hooks";
 const ACTIVE_REPO_FILE = join(CACHE_DIR, "graphify-active-cwd");
 const VAULT_ROOT = "/home/user/Vault";
 const GLOBAL_GRAPH_LOCK = "/tmp/graphify-global.lock";
 const GRAPHIFY_BYPASS = "/tmp/graphify-bypass";
+const LOCAL_BUILD_BYPASS = "/tmp/local-build-bypass";
+const PI_SETTINGS_FILE = "/home/user/.pi/agent/settings.json";
+const CONTEXT_MODE_PACKAGE = "npm:context-mode@1.0.151";
+const CONTEXT_MODE_PACKAGE_ID = "npm:context-mode";
+const CONTEXT_MODE_DISABLED_PACKAGE = { source: CONTEXT_MODE_PACKAGE, extensions: [], skills: [] };
+
+type PiSettings = {
+  packages?: Array<string | { source?: string; extensions?: string[]; skills?: string[]; [key: string]: unknown }>;
+  extensions?: string[];
+  [key: string]: unknown;
+};
 
 function ensureCacheDir(): void {
   mkdirSync(CACHE_DIR, { recursive: true });
@@ -32,7 +44,7 @@ function findGitRoot(startDir: string): string | undefined {
 }
 
 function shell(command: string, cwd: string): string {
-  return execFileSync("bash", ["-lc", command], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("bash", ["-lc", command], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }).trim();
 }
 
 function currentBranch(repo: string): string | undefined {
@@ -70,13 +82,31 @@ function hasGraph(repo: string): boolean {
 function graphSummary(repo: string): string | undefined {
   const graphPath = join(repo, "graphify-out", "graph.json");
   if (!existsSync(graphPath)) return undefined;
+  const layout = "Repo graphs live under <repo>/graphify-out/graph.json, never /home/user/workspace/graphify-out. Vault graph: /home/user/Vault/graphify-out/graph.json. Global graph: /home/user/.graphify/global-graph.json.";
   try {
-    const graph = JSON.parse(readFileSync(graphPath, "utf8")) as { nodes?: unknown[]; links?: unknown[]; edges?: unknown[] };
+    // Skip the synchronous parse on very large graphs; reading a multi-MB graph at
+    // session start would block the agent. 30MB mirrors the Claude session-start guard.
+    if (statSync(graphPath).size > 31457280) {
+      return `Graphify repo graph available for ${basename(repo)} at ${graphPath} (large graph; node counts skipped). ${layout} Prefer graphify query tools for architecture/dependency/call-flow questions before broad text search.`;
+    }
+    const graph = JSON.parse(readFileSync(graphPath, "utf8")) as { nodes?: unknown[]; links?: unknown[]; edges?: unknown[]; built_at_commit?: string };
     const nodes = Array.isArray(graph.nodes) ? graph.nodes.length : 0;
     const links = Array.isArray(graph.links) ? graph.links.length : Array.isArray(graph.edges) ? graph.edges.length : 0;
-    return `Graphify graph available for ${basename(repo)}: ${nodes} nodes, ${links} links at ${graphPath}. Prefer graphify query tools for architecture/dependency/call-flow questions before broad text search.`;
+    const built = typeof graph.built_at_commit === "string" ? graph.built_at_commit : undefined;
+    let freshness = "";
+    if (built) {
+      try {
+        const head = shell("git rev-parse HEAD", repo);
+        freshness = built === head
+          ? ` Fresh at ${head.slice(0, 12)}.`
+          : ` Stale: built at ${built.slice(0, 12)}, repo HEAD is ${head.slice(0, 12)}.`;
+      } catch {
+        freshness = ` Built at ${built.slice(0, 12)}.`;
+      }
+    }
+    return `Graphify repo graph available for ${basename(repo)}: ${nodes} nodes, ${links} links at ${graphPath}.${freshness} ${layout} Prefer graphify query tools for architecture/dependency/call-flow questions before broad text search.`;
   } catch {
-    return `Graphify graph available for ${basename(repo)} at ${graphPath}. Prefer graphify query tools for architecture/dependency/call-flow questions before broad text search.`;
+    return `Graphify repo graph available for ${basename(repo)} at ${graphPath}. ${layout} Prefer graphify query tools for architecture/dependency/call-flow questions before broad text search.`;
   }
 }
 
@@ -109,21 +139,55 @@ function isGitPush(command: string): boolean {
 }
 
 function ensureNoAttributedCommit(command: string): string | undefined {
-  if (!/(^|[;&|]\s*)(git\s+commit|gh\s+pr\s+create)\b/.test(command)) return undefined;
-  if (/Co-Authored-By:|Generated with|🤖|🧠|Claude|ChatGPT/i.test(command)) {
-    return "Codeflare blocks AI attribution in commits/PRs. Remove Co-Authored-By, generated-by text, and emoji attribution.";
+  if (!/(^|[;&|]\s*)(git\s+(commit|merge|tag|notes)|gh\s+(pr|issue|release)\s+\w+)\b/.test(command)) return undefined;
+  // Match the canonical block-attributed-commits.sh detection set. Deliberately NOT bare
+  // "Claude": that false-positives on git/gh commands naming preseed/agents/claude/ paths.
+  if (/co-authored-by|noreply@anthropic|claude\s+(sonnet|opus|haiku|code)|generated with[^\n]*claude|🤖|🧠|ChatGPT/i.test(command)) {
+    return "Codeflare blocks AI attribution in commits, PRs, issues, releases, and tags. Remove Co-Authored-By, generated-by text, model-name attribution, and emoji attribution.";
   }
   return undefined;
 }
 
 function ensureNoLocalBuild(command: string): string | undefined {
-  if (/\b(npm|pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|dev)\b/.test(command)) {
-    return "Local builds/tests/linters/dev servers are blocked in the 1-CPU container. Push and verify with CI instead.";
+  const isBuild = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|dev)\b/.test(command)
+    || /\b(pytest|vitest|go\s+test|swift\s+test|cargo\s+test|tsc|eslint|oxlint|prettier|wrangler\s+dev)\b/.test(command);
+  if (!isBuild) return undefined;
+  // User-only escape hatch (consume-on-use), mirrors Claude's /tmp/local-build-bypass.
+  if (existsSync(LOCAL_BUILD_BYPASS)) {
+    try {
+      unlinkSync(LOCAL_BUILD_BYPASS);
+      return undefined;
+    } catch { /* could not consume the sentinel; keep blocking so a stuck file cannot permanently disable the gate */ }
   }
-  if (/\b(pytest|vitest|go\s+test|swift\s+test|cargo\s+test|tsc|eslint|wrangler\s+dev)\b/.test(command)) {
-    return "Local test/build/lint/dev commands are blocked in the 1-CPU container. Push and verify with CI instead.";
+  return "Local builds/tests/linters/dev servers are blocked in the 1-CPU container. Push and verify with CI instead. User override: create /tmp/local-build-bypass.";
+}
+
+function sddRepoState(repo: string): SddRepoState {
+  return {
+    dirty: isDirtyWorkingTree(repo),
+    hasSdd: existsSync(join(repo, "sdd")),
+    hasOpenInitTriage: hasOpenInitTriage(repo),
+  };
+}
+
+function isDirtyWorkingTree(repo: string): boolean {
+  try {
+    return shell("git status --porcelain", repo).length > 0;
+  } catch {
+    return false;
   }
-  return undefined;
+}
+
+function hasOpenInitTriage(repo: string): boolean {
+  const candidates = [join(repo, "sdd", "spec", ".init-triage.md"), join(repo, "sdd", ".init-triage.md")];
+  for (const path of candidates) {
+    try {
+      if (existsSync(path) && /\*\*Status:\*\*\s*open\b/i.test(readFileSync(path, "utf8"))) return true;
+    } catch {
+      // Ignore unreadable transition files; the skill will surface a clearer finding.
+    }
+  }
+  return false;
 }
 
 function skillPrompt(name: string, fallback: string): string {
@@ -152,6 +216,54 @@ function maybeMergeGlobalGraph(repo: string): void {
   }
 }
 
+function packageSource(entry: string | { source?: string } | undefined): string | undefined {
+  if (typeof entry === "string") return entry;
+  return typeof entry?.source === "string" ? entry.source : undefined;
+}
+
+function packageIdentity(source: string): string {
+  return source.replace(/@[^/@]+$/, "");
+}
+
+function readPiSettings(): PiSettings {
+  try {
+    return JSON.parse(readFileSync(PI_SETTINGS_FILE, "utf8")) as PiSettings;
+  } catch {
+    return {};
+  }
+}
+
+function writePiSettings(settings: PiSettings): void {
+  writeFileSync(PI_SETTINGS_FILE, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+}
+
+function isContextModePackage(entry: string | { source?: string } | undefined): boolean {
+  const source = packageSource(entry);
+  return Boolean(source && packageIdentity(source) === CONTEXT_MODE_PACKAGE_ID);
+}
+
+function contextModeEnabled(settings = readPiSettings()): boolean {
+  return (settings.packages ?? []).some((entry) => {
+    if (!isContextModePackage(entry)) return false;
+    return typeof entry === "string" || entry.extensions === undefined || entry.skills === undefined;
+  });
+}
+
+function setContextModeEnabled(enabled: boolean): "enabled" | "disabled" {
+  const settings = readPiSettings();
+  const packages = (settings.packages ?? []).filter((entry) => !isContextModePackage(entry));
+  packages.push(enabled ? CONTEXT_MODE_PACKAGE : CONTEXT_MODE_DISABLED_PACKAGE);
+  writePiSettings({ ...settings, packages });
+  return enabled ? "enabled" : "disabled";
+}
+
+function contextModeStatusText(): string {
+  const enabled = contextModeEnabled();
+  return enabled
+    ? "context-mode is enabled for this running Pi session. It will be disabled again on the next Codeflare container start. Use `/ctx off` to disable now."
+    : "context-mode is disabled. Use `/ctx on` to enable it for this running Pi session, then Pi will reload resources.";
+}
+
 function newestVaultMtime(): number | undefined {
   if (!existsSync(VAULT_ROOT)) return undefined;
   let newest = 0;
@@ -173,6 +285,7 @@ export default function (pi: ExtensionAPI) {
   let searchCountThisTurn = 0;
   let graphifyCountThisTurn = 0;
   const toolStartArgs = new Map<string, any>();
+  const gatedToolIds = new Set<string>();
 
   function toolEventId(event: any): string | undefined {
     const id = event?.toolCallId ?? event?.toolUseId ?? event?.id;
@@ -190,10 +303,22 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("sdd", {
     description: "Run Codeflare specification-driven development workflow",
+    getArgumentCompletions: (prefix) => {
+      const commands = ["init", "edit", "add", "clean", "mode"];
+      return commands.filter((command) => command.startsWith(prefix)).map((value) => ({ value, label: value }));
+    },
     handler: async (args, ctx) => {
-      const subcommand = args.trim().split(/\s+/, 1)[0] || "help";
-      const skill = subcommand === "init" ? "sdd-init" : subcommand === "clean" ? "sdd-clean" : "spec-driven-development";
-      await sendWorkflowMessage(ctx, `/sdd ${args}`.trim(), `${skillPrompt(skill, "Use the Codeflare SDD workflow.")}\n\nUser command: /sdd ${args}`);
+      const repo = activeRepo(ctx) ?? ctx.sessionManager.getCwd();
+      const decision = sddCommandDecision(args, sddRepoState(repo));
+      if (decision.kind === "help") {
+        ctx.ui.notify(decision.message || SDD_HELP_TEXT, "info");
+        return;
+      }
+      if (decision.kind === "error") {
+        ctx.ui.notify(decision.message, "warning");
+        return;
+      }
+      await sendWorkflowMessage(ctx, decision.normalizedCommand, `${skillPrompt(decision.skill, "Use the Codeflare SDD workflow.")}\n\nUser command: ${decision.normalizedCommand}`);
     },
   });
 
@@ -221,6 +346,26 @@ export default function (pi: ExtensionAPI) {
     description: "Capture a note into the persistent Vault",
     handler: async (args, ctx) => {
       await sendWorkflowMessage(ctx, `/note ${args}`.trim(), `${skillPrompt("vault-note-capture", "Capture the user's note into ~/Vault/Notes.")}\n\nNote text: ${args}`);
+    },
+  });
+
+  pi.registerCommand("ctx", {
+    description: "Show, enable, or disable context-mode for this running Pi session. Usage: /ctx status|on|off",
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase().split(/\s+/, 1)[0] || "status";
+      if (["on", "enable", "enabled"].includes(action)) {
+        setContextModeEnabled(true);
+        ctx.ui.notify("context-mode enabled for this session; reloading Pi resources...", "info");
+        await ctx.reload();
+        return;
+      }
+      if (["off", "disable", "disabled"].includes(action)) {
+        setContextModeEnabled(false);
+        ctx.ui.notify("context-mode disabled; reloading Pi resources...", "info");
+        await ctx.reload();
+        return;
+      }
+      ctx.ui.notify(contextModeStatusText(), "info");
     },
   });
 
@@ -254,31 +399,49 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const isShellSurface = toolName === "bash" || toolName.includes("ctx_execute") || toolName.includes("ctx_batch_execute") || toolName.includes("ctx_execute_file");
-    if (isShellSurface) {
+    // A shell command ran if the tool carried one (bash input.command, or the ctx_* tools'
+    // code/commands when context-mode is on). Detect by command content, not tool name, so
+    // this works whether or not context-mode is active.
+    if (command) {
       const attributionReason = ensureNoAttributedCommit(command);
       if (attributionReason) return { block: true, reason: attributionReason };
       const buildReason = ensureNoLocalBuild(command);
       if (buildReason) return { block: true, reason: buildReason };
     }
 
-    if (isShellSurface && command && isStructuralSearch(command)) {
+    if (command && isStructuralSearch(command)) {
       searchCountThisTurn++;
-      if (existsSync(GRAPHIFY_BYPASS)) {
-        try { unlinkSync(GRAPHIFY_BYPASS); } catch { /* best effort */ }
-        return;
-      }
-      const repo = activeRepo(ctx);
-      if (repo && hasGraph(repo) && searchCountThisTurn >= 3 && graphifyCountThisTurn === 0) {
-        return { block: true, reason: `Graphify graph exists for ${basename(repo)}. Query graphify_query, graphify_path, or graphify_explain before more structural searches, or ask the user to create ${GRAPHIFY_BYPASS}.` };
-      }
+      try {
+        if (existsSync(GRAPHIFY_BYPASS)) {
+          try {
+            unlinkSync(GRAPHIFY_BYPASS);
+            return;
+          } catch { /* could not consume the sentinel; fall through to the normal graph-first gate */ }
+        }
+        const repo = activeRepo(ctx);
+        if (repo && hasGraph(repo) && searchCountThisTurn >= 3 && graphifyCountThisTurn === 0) {
+          return { block: true, reason: `Graphify graph exists for ${basename(repo)}. Query graphify_query, graphify_path, or graphify_explain before more structural searches, or ask the user to create ${GRAPHIFY_BYPASS}.` };
+        }
+      } catch { /* fail open: never block a tool call on an internal gate error */ }
     }
   };
 
-  pi.on("tool_call", onToolStart);
+  // onToolStart is the pre-execution gate. Pi can surface one tool invocation as both
+  // `tool_call` and `tool_execution_start`; running the gate (with its consume-on-use bypass and
+  // per-turn counters) on both passes would double-count searches and consume a bypass on the
+  // first pass only to block on the second. Gate exactly once per invocation, keyed by tool id,
+  // while still gating tools that surface only one of the two events. Monotonic: this only
+  // suppresses a redundant second pass, it never skips gating an invocation.
+  pi.on("tool_call", (event: any, ctx: any) => {
+    const id = toolEventId(event);
+    if (id) gatedToolIds.add(id);
+    return onToolStart(event, ctx);
+  });
   pi.on("tool_execution_start", (event: any, ctx: any) => {
     const id = toolEventId(event);
     if (id) toolStartArgs.set(id, event?.args ?? event?.input ?? event?.params ?? {});
+    if (id && gatedToolIds.has(id)) return;
+    if (id) gatedToolIds.add(id);
     return onToolStart(event, ctx);
   });
 
@@ -312,5 +475,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", (_event, _ctx) => {
     searchCountThisTurn = 0;
     graphifyCountThisTurn = 0;
+    gatedToolIds.clear();
   });
 }

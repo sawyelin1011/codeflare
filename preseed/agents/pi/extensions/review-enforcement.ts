@@ -3,18 +3,26 @@
  *
  * Native Pi counterpart to Claude Code's PR-boundary review hooks.
  * It watches pushes/PR creation/PR merges for SDD projects with an open PR to
- * main/master, computes the minimal required review lanes, emits Agent calls
+ * main/master, computes the minimal required review lanes, spawns Pi subagents
  * for only those lanes, persists progress under .git/, and acknowledges the PR
  * head only after the required lanes complete.
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { pathToFileURL } from "node:url";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ALL_REVIEW_LANES, classifyReviewFiles, isCurrentReviewHead, isFailedToolExecution, isPrBoundaryCommand, isReviewCompletionForLane } from "./review-helpers";
 
 const REVIEW_BYPASS = "/tmp/review-bypass";
+
+// Circuit-breaker bounds. A pending review for a given HEAD that cannot make
+// progress (e.g. the subagent service ctx went stale after a compaction) must
+// stop re-spawning and re-reminding instead of spiralling unbounded. Latch once
+// we exceed either bound; the counter is reset on real progress.
+const MAX_REVIEW_ATTEMPTS = 5;
+const MAX_REVIEW_AGE_MS = 20 * 60 * 1000;
 
 type PrState = {
   state?: string;
@@ -40,7 +48,7 @@ type PendingReview = {
 };
 
 function shell(command: string, cwd: string): string {
-  return execFileSync("bash", ["-lc", command], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync("bash", ["-lc", command], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 }).trim();
 }
 
 function findGitRoot(startDir: string): string | undefined {
@@ -115,6 +123,14 @@ function pendingPath(repo: string): string {
   return join(repo, ".git", "sdd-review-pending.json");
 }
 
+function reviewResultsDir(repo: string, head: string): string {
+  return join(repo, ".git", "sdd-review-results", head);
+}
+
+function reviewResultPath(repo: string, head: string, lane: string): string {
+  return join(reviewResultsDir(repo, head), `${lane}.md`);
+}
+
 function blockCountPath(repo: string): string {
   return join(repo, ".git", "sdd-review-block-count");
 }
@@ -148,10 +164,62 @@ function incrementBlockCount(repo: string): number {
   return count;
 }
 
+function breakerPath(repo: string): string {
+  return join(repo, ".git", "sdd-review-breaker");
+}
+
+// The breaker latch is keyed by HEAD: once open for a head, all enforcement for
+// that exact head becomes a no-op until a new head is pushed or the user acks/bypasses.
+function isBreakerOpen(repo: string, head: string): boolean {
+  try { return readFileSync(breakerPath(repo), "utf8").trim() === head; } catch { return false; }
+}
+
+function openBreaker(repo: string, head: string): void {
+  writeFileSync(breakerPath(repo), `${head}\n`, "utf8");
+}
+
+function clearBreaker(repo: string): void {
+  try { unlinkSync(breakerPath(repo)); } catch { /* best effort */ }
+}
+
 function consumeBypass(): boolean {
   if (!existsSync(REVIEW_BYPASS)) return false;
-  try { unlinkSync(REVIEW_BYPASS); } catch { /* best effort */ }
-  return true;
+  try {
+    unlinkSync(REVIEW_BYPASS);
+    return true;
+  } catch {
+    return false; // cannot consume the sentinel; do not grant a bypass that would persist and leave the merge gate permanently open
+  }
+}
+
+function stringifyReviewResult(result: unknown): string {
+  if (typeof result === "string") return result.trim();
+  if (result == null) return "";
+  try { return JSON.stringify(result, null, 2); } catch { return String(result); }
+}
+
+function toolResultPayload(event: any): unknown {
+  return event?.result ?? event?.output ?? event?.content ?? event?.message ?? event?.data;
+}
+
+function persistReviewResult(state: PendingReview, lane: string, result: unknown): string {
+  const dir = reviewResultsDir(state.repo, state.head);
+  mkdirSync(dir, { recursive: true });
+  const text = stringifyReviewResult(result) || "No findings reported.";
+  const path = reviewResultPath(state.repo, state.head, lane);
+  writeFileSync(path, [`# PR-boundary ${lane}`, "", `Repo: ${basename(state.repo)}`, `Head: ${state.head}`, `PR: ${state.prNumber || "?"}`, "", text, ""].join("\n"), "utf8");
+  return path;
+}
+
+// Keep only the current head's results under .git/sdd-review-results/ so old PR HEADs do
+// not accumulate across a long-lived branch. Best-effort; never throws.
+function pruneReviewResults(repo: string, keepHead: string): void {
+  try {
+    const base = join(repo, ".git", "sdd-review-results");
+    for (const entry of readdirSync(base)) {
+      if (entry !== keepHead) rmSync(join(base, entry), { recursive: true, force: true });
+    }
+  } catch { /* best effort: dir may not exist yet */ }
 }
 
 function loadPending(repo: string): PendingReview | undefined {
@@ -202,42 +270,103 @@ function mergeLaneState(repo: string, currentHead: string, previous?: PendingRev
   return { lanes, completed };
 }
 
-function agentCall(type: string, prompt: string, description: string): string {
-  return `Agent({ subagent_type: ${JSON.stringify(type)}, prompt: ${JSON.stringify(prompt)}, description: ${JSON.stringify(description)}, run_in_background: false })`;
+type SubagentRecordLike = {
+  status?: string;
+  result?: unknown;
+  error?: unknown;
+};
+
+type SubagentsServiceLike = {
+  spawn?: (type: string, prompt: string, options?: Record<string, unknown>) => string;
+  getRecord?: (id: string) => SubagentRecordLike | undefined;
+  hasRunning?: () => boolean;
+  runtime?: { currentCtx?: unknown; setSessionContext?: (ctx: unknown) => void };
+};
+
+let importedSubagentsAccessor: (() => SubagentsServiceLike | undefined) | undefined;
+
+async function importSubagentsAccessor(): Promise<(() => SubagentsServiceLike | undefined) | undefined> {
+  if (importedSubagentsAccessor) return importedSubagentsAccessor;
+  const candidates = [
+    join(getAgentDir(), "npm", "node_modules", "@gotgenes", "pi-subagents", "src", "service", "service.ts"),
+    "/home/user/.pi/agent/npm/node_modules/@gotgenes/pi-subagents/src/service/service.ts",
+  ];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    try {
+      const module = await import(pathToFileURL(candidate).href) as { getSubagentsService?: () => SubagentsServiceLike | undefined };
+      if (typeof module.getSubagentsService === "function") {
+        importedSubagentsAccessor = module.getSubagentsService;
+        return importedSubagentsAccessor;
+      }
+    } catch {
+      // Try the next candidate; fallback notification happens in spawnLane.
+    }
+  }
+  return undefined;
 }
 
-function subagentsService(): any | undefined {
-  return (globalThis as Record<symbol, unknown>)[Symbol.for("@gotgenes/pi-subagents:service")];
+async function subagentsService(): Promise<SubagentsServiceLike | undefined> {
+  const service = (globalThis as Record<symbol, unknown>)[Symbol.for("@gotgenes/pi-subagents:service")];
+  if (service && typeof service === "object" && typeof (service as SubagentsServiceLike).spawn === "function") return service as SubagentsServiceLike;
+  return (await importSubagentsAccessor())?.();
 }
 
-async function spawnLane(type: string, prompt: string, description: string, notify?: (message: string) => void): Promise<string | undefined> {
-  const service = subagentsService();
+function isRealSessionCtx(ctx: unknown): boolean {
+  // pi-subagents builds the parent snapshot from this ctx and reads ctx.modelRegistry.
+  // A fabricated/background stub (e.g. the one synthesised for the subagents:completed
+  // event) lacks it; seeding such a ctx corrupts the service so that every subsequent
+  // spawn throws "extension ctx is stale". Only ever seed a genuine session ctx.
+  return Boolean(ctx && typeof ctx === "object" && (ctx as { modelRegistry?: unknown }).modelRegistry);
+}
+
+function refreshSubagentsContext(service: SubagentsServiceLike, ctx: unknown): void {
+  if (!isRealSessionCtx(ctx)) return;
+  try {
+    if (typeof service.runtime?.setSessionContext === "function") service.runtime.setSessionContext(ctx);
+    else if (service.runtime && typeof service.runtime === "object") service.runtime.currentCtx = ctx;
+  } catch {
+    // Best effort; spawnLane handles any remaining service error without leaking internals.
+  }
+}
+
+function spawnFailureMessage(type: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes("extension ctx is stale")) {
+    return `Failed to spawn ${type}; Pi subagent service had a stale session context. Review remains pending and automatic spawn will retry after reload.`;
+  }
+  return `Failed to spawn ${type}; review remains pending and automatic spawn will retry.`;
+}
+
+async function spawnLane(type: string, prompt: string, description: string, ctx: unknown, notify?: (message: string) => void): Promise<string | undefined> {
+  const service = await subagentsService();
   if (!service?.spawn) {
-    notify?.(`Pi subagent service unavailable; falling back for ${type}.`);
+    notify?.(`Pi subagent service unavailable for ${type}; review remains pending and automatic spawn will retry.`);
     return undefined;
   }
   try {
+    refreshSubagentsContext(service, ctx);
     const id = service.spawn(type, prompt, { description, inheritContext: false });
     return typeof id === "string" ? id : undefined;
   } catch (error) {
-    notify?.(`Failed to spawn ${type}: ${error instanceof Error ? error.message : String(error)}`);
+    notify?.(spawnFailureMessage(type, error));
     return undefined;
   }
 }
 
-async function spawnInitialLanes(pending: PendingReview, pr: PrState, notify?: (message: string) => void): Promise<boolean> {
+async function spawnInitialLanes(pending: PendingReview, pr: PrState, ctx: unknown, notify?: (message: string) => void): Promise<boolean> {
   const base = reviewPrompt(pending.repo, pr, pending.head, pending.reviewBase);
   let spawned = false;
   if (pending.lanes.includes("code-reviewer")) {
-    const id = await spawnLane("code-reviewer", base, "Review code changes", notify);
+    const id = await spawnLane("code-reviewer", base, "Review code changes", ctx, notify);
     if (id) { pending.spawnedIds["code-reviewer"] = id; spawned = true; }
   }
   if (pending.lanes.includes("spec-reviewer")) {
-    const id = await spawnLane("spec-reviewer", base, "Review spec changes", notify);
+    const id = await spawnLane("spec-reviewer", base, "Review spec changes", ctx, notify);
     if (id) { pending.spawnedIds["spec-reviewer"] = id; spawned = true; }
   }
   if (pending.lanes.includes("doc-updater") && !pending.lanes.includes("spec-reviewer")) {
-    const id = await spawnLane("doc-updater", docUpdaterPrompt(pending), "Review documentation changes", notify);
+    const id = await spawnLane("doc-updater", docUpdaterPrompt(pending), "Review documentation changes", ctx, notify);
     if (id) { pending.spawnedIds["doc-updater"] = id; spawned = true; }
   }
   if (spawned) pending.spawnedAt = Date.now();
@@ -249,18 +378,6 @@ function reviewPrompt(repo: string, pr: PrState, head: string, reviewBase?: stri
     return `Work in ${repo}. Review PR #${pr.number || "?"} for ${basename(repo)}. Scope is ONLY the incremental diff from ${reviewBase} to ${head}. Run: git diff --name-only ${reviewBase} ${head} to see changed files, then git diff ${reviewBase} ${head} -- <path> for each. Do NOT review the full PR diff against ${pr.baseRefName}. Report findings only; do not modify files.`;
   }
   return `Work in ${repo}. Review PR #${pr.number || "?"} for ${basename(repo)} at head ${head}. Scope is the full PR diff (no prior review base). Run: git diff origin/${pr.baseRefName}...${head}. Report findings only; do not modify files.`;
-}
-
-function directiveFor(repo: string, pr: PrState, lanes: string[], reviewBase?: string): string {
-  const laneText = lanes.join(", ");
-  const head = pr.headRefOid!;
-  const sequence = lanes.includes("spec-reviewer") && lanes.includes("doc-updater")
-    ? `${lanes.filter((lane) => lane !== "doc-updater").join(" + ")} first; doc-updater after spec-reviewer completes`
-    : laneText;
-  const scope = reviewBase
-    ? `Scope is ONLY the incremental diff: git diff ${reviewBase} ${head}. Do NOT review the full PR diff against ${pr.baseRefName}.`
-    : `Scope is the full PR diff: git diff origin/${pr.baseRefName}...${head} (no prior review base).`;
-  return `PR-boundary review required for ${basename(repo)} PR #${pr.number || "?"} at ${head.slice(0, 12)}. ${scope} Required lanes: ${laneText}. Run: ${sequence}. Acknowledgement is automatic after required lanes complete.`;
 }
 
 function docUpdaterPrompt(pending: PendingReview): string {
@@ -279,6 +396,14 @@ function isCurrentPending(pending: PendingReview): boolean {
 export default function (pi: ExtensionAPI) {
   let pending: PendingReview | undefined;
   const toolStartArgs = new Map<string, any>();
+
+  // Background events (subagents:completed/failed) arrive without a usable session ctx.
+  // Remember the most recent real ctx from live handlers so doc-updater can still be
+  // spawned (and the service ctx re-seeded) when a reviewer completes off-turn.
+  let lastCtx: any;
+  const remember = (ctx: any): void => { if (isRealSessionCtx(ctx)) lastCtx = ctx; };
+  const completionCtx = (): any =>
+    isRealSessionCtx(lastCtx) ? lastCtx : { sessionManager: { getCwd: () => process.cwd() }, ui: { notify: () => undefined } };
 
   function toolEventId(event: any): string | undefined {
     const id = event?.toolCallId || event?.toolUseId || event?.id;
@@ -301,29 +426,64 @@ export default function (pi: ExtensionAPI) {
     return pending;
   }
 
-  async function markCompleted(type: string, ctx: any, completionId?: string, prompt?: string): Promise<void> {
+  function publishReviewResult(state: PendingReview, lane: string, result: unknown, ctx: any): void {
+    const path = persistReviewResult(state, lane, result);
+    const text = stringifyReviewResult(result) || "No findings reported.";
+    ctx.ui.notify(`PR-boundary ${lane} completed for ${basename(state.repo)} at ${state.head.slice(0, 12)}. Findings saved: ${path}`, "info");
+    try {
+      pi.sendMessage({
+        customType: "pr-boundary-review-result",
+        content: `PR-boundary ${lane} completed for ${basename(state.repo)} at ${state.head.slice(0, 12)}.\nFindings saved: ${path}\n\n${text}`,
+        display: true,
+        details: { repo: state.repo, head: state.head, lane, path, result: text },
+      });
+    } catch {
+      // UI notification + persisted result file are the reliable surfaces.
+    }
+  }
+
+  function publishReviewSummary(state: PendingReview, ctx: any): void {
+    const paths = state.lanes.map((lane) => `- ${lane}: ${reviewResultPath(state.repo, state.head, lane)}`).join("\n");
+    try {
+      pi.sendMessage({
+        customType: "pr-boundary-review-summary",
+        content: `PR-boundary review acknowledged for ${basename(state.repo)} at ${state.head.slice(0, 12)}.\nReviewer findings:\n${paths}`,
+        display: true,
+        details: { repo: state.repo, head: state.head, paths },
+      });
+    } catch {
+      ctx.ui.notify(`PR-boundary review acknowledged for ${basename(state.repo)} at ${state.head.slice(0, 12)}. Findings saved under ${reviewResultsDir(state.repo, state.head)}.`, "info");
+    }
+  }
+
+  async function markCompleted(type: string, ctx: any, completionId?: string, prompt?: string, result?: unknown): Promise<void> {
     const state = hydratePending(ctx);
     if (!state || !state.lanes.includes(type)) return;
     if (!isReviewCompletionForLane({ ...state, fallbackLanes: [...state.fallbackLanes] }, type, completionId, prompt)) return;
+    if (state.completed.has(type)) return;
     if (!isCurrentPending(state)) {
       clearPending(state.repo);
       pending = undefined;
       return;
     }
+    publishReviewResult(state, type, result, ctx);
     state.completed.add(type);
+    resetBlockCount(state.repo); // a lane completing is progress: reset the breaker patience counter
     if (type === "spec-reviewer" && state.lanes.includes("doc-updater") && !state.docPromptSent) {
       state.docPromptSent = true;
       savePending(state);
       const docPrompt = docUpdaterPrompt(state);
-      const spawnedId = await spawnLane("doc-updater", docPrompt, "Review documentation changes", (message) => ctx.ui.notify(message, "warning"));
+      ctx.ui.notify(`PR-boundary spec-reviewer completed; starting doc-updater for ${basename(state.repo)} at ${state.head.slice(0, 12)}.`, "info");
+      const spawnedId = await spawnLane("doc-updater", docPrompt, "Review documentation changes", ctx, (message) => ctx.ui.notify(message, "warning"));
       if (spawnedId) {
         state.spawnedIds["doc-updater"] = spawnedId;
         state.spawned = true;
         savePending(state);
+        ctx.ui.notify(`PR-boundary doc-updater started for ${basename(state.repo)} at ${state.head.slice(0, 12)}. Agent: ${spawnedId}`, "info");
       } else {
         state.fallbackLanes.add("doc-updater");
         savePending(state);
-        pi.sendUserMessage(agentCall("doc-updater", docPrompt, "Review documentation changes"), { deliverAs: "followUp" });
+        ctx.ui.notify(`PR-boundary doc-updater spawn pending for ${basename(state.repo)} at ${state.head.slice(0, 12)}; automatic spawn will retry.`, "warning");
       }
       return;
     }
@@ -331,8 +491,10 @@ export default function (pi: ExtensionAPI) {
     if (state.lanes.every((lane) => state.completed.has(lane))) {
       writeAck(state.repo, state.head);
       resetBlockCount(state.repo);
+      clearBreaker(state.repo);
       clearPending(state.repo);
       ctx.ui.notify(`PR-boundary review acknowledged for ${basename(state.repo)} at ${state.head.slice(0, 12)}.`, "info");
+      publishReviewSummary(state, ctx);
       pending = undefined;
     }
   }
@@ -341,8 +503,9 @@ export default function (pi: ExtensionAPI) {
     const toolName = String(event?.toolName || "").toLowerCase();
     const input = event?.input || event?.params || event?.args || {};
     const command = commandText(event);
-    const isShellSurface = toolName === "bash" || toolName.includes("ctx_execute") || toolName.includes("ctx_batch_execute");
-    if (isShellSurface && isGhPrMerge(command)) {
+    // commandText() pulls the command from bash (input.command) or, when context-mode is on,
+    // the ctx_* tools (code/commands). Gate on the command itself, never the tool name.
+    if (isGhPrMerge(command)) {
       const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
       if (!repo || !isSddProject(repo) || consumeBypass()) return;
       const pr = prState(repo);
@@ -386,14 +549,13 @@ export default function (pi: ExtensionAPI) {
       const prompt = String(input.prompt || "");
       const state = hydratePending(ctx);
       if (type && state?.fallbackLanes.has(type) && input.run_in_background !== true) {
-        await markCompleted(type, ctx, undefined, prompt);
+        await markCompleted(type, ctx, undefined, prompt, toolResultPayload(event));
       }
       return;
     }
 
     const command = commandText(event);
-    const isShellSurface = toolName === "bash" || toolName.includes("ctx_execute") || toolName.includes("ctx_batch_execute");
-    if (!isShellSurface || !isPrBoundaryCommand(command)) return;
+    if (!isPrBoundaryCommand(command)) return;
 
     const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
     if (!repo || !isSddProject(repo) || consumeBypass()) return;
@@ -403,6 +565,7 @@ export default function (pi: ExtensionAPI) {
     const head = localHead(repo) || pr.headRefOid;
     const effectivePr = { ...pr, headRefOid: head };
     if (acked(repo, head)) return;
+    if (isBreakerOpen(repo, head)) return; // breaker already gave up on this exact head; push a new commit to retry
 
     const previous = loadPending(repo);
     if (previous && previous.head === head) return;
@@ -418,11 +581,13 @@ export default function (pi: ExtensionAPI) {
     const reviewBase = previous?.head || lastAckHead(repo) || undefined;
     const validBase = reviewBase && isAncestor(repo, reviewBase, head) ? reviewBase : undefined;
     resetBlockCount(repo);
+    clearBreaker(repo); // new head under review: drop any stale breaker latch from a prior head
     pending = { repo, prNumber: pr.number, baseRefName: pr.baseRefName, head, reviewBase: validBase, lanes: review.lanes, completed: review.completed, docPromptSent: false, spawned: false, spawnedIds: {}, fallbackLanes: new Set() };
-    await spawnInitialLanes(pending, effectivePr, (message) => ctx.ui.notify(message, "warning"));
+    await spawnInitialLanes(pending, effectivePr, ctx, (message) => ctx.ui.notify(message, "warning"));
     const initialLanes = pending.lanes.filter((lane) => lane !== "doc-updater" || !pending.lanes.includes("spec-reviewer"));
     pending.spawned = initialLanes.length > 0 && initialLanes.every((lane) => Boolean(pending.spawnedIds[lane]));
     savePending(pending);
+    pruneReviewResults(repo, head); // a new head is under review; drop stale prior-head result dirs
     ctx.ui.notify(`PR-boundary review required for ${basename(repo)} at ${head.slice(0, 12)}. Lanes: ${review.lanes.join(", ")}.`, "warning");
     if (!pending.spawned) {
       for (const lane of initialLanes) {
@@ -430,7 +595,9 @@ export default function (pi: ExtensionAPI) {
       }
       savePending(pending);
       const fallbackLanes = initialLanes.filter((lane) => !pending.spawnedIds[lane]);
-      pi.sendUserMessage(directiveFor(repo, effectivePr, fallbackLanes.length > 0 ? fallbackLanes : review.lanes, validBase), { deliverAs: "followUp" });
+      if (fallbackLanes.length > 0) {
+        ctx.ui.notify(`PR-boundary automatic reviewer spawn pending for ${basename(repo)} at ${head.slice(0, 12)}. Lanes: ${fallbackLanes.join(", ")}.`, "warning");
+      }
     }
   };
 
@@ -439,11 +606,21 @@ export default function (pi: ExtensionAPI) {
 
   const onSubagentCompleted = async (event: any, ctx: any) => {
     const type = String(event?.type || "");
-    if (type) await markCompleted(type, ctx, typeof event?.id === "string" ? event.id : undefined);
+    if (!type) return;
+    // Persist the result the instant the reviewer finishes, before the completion gate. If
+    // completion-detection later no-ops (stale PR state, id mismatch), the findings are already
+    // on disk instead of surviving only in the /tmp subagent transcript.
+    if (event?.result != null) {
+      const state = hydratePending(ctx);
+      if (state && state.lanes.includes(type)) {
+        try { persistReviewResult(state, type, event.result); } catch { /* best effort */ }
+      }
+    }
+    await markCompleted(type, ctx, typeof event?.id === "string" ? event.id : undefined, undefined, event?.result);
   };
 
   pi.on("subagents:completed", onSubagentCompleted);
-  (pi as any).events?.on?.("subagents:completed", (event: any) => onSubagentCompleted(event, { sessionManager: { getCwd: () => process.cwd() }, ui: { notify: () => undefined } }));
+  (pi as any).events?.on?.("subagents:completed", (event: any) => onSubagentCompleted(event, completionCtx()));
 
   const onSubagentFailed = async (event: any, ctx: any) => {
     const state = hydratePending(ctx);
@@ -459,11 +636,13 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("subagents:failed", onSubagentFailed);
-  (pi as any).events?.on?.("subagents:failed", (event: any) => onSubagentFailed(event, { sessionManager: { getCwd: () => process.cwd() }, ui: { notify: () => undefined } }));
+  (pi as any).events?.on?.("subagents:failed", (event: any) => onSubagentFailed(event, completionCtx()));
 
   pi.on("agent_end", async (_event, ctx) => {
+    remember(ctx);
     const state = hydratePending(ctx);
     if (!state) return;
+    if (isBreakerOpen(state.repo, state.head)) { pending = undefined; return; } // latched: do no further work for this head
     if (acked(state.repo, state.head) || consumeBypass()) {
       clearPending(state.repo);
       pending = undefined;
@@ -475,12 +654,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const service = subagentsService();
+    const service = await subagentsService();
     const currentState = loadPending(state.repo) || state;
     for (const [lane, spawnedId] of Object.entries(currentState.spawnedIds)) {
+      if (currentState.completed.has(lane)) continue; // already reconciled; don't let it shadow still-pending lanes
       const record = service?.getRecord?.(spawnedId);
       if (record?.status === "completed" || record?.status === "steered") {
-        await markCompleted(lane, ctx, spawnedId);
+        await markCompleted(lane, ctx, spawnedId, undefined, record.result);
         return;
       }
       if (["error", "stopped", "aborted"].includes(String(record?.status || ""))) {
@@ -504,6 +684,21 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    // Reviewers are not running (or have stalled past the timeout). Count this fruitless
+    // decision cycle and latch the breaker once we exceed the attempt or age bound, so a
+    // review that can never complete (e.g. stale subagent ctx after compaction) stops
+    // re-spawning and re-reminding on every agent_end instead of spiralling unbounded.
+    // The counter is reset on real progress (markCompleted) and when a new head is pushed.
+    const attempts = incrementBlockCount(currentState.repo);
+    if (attempts >= MAX_REVIEW_ATTEMPTS || pendingAge >= MAX_REVIEW_AGE_MS) {
+      openBreaker(currentState.repo, currentState.head);
+      clearPending(currentState.repo);
+      resetBlockCount(currentState.repo);
+      pending = undefined;
+      ctx.ui.notify(`Review enforcement gave up for ${basename(currentState.repo)} at ${currentState.head.slice(0, 12)} after ${attempts} attempts; merge stays blocked. Push a new commit to retry, or use the user-only ${REVIEW_BYPASS} bypass.`, "warning");
+      return;
+    }
+
     const eligibleUnstarted = currentState.lanes.filter((lane) => {
       if (currentState.completed.has(lane) || currentState.spawnedIds[lane]) return false;
       return !(lane === "doc-updater" && currentState.lanes.includes("spec-reviewer") && !currentState.completed.has("spec-reviewer"));
@@ -514,7 +709,7 @@ export default function (pi: ExtensionAPI) {
       let respawned = false;
       for (const lane of eligibleUnstarted) {
         const prompt = lane === "doc-updater" ? docUpdaterPrompt(currentState) : basePrompt;
-        const id = await spawnLane(lane, prompt, lane === "doc-updater" ? "Review documentation changes" : lane === "spec-reviewer" ? "Review spec changes" : "Review code changes", (message) => ctx.ui.notify(message, "warning"));
+        const id = await spawnLane(lane, prompt, lane === "doc-updater" ? "Review documentation changes" : lane === "spec-reviewer" ? "Review spec changes" : "Review code changes", ctx, (message) => ctx.ui.notify(message, "warning"));
         if (id) {
           currentState.spawnedIds[lane] = id;
           currentState.fallbackLanes.delete(lane);
@@ -528,15 +723,7 @@ export default function (pi: ExtensionAPI) {
       if (respawned) return;
     }
 
-    const count = incrementBlockCount(currentState.repo);
-    if (count >= 3) {
-      ctx.ui.notify(`Review enforcement circuit breaker opened after ${count} reminders for ${basename(currentState.repo)}.`, "warning");
-      pending = undefined;
-      return;
-    }
     const remaining = currentState.lanes.filter((lane) => !currentState.completed.has(lane)).join(", ") || "none";
-    const reminder = `PR-boundary review still pending for ${basename(currentState.repo)} at ${currentState.head.slice(0, 12)}. Remaining lanes: ${remaining}. Reminder ${count}/3.`;
-    ctx.ui.notify(reminder, "warning");
-    pi.sendUserMessage(`${reminder}\nComplete the remaining subagents or use the user-only bypass ${REVIEW_BYPASS}.`, { deliverAs: "followUp" });
+    ctx.ui.notify(`PR-boundary review still pending for ${basename(currentState.repo)} at ${currentState.head.slice(0, 12)}. Remaining lanes: ${remaining}. Attempt ${attempts}/${MAX_REVIEW_ATTEMPTS}. Automatic reviewer spawn will retry; user-only bypass: ${REVIEW_BYPASS}.`, "warning");
   });
 }

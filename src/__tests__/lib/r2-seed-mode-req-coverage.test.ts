@@ -139,6 +139,21 @@ describe('REQ-AGENT-005 + REQ-AGENT-014: getConfigsForMode', () => {
     const keys = docs.map((d) => d.key);
     expect(keys).toContain('.claude/plugins/context-mode/plugin.json');
   });
+
+  it('REQ-AGENT-005: Pi agents keep context-mode tool declarations (inert when off); enforcement extension and mcp.json context-mode server are removed', () => {
+    testState.agentDocs = [
+      makeDoc('.pi/agent/extensions/context-mode-enforcement.ts', ['advanced']),
+      { ...makeDoc('.pi/agent/agents/code-reviewer.md', ['advanced']), content: '---\ntools: read, bash, ctx_execute, ctx_batch_execute, graphify_query\n---\n' },
+      { ...makeDoc('.pi/agent/mcp.json', ['advanced']), content: '{"mcpServers":{"context-mode":{"command":"context-mode"},"graphify":{"command":"graphify"}}}\n' },
+    ];
+
+    const docs = getConfigsForMode('advanced', true);
+    const keys = docs.map((d) => d.key);
+    expect(keys).not.toContain('.pi/agent/extensions/context-mode-enforcement.ts');
+    // ctx_* tool declarations are retained: absent at runtime when context-mode is off, usable when /ctx enables it.
+    expect(docs.find((d) => d.key === '.pi/agent/agents/code-reviewer.md')?.content).toContain('tools: read, bash, ctx_execute, ctx_batch_execute, graphify_query');
+    expect(docs.find((d) => d.key === '.pi/agent/mcp.json')?.content).not.toContain('context-mode');
+  });
 });
 
 // ─── REQ-AGENT-014: getPreseedKeysNotInMode ───────────────────────────────────

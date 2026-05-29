@@ -61,11 +61,6 @@ const TOOL_MAP = {
   opencode: { Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash', Grep: 'search', Glob: 'glob' },
   pi: {
     Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash', Grep: 'grep', Glob: 'find',
-    'mcp__context-mode__ctx_search': 'ctx_search',
-    'mcp__context-mode__ctx_batch_execute': 'ctx_batch_execute',
-    'mcp__context-mode__ctx_execute': 'ctx_execute',
-    'mcp__context-mode__ctx_execute_file': 'ctx_execute_file',
-    'mcp__context-mode__ctx_fetch_and_index': 'ctx_fetch_and_index',
     'mcp__graphify__query_graph': 'graphify_query',
     'mcp__graphify__get_node': 'graphify_explain',
     'mcp__graphify__get_neighbors': 'graphify_explain',
@@ -73,6 +68,11 @@ const TOOL_MAP = {
     'mcp__graphify__god_nodes': 'graphify_query',
     'mcp__graphify__shortest_path': 'graphify_path',
     'mcp__graphify__graph_stats': 'graphify_query',
+    'mcp__context-mode__ctx_execute': 'ctx_execute',
+    'mcp__context-mode__ctx_batch_execute': 'ctx_batch_execute',
+    'mcp__context-mode__ctx_execute_file': 'ctx_execute_file',
+    'mcp__context-mode__ctx_search': 'ctx_search',
+    'mcp__context-mode__ctx_fetch_and_index': 'ctx_fetch_and_index',
   },
 };
 
@@ -152,7 +152,8 @@ function remapTools(toolsArray, agentId) {
 }
 
 /**
- * Adapt an agent definition's frontmatter: remap tools, remove model field unless the target supports model frontmatter.
+ * Adapt an agent definition's frontmatter: remap tools and remove Claude-specific
+ * model pins so transformed agents default to the active runtime model.
  * Body content gets path adaptation only.
  */
 function adaptAgentFrontmatter(content, agentId) {
@@ -165,7 +166,7 @@ function adaptAgentFrontmatter(content, agentId) {
   let sawTools = false;
 
   for (const line of lines) {
-    if (line.startsWith('model:') && agentId !== 'pi') continue;
+    if (line.startsWith('model:')) continue;
 
     if (line.startsWith('tools:')) {
       sawTools = true;
@@ -180,8 +181,11 @@ function adaptAgentFrontmatter(content, agentId) {
         } else if (agentId === 'pi') {
           const allowed = [
             'read', 'grep', 'find', 'ls', 'bash', 'edit', 'write',
-            'ctx_search', 'ctx_batch_execute', 'ctx_execute', 'ctx_execute_file', 'ctx_fetch_and_index',
             'graphify_query', 'graphify_path', 'graphify_explain',
+            // context-mode helpers: declared in the shared agent frontmatter and remapped
+            // to Pi-native names above. Harmless when context-mode is off (the tools do not
+            // exist, so Pi drops them), usable when /ctx enables it. No Pi-specific agent edits.
+            'ctx_execute', 'ctx_batch_execute', 'ctx_execute_file', 'ctx_search', 'ctx_fetch_and_index',
           ];
           const piTools = [...new Set(remapped.filter((t) => allowed.includes(t)))];
           const dropped = remapped.filter((t) => !allowed.includes(t));
@@ -214,8 +218,60 @@ function adaptAgentFrontmatter(content, agentId) {
   return `---\n${newLines.join('\n')}\n---\n${adaptPaths(body, agentId)}`;
 }
 
-/** Adapt skill content (path replacement only — skills have no tools/model in frontmatter). */
-function adaptSkillContent(content, agentId) {
+const PI_SDD_SKILLS = new Set([
+  'spec-driven-development',
+  'sdd-init',
+  'sdd-clean',
+  'spec-enforce',
+  'spec-enforce-ac',
+  'spec-enforce-truth',
+  'doc-enforce',
+  'doc-enforce-lanes',
+  'doc-enforce-shape',
+  'doc-enforce-truth',
+]);
+
+const PI_SDD_COMPATIBILITY_NOTE = `\n## Pi runtime compatibility\n\nThis transformed Pi skill uses Pi-native tool names and workflows:\n\n- Use Bash/Read/Grep/Find/Edit/Write directly; do not assume context-mode \`ctx_*\` tools exist.\n- Use \`graphify_query\`, \`graphify_path\`, and \`graphify_explain\` directly. If a native graphify tool resolves the workspace root instead of the active repo, use the CLI fallback with \`--graph <repo>/graphify-out/graph.json\`.\n- Use Pi's \`Agent\` tool for subagents. For Plan Mode, invoke the \`Plan\` agent or produce an explicit plan and wait for user approval before source edits.\n`;
+
+function adaptPiSkillContent(content, withinClaude) {
+  let next = adaptPaths(content, 'pi');
+  const replacements = [
+    ['mcp__graphify__god_nodes(top_n=50)', 'graphify_query("top 50 most-connected nodes / god nodes")'],
+    ['mcp__graphify__god_nodes(top_n=20)', 'graphify_query("top 20 most-connected nodes / god nodes")'],
+    ['mcp__graphify__get_neighbors(<concept-or-symbol>)', 'graphify_explain(<concept-or-symbol>)'],
+    ['mcp__graphify__get_node(<symbol>)', 'graphify_explain(<symbol>)'],
+    ['mcp__graphify__shortest_path', 'graphify_path'],
+    ['mcp__graphify__query_graph', 'graphify_query'],
+    ['mcp__graphify__get_neighbors', 'graphify_explain'],
+    ['mcp__graphify__get_node', 'graphify_explain'],
+    ['mcp__graphify__god_nodes', 'graphify_query'],
+    ['mcp__graphify__*', 'Pi graphify tools'],
+    ['mcp__context-mode__ctx_batch_execute', 'ctx_batch_execute'],
+    ['mcp__context-mode__ctx_execute_file', 'ctx_execute_file'],
+    ['mcp__context-mode__ctx_execute', 'ctx_execute'],
+    ['mcp__context-mode__ctx_search', 'ctx_search'],
+    ['mcp__context-mode__ctx_fetch_and_index', 'ctx_fetch_and_index'],
+    ['Claude Code: `EnterPlanMode`', 'Pi: use the `Plan` agent'],
+    ['`EnterPlanMode`', 'the Pi `Plan` agent'],
+    ['Task tool', 'Agent tool'],
+    ['Claude Code', 'Pi'],
+  ];
+  for (const [from, to] of replacements) next = next.replaceAll(from, to);
+
+  const skillName = withinClaude.match(/^skills\/([^/]+)\//)?.[1];
+  if (PI_SDD_SKILLS.has(skillName)) {
+    const parts = next.split('\n---\n');
+    if (parts.length >= 3) {
+      return `${parts[0]}\n---\n${parts.slice(1).join('\n---\n')}${PI_SDD_COMPATIBILITY_NOTE}`;
+    }
+    return `${next}${PI_SDD_COMPATIBILITY_NOTE}`;
+  }
+  return next;
+}
+
+/** Adapt skill content for the target runtime. */
+function adaptSkillContent(content, agentId, withinClaude) {
+  if (agentId === 'pi') return adaptPiSkillContent(content, withinClaude);
   return adaptPaths(content, agentId);
 }
 
@@ -260,6 +316,7 @@ function piNativeKey(withinPi) {
   if (withinPi.startsWith('extensions/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('skills/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('scripts/')) return `.pi/agent/${withinPi}`;
+  if (withinPi.startsWith('prompts/')) return `.pi/agent/${withinPi}`;
   if (withinPi === 'package.json') return '.pi/agent/npm/package.json';
   if (withinPi === 'package-lock.json') return '.pi/agent/npm/package-lock.json';
   if (withinPi === 'mcp.json') return '.pi/agent/mcp.json';
@@ -415,7 +472,7 @@ async function generate() {
         documents.push({
           key,
           contentType: inferContentType(file.withinClaude),
-          content: adaptSkillContent(file.content, agentId),
+          content: adaptSkillContent(file.content, agentId, file.withinClaude),
           modes: file.modes,
         });
       }
