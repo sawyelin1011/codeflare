@@ -723,7 +723,7 @@ None.
 2. Every `/sdd` sub-command (`init`, `edit`, `add`, `clean`, `mode`) works in Pi without context-mode by using native Bash/Read/Grep/Find/Write/Edit tools; context-management helper tools, when present in another runtime, are optional rather than required.
 3. Discovery commands producing more than 20 lines of output (`gh pr list --state all`, `git log --follow`, `npm view <pkg> peerDependencies`, full-tree scans, scaffold-only `npm install --package-lock-only`) run through native discovery tools in Pi without context-mode, with any runtime-specific output-management wrapper treated as an optional optimization.
 4. Pi-transformed SDD skills replace Claude MCP tool names and Plan Mode surfaces with Pi-native graphify tools and `Agent`/`Plan` terminology, and the native `/sdd` command enforces the command-file hard gates (help, unknown subcommand, clean working tree, `clean`/`mode` require `sdd/`, existing-spec `init` handling) before dispatching to the workflow skill.
-5. After pushes that trigger GitHub Actions, the `ci-monitoring` skill uses one continuous tail-followed monitor for the pushed HEAD through native Bash; agents do not emit repeated chat-visible polling calls and do not require context-mode.
+5. After pushes that trigger GitHub Actions, the `ci-monitoring` skill uses one background continuous tail-followed monitor for the pushed HEAD through native Bash; agents do not emit repeated chat-visible polling calls, do not block the main session while CI runs, and do not require context-mode.
 
 **Constraints:**
 
@@ -1037,7 +1037,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh — PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC3 intermediate branches deferred + git-push-review-reminder.sh — MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh — PR state gating describe -> AC1/AC6 PR-state HEAD check + AC4 no-PR push no-op + enforce-review-spawn.sh — vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh — MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts trigger/ctx-surface markers -> AC2) -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh — PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC3 intermediate branches deferred + git-push-review-reminder.sh — MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh — PR state gating describe -> AC1/AC6 PR-state HEAD check + AC4 no-PR push no-op + enforce-review-spawn.sh — vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh — MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts trigger/ctx-surface markers -> AC2 + review head classification separates a moved-on PR from an unreadable gh query -> AC6 Pi head-currency classification) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -1050,7 +1050,7 @@ None.
 3. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed.
 4. A plain push to a branch with no open PR does NOT trigger reviews.
 5. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge); the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks.
-6. Layer 2 false-positive filtering validates that the candidate push belongs to the currently open PR; same-session pushes may use local HEAD as the candidate SHA while GitHub's PR API catches up, with every directive carrying a freshness gate for the exact head.
+6. Layer 2 false-positive filtering validates that the candidate push belongs to the currently open PR; same-session pushes may use local HEAD as the candidate SHA while GitHub's PR API catches up, with every directive carrying a freshness gate for the exact head. A pending review window is discarded only when the open PR has definitively moved on or closed, and always with a visible warning; when the PR state cannot be read (the `gh` query fails), the window is left intact and retried, so a transient query failure never drops the merge gate or leaves a reviewed head un-acked.
 7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
 
 **Constraints:**
@@ -1073,7 +1073,8 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC4 sequential spec-reviewer then doc-updater + AC5 fix-push cascade ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts lane-classifier/pending-state markers -> AC1/AC2/AC5) -->
+<!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC4 sequential spec-reviewer then doc-updater + AC5 fix-push cascade ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 automatic reviewer spawn options + paired terminal-event dedupe + AC5 incremental review-base selection and stale-pending discard) -->
 
 **Intent:** Once a PR-boundary trigger fires (REQ-AGENT-036), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
@@ -1084,8 +1085,8 @@ None.
 1. Layer 1 lane classification uses one internally shared classifier per runtime surface so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
 2. Lane mapping: docs-only (no sdd, no source) → `doc-updater`; `sdd/` touched without source (with or without docs) → `spec-reviewer` then `doc-updater`; any source touch → all three agents.
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
-4. On trigger, `code-reviewer` may run in parallel with `spec-reviewer`; `doc-updater` starts only after `spec-reviewer` completes on any project containing `sdd/`.
-5. In a fix-push cascade (multiple pushes inside one turn), the gate advances the ack pointer through each push whose review window completed all lanes required by that push's diff; bypassed pushes (no spawns in window, per REQ-AGENT-041) are absorbed into the next complete window's cumulative review.
+4. On trigger, `code-reviewer` may run in parallel with `spec-reviewer`; `doc-updater` starts only after `spec-reviewer` completes on any project containing `sdd/`. Pi launches PR-boundary reviewers automatically from the extension (not by asking the assistant to call `Agent`), records the returned subagent ID for each lane, and dedupes paired Pi tool-result events so each push produces one review window.
+5. In a fix-push cascade (multiple pushes inside one turn), the gate advances the ack pointer through each push whose review window completed all lanes required by that push's diff; bypassed pushes (no spawns in window, per REQ-AGENT-041) are absorbed into the next complete window's cumulative review. Pi preserves the first unreviewed review base while prior lanes are incomplete, discards stale non-ancestor pending state, and accepts completion only from the registered subagent ID or a foreground fallback prompt that names the pending head.
 
 **Constraints:**
 
@@ -1095,7 +1096,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** [Automated test](../../host/__tests__/lane-classifier.test.js)
+**Verification:** [Lane classifier tests](../../host/__tests__/lane-classifier.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1364,8 +1365,8 @@ None.
 1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep.
 2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package and native graphify skill override; MCP parity in Pi is optional and not required for the Pi graphify workflow.
 3. AC1 and AC2 hold across all paid tiers; the capability functions in sessions without context-mode preseeded because the agent-orchestrated `/graphify` skill keeps the main agent's context bounded via subagent chunking.
-4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while Pi prompts for AST-only or Full graph creation after clone and queries once `graphify-out/graph.json` exists.
-5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact.
+4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while Pi prompts for AST-only or Full graph creation after clone and queries once `graphify-out/graph.json` exists. When Pi's packaged native graphify tool resolves the session cwd (`/home/user/workspace`) and reports `/home/user/workspace/graphify-out/graph.json` missing, the Codeflare Pi adapter retries `graphify_query`, `graphify_path`, and `graphify_explain` against `<active-repo>/graphify-out/graph.json` via the graphify CLI and returns the retry as the tool result.
+5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact. Pi tracks the same active repo from command-local `cd ... &&` and `git -C ...` forms, and its session context identifies the active repo by basename, checked-out branch, and HEAD prefix.
 6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
 
 **Constraints:**

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
 import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution } from '../../../preseed/agents/pi/extensions/graphify-helpers';
-import { classifyReviewFiles, isCurrentReviewHead, isFailedToolExecution, isPrBoundaryCommand, isReviewCompletionForLane } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isCurrentReviewHead, isFailedToolExecution, isPrBoundaryCommand, isReviewCompletionForLane, reusablePendingReview, selectReviewBase, startReviewLaneSpawns } from '../../../preseed/agents/pi/extensions/review-helpers';
 import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isResumedSession, MEMORY_EVERY_N_PROMPTS, sessionId, shouldCapture, stableId, titleFor } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
 
 /**
@@ -283,6 +283,23 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isCurrentReviewHead('stale-head', 'current-pr-head', 'new-local-commit')).toBe(false);
   });
 
+  it('REQ-AGENT-036 AC6: review head classification separates a moved-on PR from an unreadable gh query', () => {
+    // Local HEAD still at the reviewed head -> current, even if GitHub lags or gh fails.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h1', prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('current');
+    // PR is open at main and still names the pending head -> current.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: true, prHead: 'h1', prQueryFailed: false })).toBe('current');
+    // PR is open but now names a different head, and local moved on too -> definitively stale.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: true, prHead: 'h2', prQueryFailed: false })).toBe('stale');
+    // PR is no longer open at main (closed/merged/retargeted) and local moved on -> stale.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: false, prHead: undefined, prQueryFailed: false })).toBe('stale');
+    // failure #13: gh pr view failed and local moved on; the PR may still be open at h1.
+    // This MUST be "unknown" (preserve pending, retry), never "stale" -- discarding here
+    // would drop the merge gate and leave the reviewed head un-acked.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('unknown');
+    // gh failed and local HEAD is also unreadable -> still unknown, not stale.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: undefined, prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('unknown');
+  });
+
   it('REQ-AGENT-040: Pi review enforcement accepts only completions for the pending head and spawned agent id', () => {
     const state = {
       head: 'abc123',
@@ -299,7 +316,20 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head abc123')).toBe(true);
     expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head stale')).toBe(false);
     expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater')).toBe(false);
+    expect(isReviewCompletionForLane({ head: 'abc123', lanes: ['code-reviewer'], spawned: false }, 'code-reviewer')).toBe(false);
+    expect(isReviewCompletionForLane({ head: 'abc123', lanes: ['code-reviewer'], spawned: false }, 'code-reviewer', undefined, 'Review head abc123')).toBe(true);
     expect(isReviewCompletionForLane(state, 'spec-reviewer', 'spawned-spec')).toBe(false);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement extracts visible background Agent IDs for pending lanes', () => {
+    expect(extractBackgroundAgentId({ details: { agentId: 'abc12345-1234-abc' } })).toBe('abc12345-1234-abc');
+    expect(extractBackgroundAgentId({
+      content: [{ type: 'text', text: 'Agent started in background.\nAgent ID: def67890-4321-cba\nType: code-reviewer' }],
+    })).toBe('def67890-4321-cba');
+    expect(extractBackgroundAgentId({
+      content: [{ type: 'text', text: 'Agent started in background.\nAgent ID: 1386d8ec-28ca-48e7-9abc-0123456789ab\nType: code-reviewer' }],
+    })).toBe('1386d8ec-28ca-48e7-9abc-0123456789ab');
+    expect(extractBackgroundAgentId({ content: [{ type: 'text', text: 'No agent id here' }] })).toBeUndefined();
   });
 
   it('REQ-AGENT-040: Pi review enforcement classifies lanes by changed file surface', () => {
@@ -311,6 +341,122 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isPrBoundaryCommand('gh pr create --base main')).toBe(true);
     expect(isPrBoundaryCommand('gh pr merge 12')).toBe(true);
     expect(isPrBoundaryCommand('gh pr view --json number')).toBe(false);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement dedupes paired terminal events and evicts old ids', () => {
+    const shouldProcess = createBoundedOnceTracker(2);
+    expect(shouldProcess('tool-1')).toBe(true);
+    expect(shouldProcess('tool-1')).toBe(false);
+    expect(shouldProcess('tool-2')).toBe(true);
+    expect(shouldProcess('tool-3')).toBe(true);
+    expect(shouldProcess('tool-1')).toBe(true);
+    expect(shouldProcess(undefined)).toBe(true);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement only consumes a terminal event id after command context is ready', () => {
+    const shouldProcess = createReadyOnceTracker(2);
+    expect(shouldProcess('tool-1', false)).toBe(false);
+    expect(shouldProcess('tool-1', true)).toBe(true);
+    expect(shouldProcess('tool-1', true)).toBe(false);
+    expect(shouldProcess('tool-2', true)).toBe(true);
+    expect(shouldProcess('tool-3', true)).toBe(true);
+    expect(shouldProcess('tool-1', true)).toBe(true);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement spawns reviewers with bounded background options', () => {
+    const calls: Array<{ lane: string; prompt: string; options: Record<string, unknown> }> = [];
+    const result = startReviewLaneSpawns({
+      state: {
+        completed: [],
+        spawnedIds: {},
+        fallbackLanes: [],
+        requestedAt: {},
+        spawned: false,
+        reviewStartedAt: 900,
+      },
+      requests: [
+        { lane: 'code-reviewer', prompt: 'Review head abc123', description: 'Review code changes' },
+        { lane: 'spec-reviewer', prompt: 'Review head abc123', description: 'Review spec changes' },
+      ],
+      service: {
+        spawn: (lane, prompt, options) => {
+          calls.push({ lane, prompt, options });
+          return `${lane}-id`;
+        },
+      },
+      now: 1000,
+    });
+
+    expect(calls).toEqual([
+      {
+        lane: 'code-reviewer',
+        prompt: 'Review head abc123',
+        options: { description: 'Review code changes', inheritContext: false, maxTurns: 8, bypassQueue: true },
+      },
+      {
+        lane: 'spec-reviewer',
+        prompt: 'Review head abc123',
+        options: { description: 'Review spec changes', inheritContext: false, maxTurns: 8, bypassQueue: true },
+      },
+    ]);
+    expect(result.launched).toEqual(['code-reviewer:code-reviewer-id', 'spec-reviewer:spec-reviewer-id']);
+    expect(result.state.spawnedIds).toEqual({
+      'code-reviewer': 'code-reviewer-id',
+      'spec-reviewer': 'spec-reviewer-id',
+    });
+    expect(result.state.spawned).toBe(true);
+    expect(result.state.reviewStartedAt).toBe(900);
+    expect(result.state.spawnedAt).toBe(1000);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement skips already-started lanes and preserves fallback lanes on spawn failure', () => {
+    const result = startReviewLaneSpawns({
+      state: {
+        completed: [],
+        spawnedIds: { 'code-reviewer': 'existing-code-id' },
+        fallbackLanes: [],
+        requestedAt: {},
+        spawned: true,
+        reviewStartedAt: 400,
+        spawnedAt: 500,
+      },
+      requests: [
+        { lane: 'code-reviewer', prompt: 'Review head abc123', description: 'Review code changes' },
+        { lane: 'spec-reviewer', prompt: 'Review head abc123', description: 'Review spec changes' },
+      ],
+      service: { spawn: () => undefined },
+      now: 1000,
+    });
+
+    expect(result.launched).toEqual([]);
+    expect(result.state.spawnedIds).toEqual({ 'code-reviewer': 'existing-code-id' });
+    expect(result.state.fallbackLanes).toEqual(['spec-reviewer']);
+    expect(result.state.requestedAt).toEqual({ 'spec-reviewer': 1000 });
+    expect(result.state.reviewStartedAt).toBe(400);
+    expect(result.state.spawnedAt).toBe(500);
+  });
+
+  it('REQ-AGENT-040: Pi review enforcement selects the unreviewed incremental review base', () => {
+    const previous = {
+      head: 'old-head',
+      reviewBase: 'first-unreviewed-base',
+      lanes: ['code-reviewer', 'spec-reviewer'],
+      completed: ['code-reviewer'],
+    };
+    expect(reusablePendingReview(previous, 'new-head', (ancestor, current) => ancestor === 'old-head' && current === 'new-head')).toBe(previous);
+    expect(selectReviewBase({ previous, lastAck: 'last-ack', previousRemoteHead: 'remote-prev' })).toBe('first-unreviewed-base');
+    expect(selectReviewBase({
+      previous: { ...previous, reviewBase: undefined },
+      lastAck: 'last-ack',
+      previousRemoteHead: 'remote-prev',
+    })).toBeUndefined();
+    expect(selectReviewBase({
+      previous: { ...previous, completed: ['code-reviewer', 'spec-reviewer'] },
+      lastAck: 'last-ack',
+      previousRemoteHead: 'remote-prev',
+    })).toBe('old-head');
+    expect(reusablePendingReview(previous, 'rebased-head', () => false)).toBeUndefined();
+    expect(selectReviewBase({ previous: undefined, lastAck: undefined, previousRemoteHead: 'remote-prev' })).toBe('remote-prev');
   });
 
   it('REQ-AGENT-023: Pi native runtime assets include graphify package, MCP config, and skill override', () => {
@@ -629,6 +775,9 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(cp?.content).toContain('graphSummary');
     expect(cp?.content).toContain('Graphify repo graph available');
     expect(cp?.content).toContain('graphify-out');
+    expect(cp?.content).toContain('fallbackGraphifyToolResult');
+    expect(cp?.content).toContain('/home/user/workspace/graphify-out');
+    expect(cp?.content).toContain('--graph');
   });
 
   it('REQ-AGENT-023: Pi safe-graphify-update.sh includes RLIMIT_AS memory cap', () => {
