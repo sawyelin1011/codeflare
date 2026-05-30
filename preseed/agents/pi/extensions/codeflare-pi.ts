@@ -238,9 +238,12 @@ function isGitPush(command: string): boolean {
 
 function ensureNoAttributedCommit(command: string): string | undefined {
   if (!/(^|[;&|]\s*)(git\s+(commit|merge|tag|notes)|gh\s+(pr|issue|release)\s+\w+)\b/.test(command)) return undefined;
-  // Match the canonical block-attributed-commits.sh detection set. Deliberately NOT bare
-  // "Claude": that false-positives on git/gh commands naming preseed/agents/claude/ paths.
-  if (/co-authored-by|noreply@anthropic|claude\s+(sonnet|opus|haiku|code)|generated with[^\n]*claude|🤖|🧠|ChatGPT/i.test(command)) {
+  // Match the canonical block-attributed-commits.sh detection set: genuine attribution
+  // signatures only (co-author trailer, bot noreply email, generated-with footer, emoji,
+  // ChatGPT). Deliberately NOT bare model/product names ("claude code", "claude opus"):
+  // those false-positive on legitimate prose and on git/gh commands naming
+  // preseed/agents/claude/ paths.
+  if (/co-authored-by|noreply@anthropic|generated with[^\n]*claude|🤖|🧠|ChatGPT/i.test(command)) {
     return "Codeflare blocks AI attribution in commits, PRs, issues, releases, and tags. Remove Co-Authored-By, generated-by text, model-name attribution, and emoji attribution.";
   }
   return undefined;
@@ -299,9 +302,15 @@ function skillPrompt(name: string, fallback: string): string {
   return fallback;
 }
 
-async function sendWorkflowMessage(ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
+async function sendWorkflowMessage(pi: ExtensionAPI, ctx: ExtensionCommandContext, title: string, body: string): Promise<void> {
   await ctx.waitForIdle();
-  await ctx.sendUserMessage(`${title}\n\n${body}`);
+  const message = `${title}\n\n${body}`;
+  const contextSender = (ctx as ExtensionCommandContext & { sendUserMessage?: (content: string) => void | Promise<void> }).sendUserMessage;
+  if (typeof contextSender === "function") {
+    await contextSender.call(ctx, message);
+    return;
+  }
+  pi.sendUserMessage(message);
 }
 
 function maybeMergeGlobalGraph(repo: string): void {
@@ -416,7 +425,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(decision.message, "warning");
         return;
       }
-      await sendWorkflowMessage(ctx, decision.normalizedCommand, `${skillPrompt(decision.skill, "Use the Codeflare SDD workflow.")}\n\nUser command: ${decision.normalizedCommand}`);
+      await sendWorkflowMessage(pi, ctx, decision.normalizedCommand, `${skillPrompt(decision.skill, "Use the Codeflare SDD workflow.")}\n\nUser command: ${decision.normalizedCommand}`);
     },
   });
 
@@ -425,10 +434,10 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const repo = activeRepo(ctx) ?? ctx.sessionManager.getCwd();
       if (args.trim() === "refresh") {
-        await sendWorkflowMessage(ctx, "/graphify refresh", `Refresh the graphify graph for ${repo}. Use the safe AST-only update first, then merge ${repo}/graphify-out/graph.json into the global graph if present.`);
+        await sendWorkflowMessage(pi, ctx, "/graphify refresh", `Refresh the graphify graph for ${repo}. Use the safe AST-only update first, then merge ${repo}/graphify-out/graph.json into the global graph if present.`);
         return;
       }
-      await sendWorkflowMessage(ctx, `/graphify ${args}`.trim(), `${skillPrompt("graphify", "Use graphify to build/query the project graph.")}\n\nTarget repo: ${repo}\nUser command: /graphify ${args}`);
+      await sendWorkflowMessage(pi, ctx, `/graphify ${args}`.trim(), `${skillPrompt("graphify", "Use graphify to build/query the project graph.")}\n\nTarget repo: ${repo}\nUser command: /graphify ${args}`);
     },
   });
 
@@ -436,14 +445,14 @@ export default function (pi: ExtensionAPI) {
     description: "Run Codeflare vault operations",
     handler: async (args, ctx) => {
       const action = args.trim() || "status";
-      await sendWorkflowMessage(ctx, `/vault ${action}`, `${skillPrompt("vault-operations", "Use Codeflare vault operations.")}\n\nIf action is index, update the Vault graph at ~/Vault/graphify-out and merge it into the global graph.`);
+      await sendWorkflowMessage(pi, ctx, `/vault ${action}`, `${skillPrompt("vault-operations", "Use Codeflare vault operations.")}\n\nIf action is index, update the Vault graph at ~/Vault/graphify-out and merge it into the global graph.`);
     },
   });
 
   pi.registerCommand("note", {
     description: "Capture a note into the persistent Vault",
     handler: async (args, ctx) => {
-      await sendWorkflowMessage(ctx, `/note ${args}`.trim(), `${skillPrompt("vault-note-capture", "Capture the user's note into ~/Vault/Notes.")}\n\nNote text: ${args}`);
+      await sendWorkflowMessage(pi, ctx, `/note ${args}`.trim(), `${skillPrompt("vault-note-capture", "Capture the user's note into ~/Vault/Notes.")}\n\nNote text: ${args}`);
     },
   });
 
@@ -468,6 +477,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
+    // Durable PR-boundary review lanes load this extension in-process for the build-blocker and
+    // other guards, but must not re-run the per-repo global-graph merge (redundant; the main
+    // session already merged it). The lane runner sets this depth counter around the session.
+    if (((globalThis as { __codeflareReviewLaneDepth?: number }).__codeflareReviewLaneDepth ?? 0) > 0) return;
     const repo = activeRepo(ctx);
     if (repo) maybeMergeGlobalGraph(repo);
     const summary = repo ? graphSummary(repo) : undefined;

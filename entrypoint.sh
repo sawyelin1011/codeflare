@@ -243,9 +243,6 @@ SYNC_MODE="${SYNC_MODE:-none}"
 #   .codex/auth.json          - Codex OAuth/API credentials
 #   .codex/config.toml        - Codex model config, project trust levels
 #   .codex/skills/            - Installed Codex skills (skill-installer, skill-creator)
-#   .gemini/oauth_creds.json  - Gemini OAuth tokens
-#   .gemini/settings.json     - Gemini user settings
-#   .gemini/*.json            - Gemini account info, trusted folders, state
 #   .config/gh/               - GitHub CLI auth (oauth_token) and config (aliases, protocol)
 #   .config/lazygit/          - Lazygit configuration
 #   .config/opencode/         - OpenCode plugin config
@@ -354,10 +351,18 @@ RCLONE_FILTERS_COMMON=(
     # Pi — context-mode FTS5 store (equivalent to .claude/context-mode/**)
     --filter "- .pi/context-mode/**"
 
+    # Pi cross-harness skill root. Codeflare seeds skills to ~/.pi/agent/skills
+    # (see generate-agent-seed.mjs AGENT_CONFIGS — no .agents entry exists), so
+    # ~/.agents/ is never codeflare-managed state. Pi scans it as a second skill
+    # root and reports every seeded skill as a "collision (skipped)" against the
+    # .pi copy. Syncing it round-trips a duplicate tree through R2 that reappears
+    # after every deploy; excluding it keeps the .pi copy the single source.
+    --filter "- .agents/**"
+
     # Perl CPAN cache — created by Perl module installs during build, regenerated
     --filter "- .cpan/**"
 
-    # Gemini CLI — tmp contains a downloaded ripgrep binary (~5MB) and session chat logs
+    # Legacy .gemini/tmp exclusion retained as a no-op (the Gemini CLI agent was removed)
     --filter "- .gemini/tmp/**"
 
     # OpenCode — session logs and SQLite temp files (WAL/SHM cause sync conflicts)
@@ -378,7 +383,7 @@ RCLONE_FILTERS_COMMON=(
     # configstore (npm), fish (shell), opencode, uv (Python tooling),
     # wrangler (XDG location), rclone (R2 secrets).
     # No codeflare-managed state lives under .config/ - all of that sits
-    # at $HOME root (.claude.json, .claude/, .codex/, .gemini/, .copilot/).
+    # at $HOME root (.claude.json, .claude/, .codex/, .copilot/).
     --filter "- .config/**"
 
     # Persistent user folders (REQ-MEMORY-100, REQ-FS-010) - the vault and
@@ -1289,15 +1294,7 @@ CASE_EOF
             ;;
 CASE_EOF
                     ;;
-                codex|opencode|copilot*|pi)
-                    cat >> "$BASHRC_FILE" << CASE_EOF
-        ${key})
-            # ${cmd} (bash stays as session leader for TTY stability)
-            ${cmd}
-            ;;
-CASE_EOF
-                    ;;
-                gemini*)
+                codex|opencode|copilot*|pi|agy|agy\ *)
                     cat >> "$BASHRC_FILE" << CASE_EOF
         ${key})
             # ${cmd} (bash stays as session leader for TTY stability)
@@ -1466,6 +1463,19 @@ init_user_vault() {
             fi
         done
         shopt -u nullglob
+    fi
+
+    # Vault .graphifyignore (codeflare-authoritative, overwrite-on-boot). Without
+    # it the minified SilverBullet plug bundles under Library/Codeflare/
+    # (silverbullet-pdf.plug.js, 2.5 MB) get mis-parsed by graphify's AST
+    # extractor into a god-node that dominates the unified global graph. The
+    # vault-extract subagent and the boot-time global-add below both read this
+    # file (graphify prefers .graphifyignore over .gitignore), so the plug
+    # bundles are excluded from extraction everywhere the vault is ingested.
+    if [ -f "$PRESEED_DIR/.graphifyignore" ] \
+       && ! cmp -s "$PRESEED_DIR/.graphifyignore" "$VAULT/.graphifyignore" 2>/dev/null; then
+        cp "$PRESEED_DIR/.graphifyignore" "$VAULT/.graphifyignore"
+        echo "[entrypoint] Vault .graphifyignore synced from preseed"
     fi
 
     # Seed the global graph with the vault. Hash-keyed idempotent - safe to
@@ -1886,11 +1896,16 @@ if [ "${SESSION_MODE:-default}" = "advanced" ]; then
     # settings.json instead so it follows the same pattern as the other
     # plugins (bare plugin.json, real wiring in entrypoint).
     if [ -f "$CONTEXT_MODE_MANIFEST" ]; then
-        CTX_ENFORCE="$PLUGIN_DIR/context-mode/scripts/enforce-ctx-mode.sh"
-        CTX_HOOKS=$(jq -n --arg enforce "$CTX_ENFORCE" '{
+        # enforce-ctx-mode.sh Bash/WebFetch/Grep deny-gate REMOVED: it forced
+        # every shell command through ctx_execute and caused cascading
+        # "Cancelled: parallel tool call" failures. context-mode stays as a
+        # TOOL (MCP server + the indexing pretooluse/posttooluse/precompact/
+        # sessionstart hooks below); only the deny-gate is gone. The prune
+        # regex further down still lists enforce-ctx-mode.sh so any stale
+        # settings.json carrying the old gate gets it stripped on startup.
+        CTX_HOOKS=$(jq -n '{
           PreToolUse: [
-            {matcher:"Bash|Read|WebFetch|Grep|Glob|Agent",hooks:[{type:"command",command:"context-mode hook claude-code pretooluse"}]},
-            {matcher:"Bash|WebFetch|Grep",hooks:[{type:"command",command:("bash " + $enforce)}]}
+            {matcher:"Bash|Read|WebFetch|Grep|Glob|Agent",hooks:[{type:"command",command:"context-mode hook claude-code pretooluse"}]}
           ],
           PostToolUse: [{matcher:"Bash|Read|WebFetch|Grep|Glob",hooks:[{type:"command",command:"context-mode hook claude-code posttooluse"}]}],
           PreCompact: [{matcher:"",hooks:[{type:"command",command:"context-mode hook claude-code precompact"}]}],
@@ -2063,28 +2078,12 @@ fi
 
 # === Fast Start: tool-specific config files ===
 if [ "${FAST_CLI_START:-true}" != "false" ]; then
-    # Gemini: merge enableAutoUpdate:false into settings (file may be synced via rclone)
-    mkdir -p "$USER_HOME/.gemini"
-    if [ -f "$USER_HOME/.gemini/settings.json" ]; then
-        jq '. * {"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}' \
-            "$USER_HOME/.gemini/settings.json" > /tmp/gemini-settings.json 2>/dev/null && \
-            mv /tmp/gemini-settings.json "$USER_HOME/.gemini/settings.json"
-    else
-        echo '{"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}' \
-            > "$USER_HOME/.gemini/settings.json"
-    fi
-
     # Codex: dismiss version notification (excluded from rclone sync)
     mkdir -p "$USER_HOME/.codex"
     echo '{"dismissed_version":"999.0.0"}' > "$USER_HOME/.codex/version.json"
 else
     # Fast Start OFF: remove Codeflare's settings-file suppressors so tools can
-    # run their normal update path. Keep unrelated Gemini settings intact.
-    if [ -f "$USER_HOME/.gemini/settings.json" ]; then
-        jq 'del(.general.enableAutoUpdate, .general.enableAutoUpdateNotification)' \
-            "$USER_HOME/.gemini/settings.json" > /tmp/gemini-settings.json 2>/dev/null && \
-            mv /tmp/gemini-settings.json "$USER_HOME/.gemini/settings.json"
-    fi
+    # run their normal update path.
     if [ -f "$USER_HOME/.codex/version.json" ] && grep -q '"dismissed_version"[[:space:]]*:[[:space:]]*"999\.0\.0"' "$USER_HOME/.codex/version.json"; then
         rm -f "$USER_HOME/.codex/version.json"
     fi
@@ -2094,7 +2093,7 @@ fi
 configure_tab_autostart
 
 # Step 2: Establish bisync baseline IN BACKGROUND (don't block startup)
-# Runs AFTER all file modifications (.claude.json, .claude/settings.json, .gemini/settings.json,
+# Runs AFTER all file modifications (.claude.json, .claude/settings.json,
 # .codex/version.json, .bashrc tab autostart) to avoid hash mismatches from files changing during --resync.
 if [ $RCLONE_CONFIG_RESULT -eq 0 ] && [ "${STEP1_RESULT:-1}" -eq 0 ]; then
     (

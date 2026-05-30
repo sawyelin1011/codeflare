@@ -6,7 +6,7 @@ Multi-agent support, preseed system, and session modes.
 
 | Concept | Definition |
 |---------|-----------|
-| Agent | One of seven supported AI coding tools (`claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `pi`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
+| Agent | One of seven supported AI coding tools (`claude-code`, `codex`, `copilot`, `antigravity`, `opencode`, `pi`, `bash`) that runs inside the container and is auto-started in terminal tab 1 |
 | Preseed | A set of configuration files (rules, skills, agents, commands, plugins) generated from a single Claude Code source of truth and deployed to each user's R2 bucket |
 | Session Mode | Either Standard (`default`) or Pro (`advanced`) controlling the scope of agent enhancements seeded to a user's storage |
 | Manifest | The declarative `manifest.json` file that maps each preseed source file to its applicable modes and drives the code generation pipeline |
@@ -27,7 +27,7 @@ Multi-agent support, preseed system, and session modes.
 
 ---
 
-<!-- @test: host/__audits__/dockerfile-agents.audit.js (Dockerfile agent CLI pre-install describe -> @anthropic-ai/claude-code + @openai/codex + @google/gemini-cli + @github/copilot + opencode-ai npm installs + NODE_COMPILE_CACHE + V8 warmup --version runs + Go native exclusion -> AC3,4) -->
+<!-- @test: host/__audits__/dockerfile-agents.audit.js (Dockerfile agent CLI pre-install describe -> @anthropic-ai/claude-code + @openai/codex + @github/copilot + opencode-ai npm installs + antigravity curl install (Go-native, excluded from npm + V8 warmup like opencode) + NODE_COMPILE_CACHE + V8 warmup --version runs + Go native exclusion -> AC3,4) -->
 ### REQ-AGENT-001: Support Multiple AI Coding Agents
 
 <!-- @impl: Dockerfile -->
@@ -42,10 +42,10 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `gemini`, `opencode`, `pi`, `bash`.
+1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `antigravity`, `opencode`, `pi`, `bash`.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
-4. Node.js-based agent CLIs (Codex, Gemini, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode) are natively compiled.
+4. Node.js-based agent CLIs (Codex, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode, Antigravity) are natively compiled.
 5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install.
 
 **Constraints:**
@@ -63,7 +63,7 @@ Multi-agent support, preseed system, and session modes.
 
 ---
 
-<!-- @test: src/__tests__/routes/session-agent-type.test.ts (REQ-AGENT-002 describe -> POST /api/sessions accepts/persists agentType + Zod rejects invalid + all 7 valid types + lastAgentType via PATCH /preferences + default claude-code -> AC1..AC5) -->
+<!-- @test: src/__tests__/routes/session-agent-type.test.ts (REQ-AGENT-002 describe -> POST /api/sessions accepts/persists agentType + Zod rejects invalid + all 7 valid types + lastAgentType via PATCH /preferences + default claude-code -> AC1..AC5) + web-ui/src/__tests__/components/CreateSessionDialog.test.tsx (agent type rendering describe -> AC6 beta badge: antigravity + opencode badged, claude-code/codex/copilot/pi/bash unbadged) -->
 ### REQ-AGENT-002: Agent Selection at Session Creation
 
 <!-- @impl: src/routes/session/crud.ts -->
@@ -81,6 +81,7 @@ Multi-agent support, preseed system, and session modes.
 3. The selected agent type is persisted in the session record.
 4. The UI defaults to the agent type used in the user's most recent session.
 5. When `agentType` is not specified, it defaults to `claude-code`.
+6. The session-creation UI renders a `beta` badge on agents in preview status: `antigravity` and `opencode` carry the badge; all other agents (Claude Code, Codex, Copilot, Pi, Bash) render without one.
 
 **Constraints:**
 
@@ -91,7 +92,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** [REQ-AGENT-001](#req-agent-001-support-multiple-ai-coding-agents)
 
-**Verification:** [Automated test](../../src/__tests__/lib/agent-config.test.ts)
+**Verification:** [Automated test](../../src/__tests__/lib/agent-config.test.ts), [Beta-badge UI test](../../web-ui/src/__tests__/components/CreateSessionDialog.test.tsx)
 
 **Status:** Implemented
 
@@ -222,7 +223,7 @@ Multi-agent support, preseed system, and session modes.
 3. A build-time seed generator reads the manifest and source files, producing the runtime payload the Worker ships to the container.
 4. The generator is manifest-driven; files not in the manifest are ignored.
 5. No duplicate preseed source files exist on disk.
-6. The generator produces output for all supported agents (Claude Code as the source-of-truth lane plus adapted lanes for Codex, Gemini, Copilot, OpenCode, and Pi).
+6. The generator produces output for all supported agents (Claude Code as the source-of-truth lane plus adapted lanes for Codex, Copilot, OpenCode, and Pi).
 
 **Constraints:**
 
@@ -251,8 +252,8 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. Adapted configs are generated for all supported non-Claude agents from the Claude Code source.
-2. Tool names are remapped per agent (e.g., `Read` -> `read_file` for Gemini, `Read` -> `read` for Codex and Pi).
-3. Instructions are concatenated into a single file for agents that use monolithic config (Codex: `AGENTS.md`, Gemini: `GEMINI.md`, Copilot: `copilot-instructions.md`, OpenCode: `AGENTS.md`, Pi: `AGENTS.md`).
+2. Tool names are remapped per agent (e.g., `Read` -> `read` for Codex and Pi).
+3. Instructions are concatenated into a single file for agents that use monolithic config (Codex: `AGENTS.md`, Copilot: `copilot-instructions.md`, OpenCode: `AGENTS.md`, Pi: `AGENTS.md`).
 4. Claude Code keeps individual rule files in `~/.claude/rules/`, and Pi receives native runtime-adapter assets for Pi extension/package/MCP/subagent surfaces.
 
 **Constraints:**
@@ -260,6 +261,7 @@ Multi-agent support, preseed system, and session modes.
 - Hooks, commands, and plugins are excluded from generic transformed agents because they are Claude-specific surfaces; Pi is the native-runtime exception and receives Pi-native equivalents (extension/package/MCP/subagent adapters, native command handlers for Claude-only slash commands, and Pi-native skills) instead of copied Claude hooks and commands. Specific Pi command/skill reimplementations live in [REQ-AGENT-050](#req-agent-050-pi-native-review-workflow-skill) and [REQ-AGENT-051](#req-agent-051-pi-debug-deploy-and-brainstorm-commands).
 - `rules/memory.md` and `consult-llm` skill are excluded from non-CC agents (they depend on CC-specific MCP).
 - Generic non-CC agents get a strictly-smaller config than Claude Code, since CC is the source-of-truth lane and those agents drop CC-specific content. Pi may receive additional Pi-native runtime adapters when equivalent Pi primitives exist.
+- Antigravity (`agy`) receives no preseed adaptation lane: it is a Go-native, curl-installed CLI with no rules/skills/agents directory convention, so the generator emits nothing for it and AC6 covers only Claude Code, Codex, Copilot, OpenCode, and Pi.
 - The per-agent format transforms (frontmatter shape, removed fields, path rewrites, file extensions) live in [REQ-AGENT-030](#req-agent-030-multi-agent-format-transforms).
 
 **Priority:** P1
@@ -436,7 +438,6 @@ Multi-agent support, preseed system, and session modes.
 
 **Constraints:**
 
-- Gemini settings file is synced via rclone, so jq merge must preserve user customizations.
 - Codex `~/.codex/` directory is excluded from sync, so `version.json` is safe to recreate on every start.
 - Restored user-added Pi packages outside the Codeflare image cache may require Fast Start OFF once so Pi can reconcile package state.
 
@@ -454,6 +455,8 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: Dockerfile -->
 <!-- @impl: web-ui/src/lib/terminal-link-provider.ts -->
+<!-- @impl: web-ui/src/stores/terminal-url-detection.ts -->
+<!-- @test: web-ui/src/__tests__/stores/terminal-url-detection.test.ts -->
 
 **Intent:** Agent CLIs that attempt to open a browser for OAuth must degrade gracefully to printing clickable URLs in the terminal.
 
@@ -464,18 +467,18 @@ Multi-agent support, preseed system, and session modes.
 1. A browser-shim is installed in the container that intercepts browser-launch attempts and exits with a non-zero code, causing the calling CLI to fall back to plain-text URL output.
 2. The XDG browser-launch entry-point is similarly shimmed so any tool that bypasses the BROWSER convention also degrades to text output.
 3. CLIs fall back to printing auth URLs as plain text in the PTY when the browser fails to open.
-4. The xterm.js link provider detects URLs in terminal output and makes them clickable.
+4. The xterm.js link provider detects URLs in terminal output and makes them clickable. When a URL spans multiple terminal rows (soft-wrap or application-inserted newlines), the detector joins continuation rows to the end of the terminal buffer rather than stopping at the visible viewport, so long OAuth URLs printed on narrow or mobile-keyboard-shrunk viewports are assembled and offered in full (never truncated mid-URL). The number of continuation rows joined per logical line is bounded by a fixed cap so the periodic buffer scan cannot walk an unbounded scrollback.
 
 **Constraints:**
 
 - The shim must not block or hang; it must exit immediately with a non-zero code.
-- All CLI tools that attempt browser-based OAuth (Claude Code, OpenCode, Gemini) must be covered.
+- All CLI tools that attempt browser-based OAuth (Claude Code, OpenCode, Antigravity) must be covered.
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-001](#req-agent-001-support-multiple-ai-coding-agents)
 
-**Verification:** [Automated test](../../src/__tests__/lib/r2-seed-mode-req-coverage.test.ts)
+**Verification:** [r2-seed-mode-req-coverage.test.ts](../../src/__tests__/lib/r2-seed-mode-req-coverage.test.ts) (AC1-AC3 shim seeding), [terminal-url-detection.test.ts](../../web-ui/src/__tests__/stores/terminal-url-detection.test.ts) (AC4 multi-row URL assembly)
 
 **Status:** Implemented
 
@@ -712,6 +715,7 @@ None.
 <!-- @impl: preseed/agents/claude/rules/tdd-discipline.md -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @test: src/__tests__/lib/agent-seed-ecc-rules.test.ts (spec-discipline + documentation-discipline + tdd-discipline + graph-first advanced-only describes -> AC1 Pro-mode rule preseed) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi command extensions dispatch through both ctx and pi user-message APIs -> AC2 /sdd command works with and without context-mode) -->
 
 **Intent:** Pro users need the spec-driven-development workflow available out of the box, with every sub-command working through the native shell/file tools available in the active runtime so the workflow still works when context-mode is absent.
 
@@ -723,7 +727,7 @@ None.
 2. Every `/sdd` sub-command (`init`, `edit`, `add`, `clean`, `mode`) works in Pi without context-mode by using native Bash/Read/Grep/Find/Write/Edit tools; context-management helper tools, when present in another runtime, are optional rather than required.
 3. Discovery commands producing more than 20 lines of output (`gh pr list --state all`, `git log --follow`, `npm view <pkg> peerDependencies`, full-tree scans, scaffold-only `npm install --package-lock-only`) run through native discovery tools in Pi without context-mode, with any runtime-specific output-management wrapper treated as an optional optimization.
 4. Pi-transformed SDD skills replace Claude MCP tool names and Plan Mode surfaces with Pi-native graphify tools and `Agent`/`Plan` terminology, and the native `/sdd` command enforces the command-file hard gates (help, unknown subcommand, clean working tree, `clean`/`mode` require `sdd/`, existing-spec `init` handling) before dispatching to the workflow skill.
-5. After pushes that trigger GitHub Actions, the `ci-monitoring` skill uses one background continuous tail-followed monitor for the pushed HEAD through native Bash; agents do not emit repeated chat-visible polling calls, do not block the main session while CI runs, and do not require context-mode.
+5. When the user explicitly asks to monitor CI or a deploy/merge gate requires a fresh result, the `ci-monitoring` skill uses one background continuous tail-followed monitor for the target HEAD; routine pushes do not auto-start CI monitoring.
 
 **Constraints:**
 
@@ -733,7 +737,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-005](#req-agent-005-pro-mode-includes-additional-skills-rules-agents-and-mcp-servers), [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth), [REQ-AGENT-007](#req-agent-007-multi-agent-adaptation-pipeline), [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-025](#req-agent-025-post-clone-graph-triage)
 
-**Verification:** [Automated test](../../src/__tests__/lib/agent-seed-ecc-rules.test.ts)
+**Verification:** [Automated tests](../../src/__tests__/lib/agent-seed-ecc-rules.test.ts), [Pi command dispatch tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -862,7 +866,7 @@ None.
 
 **Status:** Partial
 
-<!-- coverage-gap: AC6 (manifest-presence of skills/review/SKILL.md) is covered by agent-seed-manifest.test.ts. AC1-AC5 (flag parsing and the runtime workflow phases) are skill-content behavior injected at command time, with no dedicated automated test. -->
+<!-- coverage-gap: AC6 (manifest-presence of skills/review/SKILL.md) and command-dispatch API compatibility are covered by agent-seed-manifest.test.ts. AC1-AC5 (flag parsing and the runtime workflow phases) are skill-content behavior injected at command time, with no dedicated automated test. -->
 
 ---
 
@@ -896,7 +900,7 @@ None.
 
 **Status:** Partial
 
-<!-- coverage-gap: AC6 (manifest-presence of codeflare-commands.ts) is covered by agent-seed-manifest.test.ts. AC1-AC5 (the debug/deploy/brainstorm registration and their injected-workflow content) are runtime behavior with no dedicated automated test. -->
+<!-- coverage-gap: AC6 (manifest-presence of codeflare-commands.ts) and command-dispatch API compatibility are covered by agent-seed-manifest.test.ts. AC1-AC5 (the debug/deploy/brainstorm registration and their injected-workflow content) are runtime behavior with no dedicated automated test. -->
 
 ---
 
@@ -911,14 +915,14 @@ None.
 **Acceptance Criteria:**
 
 1. The attribution guard fires not only on `git commit` and `gh pr create` but across `git merge`, `git tag`, `git notes`, and the `gh pr`, `gh issue`, and `gh release` subcommand families.
-2. The attribution detection set is aligned to the canonical `block-attributed-commits.sh`: it matches `Co-Authored-By`, `noreply@anthropic`, model-name attribution (`claude sonnet|opus|haiku|code`), `generated with ... claude`, the robot/brain emoji, and `ChatGPT`.
+2. The attribution detection set matches attribution signatures only. The canonical `block-attributed-commits.sh` set is `Co-Authored-By`, `noreply@anthropic`, `generated with ... claude`, and the robot emoji; the Pi guard (`codeflare-pi.ts`) additionally matches the brain emoji and `ChatGPT` as a deliberate superset (a Pi session may run a non-Claude model). Bare model/product names (`claude code`, `claude opus`, `claude sonnet`, `claude haiku`) are deliberately NOT matched: they false-positive on legitimate prose (e.g. a PR titled "Claude Code parity") and on git/gh commands naming `preseed/agents/claude/` paths.
 3. The attribution guard does not match a bare `Claude`, so `git`/`gh` commands that name `preseed/agents/claude/` paths are not false-positives.
 4. The local-build guard covers the package-manager build/test/lint/typecheck/dev verbs plus `pytest`, `vitest`, `go test`, `swift test`, `cargo test`, `tsc`, `eslint`, `oxlint`, `prettier`, and `wrangler dev`.
 5. The local-build guard honors a user-only consume-on-use sentinel at `/tmp/local-build-bypass`: when present, the guard deletes it and allows the one command through; the block message names the override path.
 
 **Constraints:**
 
-- The attribution and local-build detection sets are kept aligned with the canonical Claude hook scripts (`block-attributed-commits.sh`, the no-local-builds rule); divergence is a regression.
+- The attribution and local-build detection sets are kept aligned with the canonical Claude hook scripts (`block-attributed-commits.sh`, the no-local-builds rule); divergence is a regression, except the documented Pi superset (brain emoji + `ChatGPT`) in AC2.
 - The bypass sentinel is user-only and consume-on-use, mirroring the `/tmp/graphify-bypass` discipline in [REQ-AGENT-042](#req-agent-042-graphify-hard-block-enforcement) AC7.
 
 **Priority:** P1
@@ -1037,7 +1041,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh — PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC3 intermediate branches deferred + git-push-review-reminder.sh — MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh — PR state gating describe -> AC1/AC6 PR-state HEAD check + AC4 no-PR push no-op + enforce-review-spawn.sh — vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh — MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi native runtime assets include review-enforcement.ts trigger/ctx-surface markers -> AC2 + review head classification separates a moved-on PR from an unreadable gh query -> AC6 Pi head-currency classification) -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1/AC6 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -1045,13 +1049,13 @@ None.
 
 **Acceptance Criteria:**
 
-1. PR-boundary review fires only for PRs targeting `main` or `master` (a new PR opens with that target via `gh pr create`, or a push lands on a branch with an open PR to that target).
-2. PUSH_LINE detection recognises both `git push` and `gh pr merge` across all three tool surfaces (Bash, `mcp__*__ctx_batch_execute`, `mcp__*__ctx_execute` with `language=shell`); the `gh pr merge` surface is required because a server-side merge into `develop` advances the develop->main PR HEAD without producing a local `git push` line.
-3. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed.
-4. A plain push to a branch with no open PR does NOT trigger reviews.
-5. Direct pushes to `main` are expected to be prevented by GitHub branch protection (require PR before merge); the review pipeline is not engineered to compensate for a bypass that the upstream platform already blocks.
-6. Layer 2 false-positive filtering validates that the candidate push belongs to the currently open PR; same-session pushes may use local HEAD as the candidate SHA while GitHub's PR API catches up, with every directive carrying a freshness gate for the exact head. A pending review window is discarded only when the open PR has definitively moved on or closed, and always with a visible warning; when the PR state cannot be read (the `gh` query fails), the window is left intact and retried, so a transient query failure never drops the merge gate or leaves a reviewed head un-acked.
-7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode).
+1. PR-boundary review fires only for open PRs targeting `main` or `master`. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
+2. Local push detection recognises `git push` and `git -C <repo> push` across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
+3. GitHub CLI detection recognises PR-head-moving operations: `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
+4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
+5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
+6. A pending review window is discarded only when the open PR has definitively moved on or closed; if the PR state cannot be read, the window is left intact for retry. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
+7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode). <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject -->
 
 **Constraints:**
 
@@ -1074,7 +1078,9 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC4 sequential spec-reviewer then doc-updater + AC5 fix-push cascade ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 automatic reviewer spawn options + paired terminal-event dedupe + AC5 incremental review-base selection and stale-pending discard) -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC5 doc-updater sequencing + AC7 fix-push ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial lane scheduling + AC5 doc-updater sequencing + AC6 review-base preservation + AC7 durable result-file gating) -->
 
 **Intent:** Once a PR-boundary trigger fires (REQ-AGENT-036), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
@@ -1085,8 +1091,78 @@ None.
 1. Layer 1 lane classification uses one internally shared classifier per runtime surface so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
 2. Lane mapping: docs-only (no sdd, no source) → `doc-updater`; `sdd/` touched without source (with or without docs) → `spec-reviewer` then `doc-updater`; any source touch → all three agents.
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
-4. On trigger, `code-reviewer` may run in parallel with `spec-reviewer`; `doc-updater` starts only after `spec-reviewer` completes on any project containing `sdd/`. Pi launches PR-boundary reviewers automatically from the extension (not by asking the assistant to call `Agent`), records the returned subagent ID for each lane, and dedupes paired Pi tool-result events so each push produces one review window.
-5. In a fix-push cascade (multiple pushes inside one turn), the gate advances the ack pointer through each push whose review window completed all lanes required by that push's diff; bypassed pushes (no spawns in window, per REQ-AGENT-041) are absorbed into the next complete window's cumulative review. Pi preserves the first unreviewed review base while prior lanes are incomplete, discards stale non-ancestor pending state, and accepts completion only from the registered subagent ID or a foreground fallback prompt that names the pending head.
+4. The initial review wave starts `code-reviewer` and `spec-reviewer` together when both lanes are required. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewInitialLanes -->
+5. `doc-updater` starts only after `spec-reviewer` completes on SDD projects. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
+6. A fix-push cascade preserves the first unreviewed review base for cumulative review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
+7. Pi acknowledges a PR head only after durable result files exist for every required lane. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::completedDurableReviewLanes -->
+8. Review agents are dispatched with `run_in_background: true` so the main session stays interactive while reviewers run; the turn-end gate suppresses re-summoning PER LANE (each lane is demanded only when it was not spawned-after-push AND is not currently in flight), so a single slow lane still in flight never masks the demand for the other lanes (notably the sequential `doc-updater` follow-up after `spec-reviewer` completes). The in-flight tolerance is bounded by transcript recency (`IN_FLIGHT_STALE_LINES`): a spawn far behind the transcript tail with no completion marker is treated as orphaned and enforcement re-fires, so a crashed or killed review subagent cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-040 AC8 review dispatch is backgrounded with a bounded in-flight guard describe -> seeded enforce-review-spawn.sh carries lane_in_flight + IN_FLIGHT_STALE_LINES + run_in_background, and applies per-lane suppression with no blanket whole-gate exit) -->
+
+**Constraints:**
+
+- The agent must not push to the PR branch or start a second review wave while any required review lane is in flight. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight -->
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
+
+**Verification:** [Lane classifier tests](../../host/__tests__/lane-classifier.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1-AC7 lane classification + dispatch sequencing; AC8 background-dispatch + bounded in-flight guard via the seeded `enforce-review-spawn.sh` content assertion)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-053: Pi Durable Review Status, Result Formatting, and Fix Loop
+
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1/AC2/AC3/AC4/AC5/AC6/AC7 + lane extension sources -> AC8) -->
+<!-- coverage-gap: AC8's lane-source selection is unit-tested via laneExtensionSources; the in-lane loading of codeflare-pi and the per-session global-graph-merge skip are runtime behaviors verified by integration smoke test, with no dedicated automated test. -->
+
+**Intent:** Pi operators need consistent PR-boundary review output, a compact indication that internal durable lanes are active, and an automatic next-fix prompt when actionable findings remain.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. Durable PR-boundary result files use a shared `## Findings` plus severity-count Review Summary table format. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatDurableReviewResult -->
+2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus -->
+3. Pi suppresses duplicate PR-boundary review result and summary announcements for the same repo, head, lane, and result path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
+4. After all required lanes complete, Pi publishes a merged chat summary instead of separate per-lane chat result blocks. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewSummaryMarkdown -->
+5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel -->
+6. The merged chat summary renders findings across code, spec, and documentation lanes sorted by criticality and does not require per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
+7. When completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; the next PR-boundary review uses the pushed fix diff. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix -->
+8. Durable PR-boundary review lanes additively load the graphify package (always when configured), the context-mode package (only when enabled in Pi settings), and the `codeflare-pi` guard extension (local-build blocker, attribution, graphify gate), while excluding the `review-enforcement` extension and the `@gotgenes/pi-subagents` package from the lane; `codeflare-pi`'s per-session global-graph merge is skipped inside lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
+
+**Constraints:**
+
+None.
+
+**Priority:** P2
+
+**Dependencies:** [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-054: Pi Durable Review Lane Failure Handling
+
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (durable lane recovery + result-file gating tests -> AC1/AC2/AC3) -->
+
+**Intent:** Pi operators need durable PR-boundary review failures to fail closed without falsely acknowledging a PR head.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. When a durable Pi review lane times out or records a failure, the lane is persisted as failed instead of completed. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
+2. Failed or timed-out durable lanes do not satisfy the required result-file gate. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::completedDurableReviewLanes -->
+3. A PR head remains unacked until a later review run writes every required lane result file. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::markCompleted -->
 
 **Constraints:**
 
@@ -1094,9 +1170,9 @@ None.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
+**Dependencies:** [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)
 
-**Verification:** [Lane classifier tests](../../host/__tests__/lane-classifier.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1570,16 +1646,15 @@ None.
 
 <!-- @impl: preseed/agents/claude/plugins/context-mode -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graph-first-nudge.sh -->
-<!-- @test: host/__tests__/enforce-ctx-mode-graphify.test.js (graphify in context-mode Bash whitelist → AC1) -->
-<!-- @test: host/__tests__/graph-first-nudge.test.js (soft-nudge fires on ctx_search/ctx_batch_execute → AC2) -->
+<!-- @test: host/__tests__/graph-first-nudge.test.js (soft-nudge fires on ctx_search/ctx_batch_execute → AC2) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-027 AC1 context-mode wired as a tool only describe → no enforce-ctx-mode deny-gate is preseeded in any seeded config) + host/__tests__/entrypoint-enforce-ctx-mode-dedup.test.js (managed-hooks prune regex strips stale deny-gate → AC1 runtime stale-gate pruning) -->
 
-**Intent:** When the context-mode plugin is preseeded, the graphify CLI must coexist with the enforce-ctx-mode Bash whitelist and the graph-first soft-nudge must reach the agent through context-mode's redirected tool-call path.
+**Intent:** When the context-mode plugin is preseeded, the graphify CLI must coexist with context-mode and the graph-first soft-nudge must reach the agent through context-mode's redirected tool-call path.
 
 **Applies To:** Agent
 
 **Acceptance Criteria:**
 
-1. When the context-mode plugin is preseeded (effectiveTier `unlimited` plus advanced session mode), `graphify` is in the context-mode Bash whitelist so `graphify update .` and `graphify query ...` are not denied.
+1. When the context-mode plugin is preseeded (effectiveTier `unlimited` plus advanced session mode), `graphify update .` and `graphify query ...` run unimpeded: context-mode is wired as a tool only (MCP server plus the indexing PreToolUse/PostToolUse hooks), with no Bash deny-gate, so no command-routing whitelist is needed. Any stale `enforce-ctx-mode.sh` deny-gate left in a pre-existing `settings.json` is stripped on container start by the managed-hooks prune regex.
 2. The REQ-AGENT-024 AC7 PreToolUse soft-nudge hook registers both the non-ctx matchers (`Grep`, `Glob`) and the ctx grep-equivalents (`mcp__context-mode__ctx_search`, `mcp__context-mode__ctx_batch_execute`) so the nudge fires in both tier paths.
 
 **Constraints:**
@@ -1590,7 +1665,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)
 
-**Verification:** [Automated test](../../host/__tests__/enforce-ctx-mode-graphify.test.js)
+**Verification:** [Soft-nudge test](../../host/__tests__/graph-first-nudge.test.js) (AC2) and [agent-seed manifest test](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1: no `enforce-ctx-mode` deny-gate is preseeded in any seeded config, so context-mode ships as a tool with no command deny-gate). The stale-gate pruning AC1 relies on at runtime is additionally covered by [the settings.json hook-merge dedup test](../../host/__tests__/entrypoint-enforce-ctx-mode-dedup.test.js).
 
 **Status:** Implemented
 
@@ -1629,7 +1704,8 @@ None.
 
 <!-- @impl: src/container/container-env.ts -->
 <!-- @impl: entrypoint.sh -->
-<!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe → OPENAI_API_KEY + GEMINI_API_KEY injection → AC1) -->
+<!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
+<!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe → OPENAI_API_KEY + GEMINI_API_KEY injection → AC1) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-031 consult-llm invocation behaviour describe → AC4 provider dialog + AC5 latest-flagship model) -->
 
 **Intent:** Stored LLM API keys must reach the container as environment variables and trigger the consult-llm MCP server wiring, so the in-container agent can call OpenAI or Gemini without re-authentication.
 
@@ -1640,16 +1716,19 @@ None.
 1. Stored LLM API keys are propagated into the container environment at container start so in-container CLIs can call OpenAI or Gemini without re-authentication.
 2. When keys are present, the container entrypoint configures the `consult-llm-mcp` MCP server in `~/.claude.json`.
 3. Keys are NOT persisted in DO storage; they are read fresh from KV on each container start.
+4. When the user invokes the consult-llm skill without naming a provider, the agent shows an interactive provider-selection dialog (multi-select over the two configured providers, OpenAI and Google Gemini) before calling `consult_llm`; it never silently defaults to a provider. When the user names a provider explicitly, no dialog is shown. <!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
+5. The agent always passes an explicit `model` to `consult_llm`, resolved live from the provider's model listing at call time (OpenAI `/v1/models`, Gemini `/v1beta/models`) to the provider's current latest flagship; it never relies on the MCP server's configured default model. An explicitly named model from the user overrides the flagship auto-pick. <!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
 
 **Constraints:**
 
 - The container reads keys at start and on restart; mid-session key changes take effect only after the next session start.
+- AC4 and AC5 are skill-directed agent behaviour; the consult-llm SKILL.md is the implementation surface and is verified by asserting its bundled-seed content (the provider-dialog mandate and the latest-flagship/never-server-default model directive).
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-009](#req-agent-009-llm-api-key-storage-encrypted-in-kv)
 
-**Verification:** [Automated test](../../src/__tests__/container/container-env.test.ts)
+**Verification:** [Container-env test](../../src/__tests__/container/container-env.test.ts) (AC1) and [agent-seed manifest test](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC4/AC5 consult-llm skill content).
 
 **Status:** Implemented
 

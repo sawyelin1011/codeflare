@@ -1,5 +1,5 @@
 import type { Terminal } from '@xterm/xterm';
-import { ACTIONABLE_URL_PATTERNS, URL_CHECK_INTERVAL_MS } from '../lib/constants';
+import { ACTIONABLE_URL_PATTERNS, URL_CHECK_INTERVAL_MS, MAX_URL_CONTINUATION_ROWS } from '../lib/constants';
 import { getBufferActive } from '../lib/xterm-internals';
 
 /**
@@ -86,15 +86,24 @@ export function getLastUrlFromBuffer(term: Terminal): string | null {
 
     let fullText = line.translateToString(true);
     let j = i + 1;
-    while (j < endLine) {
+    // Once a logical line begins, follow its continuation rows past the viewport
+    // edge (endLine) so a long URL whose tail scrolls just below the visible
+    // viewport is still joined in full (matters on mobile where the on-screen
+    // keyboard shrinks `rows`, and thus endLine). A single shared budget bounds
+    // ALL joins for this logical line (soft-wrap rows + heuristic rows) so a
+    // pathological soft-wrapped blob (e.g. `cat` of a minified file producing
+    // tens of thousands of isWrapped rows) cannot make this 2s-interval scan
+    // walk the entire scrollback and stall the main thread.
+    let joinedRows = 0;
+    while (j < buffer.length && joinedRows < MAX_URL_CONTINUATION_ROWS) {
       const nextLine = buffer.getLine(j);
       if (!nextLine?.isWrapped) break;
       fullText += nextLine.translateToString(true);
       j++;
+      joinedRows++;
     }
 
-    let heuristicCount = 0;
-    while (j < endLine && heuristicCount < 10) {
+    while (j < buffer.length && joinedRows < MAX_URL_CONTINUATION_ROWS) {
       const nextLine = buffer.getLine(j);
       if (!nextLine) break;
       const nextText = nextLine.translateToString(true);
@@ -109,12 +118,13 @@ export function getLastUrlFromBuffer(term: Terminal): string | null {
         fullText += nextText;
       }
       j++;
-      heuristicCount++;
-      while (j < endLine) {
+      joinedRows++;
+      while (j < buffer.length && joinedRows < MAX_URL_CONTINUATION_ROWS) {
         const wrapped = buffer.getLine(j);
         if (!wrapped?.isWrapped) break;
         fullText += wrapped.translateToString(true);
         j++;
+        joinedRows++;
       }
     }
 

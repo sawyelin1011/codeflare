@@ -110,6 +110,27 @@ describe('entrypoint.sh configure_tab_autostart / REQ-AGENT-003 (Agent CLI auto-
     assert.doesNotMatch(bashrc, /rm -rf/);
   });
 
+  // REQ-AGENT-003: the Antigravity agent launches as `agy --dangerously-skip-permissions`.
+  // The autostart case arm lists `agy` among the known-safe CLIs (matching the
+  // "Only known-safe CLIs autostart" design comment); this guards that an agy tab
+  // emits its launch line into .bashrc and is not silently dropped.
+  it('AC1 dynamic: an agy (Antigravity) tab emits its launch command into .bashrc', () => {
+    const tabConfig = JSON.stringify([
+      { id: '1', command: 'agy --dangerously-skip-permissions', label: 'Terminal 1' },
+    ]);
+    const { result, bashrc } = runHarness({ tabConfig });
+    assert.equal(result.status, 0, `configure_tab_autostart exited non-zero: ${result.stderr}`);
+    assert.match(bashrc, /agy --dangerously-skip-permissions/,
+      'agy tab must emit its launch command for tab 1');
+    // Guard the real bug: an autostart arm that matched `antigravity*` (the agent
+    // type) instead of `agy` (the binary) sent the command to the `*)` fallback,
+    // which emits a "Unknown command ... falling back to bash" comment and never
+    // executes it. The match above alone is satisfied by that comment, so assert
+    // the fallback warning is absent.
+    assert.doesNotMatch(bashrc, /Unknown command/,
+      'agy tab must hit the known-safe autostart arm, not the unknown-command fallback');
+  });
+
   it('idempotent: a second invocation does NOT re-append the marker block', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tab-autostart-idempotent-'));
     const body = extractConfigureBody();

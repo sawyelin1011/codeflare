@@ -1,7 +1,7 @@
 
 # Architecture Decisions
 
-Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as AD1-AD63 throughout the codebase and documentation. 48 ADRs carry active content (AD4 superseded by AD56 + AD57; AD38 superseded by AD48; AD45 and AD50 superseded by AD51); 11 anchors are redirects (6 merged 2026-05-03, 5 reclassified 2026-05-09 per the documentation-discipline "What is NOT an ADR" rule).
+Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as AD1-AD64 throughout the codebase and documentation. 49 ADRs carry active content (AD4 superseded by AD56 + AD57; AD38 superseded by AD48; AD45 and AD50 superseded by AD51); 11 anchors are redirects (6 merged 2026-05-03, 5 reclassified 2026-05-09 per the documentation-discipline "What is NOT an ADR" rule).
 
 **Audience:** Developers
 
@@ -74,6 +74,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD61](#ad61-pi-review-ships-as-a-dedicated-native-skill) | Pi `/review` ships as a dedicated native skill (Claude commands do not deploy to Pi) | Architecture |
 | [AD62](#ad62-pi-model-name-genericization-with-codeflare_memory_model-lever) | Pi model-name genericization with `CODEFLARE_MEMORY_MODEL` lever | Architecture |
 | [AD63](#ad63-pi-safe-graphify-updatesh-is-fail-closed-and-two-step) | Pi `safe-graphify-update.sh` is fail-closed and two-step | Architecture |
+| [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) | Durable review lanes load extensions additively behind the `noExtensions` shield | Agents |
 
 ---
 
@@ -1094,6 +1095,7 @@ Three smaller decisions bundled in:
 - The capture contract has a single owner in source. A future change to the AD58 contract updates the Claude agent files and the Pi prompts from the same intent; the Pi copies are deployed prompts, not a fork.
 - The prefilter shifts work to spawn time. The transcript is reduced to user/assistant text before the subagent reads it, so the subagent never sees raw tool I/O and recency bias is structurally prevented as on the Claude path.
 - Stale captures written by the old thin-contract Pi path are not migrated; they remain as historical record.
+- Later refinement (REQ-MEM-001 AC8, 2026-05-30): the prefilter input is the durable on-disk session transcript Pi persists for `/resume`, read via `ctx.sessionManager.getSessionFile()` and parsed by `parseSessionMessages` - not the volatile in-memory message buffer the original Pi path used. That buffer was empty immediately after a Pi reload/resume, so the first capture-boundary prompt produced a hollow "no substantive content" note even though the full session JSONL was on disk; reading the persisted file fixed it, and a skip-empty guard now suppresses the capture rather than writing a placeholder note.
 
 **Alternative considered:** Keep the thin inline Pi contract and ratchet its prompt. Rejected for the same reason AD58 rejected prompt-only tightening: recency bias is a function of feeding raw tool records to the model, not a prompt-comprehension gap, and a divergent contract drifts from the AD58 source of truth over time.
 
@@ -1169,6 +1171,49 @@ Three smaller decisions bundled in:
 **Alternative considered:** Make the Pi wrapper fail-open like the Claude one and rely on the `codeflare-pi.ts` gate to absorb failures. Rejected because fail-open at the wrapper means a failed memory cap runs unbounded and a misresolved directory updates the wrong graph silently; the gate's fail-open is about not blocking the user, not about tolerating a corrupt build.
 
 **Related REQ:** REQ-AGENT-023 (knowledge-graph capability via graphify), REQ-AGENT-043 (graphify build-mode dispatch).
+
+---
+
+### AD64: Durable review lanes load extensions additively behind the `noExtensions` shield
+
+**Category:** Architecture
+
+**Status:** Active (2026-05-30)
+
+**Context:** PR-boundary review enforcement (REQ-AGENT-040/053/054) runs each lane as an in-process `createAgentSession` (`review-jobs.ts::runDurableLane`) with `DefaultResourceLoader({ noExtensions: true })`. That shield exists because extension factories run synchronously during load (pi's `loader.js` `await factory(api)`), and `review-enforcement.ts`'s factory writes a process-global run token (`__codeflareReviewEnforcementRun`) at load time; if a lane loaded that extension in the same process it would overwrite the token and silently disable the **main** session's enforcement (the merge gate). `@gotgenes/pi-subagents` similarly couples in-process state. But the blunt `noExtensions: true` also stripped every useful capability, leaving lanes with only the 7 built-in tools: reviewers had no `graphify_*`, no `ctx_*`, and none of `codeflare-pi`'s guards. A transient `gh pr view` failure once dropped the merge gate by mis-classifying a live head as stale (the "failure #13" referenced in `review-helpers.ts`); `classifyReviewHead` now separates `stale` from `unknown` to keep the gate fail-closed, and the durable `.git/`-persisted state makes that classification recoverable.
+
+**Decision:** Keep `noExtensions: true` and load capabilities **additively** via `additionalExtensionPaths` (which still load under `noExtensions`): always the graphify package, the `context-mode` package only when enabled in Pi settings (so lanes inherit `/ctx on`), and `codeflare-pi.ts` as a local file (for the local-build blocker, attribution gate, and graphify-first gate). `review-enforcement` and `@gotgenes/pi-subagents` are never added, so neither clobbers the main session. Lane source selection is the pure `review-job-helpers.ts::laneExtensionSources`. `codeflare-pi`'s `session_start` global-graph merge is skipped inside lanes via a `globalThis.__codeflareReviewLaneDepth` counter set by `runDurableLane`, avoiding a redundant `graphify global add` subprocess per lane on the 1 vCPU container.
+
+**Consequences:**
+- Reviewers gain graphify and (when enabled) context-mode, and run under the same build-blocker/graphify-first gates as the main agent.
+- The `noExtensions` shield is load-bearing and must stay; a future maintainer must not "simplify" by removing it, because that reloads `review-enforcement`'s clobbering factory in-process.
+- `extensionsOverride` cannot substitute for this: it filters after factories have already run, so it cannot prevent the load-time global clobber.
+- graphify tools spawn bounded Python; lanes are steered (system prompt) to read-only `graphify_query/path/explain`.
+
+**Alternative considered:** Remove `noExtensions` and filter `review-enforcement` out with `extensionsOverride`. Rejected: factories run during load, so the clobber happens before the filter.
+
+**Alternative considered:** Self-guard `review-enforcement` to no-op when loaded in a lane. Rejected as the primary mechanism: it does not cover `@gotgenes/pi-subagents`' in-process coupling, and the additive allowlist is simpler and strictly scopes what a lane can load.
+
+**Related REQ:** REQ-AGENT-053 (durable review status/result/fix loop, AC8), REQ-AGENT-040 (PR-boundary lane classification and dispatch), REQ-AGENT-054 (durable lane failure handling).
+
+---
+
+### AD65: Gemini CLI replaced by Antigravity (agy)
+
+**Category:** Architecture
+
+**Status:** Active (2026-05-30)
+
+**Context:** `@google/gemini-cli` (npm, `gemini` command) was removed from the Dockerfile and entrypoint. The replacement is Antigravity (`agy`), Google's successor CLI, installed via `curl -fsSL https://antigravity.google/cli/install.sh | bash` as a Go-native binary. Because `agy` is not an npm package it is excluded from the V8 compile-cache warm-up step (same as `opencode`). The `~/.gemini/settings.json` auto-update suppressor written by Fast Start is also removed; `agy` has no equivalent config-file suppressor mechanism at this time.
+
+**Decision:** Install Antigravity via its official curl installer in the Dockerfile. Do not add it to the npm `install -g` line. Antigravity gets no preseed adaptation lane (it has no stable config-file convention to target). The legacy `--filter "- .gemini/tmp/**"` rclone filter is retained as a harmless no-op to avoid bisync filter-list churn.
+
+**Consequences:**
+- The Gemini CLI interactive agent (`gemini`) is no longer available in containers; users needing the Google AI agent use `agy` instead.
+- The Gemini *API* (GEMINI_API_KEY, `/api/llm-keys` geminiApiKey, consult-llm model selector) is unaffected - it is a separate provider, not the CLI agent.
+- No preseed documents are generated for Antigravity; the per-agent document total drops from 370 to 312.
+
+**Related REQ:** REQ-AGENT-001 (agent CLI pre-install).
 
 ---
 

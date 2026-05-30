@@ -98,11 +98,38 @@ describe('CreateSessionDialog', () => {
 
       expect(screen.getByTestId('csd-agent-claude-code')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-codex')).toBeInTheDocument();
-      expect(screen.getByTestId('csd-agent-gemini')).toBeInTheDocument();
+      expect(screen.getByTestId('csd-agent-antigravity')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-copilot')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-opencode')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-pi')).toBeInTheDocument();
       expect(screen.getByTestId('csd-agent-bash')).toBeInTheDocument();
+    });
+
+    // REQ-AGENT-002 AC6: a `beta` badge renders only on preview-status agents.
+    // querySelector('.csd-agent-badge') searches the agent button's descendants,
+    // so this holds regardless of the exact badge-span nesting.
+    it('renders a beta badge only on preview-status agents (antigravity, opencode)', () => {
+      render(() => (
+        <CreateSessionDialog
+          isOpen={true}
+          onClose={() => {}}
+          onSelect={() => {}}
+        />
+      ));
+
+      for (const type of ['antigravity', 'opencode']) {
+        const card = screen.getByTestId(`csd-agent-${type}`);
+        const badge = card.querySelector('.csd-agent-badge');
+        expect(badge, `${type} should carry a beta badge`).not.toBeNull();
+        expect(badge?.textContent).toBe('beta');
+      }
+      for (const type of ['claude-code', 'codex', 'copilot', 'pi', 'bash']) {
+        const card = screen.getByTestId(`csd-agent-${type}`);
+        expect(
+          card.querySelector('.csd-agent-badge'),
+          `${type} should not carry a beta badge`,
+        ).toBeNull();
+      }
     });
 
     it('does not render claude-unleashed option', () => {
@@ -226,7 +253,7 @@ describe('CreateSessionDialog', () => {
       expect(onSelect).toHaveBeenCalledWith('copilot');
     });
 
-    it('lists agents in order with Bash last', () => {
+    it('lists coding agents alphabetically by label with Bash last', () => {
       render(() => (
         <CreateSessionDialog
           isOpen={true}
@@ -237,15 +264,18 @@ describe('CreateSessionDialog', () => {
 
       const buttons = screen.getByTestId('create-session-dialog').querySelectorAll('.csd-agent-btn');
       const order = Array.from(buttons).map((btn) => btn.getAttribute('data-testid'));
+      // Coding agents sorted A->Z by display label; Bash (non-agent fallback) pinned last.
       expect(order).toEqual([
+        'csd-agent-antigravity',
         'csd-agent-claude-code',
         'csd-agent-codex',
-        'csd-agent-gemini',
         'csd-agent-copilot',
         'csd-agent-opencode',
         'csd-agent-pi',
         'csd-agent-bash',
       ]);
+      // Regression guard: Antigravity must precede Claude Code.
+      expect(order.indexOf('csd-agent-antigravity')).toBeLessThan(order.indexOf('csd-agent-claude-code'));
     });
 
     it('calls onSelect with correct agent type when clicked', () => {
@@ -448,7 +478,7 @@ describe('CreateSessionDialog', () => {
 
       expect(screen.getByText('Full Claude Code experience')).toBeInTheDocument();
       expect(screen.getByText('OpenAI Codex agent')).toBeInTheDocument();
-      expect(screen.getByText('Google Gemini CLI')).toBeInTheDocument();
+      expect(screen.getByText("Google's terminal coding agent")).toBeInTheDocument();
       expect(screen.getByText("GitHub's AI coding agent")).toBeInTheDocument();
       expect(screen.getByText('Multi-model agent')).toBeInTheDocument();
       expect(screen.getByText('Plain terminal session')).toBeInTheDocument();

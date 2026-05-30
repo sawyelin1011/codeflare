@@ -24,7 +24,7 @@ Container image contents, startup sequence, AI tool integration, auto-sleep conf
 | Category | Packages |
 |----------|----------|
 | Sync | rclone |
-| Version Control | git, github-cli (gh), lazygit (v0.61.1) |
+| Version Control | git, github-cli (gh), lazygit (v0.62.1) |
 | Editors | vim (symlinked to neovim), neovim, nano |
 | Network | curl, openssh-client |
 | Process | procps (ps, pgrep) |
@@ -40,7 +40,7 @@ AI CLI packages install with `@latest` -- each deploy pulls the newest versions 
 |---------|---------|----------|
 | `@anthropic-ai/claude-code` | latest | `claude` command. Runs with `IS_SANDBOX=1` + `--dangerously-skip-permissions` for root container support. |
 | `@openai/codex` | 0.105.0 | `codex` command |
-| `@google/gemini-cli` | 0.30.0 | `gemini` command |
+| Antigravity (agy) | beta | `agy` command. Installed via `curl -fsSL https://antigravity.google/cli/install.sh | bash` (Go-native binary, not npm). Runs with `--dangerously-skip-permissions`. |
 | `opencode-ai` | 1.2.15 | `opencode` command |
 | `@github/copilot` | 0.0.418 | `copilot` command. Post-install: non-linux-x64 prebuilds, `mxc-bin/arm64`, bundled `ripgrep/` (system `rg` used instead), and non-linux native modules (`clipboard`, `pvrecorder`, `sharp` node_modules) stripped to save ~200MB. |
 | `bun` | 1.3.14 (pinned) | JS/TS subprocess runtime. context-mode autodetects Bun for `ctx_execute` / `ctx_batch_execute`. Post-install: `node_modules/` (258MB of non-linux platform binaries) stripped; only the linux-x64 binary in `bin/` is retained. |
@@ -51,7 +51,7 @@ Pi extensions (`@gotgenes/pi-subagents`, `@gaodes/pi-graphify`, `context-mode`) 
 
 ### V8 Compile Cache Warm-Up
 
-Node.js CLIs (codex, gemini, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (like `opencode`) are already natively compiled and do not need V8 cache warm-up. Claude Code ships as a native binary (v2.1.102+) and is verified at build time via `claude --version`.
+Node.js CLIs (codex, copilot) are warmed at Docker build time by running `--version`, which triggers V8 to compile and cache bytecode via `NODE_COMPILE_CACHE`. This pre-populates the compile cache so that first-launch inside containers skips the JavaScript compilation overhead, resulting in faster startup times. Go binaries (opencode, Antigravity/agy) are already natively compiled and do not need V8 cache warm-up. Claude Code ships as a native binary (v2.1.102+) and is verified at build time via `claude --version`.
 
 ### OpenCode Database Pre-Initialization
 
@@ -59,7 +59,7 @@ OpenCode uses SQLite with Goose migrations that run on first startup ("Performin
 
 ### Browser Shims
 
-CLI tools (Claude Code, OpenCode, Gemini) try to open a browser for OAuth. The Dockerfile installs shims (`open-url` for `BROWSER` env var, `xdg-open-shim` for `xdg-open`) that exit 1, forcing CLIs to print auth URLs as plain text in the PTY. The xterm.js link provider then detects and makes these URLs clickable.
+CLI tools (Claude Code, OpenCode, Antigravity) try to open a browser for OAuth. The Dockerfile installs shims (`open-url` for `BROWSER` env var, `xdg-open-shim` for `xdg-open`) that exit 1, forcing CLIs to print auth URLs as plain text in the PTY. The xterm.js link provider then detects and makes these URLs clickable.
 
 Port: 8080 (single port architecture).
 
@@ -73,14 +73,14 @@ Uses polling with safety timeouts: poll until success OR background process exit
 
 ### Startup Sequence
 
-Port 8080 must bind before Cloudflare's container port-wait timeout (~10-15s) elapses. The entrypoint therefore starts the terminal server immediately — before R2 sync — then gates PTY pre-warm behind a flag file written only after sync and configuration complete.
+Port 8080 must bind before Cloudflare's container port-wait timeout (~10-15s) elapses. The entrypoint therefore starts the terminal server immediately - before R2 sync - then gates PTY pre-warm behind a flag file written only after sync and configuration complete.
 
 ```mermaid
 flowchart TD
-    A[Container Start] --> B["Start terminal server (:8080)\n— port binds, PTY pre-warm blocked"]
+    A[Container Start] --> B["Start terminal server (:8080)\n- port binds, PTY pre-warm blocked"]
     B --> C["initial_sync_from_r2()"]
-    C -->|"Blocking — waits for sync to complete"| D["configure_tab_autostart()"]
-    D --> E["touch /tmp/codeflare-init-complete\n— releases PTY pre-warm"]
+    C -->|"Blocking - waits for sync to complete"| D["configure_tab_autostart()"]
+    D --> E["touch /tmp/codeflare-init-complete\n- releases PTY pre-warm"]
 ```
 
 **Init-complete flag (REQ-SESSION-015 AC1):** `CODEFLARE_INIT_FLAG_FILE=/tmp/codeflare-init-complete`. The terminal server polls for this file (every 250ms, up to 90s) before spawning the tab-1 PTY session. This ensures pre-warm reads the fully-restored `.claude.json`, `.bashrc`, and MCP server registrations rather than pre-sync state. If the flag does not appear within 90s, pre-warm proceeds anyway. The flag is deleted and recreated on every container start.
@@ -101,15 +101,12 @@ When enabled, `entrypoint.sh` disables auto-update checks for all 6 AI tools, el
 | Claude Code | `DISABLE_AUTOUPDATER=1` | Env var |
 | OpenCode | `OPENCODE_DISABLE_AUTOUPDATE=1` | Env var |
 | Copilot | `COPILOT_AUTO_UPDATE=false` | Env var |
-| Gemini | `~/.gemini/settings.json` -> `general.enableAutoUpdate: false` | Config file (jq merge) |
 | Codex | `~/.codex/version.json` -> `dismissed_version: "999.0.0"` | Config file (overwrite) |
 | Pi | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1` | Env vars |
 
-**Gemini settings.json merge pattern:** Uses `jq '. * {"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false}}'` to deep-merge into existing settings. This preserves user customizations since the file is synced via rclone from R2. If the file doesn't exist, creates it with only the auto-update keys.
-
 **Codex dismissed_version hack:** Writes `{"dismissed_version":"999.0.0"}` to trick the Codex version checker into thinking a future version was already dismissed. The `~/.codex/` directory is excluded from rclone sync, so this file is safe to recreate on every container start.
 
-When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`DISABLE_AUTOUPDATER`, `DISABLE_INSTALLATION_CHECKS`) and the entrypoint-level update suppressors (`OPENCODE_DISABLE_AUTOUPDATE`, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK`), skips setting `COPILOT_AUTO_UPDATE`, removes Codeflare-managed Gemini/Codex settings-file suppressors, and runs `pi update` so Pi and Pi packages reconcile before the session starts. Fast Start ON sets `PI_OFFLINE=1`, so Pi skips startup network checks and will not install restored user-added Pi packages that are absent from the image cache until Fast Start is turned off.
+When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the Dockerfile-level env vars (`DISABLE_AUTOUPDATER`, `DISABLE_INSTALLATION_CHECKS`) and the entrypoint-level update suppressors (`OPENCODE_DISABLE_AUTOUPDATE`, `PI_OFFLINE`, `PI_SKIP_VERSION_CHECK`), skips setting `COPILOT_AUTO_UPDATE`, removes Codeflare-managed Codex settings-file suppressors, and runs `pi update` so Pi and Pi packages reconcile before the session starts. Fast Start ON sets `PI_OFFLINE=1`, so Pi skips startup network checks and will not install restored user-added Pi packages that are absent from the image cache until Fast Start is turned off.
 
 ### Auto-sleep (Configurable sleepAfter)
 
@@ -130,11 +127,11 @@ When Fast Start is disabled (`FAST_CLI_START=false`), `entrypoint.sh` unsets the
 8. On DO reset (cold start), constructor loads `sleepAfter` from DO storage before any `collectMetrics` alarm fires
 
 **Access control:**
-- **Admins** — always allowed to change their own `sleepAfter`
-- **Paying users** (standard, advanced, max, unlimited) — allowed to change, default `30m`
-- **Free users** — dropdown visible but disabled, locked to `15m`; hint text: "Fixed at 15 minutes on the Free plan. Upgrade for longer idle timeouts."
-- **Non-subscribed users** — dropdown disabled; hint text: "Auto-sleep is managed by your administrator."
-- Backend enforcement in `lifecycle.ts`: `effectiveTier === 'free' ? '15m' : (preferences.sleepAfter || '30m')` — free tier cannot bypass via API
+- **Admins** - always allowed to change their own `sleepAfter`
+- **Paying users** (standard, advanced, max, unlimited) - allowed to change, default `30m`
+- **Free users** - dropdown visible but disabled, locked to `15m`; hint text: "Fixed at 15 minutes on the Free plan. Upgrade for longer idle timeouts."
+- **Non-subscribed users** - dropdown disabled; hint text: "Auto-sleep is managed by your administrator."
+- Backend enforcement in `lifecycle.ts`: `effectiveTier === 'free' ? '15m' : (preferences.sleepAfter || '30m')` - free tier cannot bypass via API
 
 **Settings UI:** Rendered in `SessionSection.tsx` as a `<select>` dropdown with 5 options. `SettingsPanel.tsx` fetches `hasSubscribed` from `/api/user` and computes `isFreeUser()` from `liveAccessTier()`. The `canChangeSleepAfter` accessor returns `(isAdmin() || userHasSubscribed()) && !isFreeUser()`. The `isFreeUser` prop is passed to `SessionSection` to show tier-specific hint text.
 
@@ -174,7 +171,7 @@ Claude Code runs directly via the official `@anthropic-ai/claude-code` npm packa
 
 **Active-repo tracking (advanced only, AD53):** Codeflare sessions begin with an empty workspace and typically hold 2-3 cloned repos. `graphify-active-repo.sh` is a PostToolUse hook on `Bash | Edit | Write | Read | NotebookEdit | mcp__context-mode__ctx_execute | mcp__context-mode__ctx_execute_file | mcp__context-mode__ctx_batch_execute`. It resolves the agent's current repo root (Bash from session cwd; Edit/Write/Read by walking up from `file_path`; ctx_execute variants by parsing `cd X` from the shell snippet) and writes it to a sentinel at `~/.cache/codeflare-hooks/graphify-active-cwd`. The wrapper polls the sentinel and rebinds G to that repo's `graphify-out/graph.json`. When the sentinel is absent (default mode, or before the first hook fires), the wrapper falls back to the freshest mtime across `CODEFLARE_WORKSPACE/*/graphify-out/graph.json`. Per-branch graphs are not supported - the wrapper reads `<repo>/.git/HEAD` only for an informative log line on rebind; users run `graphify update` after a checkout and the mtime watcher picks it up.
 
-**Coexistence:** graphify functions in all paid tiers and does not depend on context-mode. When context-mode is active (custom tier), `graphify` is whitelisted in `enforce-ctx-mode.sh` so Bash invocations of `graphify update .` are not denied; subagent Read/Grep calls during `/graphify` extraction route through `ctx_execute` for bonus token savings. Without context-mode, graphify's own subagent-chunking model bounds the main agent's context.
+**Coexistence:** graphify functions in all paid tiers and does not depend on context-mode. Context-mode routing is advisory (the Bash deny-gate was removed); when context-mode is present, subagent Read/Grep calls during `/graphify` extraction route through `ctx_execute` for bonus token savings. Without context-mode, graphify's own subagent-chunking model bounds the main agent's context.
 
 **MCP tools exposed:** `mcp__graphify__query_graph`, `mcp__graphify__get_node`, `mcp__graphify__get_neighbors`, `mcp__graphify__get_community`, `mcp__graphify__god_nodes`, `mcp__graphify__graph_stats`, `mcp__graphify__shortest_path`.
 
@@ -184,18 +181,20 @@ Claude Code runs directly via the official `@anthropic-ai/claude-code` npm packa
 
 ## LLM Consultation
 
-When `OPENAI_API_KEY` or `GEMINI_API_KEY` env vars are present, `entrypoint.sh` configures the `consult-llm-mcp` MCP server in `~/.claude.json`. This enables Claude Code to query external LLMs via the `consult_llm` MCP tool. Keys are stored in KV as `llm-keys:{bucketName}`, managed via `PUT /api/llm-keys`, and injected as container env vars during `setBucketName()`. Keys are NOT persisted in DO storage — read fresh from KV on each container start.
+When `OPENAI_API_KEY` or `GEMINI_API_KEY` env vars are present, `entrypoint.sh` configures the `consult-llm-mcp` MCP server in `~/.claude.json`. This enables Claude Code to query external LLMs via the `consult_llm` MCP tool. Keys are stored in KV as `llm-keys:{bucketName}`, managed via `PUT /api/llm-keys`, and injected as container env vars during `setBucketName()`. Keys are NOT persisted in DO storage - read fresh from KV on each container start.
 
 **Skill trigger phrases:** "discuss with llms", "consult llms", "ask llms", "get a second opinion", "ask ChatGPT", "consult Gemini", "ask GPT", "ask another AI".
 
-**Default model pair** (skill sends to both providers in parallel, latest flagship per family):
+**Provider selection:** when the user does not name a provider, the skill shows an `AskUserQuestion` multi-select dialog to choose OpenAI and/or Gemini (queries run in parallel only if both are selected); naming a provider explicitly skips the dialog.
+
+**Model resolution** (latest flagship per family, resolved live):
 
 | Provider | Resolved by |
 |----------|-------------|
-| OpenAI | `consult_llm` server-side mapping — latest GPT |
-| Google | `consult_llm` server-side mapping — latest Gemini |
+| OpenAI | live `GET /v1/models`, newest flagship GPT |
+| Google | live `GET /v1beta/models`, `gemini-pro-latest` flagship |
 
-Pass family selectors (`model: "openai"` / `model: "gemini"`) to let the MCP server pick the current flagship; pinning concrete IDs (e.g. `gpt-5.4`, `gemini-3.1-pro-preview`) goes stale within weeks of the next release. Specific model IDs are still accepted as advanced overrides when the user names one explicitly.
+The skill always passes an explicit `model` resolved live from the provider model list at call time, never the `consult_llm` server's static default (which drifts to old versions). A user-named model (e.g. `gpt-5.4`, `gemini flash`) overrides the auto-picked flagship.
 
 Skill definition: `preseed/agents/claude/skills/consult-llm/SKILL.md`.
 
@@ -207,7 +206,7 @@ Optional feature that lets users connect GitHub and Cloudflare accounts once in 
 
 **Environment variables injected:** `GH_TOKEN` (GitHub fine-grained PAT), `CLOUDFLARE_API_TOKEN` (Cloudflare API token), `CLOUDFLARE_ACCOUNT_ID` (auto-fetched from CF API).
 
-**Backend:** `src/routes/deploy-keys.ts` — GET returns masked tokens, PUT validates against GitHub/Cloudflare APIs before storing, DELETE clears all. Follows the same pattern as `llm-keys.ts`.
+**Backend:** `src/routes/deploy-keys.ts` - GET returns masked tokens, PUT validates against GitHub/Cloudflare APIs before storing, DELETE clears all. Follows the same pattern as `llm-keys.ts`.
 
 **Container injection:** Deploy keys are read from KV in `src/routes/container/lifecycle.ts` and passed to the Container DO via `buildSetBucketNameBody()`. The DO injects them as `envVars`. Keys are sent as explicit `null` when absent (not omitted) to ensure revocation propagates on session restart.
 
@@ -217,14 +216,14 @@ Optional feature that lets users connect GitHub and Cloudflare accounts once in 
 
 **GitHub PAT template (Aug 2025 format):** Uses correct parameter names (`emails` for email addresses, added `user_copilot_requests=read` account permission). Copilot CLI checks env vars in order: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`. If `GH_TOKEN` is set but lacks Copilot scope, auth fails silently. See [GitHub docs](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
 
-**Frontend:** `web-ui/src/components/settings/DeployKeysSection.tsx` — self-contained component with connect/disconnect flows for both providers, multi-account Cloudflare dropdown, and token masking.
+**Frontend:** `web-ui/src/components/settings/DeployKeysSection.tsx` - self-contained component with connect/disconnect flows for both providers, multi-account Cloudflare dropdown, and token masking.
 
-**Preseed rule:** `preseed/agents/claude/rules/deploy-credentials.md` — comprehensive capability reference telling agents what commands are available with each token.
+**Preseed rule:** `preseed/agents/claude/rules/deploy-credentials.md` - comprehensive capability reference telling agents what commands are available with each token.
 
 **Docker Hub fallback:** When the primary Cloudflare-managed registry drops connections mid-upload, `deploy-dockerhub.yml` provides a fallback deploy path via Docker Hub. See [CI/CD](ci-cd.md) for workflow details.
 
 **Known gotchas:**
-- `printf '%s' "$SECRET" | gh secret set` can store empty values — use file redirect (`< tmpfile`) instead.
+- `printf '%s' "$SECRET" | gh secret set` can store empty values - use file redirect (`< tmpfile`) instead.
 - `cloudflare/wrangler-action@v3` bundles an old wrangler. Use `npx --yes wrangler deploy` with `env:` block for secrets.
 
 ---

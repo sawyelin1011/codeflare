@@ -107,8 +107,8 @@ RUN YAZI_VERSION="26.5.6" && \
     mv /tmp/yazi/yazi-x86_64-unknown-linux-musl/yazi /usr/local/bin/yazi && \
     chmod +x /usr/local/bin/yazi && \
     rm -rf /tmp/yazi /tmp/yazi.zip
-RUN LAZYGIT_VERSION="0.62.0" && \
-    LAZYGIT_SHA256="c57dd766436a42c2da52c3138034f55ca6d8bb935983ee8ae272f0d0386aca6a" && \
+RUN LAZYGIT_VERSION="0.62.1" && \
+    LAZYGIT_SHA256="99d78cce8883b24150c2f4ba151f6a0443644f63f63794f18d6643e99f75be09" && \
     curl -fsSL --retry 3 --retry-delay 5 --connect-timeout 30 "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_linux_x86_64.tar.gz" -o /tmp/lazygit.tar.gz && \
     echo "${LAZYGIT_SHA256}  /tmp/lazygit.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/lazygit.tar.gz -C /usr/local/bin lazygit && \
@@ -156,13 +156,13 @@ RUN npm install -g @anthropic-ai/claude-code@latest && \
 # Verify Claude Code is installed and working as root with IS_SANDBOX=1
 RUN claude --version
 
-# Install Codex + Gemini + OpenCode + Copilot + Pi CLIs for multi-agent support (single RUN for npm dedup).
+# Install Codex + OpenCode + Copilot + Pi CLIs for multi-agent support (single RUN for npm dedup).
 # OpenCode (opencode-ai) is an open-source multi-model AI coding CLI supporting 75+ providers.
 # Consolidated install allows npm to deduplicate shared dependencies across packages.
 # OpenCode ships 11 platform binaries as optionalDependencies — delete unused ones (~446MB saved).
 # Debian uses glibc — postinstall correctly hard-links opencode-linux-x64 to bin/.opencode.
 # Uses @latest — .cache-bust above invalidates this layer so every deploy pulls newest versions
-RUN npm install -g @openai/codex@latest @google/gemini-cli@latest opencode-ai@latest @github/copilot@latest @earendil-works/pi-coding-agent@latest && \
+RUN npm install -g @openai/codex@latest opencode-ai@latest @github/copilot@latest @earendil-works/pi-coding-agent@latest && \
     cd /usr/local/lib/node_modules/opencode-ai/node_modules && \
     find . -maxdepth 1 -name 'opencode-*' ! -name 'opencode-linux-x64' -type d -exec rm -rf {} + && \
     cd /usr/local/lib/node_modules/@github/copilot && \
@@ -170,6 +170,16 @@ RUN npm install -g @openai/codex@latest @google/gemini-cli@latest opencode-ai@la
     rm -rf mxc-bin/arm64 ripgrep/ clipboard/node_modules pvrecorder/node_modules sharp/node_modules && \
     npm cache clean --force && \
     rm -rf /tmp/* /root/.npm
+
+# Antigravity (Go-native binary, curl installer, not npm). Fatal on failure (no fallback).
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
+
+# Ensure the Antigravity binary (agy) is on PATH at /usr/local/bin.
+RUN AGY_BIN=$(command -v agy || find / -name 'agy' -type f -perm -u+x 2>/dev/null | grep -v '/proc/' | head -1) && \
+    if [ -z "$AGY_BIN" ]; then echo "ERROR: agy binary not found after antigravity install" >&2; exit 1; fi && \
+    if [ "$AGY_BIN" != "/usr/local/bin/agy" ]; then ln -sf "$AGY_BIN" /usr/local/bin/agy; fi && \
+    agy --version && \
+    rm -rf /tmp/*
 
 # Preinstall Pi extension npm dependencies into an image-local seed cache.
 # ~/.pi/agent/npm/node_modules is excluded from R2 sync, so without this Pi
@@ -325,7 +335,21 @@ if [ -z "$VER" ]; then
   exit 1
 fi
 echo "[Dockerfile] installing graphifyy==$VER with [mcp,sql,pdf] extras"
+# graphifyy 0.8.25+ pulls tree-sitter-dm, an sdist-only grammar (no manylinux
+# wheel), which uv compiles from source. tree-sitter-dm builds a CPython
+# extension module, so it needs both a C compiler AND the Python dev headers
+# (Python.h). This final runtime stage has neither (gcc lives only in the
+# discarded `builder` stage, and the base ships python3 runtime without -dev),
+# so install gcc/g++/python3-dev just for this build and purge them in the same
+# layer: the runtime image stays lean and free of an extra toolchain attack
+# surface. Without this the build fails with "Python.h: No such file or
+# directory" (and, before that, "x86_64-linux-gnu-gcc: No such file or directory").
+apt-get update
+apt-get install -y --no-install-recommends gcc g++ python3-dev
 uv tool install "graphifyy[mcp,sql,pdf]==$VER"
+apt-get purge -y gcc g++ python3-dev
+apt-get autoremove -y
+rm -rf /var/lib/apt/lists/*
 
 # Expose the graphify CLI on the system PATH so non-interactive bash
 # subshells (hook scripts, memory-capture sonnet, vault-extract sonnet,
@@ -368,11 +392,10 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 # V8 compile cache warm-up: Pre-populate Node.js V8 compile cache at Docker build time.
 # Running --version triggers V8 to compile and cache bytecode for each CLI's JavaScript.
-# This speeds up first-launch of Node.js CLIs (codex, gemini, copilot, pi) inside containers
+# This speeds up first-launch of Node.js CLIs (codex, copilot, pi) inside containers
 # by avoiding the compilation overhead on every container start.
-# Note: Go binaries (like opencode) don't need this — they're already natively compiled.
+# Note: Go binaries (like opencode and antigravity) don't need this — they're already natively compiled.
 RUN codex --version 2>&1 || true && \
-    gemini --version 2>&1 || true && \
     copilot --version 2>&1 || true && \
     pi --version 2>&1 || true
 

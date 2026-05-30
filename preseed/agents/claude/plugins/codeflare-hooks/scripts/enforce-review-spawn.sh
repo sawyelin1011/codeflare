@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Stop hook — enforces SDD review-agent spawning at the PR boundary.
+# Stop hook - enforces SDD review-agent spawning at the PR boundary.
 #
 # Architecture (v5): PR HEAD SHA checkpoint + open-PR gate.
 #
-#   Layer 1 (CANDIDATE) — loose regex finds any "git push" mention in the
-#     transcript. Accepts false positives — they get filtered below.
+#   Layer 1 (CANDIDATE) - loose regex finds any "git push" mention in the
+#     transcript. Accepts false positives - they get filtered below.
 #
-#   Layer 2 (TRUTH) — `gh pr view <branch>` returns the current PR HEAD
+#   Layer 2 (TRUTH) - `gh pr view <branch>` returns the current PR HEAD
 #     SHA. The PR HEAD SHA is the unfakeable signal at PR-boundary
 #     scope: it changes only when a real push lands on the PR's source
 #     branch. The legacy reflog `update by push` truth layer is kept as
@@ -15,7 +15,7 @@
 #     because PR HEAD SHA is a stricter signal that already requires a
 #     real push to advance.
 #
-#   Layer 3 (CHECKPOINT) — `.git/sdd-last-ack-pr-head` stores the PR
+#   Layer 3 (CHECKPOINT) - `.git/sdd-last-ack-pr-head` stores the PR
 #     HEAD SHA whose review pipeline completed. A PR is un-acknowledged
 #     iff CURRENT_PR_HEAD ≠ LAST_ACK_PR_HEAD.
 #
@@ -37,7 +37,7 @@
 # exists, it is deleted on first v5 invocation. The PR HEAD SHA
 # checkpoint takes over.
 #
-# Bypass methods (USER-ONLY — the assistant must NEVER create the
+# Bypass methods (USER-ONLY - the assistant must NEVER create the
 # sentinel or write the magic phrase in its own output. An assistant
 # that creates its own bypass defeats the entire enforcement layer.):
 #   1. Sentinel file: /tmp/review-bypass (one-shot, auto-deleted)
@@ -50,7 +50,7 @@
 # Vibe-coding gate: no enforcement if sdd/ is missing.
 # Fail-safe: any unexpected error → exit 0 (never lock users out).
 #
-# Known under-block conditions (all fail-safe by design — review fires
+# Known under-block conditions (all fail-safe by design - review fires
 # on the next eligible push instead of locking the user out):
 #   1. Web-UI driven PR HEAD changes (amend from GitHub UI, branch
 #      reset via API): the current Claude session has no `git push`
@@ -95,7 +95,7 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 # one-shot /tmp/review-bypass sentinel.
 
 # ---------------------------------------------------------------------------
-# Layer 1 (CANDIDATE) — find tool_use lines whose effective shell command
+# Layer 1 (CANDIDATE) - find tool_use lines whose effective shell command
 # actually runs `git push` (not just mentions it inside an echo or
 # narration). Three tool surfaces are scanned:
 #
@@ -342,7 +342,7 @@ LEGACY_ACK="$GIT_COMMON_DIR/sdd-last-ack-push"
 [ -f "$LEGACY_ACK" ] && rm -f "$LEGACY_ACK" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# Layer 2 (TRUTH) — PR HEAD SHA via gh pr view
+# Layer 2 (TRUTH) - PR HEAD SHA via gh pr view
 #
 # If the current branch has no open PR, exit 0 (deferred). The review
 # pipeline fires when the PR opens (handled by git-push-review-reminder.sh
@@ -350,14 +350,14 @@ LEGACY_ACK="$GIT_COMMON_DIR/sdd-last-ack-push"
 # ---------------------------------------------------------------------------
 CURRENT=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || exit 0
 [ -n "$CURRENT" ] || exit 0
-[ "$CURRENT" = "HEAD" ] && exit 0  # detached HEAD — skip
+[ "$CURRENT" = "HEAD" ] && exit 0  # detached HEAD - skip
 
 # ---------------------------------------------------------------------------
 # Cheap pre-check: skip the gh network call if all four conditions hold,
 # falling through to the authoritative gh check otherwise.
 #
 #   1. last-ack matches the local remote-tracking ref (@{u})
-#   2. local HEAD matches @{u} (no local commits ahead — guards against
+#   2. local HEAD matches @{u} (no local commits ahead - guards against
 #      `git reset --hard` regressing HEAD to an old acked SHA while a
 #      newer un-acked SHA exists upstream that the next push would
 #      promote)
@@ -619,7 +619,7 @@ if [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; then
      && [ "$LAST_ACK_PR_HEAD" != "$CURRENT_PR_HEAD" ]; then
     triage_file=$(test -f sdd/spec/.review-queue.md && echo sdd/spec/.review-queue.md || echo sdd/.review-needed.md)
     {
-      printf '\n## %s — PR %s un-acked at merge/close\n' \
+      printf '\n## %s - PR %s un-acked at merge/close\n' \
         "$(date +%Y-%m-%d)" "$PR_STATE"
       printf -- '- PR for branch `%s` reached %s with un-acked HEAD `%s` (last ack: `%s`). Review pipeline did not complete before merge.\n' \
         "$CURRENT" "$PR_STATE" "${CURRENT_PR_HEAD:0:7}" "${LAST_ACK_PR_HEAD:0:7}"
@@ -634,7 +634,7 @@ fi
 # pipeline. Feature → develop defers until the develop → main PR.
 #
 # Empty BASE_REF (transient gh / jq failure between successful state
-# parse and base parse — rare but possible) is treated as fail-CLOSED:
+# parse and base parse - rare but possible) is treated as fail-CLOSED:
 # enforcement still runs (the safe direction). Better to over-block
 # when truth is uncertain than to silently let an unreviewed PR-to-main
 # slip through.
@@ -675,7 +675,7 @@ spawned_after_push() {
   ' "$TRANSCRIPT"
 }
 
-# 3-strike circuit breaker (keyed by CURRENT_PR_HEAD — unique per PR state)
+# 3-strike circuit breaker (keyed by CURRENT_PR_HEAD - unique per PR state)
 #
 # Counter format on disk: "<sha>:<count>" or "<sha>:GIVEUP".
 # After the third block for the same SHA, the counter is set to GIVEUP
@@ -727,7 +727,7 @@ emit_block() {
 }
 
 # ---------------------------------------------------------------------------
-# Lane gating (v6) — only require lanes whose surface the push actually
+# Lane gating (v6) - only require lanes whose surface the push actually
 # touches. Skip lanes that were clean last cycle and are not affected by
 # the new diff. The previous version always demanded code+spec+doc on
 # every push, burning tokens on lanes that returned 0 findings the round
@@ -772,19 +772,88 @@ requires_lane() {
 }
 
 # ---------------------------------------------------------------------------
+# In-flight guard: do not re-summon (or block) while a review wave is still
+# running. A lane is "in flight" when its MOST RECENT Agent spawn anywhere in
+# the transcript has no `completed</status>` marker yet -- i.e. that subagent
+# is still executing. Subagents always emit a completion marker on finish
+# (success OR error, per the spawned_after_push comment), so "last spawn has
+# no completion" reliably means "currently running", not "errored long ago".
+#
+# Without this guard, a push that lands while the prior wave is still running
+# advances the PR HEAD past the in-flight spawn lines; the parallel block
+# below then sees no spawn AFTER the new push line and emits a fresh spawn
+# directive, producing the re-summon loop the user hit (issue: hook keeps
+# demanding new reviewers every turn while the old wave is mid-run).
+#
+# Safety: this only SUPPRESSES the block (exit 0) -- it never advances the ack
+# pointer. The PR HEAD stays un-acked until a real completion lands and a
+# later Stop event runs the full pipeline check below. So an un-reviewed HEAD
+# can never reach `main` through this path; the gate just stops nagging while
+# reviewers work. Paired behavioural rule (rules/git-workflow.md): the agent
+# must NOT push again or start a new wave while a wave is in flight.
+#
+# Stuck-open bound: a spawn that NEVER emits a completion marker (subagent
+# crashed, session killed, transcript truncated) would otherwise suppress the
+# gate forever for this PR HEAD. To prevent that, an in-flight spawn only
+# counts as in-flight while it is RECENT -- within IN_FLIGHT_STALE_LINES of the
+# transcript tail. A genuine review completes within a turn or two (a few
+# hundred transcript lines); once an uncompleted spawn falls that far behind as
+# the session keeps appending, it is treated as orphaned and enforcement
+# re-fires (which then hits its own 3-strike breaker). The durable-review merge
+# gate (REQ-AGENT-040 AC7) is the backstop either way.
+IN_FLIGHT_STALE_LINES=1200
+lane_in_flight() {
+  local lane="$1"
+  local spawn_line
+  spawn_line=$(awk -v a="$lane" '
+    index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"" a "\"") { print NR }
+  ' "$TRANSCRIPT" | tail -1)
+  [ -n "$spawn_line" ] || return 1  # never spawned -> not in flight
+  # Staleness bound: an uncompleted spawn far behind the transcript tail is
+  # treated as orphaned (dead subagent), not in-flight, so the gate re-fires.
+  local total
+  total=$(wc -l < "$TRANSCRIPT" 2>/dev/null || echo 0)
+  if [ "$((total - spawn_line))" -gt "$IN_FLIGHT_STALE_LINES" ] 2>/dev/null; then
+    return 1
+  fi
+  local line_content tool_use_id
+  line_content=$(awk -v L="$spawn_line" 'NR==L { print; exit }' "$TRANSCRIPT")
+  tool_use_id=$(echo "$line_content" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+  [ -n "$tool_use_id" ] || return 1  # can't correlate -> treat as not in flight
+  if awk -v s="$spawn_line" 'NR > s' "$TRANSCRIPT" \
+      | grep -F "tool-use-id>${tool_use_id}<" \
+      | grep -qF 'completed</status>'; then
+    return 1  # completed -> not in flight
+  fi
+  return 0  # spawned recently, no completion yet -> in flight
+}
+
+# In-flight suppression is applied PER-LANE at each demand site below: a lane
+# is demanded only if it was NOT spawned-after-push AND is NOT currently in
+# flight. The old blanket "any required lane in flight -> exit 0" loop was
+# removed -- it masked the ENTIRE gate while a single slow lane (e.g. a
+# long-running code-reviewer) was in flight, so the sequential doc-updater
+# demand never fired even after spec-reviewer had completed. Per-lane guarding
+# keeps the re-summon-loop fix (a lane already running is never re-demanded)
+# while still letting an independent/sequential lane be demanded on schedule.
+
+# ---------------------------------------------------------------------------
 # Parallel block: code-reviewer + spec-reviewer can be spawned together.
-# Only the ones present in REQUIRED_LANES are demanded.
+# Only the ones present in REQUIRED_LANES are demanded. A lane already in
+# flight is skipped (not re-summoned) but does not suppress the other lanes.
 # ---------------------------------------------------------------------------
 MISSING=""
-if requires_lane "code-reviewer" && ! spawned_after_push "code-reviewer"; then
+if requires_lane "code-reviewer" && ! spawned_after_push "code-reviewer" && ! lane_in_flight "code-reviewer"; then
   MISSING="$MISSING code-reviewer"
 fi
-if requires_lane "spec-reviewer" && ! spawned_after_push "spec-reviewer"; then
+if requires_lane "spec-reviewer" && ! spawned_after_push "spec-reviewer" && ! lane_in_flight "spec-reviewer"; then
   MISSING="$MISSING spec-reviewer"
 fi
 
 if [ -n "$MISSING" ]; then
-  REASON="PR #$CURRENT @ ${CURRENT_PR_HEAD:0:7}: spawn$MISSING in parallel. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
+  REASON="PR #$CURRENT @ ${CURRENT_PR_HEAD:0:7}: spawn$MISSING in parallel. Run the agent(s) in the background (Agent tool with run_in_background: true) so the main session stays usable. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
   emit_block "$REASON"
 fi
 
@@ -835,8 +904,8 @@ if [ "$DOC_REQUIRED" = "1" ] && [ "$SPEC_REQUIRED" = "1" ]; then
             && index($0, "\"name\":\"Agent\"") \
             && index($0, "\"subagent_type\":\"doc-updater\"") { found=1; exit }
           END { exit !found }
-        '; then
-          REASON="spec-reviewer done; spawn doc-updater (sequential). USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
+        ' && ! lane_in_flight "doc-updater"; then
+          REASON="spec-reviewer done; spawn doc-updater (sequential). Run the agent(s) in the background (Agent tool with run_in_background: true) so the main session stays usable. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
           emit_block "$REASON"
         fi
         PIPELINE_COMPLETE=1
@@ -849,8 +918,8 @@ elif [ "$DOC_REQUIRED" = "1" ]; then
   # transcript than the push. PIPELINE_COMPLETE only flips once we see
   # the doc-updater tool-use envelope; we cannot ack a SHA we never
   # verified.
-  if ! spawned_after_push "doc-updater"; then
-    REASON="PR #$CURRENT @ ${CURRENT_PR_HEAD:0:7}: spawn doc-updater. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
+  if ! spawned_after_push "doc-updater" && ! lane_in_flight "doc-updater"; then
+    REASON="PR #$CURRENT @ ${CURRENT_PR_HEAD:0:7}: spawn doc-updater. Run the agent(s) in the background (Agent tool with run_in_background: true) so the main session stays usable. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
     emit_block "$REASON"
   fi
   PIPELINE_COMPLETE=1

@@ -2,7 +2,7 @@ import { Component, For, Show, createSignal, createEffect, onMount, onCleanup } 
 import {
   mdiRobotOutline,
   mdiCodeBraces,
-  mdiDiamond,
+  mdiRocketLaunchOutline,
   mdiConsole,
   mdiRobotIndustrial,
   mdiGithub,
@@ -28,13 +28,16 @@ interface AgentOption {
   badge?: string;
 }
 
-const AGENT_OPTIONS: AgentOption[] = [
+// Coding agents are listed alphabetically by label; Bash (plain terminal, no
+// agent) stays last as the non-agent fallback. The default selection is pinned
+// elsewhere (lastAgentType preference / caller default), independent of order.
+export const AGENT_OPTIONS: AgentOption[] = [
+  { type: 'antigravity', label: 'Antigravity', icon: mdiRocketLaunchOutline, description: "Google's terminal coding agent", badge: 'beta' },
   { type: 'claude-code', label: 'Claude Code', icon: mdiRobotOutline, description: 'Full Claude Code experience' },
   { type: 'codex', label: 'Codex', icon: mdiCodeBraces, description: 'OpenAI Codex agent' },
-  { type: 'gemini', label: 'Gemini', icon: mdiDiamond, description: 'Google Gemini CLI' },
-  { type: 'copilot', label: 'GitHub Copilot', icon: mdiGithub, description: "GitHub's AI coding agent", badge: 'beta' },
+  { type: 'copilot', label: 'GitHub Copilot', icon: mdiGithub, description: "GitHub's AI coding agent" },
   { type: 'opencode', label: 'OpenCode', icon: mdiRobotIndustrial, description: 'Multi-model agent', badge: 'beta' },
-  { type: 'pi', label: 'Pi', icon: mdiPi, description: 'Minimal, extensible coding harness', badge: 'beta' },
+  { type: 'pi', label: 'Pi', icon: mdiPi, description: 'Minimal, extensible coding harness' },
   { type: 'bash', label: 'Bash', icon: mdiConsole, description: 'Plain terminal session' },
 ];
 

@@ -227,7 +227,7 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 **Acceptance Criteria:**
 
 1. Watched Dockerfile binaries: zoxide, yazi, lazygit, silverbullet. Each has its own parallel job checking GitHub releases.
-2. Watched npm packages: context-mode (canonical version in plugin.json, echoed in entrypoint.sh fallback and hooks.json).
+2. Watched npm packages: context-mode (canonical version in plugin.json, echoed in entrypoint.sh fallback and hooks.json). Watched PyPI packages: graphifyy (canonical version in `preseed/agents/claude/plugins/graphify/.claude-plugin/plugin.json`; the Dockerfile reads the pin from plugin.json via `jq`, so there is no Dockerfile literal to bump). The graphify job diffs the plugin.json `.version` against the PyPI latest and replaceAll-bumps both the version and the `graphifyy@X.Y.Z` description string in plugin.json.
 3. SHA256 checksum is reset to a placeholder on Dockerfile bumps, causing Docker build failure until the operator verifies and updates the hash.
 4. A bump branch is skipped if one already exists for that version (deduplication guard).
 
@@ -619,7 +619,7 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 **Acceptance Criteria:**
 
 1. The container base image is a glibc-based Node.js 24 distribution (Debian bookworm-slim).
-2. All supported agent CLIs (Claude Code, Codex, Gemini CLI, Copilot, OpenCode) start without crashes.
+2. All supported agent CLIs (Claude Code, Codex, Antigravity, Copilot, OpenCode) start without crashes.
 3. Essential developer tools for terminal-based workflows are pre-installed.
 
 **Constraints:** None.

@@ -1,8 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
 import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution } from '../../../preseed/agents/pi/extensions/graphify-helpers';
-import { classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isCurrentReviewHead, isFailedToolExecution, isPrBoundaryCommand, isReviewCompletionForLane, reusablePendingReview, selectReviewBase, startReviewLaneSpawns } from '../../../preseed/agents/pi/extensions/review-helpers';
-import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isResumedSession, MEMORY_EVERY_N_PROMPTS, sessionId, shouldCapture, stableId, titleFor } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
+import { classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { actionableReviewCount, allDurableReviewLanesComplete, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
+import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, sessionId, shouldCapture, stableId, titleFor } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
 
 /**
  * Validates invariants of the generated agent seed configs.
@@ -14,7 +15,7 @@ import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isR
  * isn't available in the Workers vitest pool).
  */
 
-const VALID_KEY_PREFIXES = ['.claude/', '.codex/', '.gemini/', '.copilot/', '.config/opencode/', '.pi/agent/'];
+const VALID_KEY_PREFIXES = ['.claude/', '.codex/', '.copilot/', '.config/opencode/', '.pi/agent/'];
 
 function stripPrefix(key: string): string {
   for (const prefix of VALID_KEY_PREFIXES) {
@@ -111,7 +112,6 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
   it('each non-Claude agent has an instructions file', () => {
     const keys = new Set(AGENTS_SEEDED_CONFIGS.map((doc) => doc.key));
     expect(keys.has('.codex/AGENTS.md')).toBe(true);
-    expect(keys.has('.gemini/GEMINI.md')).toBe(true);
     expect(keys.has('.copilot/copilot-instructions.md')).toBe(true);
     expect(keys.has('.config/opencode/AGENTS.md')).toBe(true);
     expect(keys.has('.pi/agent/AGENTS.md')).toBe(true);
@@ -120,7 +120,6 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
   it('instructions files appear twice (one per mode, different content)', () => {
     const instructionKeys = [
       '.codex/AGENTS.md',
-      '.gemini/GEMINI.md',
       '.copilot/copilot-instructions.md',
       '.config/opencode/AGENTS.md',
       '.pi/agent/AGENTS.md',
@@ -149,8 +148,8 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(agents.length).toBeGreaterThan(0);
   });
 
-  it('Gemini and OpenCode have both skills and agent definitions', () => {
-    for (const prefix of ['.gemini/', '.config/opencode/']) {
+  it('OpenCode has both skills and agent definitions', () => {
+    for (const prefix of ['.config/opencode/']) {
       const docs = AGENTS_SEEDED_CONFIGS.filter((d) => d.key.startsWith(prefix));
       const skills = docs.filter((d) => d.key.includes('/skills/'));
       const agents = docs.filter((d) =>
@@ -177,7 +176,10 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       '.pi/agent/extensions/review-command.ts',
       '.pi/agent/extensions/review-enforcement.ts',
       '.pi/agent/extensions/review-helpers.ts',
+      '.pi/agent/extensions/review-job-helpers.ts',
+      '.pi/agent/extensions/review-jobs.ts',
       '.pi/agent/extensions/sdd-helpers.ts',
+      '.pi/agent/extensions/startup-header.ts',
     ]);
     expect(agents.map((d) => d.key)).toContain('.pi/agent/agents/code-reviewer.md');
     expect(agents.map((d) => d.key)).toContain('.pi/agent/agents/spec-reviewer.md');
@@ -208,6 +210,20 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(codeflarePi?.content).toContain('pi.registerCommand("ctx"');
     expect(codeflarePi?.content).toContain('context-mode is disabled');
 
+  });
+
+  it('REQ-AGENT-030 / REQ-AGENT-050 / REQ-AGENT-051: Pi command extensions dispatch through both ctx and pi user-message APIs', () => {
+    const commandExtensionKeys = [
+      '.pi/agent/extensions/codeflare-pi.ts',
+      '.pi/agent/extensions/codeflare-commands.ts',
+      '.pi/agent/extensions/review-command.ts',
+    ];
+    const docs = AGENTS_SEEDED_CONFIGS.filter((d) => commandExtensionKeys.includes(d.key));
+    expect(docs.map((d) => d.key).sort()).toEqual(commandExtensionKeys.sort());
+    for (const doc of docs) {
+      expect(doc.content, `${doc.key} must not assume ExtensionCommandContext has sendUserMessage`).not.toContain('ctx.sendUserMessage(');
+      expect(doc.content, `${doc.key} must fall back to ExtensionAPI.sendUserMessage`).toContain('pi.sendUserMessage');
+    }
   });
 
   it('Pi agents use Pi-native tool names and keep declared context-mode tools (not stripped, never mcp-prefixed)', () => {
@@ -278,9 +294,6 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isFailedToolExecution({ isError: true })).toBe(true);
     expect(isFailedToolExecution({ status: 'error' })).toBe(true);
     expect(isFailedToolExecution({ isError: false, status: 'success' })).toBe(false);
-    expect(isCurrentReviewHead('new-local-head', 'old-github-head', 'new-local-head')).toBe(true);
-    expect(isCurrentReviewHead('reviewed-pr-head', 'reviewed-pr-head', 'new-local-commit')).toBe(true);
-    expect(isCurrentReviewHead('stale-head', 'current-pr-head', 'new-local-commit')).toBe(false);
   });
 
   it('REQ-AGENT-036 AC6: review head classification separates a moved-on PR from an unreadable gh query', () => {
@@ -300,27 +313,6 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: undefined, prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('unknown');
   });
 
-  it('REQ-AGENT-040: Pi review enforcement accepts only completions for the pending head and spawned agent id', () => {
-    const state = {
-      head: 'abc123',
-      lanes: ['code-reviewer', 'doc-updater'],
-      spawned: true,
-      spawnedIds: { 'code-reviewer': 'spawned-code' },
-      fallbackLanes: ['doc-updater'],
-    };
-
-    expect(isReviewCompletionForLane(state, 'code-reviewer', 'other-code')).toBe(false);
-    expect(isReviewCompletionForLane(state, 'code-reviewer', 'spawned-code')).toBe(true);
-    expect(isReviewCompletionForLane(state, 'doc-updater')).toBe(false);
-    expect(isReviewCompletionForLane(state, 'doc-updater', undefined, 'Review head abc123')).toBe(true);
-    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head abc123')).toBe(true);
-    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater', undefined, 'Review head stale')).toBe(false);
-    expect(isReviewCompletionForLane({ ...state, fallbackLanes: [] }, 'doc-updater')).toBe(false);
-    expect(isReviewCompletionForLane({ head: 'abc123', lanes: ['code-reviewer'], spawned: false }, 'code-reviewer')).toBe(false);
-    expect(isReviewCompletionForLane({ head: 'abc123', lanes: ['code-reviewer'], spawned: false }, 'code-reviewer', undefined, 'Review head abc123')).toBe(true);
-    expect(isReviewCompletionForLane(state, 'spec-reviewer', 'spawned-spec')).toBe(false);
-  });
-
   it('REQ-AGENT-040: Pi review enforcement extracts visible background Agent IDs for pending lanes', () => {
     expect(extractBackgroundAgentId({ details: { agentId: 'abc12345-1234-abc' } })).toBe('abc12345-1234-abc');
     expect(extractBackgroundAgentId({
@@ -337,9 +329,17 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(classifyReviewFiles(['sdd/spec/agents.md'])).toEqual(['spec-reviewer', 'doc-updater']);
     expect(classifyReviewFiles(['preseed/agents/pi/extensions/review-enforcement.ts'])).toEqual(['code-reviewer', 'spec-reviewer', 'doc-updater']);
     expect(classifyReviewFiles(undefined)).toEqual(['code-reviewer', 'spec-reviewer', 'doc-updater']);
+
+  });
+
+  it('REQ-AGENT-036: Pi PR-boundary command detection covers head-moving surfaces and ignores metadata-only PR commands', () => {
     expect(isPrBoundaryCommand('git push origin develop')).toBe(true);
+    expect(isPrBoundaryCommand('git -C /repo/codeflare push origin develop')).toBe(true);
+    expect(isPrBoundaryCommand('gh repo sync owner/repo')).toBe(true);
     expect(isPrBoundaryCommand('gh pr create --base main')).toBe(true);
     expect(isPrBoundaryCommand('gh pr merge 12')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr update-branch 12')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr edit 12 --title metadata-only')).toBe(false);
     expect(isPrBoundaryCommand('gh pr view --json number')).toBe(false);
   });
 
@@ -363,77 +363,319 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(shouldProcess('tool-1', true)).toBe(true);
   });
 
-  it('REQ-AGENT-040: Pi review enforcement spawns reviewers with bounded background options', () => {
-    const calls: Array<{ lane: string; prompt: string; options: Record<string, unknown> }> = [];
-    const result = startReviewLaneSpawns({
-      state: {
-        completed: [],
-        spawnedIds: {},
-        fallbackLanes: [],
-        requestedAt: {},
-        spawned: false,
-        reviewStartedAt: 900,
-      },
-      requests: [
-        { lane: 'code-reviewer', prompt: 'Review head abc123', description: 'Review code changes' },
-        { lane: 'spec-reviewer', prompt: 'Review head abc123', description: 'Review spec changes' },
-      ],
-      service: {
-        spawn: (lane, prompt, options) => {
-          calls.push({ lane, prompt, options });
-          return `${lane}-id`;
-        },
-      },
+  it('REQ-AGENT-040: durable Pi review jobs sequence spec before docs and ack only after every lane completes', () => {
+    const lanes = ['code-reviewer', 'spec-reviewer', 'doc-updater'];
+    expect(durableReviewInitialLanes(lanes)).toEqual(['code-reviewer', 'spec-reviewer']);
+    expect(durableReviewEligibleLanes({
+      lanes,
+      completed: ['code-reviewer'],
+      running: [],
+      requestedAt: {},
       now: 1000,
-    });
-
-    expect(calls).toEqual([
-      {
-        lane: 'code-reviewer',
-        prompt: 'Review head abc123',
-        options: { description: 'Review code changes', inheritContext: false, maxTurns: 8, bypassQueue: true },
-      },
-      {
-        lane: 'spec-reviewer',
-        prompt: 'Review head abc123',
-        options: { description: 'Review spec changes', inheritContext: false, maxTurns: 8, bypassQueue: true },
-      },
-    ]);
-    expect(result.launched).toEqual(['code-reviewer:code-reviewer-id', 'spec-reviewer:spec-reviewer-id']);
-    expect(result.state.spawnedIds).toEqual({
-      'code-reviewer': 'code-reviewer-id',
-      'spec-reviewer': 'spec-reviewer-id',
-    });
-    expect(result.state.spawned).toBe(true);
-    expect(result.state.reviewStartedAt).toBe(900);
-    expect(result.state.spawnedAt).toBe(1000);
+      retryMs: 60_000,
+    })).toEqual(['spec-reviewer']);
+    expect(durableReviewEligibleLanes({
+      lanes,
+      completed: ['code-reviewer', 'spec-reviewer'],
+      running: [],
+      requestedAt: {},
+      now: 1000,
+      retryMs: 60_000,
+    })).toEqual(['doc-updater']);
+    expect(allDurableReviewLanesComplete(lanes, ['code-reviewer', 'spec-reviewer'])).toBe(false);
+    expect(allDurableReviewLanesComplete(lanes, ['code-reviewer', 'spec-reviewer', 'doc-updater'])).toBe(true);
   });
 
-  it('REQ-AGENT-040: Pi review enforcement skips already-started lanes and preserves fallback lanes on spawn failure', () => {
-    const result = startReviewLaneSpawns({
-      state: {
-        completed: [],
-        spawnedIds: { 'code-reviewer': 'existing-code-id' },
-        fallbackLanes: [],
-        requestedAt: {},
-        spawned: true,
-        reviewStartedAt: 400,
-        spawnedAt: 500,
-      },
-      requests: [
-        { lane: 'code-reviewer', prompt: 'Review head abc123', description: 'Review code changes' },
-        { lane: 'spec-reviewer', prompt: 'Review head abc123', description: 'Review spec changes' },
-      ],
-      service: { spawn: () => undefined },
-      now: 1000,
+  it('REQ-AGENT-040 / REQ-AGENT-054: durable Pi review job recovery does not treat orphaned persisted running state as active and keeps failed lanes unacked', () => {
+    expect(recoverDurableReviewLaneState({
+      lane: 'code-reviewer',
+      current: { lane: 'code-reviewer', status: 'failed', startedAt: 5, completedAt: 6, error: 'timeout' },
+      resultExists: false,
+      activeInMemory: false,
+    })).toEqual({
+      lane: 'code-reviewer',
+      status: 'failed',
+      startedAt: 5,
+      completedAt: 6,
+      error: 'timeout',
     });
+    expect(allDurableReviewLanesComplete(['code-reviewer'], [])).toBe(false);
+    expect(durableReviewAckReady({ lanes: ['code-reviewer'], resultLanes: [] })).toBe(false);
+    expect(durableReviewAckReady({ lanes: ['code-reviewer'], resultLanes: ['code-reviewer'] })).toBe(true);
+    expect(recoverDurableReviewLaneState({
+      lane: 'code-reviewer',
+      current: { lane: 'code-reviewer', status: 'running', startedAt: 10, transcriptPath: '/repo/.git/codeflare-review-jobs/head/transcripts/code-reviewer.jsonl' },
+      resultExists: false,
+      activeInMemory: false,
+    })).toEqual({
+      lane: 'code-reviewer',
+      status: 'pending',
+      startedAt: 10,
+      transcriptPath: '/repo/.git/codeflare-review-jobs/head/transcripts/code-reviewer.jsonl',
+    });
+    expect(recoverDurableReviewLaneState({
+      lane: 'spec-reviewer',
+      current: { lane: 'spec-reviewer', status: 'running', startedAt: 20 },
+      resultExists: false,
+      activeInMemory: true,
+    })).toEqual({ lane: 'spec-reviewer', status: 'running', startedAt: 20 });
+    expect(recoverDurableReviewLaneState({
+      lane: 'spec-reviewer',
+      current: { lane: 'spec-reviewer', status: 'completed', startedAt: 20, completedAt: 30, transcriptPath: '/repo/.git/codeflare-review-jobs/head/transcripts/spec-reviewer.jsonl' },
+      resultExists: false,
+      activeInMemory: false,
+    })).toEqual({
+      lane: 'spec-reviewer',
+      status: 'pending',
+      startedAt: 20,
+      completedAt: 30,
+      transcriptPath: '/repo/.git/codeflare-review-jobs/head/transcripts/spec-reviewer.jsonl',
+    });
+    expect(recoverDurableReviewLaneState({
+      lane: 'doc-updater',
+      current: { lane: 'doc-updater', status: 'running', startedAt: 30 },
+      resultExists: true,
+      resultPath: '/repo/.git/sdd-review-results/head/doc-updater.md',
+      activeInMemory: false,
+    })).toEqual({
+      lane: 'doc-updater',
+      status: 'completed',
+      startedAt: 30,
+      resultPath: '/repo/.git/sdd-review-results/head/doc-updater.md',
+    });
+  });
 
-    expect(result.launched).toEqual([]);
-    expect(result.state.spawnedIds).toEqual({ 'code-reviewer': 'existing-code-id' });
-    expect(result.state.fallbackLanes).toEqual(['spec-reviewer']);
-    expect(result.state.requestedAt).toEqual({ 'spec-reviewer': 1000 });
-    expect(result.state.reviewStartedAt).toBe(400);
-    expect(result.state.spawnedAt).toBe(500);
+  it('REQ-AGENT-053: durable Pi review results derive structured severity state from findings', () => {
+    const model = durableReviewResultModel(
+      { repo: '/repo/codeflare', head: 'abc123456789', prNumber: 443 },
+      'spec-reviewer',
+      '[HIGH] stale rule\n[LOW] wording nit\n\n## Review Summary\nold table'
+    );
+    expect(model).toMatchObject({
+      repoName: 'codeflare',
+      head: 'abc123456789',
+      prNumber: 443,
+      lane: 'spec-reviewer',
+      counts: { critical: 0, high: 1, medium: 0, low: 1 },
+      recommendation: 'fix',
+    });
+  });
+
+  it('REQ-AGENT-053: durable Pi review announcements use a stable per-lane dedupe key', () => {
+    expect(durableReviewMessageKey({ customType: 'pr-boundary-review-result', repo: '/repo', head: 'abc', lane: 'code-reviewer', path: '/repo/.git/sdd-review-results/abc/code-reviewer.md' }))
+      .toBe(durableReviewMessageKey({ customType: 'pr-boundary-review-result', repo: '/repo', head: 'abc', lane: 'code-reviewer', path: '/repo/.git/sdd-review-results/abc/code-reviewer.md' }));
+    expect(durableReviewMessageKey({ customType: 'pr-boundary-review-result', repo: '/repo', head: 'abc', lane: 'code-reviewer', path: '/repo/.git/sdd-review-results/abc/code-reviewer.md' }))
+      .not.toBe(durableReviewMessageKey({ customType: 'pr-boundary-review-result', repo: '/repo', head: 'abc', lane: 'spec-reviewer', path: '/repo/.git/sdd-review-results/abc/spec-reviewer.md' }));
+  });
+
+  it('REQ-AGENT-053: durable Pi review summary model reports table columns, per-lane counts, and fix recommendation', () => {
+    const summary = durableReviewSummaryModel([
+      { lane: 'code-reviewer', path: '/tmp/code.md', counts: { critical: 0, high: 1, medium: 0, low: 0 }, recommendation: 'fix' },
+      { lane: 'doc-updater', path: '/tmp/docs.md', counts: { critical: 0, high: 0, medium: 0, low: 0 }, recommendation: 'none' },
+    ]);
+    expect(summary).toEqual({
+      columns: ['Lane', 'Findings document', 'Critical', 'High', 'Medium', 'Low', 'Recommendation'],
+      rows: [
+        { lane: 'code-reviewer', path: '/tmp/code.md', counts: { critical: 0, high: 1, medium: 0, low: 0 }, recommendation: 'fix' },
+        { lane: 'doc-updater', path: '/tmp/docs.md', counts: { critical: 0, high: 0, medium: 0, low: 0 }, recommendation: 'none' },
+      ],
+      actionable: 1,
+      recommendation: 'automatically fix 1 actionable MEDIUM/HIGH/CRITICAL finding(s), commit, and push only the fix diff',
+    });
+  });
+
+  it('REQ-AGENT-053: merged Pi review summaries model actionable findings without per-lane document links', () => {
+    const codeText = [
+      '# PR-boundary code-reviewer',
+      '',
+      '## Findings',
+      '',
+      '[MEDIUM] Summary fallback notification is filtered out',
+      'File: `preseed/agents/pi/extensions/review-enforcement.ts:465`',
+      '',
+      'Issue: Duplicate-toast filtering also catches the summary fallback.',
+      '',
+      'Fix: Allow the explicit fallback summary notification through.',
+      '',
+      '```ts',
+      '[HIGH] inside a code fence is an example, not a separate finding',
+      '```',
+      '',
+      '## Review Summary',
+      '',
+      '| Severity | Count | Status |',
+      '|----------|-------|--------|',
+      '| MEDIUM | 1 | info |',
+    ].join('\n');
+    const docsText = '# PR-boundary doc-updater\n\n## Findings\n\nNo findings.\n';
+
+    expect(extractReviewFindings('code-reviewer', codeText)).toEqual([
+      {
+        lane: 'code-reviewer',
+        severity: 'MEDIUM',
+        title: 'Summary fallback notification is filtered out',
+        file: 'preseed/agents/pi/extensions/review-enforcement.ts:465',
+        issue: 'Duplicate-toast filtering also catches the summary fallback.',
+        fix: 'Allow the explicit fallback summary notification through.',
+      },
+    ]);
+    expect(extractReviewFindings('doc-updater', docsText)).toEqual([]);
+    const codeCounts = countReviewSeverities(codeText);
+    const docCounts = countReviewSeverities(docsText);
+    expect(codeCounts).toEqual({ critical: 0, high: 0, medium: 1, low: 0 });
+    expect(docCounts).toEqual({ critical: 0, high: 0, medium: 0, low: 0 });
+
+    const records = [
+      { lane: 'code-reviewer', path: '/tmp/code-reviewer.md', text: codeText, counts: codeCounts, recommendation: durableReviewRecommendation(codeCounts) },
+      { lane: 'doc-updater', path: '/tmp/doc-updater.md', text: docsText, counts: docCounts, recommendation: durableReviewRecommendation(docCounts) },
+    ];
+    expect(mergedReviewSummaryModel({
+      repoName: 'codeflare',
+      head: '6769bca06f843a50e2d991563afc58498fd7cf81',
+      records,
+    })).toEqual({
+      repoName: 'codeflare',
+      head: '6769bca06f843a50e2d991563afc58498fd7cf81',
+      headShort: '6769bca06f84',
+      counts: { critical: 0, high: 0, medium: 1, low: 0 },
+      findings: [
+        {
+          lane: 'code-reviewer',
+          severity: 'MEDIUM',
+          title: 'Summary fallback notification is filtered out',
+          file: 'preseed/agents/pi/extensions/review-enforcement.ts:465',
+          issue: 'Duplicate-toast filtering also catches the summary fallback.',
+          fix: 'Allow the explicit fallback summary notification through.',
+        },
+      ],
+      recommendation: 'automatically fix 1 actionable MEDIUM/HIGH/CRITICAL finding(s), commit, and push only the fix diff',
+    });
+    const escapedSummary = formatMergedReviewSummary({
+      repoName: 'codeflare',
+      head: '6769bca06f843a50e2d991563afc58498fd7cf81',
+      records: [
+        {
+          lane: 'code-reviewer',
+          path: '/tmp/code-reviewer.md',
+          text: '[HIGH] Pipe and backslash\nFile: `a|b\\c.ts`\nFix: Replace `x|y\\z` safely.',
+          counts: { critical: 0, high: 1, medium: 0, low: 0 },
+          recommendation: 'fix',
+        },
+      ],
+    });
+    expect(escapedSummary).toContain('a\\|b\\\\c.ts');
+    expect(escapedSummary).toContain('Replace x\\|y\\\\z safely.');
+  });
+
+  it('REQ-AGENT-053: hidden autofix requests send one follow-up only for actionable findings and only after marker claim', () => {
+    const sent: Array<{ message: unknown; options: unknown }> = [];
+    const sender = { sendMessage: (message: unknown, options: unknown) => sent.push({ message, options }) };
+
+    sendReviewAutofixRequest(sender, '/repo/codeflare', 'abc123');
+    expect(sent).toEqual([
+      {
+        message: {
+          customType: 'codeflare-review-autofix-request',
+          content: [
+            'Fix legitimate PR-boundary review findings for codeflare at abc123.',
+            'Use the merged review summary immediately above as the actionable finding list.',
+            'Fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.',
+            'Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.',
+            'Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.',
+          ].join('\n'),
+          display: false,
+          details: { repo: '/repo/codeflare', head: 'abc123' },
+        },
+        options: { triggerTurn: true, deliverAs: 'followUp' },
+      },
+    ]);
+
+    sent.length = 0;
+    expect(requestReviewAutofixForRows({
+      sender,
+      repo: '/repo/codeflare',
+      head: 'abc123',
+      rows: [{ counts: { critical: 0, high: 0, medium: 1, low: 0 } }],
+      claim: () => true,
+    })).toBe(true);
+    expect(sent).toHaveLength(1);
+
+    sent.length = 0;
+    expect(requestReviewAutofixForRows({
+      sender,
+      repo: '/repo/codeflare',
+      head: 'abc123',
+      rows: [{ counts: { critical: 0, high: 0, medium: 0, low: 1 } }],
+      claim: () => true,
+    })).toBe(false);
+    expect(requestReviewAutofixForRows({
+      sender,
+      repo: '/repo/codeflare',
+      head: 'abc123',
+      rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
+      claim: () => false,
+    })).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('REQ-AGENT-053: durable Pi review severity helpers identify actionable findings for the fix loop', () => {
+    const counts = countReviewSeverities('[CRITICAL] broken\n[HIGH] risky\n[MEDIUM] incomplete\n[LOW] typo');
+    expect(counts).toEqual({ critical: 1, high: 1, medium: 1, low: 1 });
+    expect(actionableReviewCount(counts)).toBe(3);
+    expect(durableReviewRecommendation(counts)).toBe('fix');
+    expect(durableReviewRecommendation({ critical: 0, high: 0, medium: 0, low: 1 })).toBe('review');
+    expect(durableReviewRecommendation({ critical: 0, high: 0, medium: 0, low: 0 })).toBe('none');
+  });
+
+  it('REQ-AGENT-053: durable Pi review status derives lane states for mobile footers', () => {
+    expect(durableReviewStatusSegments({
+      lanes: ['code-reviewer', 'spec-reviewer', 'doc-updater'],
+      completed: ['code-reviewer'],
+      running: ['spec-reviewer'],
+    })).toEqual([
+      { lane: 'code-reviewer', label: 'code', state: 'completed' },
+      { lane: 'spec-reviewer', label: 'spec', state: 'running' },
+      { lane: 'doc-updater', label: 'docs', state: 'pending' },
+    ]);
+    expect(durableReviewStatusSegments({
+      lanes: ['doc-updater'],
+      completed: [],
+      running: ['doc-updater'],
+    })).toEqual([{ lane: 'doc-updater', label: 'docs', state: 'running' }]);
+  });
+
+  it('REQ-AGENT-040: durable Pi review job paths are under .git and result paths stay on the existing review surface', () => {
+    expect(durableReviewJobDir('/repo', 'abc123')).toBe('/repo/.git/codeflare-review-jobs/abc123');
+  });
+
+  it('REQ-AGENT-053 AC8: durable review lanes load graphify always, context-mode only when enabled, never subagents', () => {
+    const enabledCtx = [
+      'npm:@gaodes/pi-graphify@0.2.2',
+      'npm:@gotgenes/pi-subagents@7.8.1',
+      'npm:context-mode@1.0.151',
+    ];
+    // graphify always; context-mode enabled (bare string); subagents never.
+    expect(laneExtensionSources(enabledCtx)).toEqual([
+      'npm:@gaodes/pi-graphify@0.2.2',
+      'npm:context-mode@1.0.151',
+    ]);
+
+    const disabledCtx = [
+      'npm:@gaodes/pi-graphify@0.2.2',
+      'npm:@gotgenes/pi-subagents@7.8.1',
+      { source: 'npm:context-mode@1.0.151', extensions: [], skills: [] },
+    ];
+    // context-mode in disabled filter form -> only graphify.
+    expect(laneExtensionSources(disabledCtx)).toEqual(['npm:@gaodes/pi-graphify@0.2.2']);
+
+    // object graphify entry without an extensions filter is still enabled.
+    expect(laneExtensionSources([{ source: 'npm:@gaodes/pi-graphify@0.2.2' }])).toEqual([
+      'npm:@gaodes/pi-graphify@0.2.2',
+    ]);
+
+    // empty / unrelated packages -> nothing.
+    expect(laneExtensionSources([])).toEqual([]);
+    expect(laneExtensionSources(['npm:@gotgenes/pi-subagents@7.8.1', '', { source: '' }])).toEqual([]);
   });
 
   it('REQ-AGENT-040: Pi review enforcement selects the unreviewed incremental review base', () => {
@@ -499,9 +741,8 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
 
   // Pi-native and transformed Pi *.md documents (skills, prompts, agent definitions,
   // instructions) must not carry Claude model names: the Pi runtime supplies its own model,
-  // and adaptAgentFrontmatter strips `model:` pins. Scoped to *.md only -- the .ts extension
-  // sources (e.g. codeflare-pi.ts) legitimately contain an attribution-detection regex that
-  // matches these tokens, so they are intentionally excluded.
+  // and adaptAgentFrontmatter strips `model:` pins. Scoped to *.md only because the
+  // model-name prose rule applies to authored docs, not to .ts extension source code.
   it('REQ-AGENT-007: Pi markdown documents contain no Claude model names', () => {
     const piMarkdown = AGENTS_SEEDED_CONFIGS.filter(
       (d) => d.key.startsWith('.pi/agent/') && d.key.endsWith('.md')
@@ -515,7 +756,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
 
   // REQ-MEM-008 AC2 (manifest declares the memory plugin files) + AC3 (all advanced-only).
   // memory-capture-block.sh is the PreToolUse hard-block companion to memory-capture.sh
-  // (UserPromptSubmit) — it prevents the assistant from skipping the deferred capture
+  // (UserPromptSubmit) - it prevents the assistant from skipping the deferred capture
   // by hard-blocking all other tool calls while .vars is undrained.
   it('codeflare-memory plugin files are advanced-only', () => {
     const pluginDocs = claudeDocs().filter((d) => d.key.includes('codeflare-memory'));
@@ -534,7 +775,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     }
   });
 
-  // REQ-MEM-008 AC7 (memory plugin files excluded from non-CC agents; no Codex/Gemini/Copilot/OpenCode equivalents)
+  // REQ-MEM-008 AC7 (memory plugin files excluded from non-CC agents; no Codex/Copilot/OpenCode equivalents)
   it('codeflare-memory plugin is excluded from non-Claude agents', () => {
     const nonClaude = AGENTS_SEEDED_CONFIGS.filter((d) => !d.key.startsWith('.claude/'));
     for (const doc of nonClaude) {
@@ -557,7 +798,6 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
         !d.key.startsWith('.pi/agent/agents/') &&
         d.key.includes('/agents/') &&
         !d.key.endsWith('AGENTS.md') &&
-        !d.key.endsWith('GEMINI.md') &&
         !d.key.endsWith('copilot-instructions.md')
     );
     for (const doc of nonClaudeAgents) {
@@ -722,6 +962,53 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(mv?.content).toContain('user_vault');
   });
 
+  // parseSessionMessages reads Pi's durable on-disk session JSONL (the file Pi persists for
+  // /resume) into the message objects compactMessages expects. This is the source that replaces
+  // the volatile in-memory buffer that produced empty captures after a reload.
+  describe('REQ-MEM-001: parseSessionMessages durable transcript source', () => {
+    it('extracts message-entry payloads and drops session header / compaction / custom entries', () => {
+      const jsonl = [
+        JSON.stringify({ type: 'session', id: 'abc', cwd: '/x', timestamp: 't' }),
+        JSON.stringify({ type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'real-user-turn' }] } }),
+        JSON.stringify({ type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'real-assistant-turn' }] } }),
+        JSON.stringify({ type: 'message', message: { role: 'toolResult', content: [{ type: 'tool_result', content: 'noise' }] } }),
+        JSON.stringify({ type: 'compaction', summary: 'compaction-should-be-dropped' }),
+        JSON.stringify({ type: 'custom', customType: 'x', data: {} }),
+      ].join('\n');
+      const messages = parseSessionMessages(jsonl);
+      expect(messages.map((m) => m.role)).toEqual(['user', 'assistant', 'toolResult']);
+      // round-trips through compactMessages: user + assistant text kept, toolResult role dropped
+      const transcript = compactMessages(messages);
+      expect(transcript).toContain('real-user-turn');
+      expect(transcript).toContain('real-assistant-turn');
+      expect(transcript).not.toContain('noise');
+      expect(transcript).not.toContain('compaction-should-be-dropped');
+    });
+
+    it('skips malformed lines and blank lines without throwing, returns [] for empty input', () => {
+      expect(parseSessionMessages('')).toEqual([]);
+      expect(parseSessionMessages('\n  \n')).toEqual([]);
+      const jsonl = [
+        '{ this is not json',
+        JSON.stringify({ type: 'message', message: { role: 'user', content: 'kept' } }),
+        '',
+      ].join('\n');
+      const messages = parseSessionMessages(jsonl);
+      expect(messages).toHaveLength(1);
+      expect(messages[0].content).toBe('kept');
+    });
+  });
+
+  it('REQ-MEM-001: memory-vault.ts capture reads the durable on-disk session, not volatile state', () => {
+    const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
+    // Durable source: capture pulls the transcript from the persisted session file Pi writes for /resume.
+    expect(mv?.content).toContain('getSessionFile');
+    expect(mv?.content).toContain('parseSessionMessagesHelper');
+    expect(mv?.content).toContain('readSessionMessages');
+    // Skip-empty guard: a blank transcript must never produce a hollow "no substantive content" note.
+    expect(mv?.content).toContain('if (!transcript.trim()) return;');
+  });
+
   it('REQ-MEM-010 AC5: shouldCapture fires at exact 15-message intervals from source constant', () => {
     expect(MEMORY_EVERY_N_PROMPTS).toBe(15);
     expect(shouldCapture(14)).toBe(false);
@@ -792,5 +1079,73 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     const sorted = [...AGENTS_SEEDED_CONFIGS].sort((a, b) => a.key.localeCompare(b.key));
     const recomputed = createHash('sha256').update(JSON.stringify(sorted)).digest('hex').slice(0, 16);
     expect(PRESEED_CONTENT_HASH).toBe(recomputed);
+  });
+});
+
+describe('REQ-AGENT-031 consult-llm invocation behaviour (provider dialog + latest-flagship model)', () => {
+  function consultLlmSkill(): string {
+    const doc = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.claude/skills/consult-llm/SKILL.md');
+    expect(doc, 'consult-llm SKILL.md must be bundled in the Claude seed').toBeTruthy();
+    return doc!.content;
+  }
+
+  it('AC4: skill mandates an AskUserQuestion provider dialog naming OpenAI + Gemini', () => {
+    const body = consultLlmSkill();
+    expect(body).toContain('AskUserQuestion');
+    expect(body).toMatch(/OpenAI/);
+    expect(body).toMatch(/Gemini/);
+    expect(body).toMatch(/provider/i);
+  });
+
+  it('AC5: skill requires an explicit latest-flagship model and forbids the MCP server default', () => {
+    const body = consultLlmSkill();
+    expect(body.toLowerCase()).toContain('latest flagship');
+    expect(body).toContain('/v1/models');
+    expect(body).toContain('/v1beta/models');
+    expect(body.toLowerCase()).toMatch(/never rely on the .*default|never the (mcp )?server default|never let the call fall back/);
+  });
+});
+
+describe('REQ-AGENT-027 AC1 context-mode wired as a tool only (no Bash deny-gate)', () => {
+  it('context-mode ships as a plugin/tool with no hooks config and no deny-gate script', () => {
+    const ctxKeys = AGENTS_SEEDED_CONFIGS.map((d) => d.key).filter((k) => k.includes('context-mode'));
+    expect(ctxKeys.some((k) => k.endsWith('.claude-plugin/plugin.json'))).toBe(true);
+    for (const doc of AGENTS_SEEDED_CONFIGS) {
+      expect(doc.key.endsWith('enforce-ctx-mode.sh'), `${doc.key} must not preseed the deny-gate script`).toBe(false);
+      expect(
+        doc.key.endsWith('context-mode/hooks/hooks.json'),
+        `${doc.key} must not preseed a context-mode hooks config`
+      ).toBe(false);
+    }
+  });
+});
+
+describe('REQ-AGENT-040 AC8 review dispatch is backgrounded with a bounded in-flight guard', () => {
+  it('the seeded enforce-review-spawn.sh carries the in-flight guard, a staleness bound, and the background-dispatch directive', () => {
+    const hook = AGENTS_SEEDED_CONFIGS.find((d) =>
+      d.key.endsWith('codeflare-hooks/scripts/enforce-review-spawn.sh')
+    );
+    expect(hook, 'enforce-review-spawn.sh must be bundled in the Claude seed').toBeTruthy();
+    const body = hook!.content;
+    expect(body).toContain('lane_in_flight');
+    expect(body).toContain('IN_FLIGHT_STALE_LINES');
+    expect(body).toContain('run_in_background');
+  });
+
+  it('applies in-flight suppression PER-LANE, not as a blanket whole-gate exit', () => {
+    const hook = AGENTS_SEEDED_CONFIGS.find((d) =>
+      d.key.endsWith('codeflare-hooks/scripts/enforce-review-spawn.sh')
+    );
+    expect(hook, 'enforce-review-spawn.sh must be bundled in the Claude seed').toBeTruthy();
+    const body = hook!.content;
+    // The blanket "any required lane in flight -> exit 0" loop must be gone: it
+    // masked the whole gate while one slow lane ran, so the sequential
+    // doc-updater demand never fired.
+    expect(body).not.toContain('a required review lane is still running');
+    // Each lane demand is guarded by its own lane_in_flight check so a lane
+    // already running is skipped without suppressing the others.
+    expect(body).toContain('! spawned_after_push "code-reviewer" && ! lane_in_flight "code-reviewer"');
+    expect(body).toContain('! spawned_after_push "spec-reviewer" && ! lane_in_flight "spec-reviewer"');
+    expect(body).toContain('! lane_in_flight "doc-updater"');
   });
 });
