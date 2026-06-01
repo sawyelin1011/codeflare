@@ -1,13 +1,14 @@
 /**
- * Vault HTML/JS rewriting + the service-worker shim string.
+ * Vault HTML/JS rewriting + the service-worker request selectors.
  *
  * Extracted from src/routes/vault.ts (CF-002) so the routing/auth module
  * stays focused on the request chain. This module owns every byte the
  * Worker injects into, or serves to, the browser on behalf of the
  * in-container SilverBullet editor:
  *
- *   - VAULT_KEY_SHIM_SERVICE_WORKER_JS: the key-shim SW source.
- *   - isServiceWorkerRegistration: the SW-registration request selector.
+ *   - isServiceWorkerRegistration / isServiceWorkerContextFetch: the
+ *     SW-registration and SW-context request selectors. The worker bytes
+ *     served for registration live in src/routes/vault-native-sw.ts (AD69).
  *   - injectVaultEncryptionConfig / injectVaultBootScript /
  *     injectVaultIdbRecorder: BootConfig + shell-HTML injectors.
  *   - injectVaultBootstrapHopHtml + VAULT_BOOTSTRAP_COOKIE helpers.
@@ -20,6 +21,7 @@
  */
 import { SESSION_ID_PATTERN } from '../lib/constants';
 import { toErrorMessage } from '../lib/error-types';
+import { CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from '../lib/access';
 
 /**
  * Synthesise `X-Requested-With: XMLHttpRequest` on a request clone when
@@ -37,6 +39,17 @@ import { toErrorMessage } from '../lib/error-types';
  *   - If the method is not state-changing (GET/HEAD/OPTIONS) → unchanged.
  *   - Otherwise clone the FULL request (preserves body, signal, etc.) and
  *     set the synthesised header.
+ *
+ * CF-019: when an independent double-submit CSRF cookie is present, this
+ * function ALSO echoes its value into the X-Vault-Csrf header on the clone.
+ * The Worker reading the cookie and synthesising the matching header has the
+ * SAME trust basis as the X-Requested-With synthesis above (originValidated),
+ * so SilverBullet's client.js / SPA writes - which cannot set custom headers
+ * themselves - satisfy the double-submit check in authenticateRequest. A
+ * genuine cross-site attacker never reaches this branch: they cannot produce
+ * an allowlisted Origin (or the same-origin no-Origin carve-out) for a
+ * cross-site request, so originValidated is false and the request passes
+ * through unchanged to hit the cookie/header layer directly.
  *
  * The full-clone form `new Request(request, { headers })` is critical:
  * `authenticateRequest` only reads method + headers today, but the next
@@ -57,71 +70,56 @@ export function maybeSynthesizeCsrfHeader(request: Request, originValidated: boo
   if (!originValidated) return request;
   const method = request.method.toUpperCase();
   if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return request;
-  if (request.headers.has('X-Requested-With')) return request;
+  // CF-019: echo the CSRF cookie into the X-Vault-Csrf header for origin-
+  // validated writes when the client did not supply it. This is what makes the
+  // token defense-in-depth rather than an independent factor (see access.ts):
+  // the Origin allowlist is the primary CSRF defense.
+  const csrfCookie = readCsrfCookie(request);
+  const needsCsrfEcho = !!csrfCookie && !request.headers.has(CSRF_HEADER_NAME);
+  const needsXrwEcho = !request.headers.has('X-Requested-With');
+  if (!needsCsrfEcho && !needsXrwEcho) return request;
   const headers = new Headers(request.headers);
-  headers.set('X-Requested-With', 'XMLHttpRequest');
+  if (needsXrwEcho) headers.set('X-Requested-With', 'XMLHttpRequest');
+  if (needsCsrfEcho) headers.set(CSRF_HEADER_NAME, csrfCookie as string);
   return new Request(request, { headers });
 }
 
 /**
- * Service Worker shim served by the Worker for `service_worker.js`
- * registration requests. SilverBullet's real SW (offline-cache bundle)
- * cannot be served via the vault proxy because Chrome omits cookies on
- * the SW script fetch - the browser's `navigator.serviceWorker.register()`
- * call sends only `Accept`, `DNT`, and `Service-Worker: script` (no
- * `Cookie`), so any cookie-gated route returns 401 and registration
- * fails permanently.
+ * CF-019: append a Set-Cookie for the double-submit CSRF token to `headers`
+ * when the request does not already carry one. Called on safe (GET) vault
+ * responses so the browser holds a token before issuing any state-changing
+ * write. Mutates the passed Headers in place (caller owns a fresh Headers).
  *
- * The shim is functionally a no-op for SB's sync engine (file sync still
- * goes through the auth-gated Worker proxy directly), with one carved-out
- * responsibility: hold the per-session AES-CTR encryption key in memory
- * so SilverBullet's `client/boot.ts` get-encryption-key message returns
- * a non-undefined value. The codeflare bootstrap-hop page posts the key
- * via `{type: "set-encryption-key"}` before SB boots; SB's boot then
- * polls `{type: "get-encryption-key"}` and uses the reply to enable the
- * `EncryptedKvPrimitives` wrapper on the sb_data IDB.
+ *   - HttpOnly: the value never needs to be read by page JS; the Worker echoes
+ *     it into the request header itself (maybeSynthesizeCsrfHeader). HttpOnly
+ *     keeps it out of reach of XSS-based exfiltration.
+ *   - SameSite=Lax + Secure: standard CSRF cookie hardening.
+ *   - Path=/api/vault/<sid>/: scoped to the session's vault namespace.
  *
- * The key never leaves the SW process - it is in-memory only, scoped to
- * `/api/vault/<sid>/`, and gone the moment the browser tears the SW down.
- * That matches SilverBullet's upstream contract for `encryptionKeyMemoryStore`
- * (client/service_worker.ts:60 in SB 2.8). Implements REQ-VAULT-008 AC5.
+ * No-op when the cookie is already present (stable token across the session).
  */
-export const VAULT_KEY_SHIM_SERVICE_WORKER_JS =
-  '// Codeflare vault key-shim service worker - see src/routes/vault.ts.\n' +
-  'let encryptionKey = undefined;\n' +
-  'function isSameOriginClient(source) {\n' +
-  '  if (!source || typeof source.url !== "string") return false;\n' +
-  '  try { return new URL(source.url).origin === self.location.origin; }\n' +
-  '  catch (_) { return false; }\n' +
-  '}\n' +
-  'async function recoverKey() {\n' +
-  '  if (encryptionKey !== undefined) return;\n' +
-  '  try {\n' +
-  '    var r = await fetch(self.registration.scope + ".vault-key", { credentials: "same-origin" });\n' +
-  '    if (r.ok) { var b = await r.json(); if (b && b.key) encryptionKey = b.key; }\n' +
-  '  } catch (_) {}\n' +
-  '}\n' +
-  'self.addEventListener("install", () => self.skipWaiting());\n' +
-  'self.addEventListener("activate", (event) => event.waitUntil(\n' +
-  '  recoverKey().then(() => self.clients.claim())\n' +
-  '));\n' +
-  'self.addEventListener("message", (event) => {\n' +
-  '  const msg = event && event.data;\n' +
-  '  if (!msg || typeof msg !== "object") return;\n' +
-  '  if (!isSameOriginClient(event.source)) return;\n' +
-  '  if (msg.type === "set-encryption-key") {\n' +
-  '    encryptionKey = msg.key;\n' +
-  '    return;\n' +
-  '  }\n' +
-  '  if (msg.type === "get-encryption-key") {\n' +
-  '    if (encryptionKey === undefined) {\n' +
-  '      recoverKey().then(() => event.source.postMessage({ type: "encryption-key", key: encryptionKey !== undefined ? encryptionKey : null }));\n' +
-  '      return;\n' +
-  '    }\n' +
-  '    event.source.postMessage({ type: "encryption-key", key: encryptionKey });\n' +
-  '    return;\n' +
-  '  }\n' +
-  '});\n';
+export function maybeIssueCsrfCookie(request: Request, headers: Headers, sessionId: string): void {
+  if (readCsrfCookie(request)) return;
+  if (!SESSION_ID_PATTERN.test(sessionId)) return;
+  const token = crypto.randomUUID();
+  headers.append(
+    'Set-Cookie',
+    `${CSRF_COOKIE_NAME}=${token}; Path=/api/vault/${sessionId}/; HttpOnly; SameSite=Lax; Secure`,
+  );
+}
+
+/** Read the CF-019 double-submit CSRF cookie value, or null. */
+function readCsrfCookie(request: Request): string | null {
+  const cookieHeader = request.headers.get('Cookie');
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx === -1) continue;
+    const name = part.slice(0, idx).trim();
+    if (name === CSRF_COOKIE_NAME) return part.slice(idx + 1).trim() || null;
+  }
+  return null;
+}
 
 /**
  * Identify a browser-initiated Service Worker registration GET. The
@@ -132,21 +130,53 @@ export const VAULT_KEY_SHIM_SERVICE_WORKER_JS =
  *
  * Cookie header is intentionally NOT checked. Chrome 76+ strips cookies
  * on SW registration fetches per spec, but Samsung Internet and other
- * Chromium forks may not. When cookies are present and this function
- * returns false, the request falls through to the proxy chain which
- * serves SilverBullet's real 97KB SW instead of the key-shim. That SW
- * runs cache.addAll() during install, which fetches the vault root
- * without the bootstrap cookie and gets a 302 redirect, causing the
- * install to fail and navigator.serviceWorker.ready to hang forever.
- * The service-worker header alone is sufficient security (forbidden
- * header, not forgeable by page JS) and the response is a static JS
- * string with no user data.
+ * Chromium forks may not. Serving the native worker (vault-native-sw.ts,
+ * AD69) for this exact request regardless of cookie presence keeps
+ * registration browser-agnostic; the response is open-source SilverBullet
+ * frontend bytes plus the codeflare key-recovery graft, with no user data.
+ * The `service-worker` header alone is sufficient security (forbidden
+ * header, not forgeable by page JS).
  */
 export function isServiceWorkerRegistration(request: Request, remainingPath: string | undefined): boolean {
   if (request.method !== 'GET') return false;
   if (remainingPath !== '/service_worker.js') return false;
   if (request.headers.get('service-worker') !== 'script') return false;
   return true;
+}
+
+/**
+ * Identify a fetch issued from the Service Worker context rather than a
+ * top-level browser navigation. SilverBullet's native service worker (now
+ * served by the vault proxy, see VAULT_NATIVE_SERVICE_WORKER_JS) precaches
+ * the shell `/` plus its `/.client/*` assets via `cache.addAll(...)` during
+ * `install`. Those precache fetches carry `Sec-Fetch-Mode: no-cors` (or
+ * `same-origin`), NOT `navigate` - the browser only sets `navigate` on
+ * top-level document loads. The shell-path 302 to the bootstrap-hop is meant
+ * for navigations; if it also fires on the SW precache fetch, `cache.addAll`
+ * sees a redirect, rejects atomically, and `navigator.serviceWorker.ready`
+ * hangs forever. Returning true here lets the dispatcher suppress that 302
+ * for SW-context fetches so the precache resolves against the real shell.
+ *
+ * `Sec-Fetch-Mode` is a browser-set forbidden header (page JS cannot forge
+ * it), the same trust basis already relied on at vault.ts for the WS Origin
+ * gate. Fail-safe polarity: when the header is ABSENT (older browsers, exotic
+ * WebViews, non-browser clients) this returns false, so the 302 still fires
+ * and a real navigation is never accidentally served the raw shell without
+ * the bootstrap hop. Only an explicit non-`navigate` mode suppresses it.
+ *
+ * Breadth is deliberate: every non-`navigate` mode (`no-cors`, `same-origin`,
+ * `cors`, `websocket`) suppresses the 302, not just the `no-cors`/`same-origin`
+ * the precache emits. This is safe because the suppression is applied AFTER the
+ * full auth + session-ownership chain in handleVaultRequest, so it only changes
+ * whether an already-authorized request is redirected to the hop vs. proxied -
+ * it never exposes a path to an unauthenticated caller. The one functional
+ * consequence is that a non-navigation same-origin GET to `/` (e.g. a prefetch)
+ * would skip the hop; acceptable, since only top-level navigations need it.
+ */
+export function isServiceWorkerContextFetch(request: Request): boolean {
+  const mode = request.headers.get('Sec-Fetch-Mode');
+  if (!mode) return false;
+  return mode !== 'navigate';
 }
 
 /**
@@ -462,6 +492,8 @@ export function filterVaultFsListing(body: string): string {
     if (filtered.length === parsed.length) return body;
     return JSON.stringify(filtered);
   } catch {
+    // CF-026: fail-safe - never break a 200 listing because the upstream
+    // shape drifted; return the body untouched (see JSDoc fail-safe note).
     return body;
   }
 }
@@ -513,6 +545,7 @@ export async function rewriteVaultHtmlResponse(
   pathname: string,
   contentType: string,
   logger: { warn: (msg: string, meta?: Record<string, unknown>) => void },
+  request?: Request,
 ): Promise<Response> {
   const body = await response.text();
   const { rewritten: baseRewritten, wasNoOp } = rewriteVaultBaseHref(body, sessionId);
@@ -533,6 +566,13 @@ export async function rewriteVaultHtmlResponse(
   const headers = new Headers(response.headers);
   headers.delete('content-length');
   headers.delete('content-encoding');
+  // CF-019: issue the double-submit CSRF cookie on this safe (GET) HTML
+  // response so the SPA holds a token before it issues any write. `request`
+  // is optional only for the existing unit tests that call this helper
+  // without it; the production call site (handleVaultRequest) always passes it.
+  if (request && request.method === 'GET') {
+    maybeIssueCsrfCookie(request, headers, sessionId);
+  }
   return new Response(rewritten, {
     status: response.status,
     statusText: response.statusText,

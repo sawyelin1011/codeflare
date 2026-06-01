@@ -12,6 +12,10 @@ const logger = createLogger('access');
 
 // Module-level cache for auth config (avoids KV reads on every request)
 const AUTH_CONFIG_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// CF-149: pre-setup (negative/null) auth config is the spoofable-email trust
+// window. Expire it after 30s instead of 5min so a freshly-configured
+// instance stops trusting cf-access-authenticated-user-email much sooner.
+const AUTH_CONFIG_NULL_TTL_MS = 30 * 1000; // 30 seconds
 let cachedAuthDomain: string | null | undefined = undefined;
 let cachedAccessAud: string | null | undefined = undefined;
 let cachedAccessAudList: string[] | null | undefined = undefined;
@@ -23,6 +27,24 @@ let pendingAuthConfigFetch: Promise<void> | null = null;
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
+}
+
+// CF-019: vault CSRF token (defense-in-depth). The cookie is issued on the
+// vault GET path (see src/routes/vault.ts) and compared header===cookie in
+// authenticateRequest. NOTE: for an origin-validated request the Worker mints
+// the X-Vault-Csrf header from the cookie (vault-html.ts), so this is NOT an
+// independent second factor that proves client token knowledge - the Origin
+// allowlist (checkVaultOrigin) remains the primary CSRF defense. The token
+// layers on top and leaves room for a future client-echoed double-submit.
+export const CSRF_COOKIE_NAME = 'codeflare_vault_csrf';
+export const CSRF_HEADER_NAME = 'X-Vault-Csrf';
+
+/** Constant-time string equality for the double-submit token compare. */
+async function timingSafeEqualStrings(a: string, b: string): Promise<boolean> {
+  const ea = new TextEncoder().encode(a);
+  const eb = new TextEncoder().encode(b);
+  if (ea.byteLength !== eb.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(ea, eb);
 }
 
 const VALID_ACCESS_TIERS = new Set<string>(['pending', 'standard', 'advanced', 'blocked']);
@@ -98,8 +120,15 @@ export async function getUserFromRequest(request: Request, env?: Env): Promise<A
 
   // Load auth config from KV REGARDLESS of JWT presence (FIX-1).
   // This determines whether we're in pre-setup or post-setup state.
-  // Invalidate stale cache after TTL (FIX-9)
-  if (authConfigCachedAt > 0 && Date.now() - authConfigCachedAt > AUTH_CONFIG_CACHE_TTL_MS) {
+  // Invalidate stale cache after TTL (FIX-9).
+  // CF-149: when the cached config is the negative/null (pre-setup) state, use
+  // the shorter NULL TTL so the header-trust window shrinks from 5min to 30s.
+  // A populated config (cachedAuthDomain is a non-empty string) keeps the 5min
+  // TTL. cachedAuthDomain === undefined means "not yet fetched" and is handled
+  // by the cold-fetch branch below, not here.
+  const configIsPopulated = !!cachedAuthDomain;
+  const effectiveTtlMs = configIsPopulated ? AUTH_CONFIG_CACHE_TTL_MS : AUTH_CONFIG_NULL_TTL_MS;
+  if (authConfigCachedAt > 0 && Date.now() - authConfigCachedAt > effectiveTtlMs) {
     cachedAuthDomain = undefined;
     cachedAccessAud = undefined;
     cachedAccessAudList = undefined;
@@ -376,10 +405,34 @@ export async function authenticateRequest(
   request: Request,
   env: Env
 ): Promise<{ user: AccessUser; bucketName: string }> {
-  // CSRF protection: require X-Requested-With header on state-changing methods
+  // CSRF protection on state-changing methods. Two layers:
+  //
+  //   1. CF-019 vault CSRF token (defense-in-depth, NOT an independent factor).
+  //      If the request carries both the CSRF cookie and the X-Vault-Csrf
+  //      header they MUST match. For an origin-validated vault request the
+  //      Worker itself mints the header from the cookie (vault-html.ts), so a
+  //      match does not prove independent client knowledge - the Origin
+  //      allowlist (checkVaultOrigin, applied before auth) is the real CSRF
+  //      defense and a cross-site request is already 403'd there. A present-
+  //      cookie/missing-header (or vice-versa) falls THROUGH to layer 2 rather
+  //      than hard-rejecting, so non-vault routes and clients that predate the
+  //      token (SilverBullet client.js, CLI) keep working. When both are
+  //      present and EQUAL we skip layer 2.
+  //   2. X-Requested-With requirement (defense-in-depth, unchanged).
   const method = request.method.toUpperCase();
   if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {
-    if (!request.headers.get('X-Requested-With')) {
+    const csrfCookie = getCookieValue(request.headers.get('Cookie'), CSRF_COOKIE_NAME);
+    const csrfHeader = request.headers.get(CSRF_HEADER_NAME);
+    let doubleSubmitSatisfied = false;
+    if (csrfCookie && csrfHeader) {
+      if (!(await timingSafeEqualStrings(csrfCookie, csrfHeader))) {
+        throw new ForbiddenError('CSRF token mismatch');
+      }
+      doubleSubmitSatisfied = true;
+    }
+    // Fall back to the legacy X-Requested-With gate only when the double-submit
+    // token did not already establish CSRF safety.
+    if (!doubleSubmitSatisfied && !request.headers.get('X-Requested-With')) {
       throw new ForbiddenError('Missing X-Requested-With header');
     }
   }
