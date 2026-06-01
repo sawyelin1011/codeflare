@@ -19,8 +19,8 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 
 ### Domain Dependencies
 
-- **Security** -- CVE scanning (REQ-OPS-002) depends on Trivy integration; pentest (REQ-OPS-005) validates security requirements
-- **Session Lifecycle** -- Container specs (REQ-OPS-007) define the resource constraints that session containers run under
+- **Security** -- CVE scanning ([REQ-OPS-002](#req-ops-002-docker-image-build-vulnerability-scan-and-registry-push)) depends on Trivy integration; pentest ([REQ-OPS-005](#req-ops-005-weekly-pentest)) validates security requirements
+- **Session Lifecycle** -- Container specs ([REQ-OPS-007](#req-ops-007-container-specs-configurable-per-environment)) define the resource constraints that session containers run under
 
 ---
 
@@ -227,7 +227,7 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 **Acceptance Criteria:**
 
 1. Watched Dockerfile binaries: zoxide, yazi, lazygit, silverbullet. Each has its own parallel job checking GitHub releases.
-2. Watched npm packages: context-mode (canonical version in plugin.json, echoed in entrypoint.sh fallback and hooks.json). Watched PyPI packages: graphifyy (canonical version in `preseed/agents/claude/plugins/graphify/.claude-plugin/plugin.json`; the Dockerfile reads the pin from plugin.json via `jq`, so there is no Dockerfile literal to bump). The graphify job diffs the plugin.json `.version` against the PyPI latest and replaceAll-bumps both the version and the `graphifyy@X.Y.Z` description string in plugin.json.
+2. Watched npm packages: context-mode (canonical version in plugin.json, echoed in entrypoint.sh fallback and hooks.json). Watched PyPI packages: graphifyy, whose canonical pin lives in `preseed/agents/claude/plugins/graphify/.claude-plugin/plugin.json` (read by the Dockerfile via `jq`, so there is no Dockerfile literal to bump); its job bumps both the `.version` and the `graphifyy@X.Y.Z` description string there.
 3. SHA256 checksum is reset to a placeholder on Dockerfile bumps, causing Docker build failure until the operator verifies and updates the hash.
 4. A bump branch is skipped if one already exists for that version (deduplication guard).
 
@@ -391,9 +391,7 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 
 **Dependencies:** None.
 
-**Verification:** [Automated test](../../src/__tests__/container/index.test.ts)
-
-**Notes:** Hibernation cost guarantee is verified manually against billing-period invoices.
+**Verification:** [Automated test](../../src/__tests__/container/index.test.ts), Manual (zero-cost guarantee checked against billing-period invoices)
 
 **Status:** Implemented
 
@@ -423,9 +421,7 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 
 **Dependencies:** [REQ-OPS-006](#req-ops-006-idle-containers-hibernate-and-cost-zero)
 
-**Verification:** [Automated test](../../src/__tests__/routes/session-sleep-timeout.test.ts)
-
-**Notes:** Preference persistence and lifecycle are covered by `src/__tests__/container/index.test.ts` (DO setBucketName + constructor reload + destroy paths).
+**Verification:** [Automated test](../../src/__tests__/routes/session-sleep-timeout.test.ts), [DO lifecycle paths](../../src/__tests__/container/index.test.ts)
 
 **Status:** Implemented
 
@@ -456,8 +452,6 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 **Dependencies:** [REQ-OPS-006](#req-ops-006-idle-containers-hibernate-and-cost-zero), [REQ-OPS-016](#req-ops-016-sleepafter-preference-persistence-and-lifecycle)
 
 **Verification:** [Automated test](../../src/__tests__/container-metrics.test.ts)
-
-**Notes:** Fail-safe invariants are covered by `src/__tests__/container/container-metrics.test.ts` and `src/__tests__/container/index.test.ts`.
 
 **Status:** Implemented
 
@@ -509,14 +503,14 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 <!-- @impl: src/lib/rate-limit-core.ts -->
 <!-- @test: host/__tests__/workflow-stress-test.test.js (workflow shape + manual dispatch describe -> AC1-AC3) + src/__tests__/index.test.ts (REQ-OPS-008 AC6 SAAS+STRESS conflict guard describe -> AC6) + src/__tests__/middleware/rate-limit.test.ts (stress test mode bypass + REQ-OPS-008 AC5 one-time warning describes -> AC4/AC5) -->
 
-**Intent:** Load testing validates that rate limiting, session lifecycle, storage operations, and WebSocket concurrency behave correctly under high load.
+**Intent:** Load testing validates that rate limiting, session lifecycle, storage operations, and API throughput behave correctly under high load.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
 1. The stress-test workflow runs on manual dispatch against the integration environment.
-2. Load tests cover API throughput, session lifecycle, storage operations, and WebSocket concurrency.
+2. Load tests cover API throughput, rate-limit validation, session lifecycle, and storage operations.
 3. Concurrency is configurable per run; disabled by default, latency thresholds loosen when enabled.
 4. In stress-test deployment mode, all HTTP and WebSocket rate limits are bypassed to allow high virtual-user counts through a single service-token identity.
 5. A one-time warning is logged per worker instance when the rate-limit bypass activates.
@@ -551,8 +545,8 @@ CI/CD pipeline, testing strategy, deployment workflow, container sizing, and cos
 
 1. The OSSF Scorecard workflow runs on push to main and weekly.
 2. Scorecard results are uploaded to GitHub Security.
-3. Repository-level secret scanning with push protection is enabled.
-4. Dependabot security updates are enabled at the repository level.
+3. Repository-level secret scanning with push protection is enabled. This is a repository-level GitHub setting verified out of band, not from source.
+4. Dependabot security updates are enabled at the repository level. This is a repository-level GitHub setting verified out of band, not from source.
 
 **Constraints:**
 

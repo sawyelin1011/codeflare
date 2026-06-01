@@ -657,23 +657,14 @@ fi
 # authoritative order. No timestamp parsing needed.
 # ---------------------------------------------------------------------------
 
-spawned_after_push() {
-  local agent="$1"
-  # Anchor on `"type":"tool_use"` AND `"name":"Agent"` on the same line so
-  # the substring match only fires on actual Agent tool_use envelopes, not
-  # on prose / tool_result text / ctx_execute output that happens to quote
-  # the literal `"subagent_type":"<name>"` bytes (e.g. a diagnostic script
-  # printing hook JSON to the transcript). The JSONL transcript serialises
-  # each tool_use envelope on a single line, so this triple-condition match
-  # is reliable.
-  awk -v p="$PUSH_LINE" -v a="$agent" '
-    NR > p \
-      && index($0, "\"type\":\"tool_use\"") \
-      && index($0, "\"name\":\"Agent\"") \
-      && index($0, "\"subagent_type\":\"" a "\"") { found = 1; exit }
-    END { exit !found }
-  ' "$TRANSCRIPT"
-}
+# Agent-envelope match contract (used by the lane-coverage and in-flight
+# checks below): anchor each `"subagent_type"` match on `"type":"tool_use"`
+# AND `"name":"Agent"` on the same line, so the substring match only fires on
+# real Agent tool_use envelopes - not on prose / tool_result text / ctx_execute
+# output that happens to quote the literal `"subagent_type":"<name>"` bytes
+# (e.g. a diagnostic script printing hook JSON to the transcript). The JSONL
+# transcript serialises each tool_use envelope on a single line, so the
+# triple-condition match is reliable.
 
 # 3-strike circuit breaker (keyed by CURRENT_PR_HEAD - unique per PR state)
 #
@@ -776,8 +767,8 @@ requires_lane() {
 # running. A lane is "in flight" when its MOST RECENT Agent spawn anywhere in
 # the transcript has no `completed</status>` marker yet -- i.e. that subagent
 # is still executing. Subagents always emit a completion marker on finish
-# (success OR error, per the spawned_after_push comment), so "last spawn has
-# no completion" reliably means "currently running", not "errored long ago".
+# (success OR error), so "last spawn has no completion" reliably means
+# "currently running", not "errored long ago".
 #
 # Without this guard, a push that lands while the prior wave is still running
 # advances the PR HEAD past the in-flight spawn lines; the parallel block
@@ -830,8 +821,71 @@ lane_in_flight() {
   return 0  # spawned recently, no completion yet -> in flight
 }
 
+latest_lane_spawn_after_line() {
+  local lane="$1"
+  local min_line="$2"
+  awk -v p="$min_line" -v a="$lane" '
+    NR > p \
+      && index($0, "\"type\":\"tool_use\"") \
+      && index($0, "\"name\":\"Agent\"") \
+      && index($0, "\"subagent_type\":\"" a "\"") { print NR }
+  ' "$TRANSCRIPT" | tail -1
+}
+
+spawn_completed() {
+  local spawn_line="$1"
+  local line_content tool_use_id
+  line_content=$(awk -v L="$spawn_line" 'NR==L { print; exit }' "$TRANSCRIPT")
+  tool_use_id=$(echo "$line_content" | grep -oE '"id"[[:space:]]*:[[:space:]]*"toolu_[^"]+"' | head -1 | grep -oE 'toolu_[^"]+')
+  [ -n "$tool_use_id" ] || return 1
+  awk -v s="$spawn_line" 'NR > s' "$TRANSCRIPT" \
+    | grep -F "tool-use-id>${tool_use_id}<" \
+    | grep -qF 'completed</status>'
+}
+
+lane_has_coverage_after_line() {
+  local lane="$1"
+  local min_line="$2"
+  local spawn_line
+  spawn_line=$(latest_lane_spawn_after_line "$lane" "$min_line")
+  [ -n "$spawn_line" ] || return 1
+
+  if spawn_completed "$spawn_line"; then
+    return 0
+  fi
+
+  local total
+  total=$(wc -l < "$TRANSCRIPT" 2>/dev/null || echo 0)
+  [ "$((total - spawn_line))" -le "$IN_FLIGHT_STALE_LINES" ] 2>/dev/null
+}
+
+lane_completed_after_line() {
+  local lane="$1"
+  local min_line="$2"
+  local spawn_line
+  spawn_line=$(latest_lane_spawn_after_line "$lane" "$min_line")
+  [ -n "$spawn_line" ] || return 1
+  spawn_completed "$spawn_line"
+}
+
+lane_has_current_coverage() {
+  lane_has_coverage_after_line "$1" "$PUSH_LINE"
+}
+
+lane_completed_for_current_head() {
+  lane_completed_after_line "$1" "$PUSH_LINE"
+}
+
+all_required_lanes_completed_for_current_head() {
+  local lane
+  for lane in $REQUIRED_LANES; do
+    lane_completed_for_current_head "$lane" || return 1
+  done
+  return 0
+}
+
 # In-flight suppression is applied PER-LANE at each demand site below: a lane
-# is demanded only if it was NOT spawned-after-push AND is NOT currently in
+# is demanded only if it lacks current-head coverage AND is NOT currently in
 # flight. The old blanket "any required lane in flight -> exit 0" loop was
 # removed -- it masked the ENTIRE gate while a single slow lane (e.g. a
 # long-running code-reviewer) was in flight, so the sequential doc-updater
@@ -841,14 +895,15 @@ lane_in_flight() {
 
 # ---------------------------------------------------------------------------
 # Parallel block: code-reviewer + spec-reviewer can be spawned together.
-# Only the ones present in REQUIRED_LANES are demanded. A lane already in
-# flight is skipped (not re-summoned) but does not suppress the other lanes.
+# Only the ones present in REQUIRED_LANES are demanded. A lane with fresh
+# current-head coverage or an in-flight run is skipped (not re-summoned) but
+# does not suppress the other lanes.
 # ---------------------------------------------------------------------------
 MISSING=""
-if requires_lane "code-reviewer" && ! spawned_after_push "code-reviewer" && ! lane_in_flight "code-reviewer"; then
+if requires_lane "code-reviewer" && ! lane_has_current_coverage "code-reviewer" && ! lane_in_flight "code-reviewer"; then
   MISSING="$MISSING code-reviewer"
 fi
-if requires_lane "spec-reviewer" && ! spawned_after_push "spec-reviewer" && ! lane_in_flight "spec-reviewer"; then
+if requires_lane "spec-reviewer" && ! lane_has_current_coverage "spec-reviewer" && ! lane_in_flight "spec-reviewer"; then
   MISSING="$MISSING spec-reviewer"
 fi
 
@@ -880,7 +935,7 @@ if [ "$DOC_REQUIRED" = "1" ] && [ "$SPEC_REQUIRED" = "1" ]; then
   # completed</status>, then require doc-updater to follow.
   # Anchor each subagent_type match on `"type":"tool_use"` AND
   # `"name":"Agent"` so prose / tool_result text quoting the bytes
-  # cannot false-positive (see spawned_after_push comment above).
+  # cannot false-positive (see the Agent-envelope match contract above).
   SPEC_SPAWN_LINE=$(awk -v p="$PUSH_LINE" '
     NR > p \
       && index($0, "\"type\":\"tool_use\"") \
@@ -897,14 +952,8 @@ if [ "$DOC_REQUIRED" = "1" ] && [ "$SPEC_REQUIRED" = "1" ]; then
       SPEC_DONE_LINE=$(echo "$SINCE_SPEC" | grep -nF "tool-use-id>${SPEC_TOOL_USE_ID}<" | grep -F 'completed</status>' | tail -1 | cut -d: -f1)
 
       if [ -n "$SPEC_DONE_LINE" ]; then
-        SINCE_SPEC_DONE=$(echo "$SINCE_SPEC" | tail -n +"$SPEC_DONE_LINE")
-        # Same precision anchor for the doc-updater follow-up scan.
-        if ! echo "$SINCE_SPEC_DONE" | awk '
-          index($0, "\"type\":\"tool_use\"") \
-            && index($0, "\"name\":\"Agent\"") \
-            && index($0, "\"subagent_type\":\"doc-updater\"") { found=1; exit }
-          END { exit !found }
-        ' && ! lane_in_flight "doc-updater"; then
+        SPEC_DONE_ABS=$((SPEC_SPAWN_LINE + SPEC_DONE_LINE - 1))
+        if ! lane_has_coverage_after_line "doc-updater" "$SPEC_DONE_ABS" && ! lane_in_flight "doc-updater"; then
           REASON="spec-reviewer done; spawn doc-updater (sequential). Run the agent(s) in the background (Agent tool with run_in_background: true) so the main session stays usable. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
           emit_block "$REASON"
         fi
@@ -918,7 +967,7 @@ elif [ "$DOC_REQUIRED" = "1" ]; then
   # transcript than the push. PIPELINE_COMPLETE only flips once we see
   # the doc-updater tool-use envelope; we cannot ack a SHA we never
   # verified.
-  if ! spawned_after_push "doc-updater" && ! lane_in_flight "doc-updater"; then
+  if ! lane_has_current_coverage "doc-updater" && ! lane_in_flight "doc-updater"; then
     REASON="PR #$CURRENT @ ${CURRENT_PR_HEAD:0:7}: spawn doc-updater. Run the agent(s) in the background (Agent tool with run_in_background: true) so the main session stays usable. USER-ONLY bypass: user types 'skip review' (agent must never self-bypass)."
     emit_block "$REASON"
   fi
@@ -970,7 +1019,7 @@ fi
 # Conservative: if any required lane is still running, exit 0 without ack
 # and the next Stop re-evaluates.
 # ---------------------------------------------------------------------------
-if [ "$PIPELINE_COMPLETE" = "1" ]; then
+if [ "$PIPELINE_COMPLETE" = "1" ] && all_required_lanes_completed_for_current_head; then
   echo "$CURRENT_PR_HEAD" > "$ACK_FILE" 2>/dev/null || true
   clear_counter
 fi

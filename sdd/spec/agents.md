@@ -16,6 +16,8 @@ Multi-agent support, preseed system, and session modes.
 - **Custom agent creation by users** -- Users cannot define their own agent types or register third-party CLI tools as agents. The seven supported agents are hardcoded.
 - **Agent marketplace** -- No mechanism for browsing, installing, or sharing community-contributed agent configurations or plugins.
 - **Runtime agent switching** -- Agent type is immutable after session creation. Switching requires creating a new session.
+- **Explicit consult-llm preference toggle** -- There is no separate Settings switch for the multi-model consultation feature. It is active implicitly whenever the user has at least one LLM provider key configured; removing the key is the off-switch.
+- **Graphify hard-block enforcement** -- The count-based PreToolUse hard-block for structural-search tools was removed; graph-first discipline is advisory only (the preseeded rule plus a per-call soft nudge, [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)). The hard-block misfired on legitimate single-file searches the graph-first rule itself excludes.
 
 ### Domain Dependencies
 
@@ -45,7 +47,7 @@ Multi-agent support, preseed system, and session modes.
 1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `antigravity`, `opencode`, `pi`, `bash`.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
-4. Node.js-based agent CLIs (Codex, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code ships as a native binary and needs no warm-up; Go-based agents (OpenCode, Antigravity) are natively compiled.
+4. Node.js-based agent CLIs (Codex, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code is installed as a global npm package and is warmed by the version smoke-test run at install time, so it is excluded from the dedicated warm-up block; Go-based agents (OpenCode, Antigravity) are natively compiled.
 5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install.
 
 **Constraints:**
@@ -150,12 +152,12 @@ Multi-agent support, preseed system, and session modes.
 2. A single resolver provides the default-to-Standard fallback when no preference is recorded; all callers read through the resolver rather than checking the raw field directly.
 3. Mode selection is available in Settings under the session-defaults area.
 4. Mode takes effect on any of: explicit "Recreate AI agent skills & rules" action, new bucket creation, payment-provider mode change (upgrade or downgrade via webhook), subscription termination, or Settings toggle of the session-mode preference.
-5. On webhook-driven or Settings-driven reconciliation, preseed files are overwritten to match the new mode; user-created files are never deleted (see REQ-AGENT-005 Constraints).
+5. On webhook-driven or Settings-driven reconciliation, preseed files are overwritten to match the new mode; user-created files are never deleted (see [REQ-AGENT-005](#req-agent-005-pro-mode-includes-additional-skills-rules-agents-and-mcp-servers) Constraints).
 6. Reconciliation triggered by webhooks or Settings is non-fatal: failure does not block the webhook response or the preference write.
 
 **Constraints:**
 
-- Only tiers whose allowed-session-modes list includes Pro can use Pro mode (see REQ-SUB-014).
+- Only tiers whose allowed-session-modes list includes Pro can use Pro mode (see [REQ-SUB-014](subscription.md#req-sub-014-session-mode-gating-by-tier)).
 - When a user is promoted to a Pro-eligible tier, Pro mode becomes their persisted default if they had not already selected a mode.
 
 **Priority:** P1
@@ -183,7 +185,7 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. Pro mode delivers a strict superset of the content Standard mode delivers, covering memory persistence, language rules, agent definitions, slash commands, cherry-picked skills, the discipline triad (spec, docs, tests), and the commit-attribution and PR-boundary review hooks. The canonical per-content-category matrix lives in [documentation/preseed.md](../../documentation/lanes/preseed.md#session-modes); the spec lane documents the user-observable contract only.
-2. Pro mode enables persistent memory (the `.memory/` directory is included in storage sync); Standard mode excludes it so memory does not persist across container restarts.
+2. Pro mode enables persistent memory by syncing the user's Vault directory tree to their R2 bucket; Standard mode excludes the Vault tree so memory does not persist across container restarts. The legacy `.memory/` directory is no longer written.
 3. Pro-mode hooks fire uniformly regardless of which tool surface invoked the underlying command, so coverage is identical whether the user is on Custom tier (commands route through context-mode) or any other tier (commands run directly): commit attribution is blocked before the commit lands, the SDD review pipeline is triggered at every PR-to-`main` boundary event, the turn cannot end while a PR HEAD remains unreviewed, and memory capture runs on the user-prompt cadence.
 4. Pi agents remain fully functional without context-mode: native Bash/Read/Grep/Find/Edit/Write plus graphify tools are sufficient on their own, and no context-mode MCP registration is required. The shared agent definitions' context-mode helper tools are remapped to their Pi-native names (`ctx_execute`, `ctx_batch_execute`, `ctx_execute_file`, `ctx_search`, `ctx_fetch_and_index`) and kept in the Pi agent frontmatter rather than stripped: they are absent at runtime when context-mode is disabled (Pi drops the unavailable tools) and usable when `/ctx on` enables it, with no Pi-specific agent variants.
 5. Pi always starts with context-mode disabled. The Codeflare Pi extension provides `/ctx status`, `/ctx on`, and `/ctx off`; `/ctx on` enables the context-mode package for the current running session and reloads resources, while the next Codeflare container start resets Pi back to disabled.
@@ -467,12 +469,13 @@ Multi-agent support, preseed system, and session modes.
 1. A browser-shim is installed in the container that intercepts browser-launch attempts and exits with a non-zero code, causing the calling CLI to fall back to plain-text URL output.
 2. The XDG browser-launch entry-point is similarly shimmed so any tool that bypasses the BROWSER convention also degrades to text output.
 3. CLIs fall back to printing auth URLs as plain text in the PTY when the browser fails to open.
-4. The xterm.js link provider detects URLs in terminal output and makes them clickable. When a URL spans multiple terminal rows (soft-wrap or application-inserted newlines), the detector joins continuation rows to the end of the terminal buffer rather than stopping at the visible viewport, so long OAuth URLs printed on narrow or mobile-keyboard-shrunk viewports are assembled and offered in full (never truncated mid-URL). The number of continuation rows joined per logical line is bounded by a fixed cap so the periodic buffer scan cannot walk an unbounded scrollback.
+4. The xterm.js link provider detects URLs in terminal output and makes them clickable, joining continuation rows for URLs that span multiple terminal rows (soft-wrap or application-inserted newlines) so long OAuth URLs on narrow or mobile-keyboard-shrunk viewports are assembled and offered in full, never truncated mid-URL.
 
 **Constraints:**
 
 - The shim must not block or hang; it must exit immediately with a non-zero code.
 - All CLI tools that attempt browser-based OAuth (Claude Code, OpenCode, Antigravity) must be covered.
+- The number of continuation rows joined per logical line is bounded by a fixed cap so the periodic buffer scan cannot walk an unbounded scrollback.
 
 **Priority:** P1
 
@@ -555,35 +558,6 @@ Multi-agent support, preseed system, and session modes.
 ---
 
 <!-- @test: host/__tests__/entrypoint-hooks-merge.test.js (settings.json configuration describe -> exercises the entrypoint MCP config merge path that also wires consult-llm when LLM_ENV is non-empty -> AC3 wiring) -->
-### REQ-AGENT-016: consult-llm preference toggle
-
-<!-- @impl: src/container/container-env.ts -->
-<!-- @impl: entrypoint.sh -->
-
-**Intent:** Users control whether their LLM API keys power the multi-model consultation feature.
-
-**Applies To:** User
-
-**Acceptance Criteria:**
-
-1. Toggle in Settings controls whether OpenAI/Gemini keys are passed to the consult-llm MCP server.
-2. Default: off.
-3. When off, consult-llm is not configured in the agent's MCP settings.
-
-**Constraints:** None.
-
-**Priority:** P2
-
-**Dependencies:** [REQ-AGENT-009](#req-agent-009-llm-api-key-storage-encrypted-in-kv)
-
-**Verification:** [Integration test](../../host/__tests__/entrypoint-hooks-merge.test.js)
-
-**Status:** Partial
-
-**Notes:** AC1 and AC2 unmet: there is no explicit Settings toggle. The consult-llm MCP surface is currently activated implicitly when at least one LLM provider key is configured; presence-of-key acts as the on/off. Closing the gap requires a frontend preference plus a gating field on the per-user preference record consulted by the container env-var forwarder.
-
----
-
 <!-- @test: host/__audits__/dockerfile-agents.audit.js (Dockerfile bubblewrap install describe -> bubblewrap in apt-get install + Codex sandbox documentation -> AC1,2) -->
 ### REQ-AGENT-017: Bubblewrap sandbox for Codex
 
@@ -597,7 +571,7 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. bubblewrap (bwrap) is installed in the container image.
-2. Codex uses it for sandboxed execution.
+2. bubblewrap is available on the system PATH for Codex's built-in sandbox; the sandbox invocation is owned by the upstream Codex CLI, not by codeflare source.
 
 **Constraints:**
 
@@ -634,7 +608,7 @@ None.
 
 **Constraints:**
 
-- Must comply with CON-SEC-003
+- Must comply with [CON-SEC-003](constraints.md#con-sec-003-credentials-encrypted-at-rest-when-encryption_key-configured)
 
 **Priority:** P1
 
@@ -659,7 +633,7 @@ None.
 1. Settings panel uses accordion groups (appearance, session, deploy, LLM, admin).
 2. Provider rows with SVG brand icons and inline expansion.
 3. Appearance section with accent color picker.
-4. Session section with agent type, sleep timeout, session mode dropdowns.
+4. Session section with a session-mode toggle and a sleep-timeout select; agent type is chosen at session creation, not here.
 
 **Constraints:**
 
@@ -669,7 +643,7 @@ None.
 
 **Dependencies:** None.
 
-**Verification:** [Automated test](../../src/__tests__/routes/llm-keys.test.ts)
+**Verification:** [Automated test](../../web-ui/src/__tests__/components/SettingsPanel.test.tsx)
 
 **Status:** Implemented
 
@@ -695,7 +669,7 @@ None.
 
 **Constraints:**
 
-- Must comply with CON-SEC-003
+- Must comply with [CON-SEC-003](constraints.md#con-sec-003-credentials-encrypted-at-rest-when-encryption_key-configured)
 
 **Priority:** P1
 
@@ -806,7 +780,7 @@ None.
 ### REQ-AGENT-049: Auto-upgrade preseed on release
 
 <!-- @impl: scripts/generate-agent-seed.mjs, src/routes/session/lifecycle.ts, src/routes/storage/seed.ts, web-ui/src/stores/session.ts -->
-<!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence + AC8 mode/tier propagation) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle + AC7 failure path) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) + web-ui/src/__tests__/components/SessionDropdown.test.tsx (REQ-AGENT-049 AC5 -> SessionDropdown disabled during upgrade) + web-ui/src/__tests__/components/SessionStatCard.test.tsx (REQ-AGENT-049 AC6 -> stopped card dimmed/click-disabled) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-049 AC1 -> PRESEED_CONTENT_HASH determinism) -->
+<!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence + AC7 mode/tier propagation) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle + AC6 failure path) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) + web-ui/src/__tests__/components/SessionDropdown.test.tsx (REQ-AGENT-049 AC5 -> SessionDropdown disabled during upgrade) + web-ui/src/__tests__/components/SessionStatCard.test.tsx (REQ-AGENT-049 AC5 -> stopped card dimmed/click-disabled) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-049 AC1 -> PRESEED_CONTENT_HASH determinism) -->
 
 **Intent:** When a new codeflare release ships changed preseed content (agent skills, rules, plugins), the user's R2 bucket should be reconciled automatically on first dashboard load - no manual "Recreate Agent Skills & Rules" click required. Session creation and stopped-session access are prevented in the UI during the brief upgrade.
 
@@ -818,16 +792,15 @@ None.
 2. After a successful reconcile (manual or auto), the applied hash is persisted in the user's preferences store.
 3. On initial dashboard load, the backend compares the stored hash against the build-time constant and returns whether an upgrade is needed. This check is omitted from periodic polling to avoid overhead.
 4. On initial dashboard load, if an upgrade is needed, the frontend triggers the reconcile in the background.
-5. While the upgrade is in progress, the "+ New Session" button is disabled and displays "Upgrading..." (both Dashboard and SessionDropdown).
-6. Stopped session cards are visually dimmed (reduced opacity) and click-disabled during upgrade.
-7. If the auto-upgrade fails, the error is logged but the dashboard remains fully usable. A page refresh retries the check.
-8. The reconcile respects the user's current session mode and tier (standard/pro/unlimited) - identical behavior to the manual "Recreate" button.
+5. While the upgrade is in progress, the "+ New Session" button is disabled and displays "Upgrading..." (both Dashboard and SessionDropdown), and stopped session cards are visually dimmed (reduced opacity) and click-disabled.
+6. If the auto-upgrade fails, the error is logged but the dashboard remains fully usable. A page refresh retries the check.
+7. The reconcile respects the user's current session mode and tier (standard/pro/unlimited) - identical behavior to the manual "Recreate" button.
 
 **Constraints:** None.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AGENT-011](#req-agent-011-manual-recreate-agent-skills-from-settings), [REQ-AGENT-014](#req-agent-014-manifest-driven-preseed-pipeline)
+**Dependencies:** [REQ-AGENT-011](#req-agent-011-agent-skills-rules-manually-recreatable-from-settings), [REQ-AGENT-014](#req-agent-014-manifest-driven-preseed-pipeline)
 
 **Verification:** [Backend route tests](../../src/__tests__/routes/session-batch-status.test.ts), [Seed hash persistence + AC8 mode/tier propagation](../../src/__tests__/routes/storage-seed.test.ts), [Store upgrade flow + AC7 failure path](../../web-ui/src/__tests__/stores/session.test.ts), [Dashboard UI AC5](../../web-ui/src/__tests__/components/Dashboard.test.tsx), [SessionDropdown AC5](../../web-ui/src/__tests__/components/SessionDropdown.test.tsx), [SessionStatCard AC6](../../web-ui/src/__tests__/components/SessionStatCard.test.tsx), [AC1 hash determinism](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
@@ -864,7 +837,7 @@ None.
 
 **Verification:** [Automated test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
-**Status:** Partial
+**Status:** Implemented
 
 <!-- coverage-gap: AC6 (manifest-presence of skills/review/SKILL.md) and command-dispatch API compatibility are covered by agent-seed-manifest.test.ts. AC1-AC5 (flag parsing and the runtime workflow phases) are skill-content behavior injected at command time, with no dedicated automated test. -->
 
@@ -874,6 +847,7 @@ None.
 
 <!-- @impl: preseed/agents/pi/extensions/codeflare-commands.ts -->
 <!-- @impl: preseed/agents/pi/manifest.json -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi /debug, /deploy, /brainstorm commands / REQ-AGENT-051 describe -> AC1-AC5) -->
 
 **Intent:** Workflows that Claude ships as slash commands (`/debug`, `/deploy`, `/brainstorm`) are unavailable in Pi because Claude commands do not deploy to Pi. Pi must reimplement them as native command handlers so Pi users get the same systematic debugging, deploy-and-verify, and structured-brainstorming workflows.
 
@@ -898,15 +872,14 @@ None.
 
 **Verification:** [Automated test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
-**Status:** Partial
-
-<!-- coverage-gap: AC6 (manifest-presence of codeflare-commands.ts) and command-dispatch API compatibility are covered by agent-seed-manifest.test.ts. AC1-AC5 (the debug/deploy/brainstorm registration and their injected-workflow content) are runtime behavior with no dedicated automated test. -->
+**Status:** Implemented
 
 ---
 
 ### REQ-AGENT-052: Pi Commit-Attribution and Local-Build Hook Hardening
 
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi commit-attribution and local-build guards / REQ-AGENT-052 describe -> AC1-AC5) -->
 
 **Intent:** Pi's PreToolUse guards that block AI attribution and local builds must cover the same surfaces and detection set as the canonical Claude hooks, so an attributed commit, PR, issue, release, or tag cannot slip through a previously-unguarded subcommand and a local build is not silently allowed.
 
@@ -915,7 +888,7 @@ None.
 **Acceptance Criteria:**
 
 1. The attribution guard fires not only on `git commit` and `gh pr create` but across `git merge`, `git tag`, `git notes`, and the `gh pr`, `gh issue`, and `gh release` subcommand families.
-2. The attribution detection set matches attribution signatures only. The canonical `block-attributed-commits.sh` set is `Co-Authored-By`, `noreply@anthropic`, `generated with ... claude`, and the robot emoji; the Pi guard (`codeflare-pi.ts`) additionally matches the brain emoji and `ChatGPT` as a deliberate superset (a Pi session may run a non-Claude model). Bare model/product names (`claude code`, `claude opus`, `claude sonnet`, `claude haiku`) are deliberately NOT matched: they false-positive on legitimate prose (e.g. a PR titled "Claude Code parity") and on git/gh commands naming `preseed/agents/claude/` paths.
+2. The attribution detection set matches genuine attribution signatures only - the canonical `block-attributed-commits.sh` set (`Co-Authored-By`, `noreply@anthropic`, `generated with ... claude`, the robot emoji) plus the brain emoji and `ChatGPT` as a deliberate Pi-guard superset since a Pi session may run a non-Claude model. Bare model and product names (`claude code`, `claude opus`, `claude sonnet`, `claude haiku`) are deliberately not matched, so legitimate prose and `preseed/agents/claude/` paths do not false-positive.
 3. The attribution guard does not match a bare `Claude`, so `git`/`gh` commands that name `preseed/agents/claude/` paths are not false-positives.
 4. The local-build guard covers the package-manager build/test/lint/typecheck/dev verbs plus `pytest`, `vitest`, `go test`, `swift test`, `cargo test`, `tsc`, `eslint`, `oxlint`, `prettier`, and `wrangler dev`.
 5. The local-build guard honors a user-only consume-on-use sentinel at `/tmp/local-build-bypass`: when present, the guard deletes it and allows the one command through; the block message names the override path.
@@ -923,7 +896,7 @@ None.
 **Constraints:**
 
 - The attribution and local-build detection sets are kept aligned with the canonical Claude hook scripts (`block-attributed-commits.sh`, the no-local-builds rule); divergence is a regression, except the documented Pi superset (brain emoji + `ChatGPT`) in AC2.
-- The bypass sentinel is user-only and consume-on-use, mirroring the `/tmp/graphify-bypass` discipline in [REQ-AGENT-042](#req-agent-042-graphify-hard-block-enforcement) AC7.
+- The bypass sentinel is user-only and consume-on-use, mirroring the user-only `/tmp/review-bypass` sentinel discipline in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces) AC1.
 
 **Priority:** P1
 
@@ -931,9 +904,7 @@ None.
 
 **Verification:** [Automated test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
-**Status:** Partial
-
-<!-- coverage-gap: the widened attribution/local-build detection regexes and the /tmp/local-build-bypass consume-on-use behavior in codeflare-pi.ts are runtime gate behavior with no dedicated automated test. -->
+**Status:** Implemented
 
 ---
 
@@ -1041,7 +1012,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1/AC6 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4) -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4, gh pr create metadata-lag base inference -> AC6) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -1049,12 +1020,12 @@ None.
 
 **Acceptance Criteria:**
 
-1. PR-boundary review fires only for open PRs targeting `main` or `master`. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
+1. For readable PR metadata, PR-boundary review fires only for open PRs targeting `main` or `master`; the `gh pr create` metadata-lag exception is limited to AC6. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 2. Local push detection recognises `git push` and `git -C <repo> push` across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 3. GitHub CLI detection recognises PR-head-moving operations: `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
-6. A pending review window is discarded only when the open PR has definitively moved on or closed; if the PR state cannot be read, the window is left intact for retry. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
+6. During a `gh pr create` metadata-visibility race, Pi may infer a protected base (`main` or `master`, including quoted CLI values or the default when no base is supplied) and synthesize an open PR from local HEAD; non-protected bases remain ignored. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prCreateBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prForBoundaryCommand -->
 7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode). <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject -->
 
 **Constraints:**
@@ -1065,7 +1036,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability)
 
-**Verification:** [Automated test](../../host/__tests__/git-push-review-reminder.test.js)
+**Verification:** [Automated test](../../host/__tests__/git-push-review-reminder.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1080,9 +1051,9 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (lane gating describe -> AC5 doc-updater sequencing + AC7 fix-push ack-pointer advancement) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial lane scheduling + AC5 doc-updater sequencing + AC6 review-base preservation + AC7 durable result-file gating) -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (agent-spawn enforcement describe -> AC4/AC5/AC6/AC7; lane gating describe -> AC1/AC2/AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial lane scheduling + AC5 doc-updater sequencing) -->
 
-**Intent:** Once a PR-boundary trigger fires (REQ-AGENT-036), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
+**Intent:** Once a PR-boundary trigger fires ([REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
 **Applies To:** User
 
@@ -1093,9 +1064,8 @@ None.
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
 4. The initial review wave starts `code-reviewer` and `spec-reviewer` together when both lanes are required. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewInitialLanes -->
 5. `doc-updater` starts only after `spec-reviewer` completes on SDD projects. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
-6. A fix-push cascade preserves the first unreviewed review base for cumulative review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
-7. Pi acknowledges a PR head only after durable result files exist for every required lane. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::completedDurableReviewLanes -->
-8. Review agents are dispatched with `run_in_background: true` so the main session stays interactive while reviewers run; the turn-end gate suppresses re-summoning PER LANE (each lane is demanded only when it was not spawned-after-push AND is not currently in flight), so a single slow lane still in flight never masks the demand for the other lanes (notably the sequential `doc-updater` follow-up after `spec-reviewer` completes). The in-flight tolerance is bounded by transcript recency (`IN_FLIGHT_STALE_LINES`): a spawn far behind the transcript tail with no completion marker is treated as orphaned and enforcement re-fires, so a crashed or killed review subagent cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-040 AC8 review dispatch is backgrounded with a bounded in-flight guard describe -> seeded enforce-review-spawn.sh carries lane_in_flight + IN_FLIGHT_STALE_LINES + run_in_background, and applies per-lane suppression with no blanket whole-gate exit) -->
+6. Review agents are dispatched with `run_in_background: true` so the main session stays interactive while reviewers run; the turn-end gate suppresses re-summoning per lane, so a single slow lane still in flight never masks the demand for other required lanes and never satisfies final acknowledgement without current-head completion. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::all_required_lanes_completed_for_current_head --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (suppresses an in-flight lane without masking missing peer lanes + does not ack while current-head lanes are still in flight) -->
+7. In-flight suppression is bounded by transcript recency: an uncompleted spawn that falls behind the transcript tail is treated as orphaned, demanded again, and cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (re-demands an orphaned in-flight lane after the transcript recency bound) -->
 
 **Constraints:**
 
@@ -1105,7 +1075,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** [Lane classifier tests](../../host/__tests__/lane-classifier.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1-AC7 lane classification + dispatch sequencing; AC8 background-dispatch + bounded in-flight guard via the seeded `enforce-review-spawn.sh` content assertion)
+**Verification:** [Lane classifier tests](../../host/__tests__/lane-classifier.test.js), [Stop-hook behavioral tests](../../host/__tests__/enforce-review-spawn.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1117,10 +1087,10 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1/AC2/AC3/AC4/AC5/AC6/AC7 + lane extension sources -> AC8) -->
-<!-- coverage-gap: AC8's lane-source selection is unit-tested via laneExtensionSources; the in-lane loading of codeflare-pi and the per-session global-graph-merge skip are runtime behaviors verified by integration smoke test, with no dedicated automated test. -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1/AC2/AC3/AC4/AC5/AC6 + lane extension sources -> AC7) -->
+<!-- coverage-gap: AC7's lane-source selection is unit-tested via laneExtensionSources; the in-lane loading of codeflare-pi and the per-session global-graph-merge skip are runtime behaviors verified by integration smoke test, with no dedicated automated test. -->
 
-**Intent:** Pi operators need consistent PR-boundary review output, a compact indication that internal durable lanes are active, and an automatic next-fix prompt when actionable findings remain.
+**Intent:** Pi operators need consistent PR-boundary review output, a compact indication that internal durable lanes are active, and an automatic next-fix prompt when actionable findings remain unless the user explicitly opts out for that round.
 
 **Applies To:** User
 
@@ -1130,10 +1100,9 @@ None.
 2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus -->
 3. Pi suppresses duplicate PR-boundary review result and summary announcements for the same repo, head, lane, and result path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
 4. After all required lanes complete, Pi publishes a merged chat summary instead of separate per-lane chat result blocks. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewSummaryMarkdown -->
-5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel -->
-6. The merged chat summary renders findings across code, spec, and documentation lanes sorted by criticality and does not require per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
-7. When completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; the next PR-boundary review uses the pushed fix diff. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix -->
-8. Durable PR-boundary review lanes additively load the graphify package (always when configured), the context-mode package (only when enabled in Pi settings), and the `codeflare-pi` guard extension (local-build blocker, attribution, graphify gate), while excluding the `review-enforcement` extension and the `@gotgenes/pi-subagents` package from the lane; `codeflare-pi`'s per-session global-graph merge is skipped inside lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
+5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes and renders findings sorted by criticality, without requiring per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
+6. When completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; if the latest explicit user directive says not to automatically fix/implement or to wait for approval, Pi presents the findings and waits instead. The next PR-boundary review uses the pushed fix diff when a fix pass runs. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
+7. Durable PR-boundary review lanes additively load the graphify package (always when configured), the context-mode package (only when enabled in Pi settings), and the `codeflare-pi` guard extension (local-build blocker, attribution, graphify gate), while excluding the `review-enforcement` extension and the `@gotgenes/pi-subagents` package from the lane; `codeflare-pi`'s per-session global-graph merge is skipped inside lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
 
 **Constraints:**
 
@@ -1178,32 +1147,68 @@ None.
 
 ---
 
-### REQ-AGENT-041: PR-Boundary Review Bypass Surfaces
+### REQ-AGENT-055: Pi PR-Boundary Review Window Advancement
 
-<!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/enforce-review-spawn.test.js (bypass 1: sentinel file + bypass 2: magic phrase + 3-strike circuit breaker describes -> AC1/AC2/AC3 user-only escape hatches with sticky-until-SHA-changes circuit) -->
+<!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC1/AC2/AC3/AC4/AC5) -->
 
-**Intent:** The user needs a small set of explicit, user-only escape hatches when a turn-end review gate would otherwise block legitimate work (hermetic tests, deliberate skip, repeated false-block). The assistant MUST NEVER trip these surfaces in its own output.
+**Intent:** Pi review enforcement must keep the merge gate attached to the first unreviewed PR window across reloads, retries, and fix-push cascades without losing findings from an earlier incomplete review.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. A user-creatable one-shot sentinel file bypasses the Stop-hook gate for a single turn; the sentinel is auto-deleted on use, never committed, and never survives container restart. The sentinel location is overridable for hermetic test environments.
-2. A magic phrase `skip review` or `skip verification` (case-insensitive, word-bounded) in any user message after the candidate push line in the transcript bypasses the gate for that push.
-3. A 3-strike circuit breaker exits silently after blocking the same un-acked PR HEAD SHA three times, sticky until the SHA changes.
-4. The assistant MUST NEVER create the sentinel file or write the magic phrase in its own output; both are explicitly user-only escape hatches.
+1. A pending review window is discarded when the readable PR has definitively closed, retargeted, or moved to an unrelated head. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
+2. If the PR state cannot be read, the pending review window is left intact for retry. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
+3. If the readable PR head advances to a descendant while review is still in flight, Pi rolls the review window forward instead of discarding it. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::rollForwardAdvancedReview -->
+4. A fix-push cascade preserves the first unreviewed review base for cumulative review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
+5. Pi does not use a remote-tracking previous head as a review base unless an explicit ack or completed previous review proves the earlier PR contents were already covered. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
 
 **Constraints:**
 
-- These bypass surfaces apply only to the turn-end gate (Stop hook); the in-turn nudge and trigger detection in REQ-AGENT-036 are unaffected.
+None.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-041: PR-Boundary Review Bypass Surfaces
+
+<!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::bypassAckHeadForStatus -->
+<!-- @test: host/__tests__/enforce-review-spawn.test.js (bypass 1: sentinel file + bypass 2: magic phrase + 3-strike circuit breaker describes -> AC1/AC2/AC3 user-only escape hatches with sticky-until-SHA-changes circuit) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-041 / REQ-AGENT-055: Pi review bypass acknowledges only the current live PR head -> AC1 Pi advanced-head acknowledgement) -->
+
+**Intent:** The user needs a small set of explicit, user-only escape hatches when a PR-boundary review gate would otherwise block legitimate work (hermetic tests, deliberate skip, repeated false-block). The assistant MUST NEVER trip these surfaces in its own output.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. A user-creatable one-shot sentinel file bypasses the current PR-boundary gate exactly once and is auto-deleted on use, never committed and never surviving a container restart: in Claude Stop-hook enforcement it bypasses without advancing the acknowledgement checkpoint, while in Pi native enforcement it acknowledges the current live protected PR HEAD rather than any stale or superseded pending state. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::BYPASS_FILE --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::acknowledgeBypass --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::bypassAckHeadForStatus -->
+2. A magic phrase `skip review` or `skip verification` (case-insensitive, word-bounded) in any user message after the candidate push line in the transcript bypasses the gate for that push.
+3. A 3-strike circuit breaker exits silently after blocking the same un-acked PR HEAD SHA three times, sticky until the SHA changes.
+4. The assistant MUST NEVER create the sentinel file or write the magic phrase in its own output; both are explicitly user-only escape hatches. The native runtime reinforces this for the sentinel half structurally: the review extension only tests for and deletes the sentinel on use, with no code path that creates it. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::acknowledgeBypass -->
+
+**Constraints:**
+
+- These bypass surfaces apply only to PR-boundary review gates; the in-turn nudge and trigger detection in [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions) are unaffected.
+- The bypass sentinel location is overridable for hermetic test environments.
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)
 
-**Verification:** [Automated test](../../host/__tests__/enforce-review-spawn.test.js)
+**Verification:** [Automated test](../../host/__tests__/enforce-review-spawn.test.js), [Pi bypass-head acknowledgement test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1322,9 +1327,9 @@ None.
 **Acceptance Criteria:**
 
 1. Every entry in `sdd/.init-triage.md` carries `**Context:**` (concrete evidence: file path + line range, git author of last meaningful change, commit SHA + subject, related tests, related PR numbers, related issue numbers, related release tags) and `**Recommendation:**` (the agent's specific best-guess answer) with `**Rationale:**` (one line tying the recommendation to specific Context evidence).
-2. Vague Context (no refs, no authors, no artifact numbers) and placeholder Recommendations (`TBD`, `(inferred)`, `unknown`) are rejected as malformed triage entries.
+2. The `/sdd init` skill instructs the agent to populate `**Context:**`, `**Recommendation:**`, and `**Rationale:**` for every entry; well-formedness (concrete Context refs, a specific Recommendation, no placeholders like `TBD`/`(inferred)`) is verified at the enforce pass, not by a programmatic parser gate.
 3. Triage entries use `**Status:** open | resolved | lost`; `lost` requires a one-line `**Reason:**` field explaining why the information is genuinely unrecoverable.
-4. While `sdd/.init-triage.md` contains any `Status: open` items, `sdd/config.yml` carries `transition: true` and the project is in SDD transition; during transition the entire review pipeline is suspended (code-reviewer, spec-reviewer, and doc-updater do not fire on any push or PR event) and `/sdd mode unleashed` is rejected with a message naming the open-item count.
+4. While `sdd/.init-triage.md` contains any `Status: open` items, `sdd/config.yml` carries `transition: true` and the project is in SDD transition; during transition the entire review pipeline is suspended (code-reviewer, spec-reviewer, and doc-updater do not fire on any push or PR event) and `/sdd mode unleashed` is rejected with a message naming the transition and the open triage items.
 5. When `enforce_tdd: false` (the Import Mode default), CLEAR REQs whose source code implements the AC default to `Status: Implemented` unconditionally so the project's opt-out from test-based verification is honored.
 6. When `enforce_tdd: true`, Status defaults `Implemented` only if a test file references the REQ ID, `Partial` otherwise.
 
@@ -1441,14 +1446,15 @@ None.
 1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep.
 2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package and native graphify skill override; MCP parity in Pi is optional and not required for the Pi graphify workflow.
 3. AC1 and AC2 hold across all paid tiers; the capability functions in sessions without context-mode preseeded because the agent-orchestrated `/graphify` skill keeps the main agent's context bounded via subagent chunking.
-4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while Pi prompts for AST-only or Full graph creation after clone and queries once `graphify-out/graph.json` exists. When Pi's packaged native graphify tool resolves the session cwd (`/home/user/workspace`) and reports `/home/user/workspace/graphify-out/graph.json` missing, the Codeflare Pi adapter retries `graphify_query`, `graphify_path`, and `graphify_explain` against `<active-repo>/graphify-out/graph.json` via the graphify CLI and returns the retry as the tool result.
+4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while Pi prompts for AST-only or Full graph creation after clone and answers queries against the active repository's `graphify-out/graph.json` once it exists.
 5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact. Pi tracks the same active repo from command-local `cd ... &&` and `git -C ...` forms, and its session context identifies the active repo by basename, checked-out branch, and HEAD prefix.
 6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
 
 **Constraints:**
 
 - The codeflare image uses the upstream graphify package without a fork.
-- The ambient MCP capability is available in every session mode; the graph-first agent discipline (REQ-AGENT-024) and active-repo tracking (AC5) are mode-gated to advanced.
+- When Pi's packaged native graphify tool resolves the session cwd (`/home/user/workspace`) and reports its `graphify-out/graph.json` missing, the Codeflare Pi adapter retries `graphify_query`, `graphify_path`, and `graphify_explain` against `<active-repo>/graphify-out/graph.json` via the graphify CLI and returns the retry as the tool result.
+- The ambient MCP capability is available in every session mode; the graph-first agent discipline ([REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)) and active-repo tracking (AC5) are mode-gated to advanced.
 - Per-branch graphs are not supported; users refresh the graph after a branch checkout.
 - Optional backend-provider and office extras are not installed by default; users who need them install upstream extras manually.
 - Preseed surfaces that invoke `graphify update` (prompts, skills, commands, hooks) call the bounded wrapper rather than the bare CLI, so a runaway rebuild cannot OOM-kill the container session. The Pi-owned wrapper fails closed: it aborts before running graphify if the target directory is missing, if the `RLIMIT_AS` cap cannot be applied, or if the `graphify` CLI is not on PATH, and it re-exports `GRAPHIFY_VIZ_NODE_LIMIT` so the HTML visualization is always generated even when the inherited env was scrubbed by a sandboxed exec.
@@ -1477,7 +1483,7 @@ None.
 <!-- @test: host/__tests__/preseed-graphify-discipline.test.js (rule + SKILL preseeded in advanced only → AC2/AC3) -->
 <!-- @test: host/__tests__/skill-graphify-content.test.js (SKILL contents → AC4/AC5/AC6) -->
 
-**Intent:** In advanced session mode, the agent is taught to prefer the knowledge graph over Grep-style text search for structural questions, so token cost on architecture, dependency, and call-flow questions is bounded. This REQ covers the SessionStart context injection, the preseeded rule and SKILL surface, and the soft-nudge PreToolUse hook. The hard-block enforcement lives in [REQ-AGENT-042](#req-agent-042-graphify-hard-block-enforcement); the `/graphify` build dispatch lives in [REQ-AGENT-043](#req-agent-043-graphify-build-mode-dispatch).
+**Intent:** In advanced session mode, the agent is taught to prefer the knowledge graph over Grep-style text search for structural questions, so token cost on architecture, dependency, and call-flow questions is bounded. This REQ covers the SessionStart context injection, the preseeded rule and SKILL surface, and the soft-nudge PreToolUse hook. Graph-first discipline is advisory only: there is no hard-block enforcement. The `/graphify` build dispatch lives in [REQ-AGENT-043](#req-agent-043-graphify-build-mode-dispatch).
 
 **Applies To:** Agent
 
@@ -1494,7 +1500,7 @@ None.
 **Constraints:**
 
 - The SessionStart hook never auto-builds a graph. It only injects context when one exists or a build suggestion when source files are present without one.
-- The soft-nudge hook never blocks; semantic judgment of whether a single grep is appropriate cannot be reliably made up-front. The hard-block in [REQ-AGENT-042](#req-agent-042-graphify-hard-block-enforcement) enforces a quantitative threshold (3 grep-class calls without a graph query), so the two layers compose: nudge on every call, block only when the pattern persists.
+- The soft-nudge hook never blocks; semantic judgment of whether a single grep is appropriate cannot be reliably made up-front. Graph-first discipline is advisory only (the preseeded rule plus the per-call nudge); a previous count-based hard-block was removed because it misfired on legitimate single-file searches the graph-first rule itself excludes.
 - The soft-nudge matcher set covers both the non-ctx tool surface (`Grep`/`Glob`) and the ctx grep-equivalents (`mcp__context-mode__ctx_search`/`mcp__context-mode__ctx_batch_execute`) because the context-mode enforcement hook denies `Grep`/`Glob`/`Read` in custom-tier sessions.
 
 **Priority:** P1
@@ -1502,40 +1508,6 @@ None.
 **Dependencies:** [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify)
 
 **Verification:** [Automated test](../../host/__tests__/entrypoint-graphify-hooks.test.js)
-
-**Status:** Implemented
-
----
-
-### REQ-AGENT-042: Graphify Hard-Block Enforcement
-
-<!-- @impl: preseed/agents/claude/plugins/graphify/scripts/enforce-graphify.sh -->
-<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
-<!-- @test: host/__tests__/enforce-graphify.test.js (3-call threshold + bypass surfaces + sentinel resolution → AC1-AC7) -->
-
-**Intent:** The graph-first soft-nudge in REQ-AGENT-024 informs but never blocks. When an agent ignores it across multiple calls, a hard-block hook denies further structural searches until a graph query is made, with explicit user-only bypass surfaces for legitimate edge cases.
-
-**Applies To:** Agent
-
-**Acceptance Criteria:**
-
-1. The hard-block hook fires on PreToolUse for `Grep`, `Bash`, `mcp__context-mode__ctx_execute`, `mcp__context-mode__ctx_batch_execute`, and `mcp__context-mode__ctx_execute_file` matchers in advanced session mode only.
-2. After 3 SEARCH-classified tool calls in one turn with no intervening `mcp__graphify__*` call (or `graphify query|path|explain` CLI invocation), the next SEARCH call is denied.
-3. SEARCH classification matches `grep|rg|ag|ack`, `git grep`, `find` with `-name|-path|-iname|-ipath|-regex`, and `awk` with `/regex/` body.
-4. The shell parser handles substitutions, heredocs, quoted regions, and pipeline segments so chained or embedded searches cannot slip past.
-5. Active-repo resolution reads the sentinel at `~/.cache/codeflare-hooks/graphify-active-cwd` (REQ-VAULT-004 AC1) and gates on `<active-repo>/graphify-out/graph.json` existing, falling back to the tool-call envelope `.cwd` when the sentinel is absent.
-6. The vault entry in `~/.graphify/global-graph.json` is NOT enforcement-eligible: a session whose active repo has no graph does not trigger the hard-block, so the user can grep freely in repos they have not yet graphified.
-7. Two user-only bypass surfaces are available: `touch /tmp/graphify-bypass` (one-shot, auto-deleted) and the magic phrase `skip graph` in a user message; any unexpected error inside the hook returns exit 0 so the user is never locked out.
-
-**Constraints:**
-
-- The codeflare session layout (every agent session has `cwd=~/workspace`, never inside a sub-repo) makes the sentinel the load-bearing signal; the envelope-cwd fallback exists for vanilla graphify usage outside codeflare.
-
-**Priority:** P1
-
-**Dependencies:** [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline), [REQ-VAULT-004](vault.md#req-vault-004-unified-global-graph-merges-vault-and-active-repos)
-
-**Verification:** [Automated test](../../host/__tests__/enforce-graphify.test.js)
 
 **Status:** Implemented
 
@@ -1571,9 +1543,9 @@ None.
 
 **Verification:** [Automated test](../../host/__tests__/skill-graphify-content.test.js)
 
-**Status:** Partial
+**Status:** Implemented
 
-<!-- coverage-gap: AC1-AC3 and AC6 are runtime behavioral checks not covered by the static SKILL.md content test. AC4-AC5 are verified by content test; AC7 is covered by the Pi seed/skill invariant test. -->
+<!-- coverage-gap: AC1-AC3 (interactive build-mode AskUserQuestion dialog) and AC6 (Part C merge preserves all Part B fields including hyperedges) are agent-behavioral and verified by manual check, not automatable in the Workers vitest pool. AC4-AC5 are verified by the SKILL.md content test; AC7 is covered by the Pi seed/skill invariant test. -->
 
 ---
 
@@ -1604,7 +1576,7 @@ None.
 
 **Verification:** [Automated test](../../host/__tests__/graphify-clone-prompt.test.js)
 
-**Status:** Partial
+**Status:** Implemented
 
 <!-- coverage-gap: Claude post-clone hook path is implemented and covered. Pi native codeflare-pi.ts implements clone triage through lifecycle events, but Pi-specific tool_execution_end arg-correlation, follow-up emission, same-session idempotency, and failed-clone suppression need dedicated behavioral coverage. -->
 
@@ -1630,7 +1602,7 @@ None.
 
 **Constraints:**
 
-- Per-repo ignore and merge-attribute wiring is the responsibility of the graphify skill (REQ-AGENT-024 AC5); this REQ covers only the platform-level pieces (sync exclusion, global merge-driver registration).
+- Per-repo ignore and merge-attribute wiring is the responsibility of the graphify skill ([REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline) AC5); this REQ covers only the platform-level pieces (sync exclusion, global merge-driver registration).
 
 **Priority:** P1
 
@@ -1655,7 +1627,7 @@ None.
 **Acceptance Criteria:**
 
 1. When the context-mode plugin is preseeded (effectiveTier `unlimited` plus advanced session mode), `graphify update .` and `graphify query ...` run unimpeded: context-mode is wired as a tool only (MCP server plus the indexing PreToolUse/PostToolUse hooks), with no Bash deny-gate, so no command-routing whitelist is needed. Any stale `enforce-ctx-mode.sh` deny-gate left in a pre-existing `settings.json` is stripped on container start by the managed-hooks prune regex.
-2. The REQ-AGENT-024 AC7 PreToolUse soft-nudge hook registers both the non-ctx matchers (`Grep`, `Glob`) and the ctx grep-equivalents (`mcp__context-mode__ctx_search`, `mcp__context-mode__ctx_batch_execute`) so the nudge fires in both tier paths.
+2. The [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline) AC7 PreToolUse soft-nudge hook registers both the non-ctx matchers (`Grep`, `Glob`) and the ctx grep-equivalents (`mcp__context-mode__ctx_search`, `mcp__context-mode__ctx_batch_execute`) so the nudge fires in both tier paths.
 
 **Constraints:**
 

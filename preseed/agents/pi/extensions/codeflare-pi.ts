@@ -11,13 +11,12 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { effectiveCwdForCommand, graphifyClonePromptDecision, isFailedToolExecution, renderGraphifyCloneDirective } from "./graphify-helpers";
 import { sddCommandDecision, type SddRepoState, SDD_HELP_TEXT } from "./sdd-helpers";
+import { attributionBlockReason, localBuildBlockReason } from "./guard-helpers";
 
 const CACHE_DIR = "/home/user/.cache/codeflare-hooks";
 const ACTIVE_REPO_FILE = join(CACHE_DIR, "graphify-active-cwd");
 const VAULT_ROOT = "/home/user/Vault";
 const GLOBAL_GRAPH_LOCK = "/tmp/graphify-global.lock";
-const GRAPHIFY_BYPASS = "/tmp/graphify-bypass";
-const LOCAL_BUILD_BYPASS = "/tmp/local-build-bypass";
 const PI_SETTINGS_FILE = "/home/user/.pi/agent/settings.json";
 const CONTEXT_MODE_PACKAGE = "npm:context-mode@1.0.151";
 const CONTEXT_MODE_PACKAGE_ID = "npm:context-mode";
@@ -134,10 +133,6 @@ function graphSummary(repo: string): string | undefined {
   }
 }
 
-function isStructuralSearch(command: string): boolean {
-  return /(^|[;&|]\s*)(rg|grep|ag|ack)\b/.test(command) || /(^|[;&|]\s*)git\s+grep\b/.test(command) || /(^|[;&|]\s*)find\b.*\s-(name|path|iname|ipath|regex)\b/.test(command) || /(^|[;&|]\s*)awk\b[^;&|]*\/.+\//.test(command);
-}
-
 function isGraphifyQuery(command: string): boolean {
   return /(^|[;&|]\s*)graphify\s+(query|path|explain)\b/.test(command);
 }
@@ -234,33 +229,6 @@ function isGitClone(command: string): boolean {
 
 function isGitPush(command: string): boolean {
   return /(^|[;&|]\s*)git\s+push\b/.test(command);
-}
-
-function ensureNoAttributedCommit(command: string): string | undefined {
-  if (!/(^|[;&|]\s*)(git\s+(commit|merge|tag|notes)|gh\s+(pr|issue|release)\s+\w+)\b/.test(command)) return undefined;
-  // Match the canonical block-attributed-commits.sh detection set: genuine attribution
-  // signatures only (co-author trailer, bot noreply email, generated-with footer, emoji,
-  // ChatGPT). Deliberately NOT bare model/product names ("claude code", "claude opus"):
-  // those false-positive on legitimate prose and on git/gh commands naming
-  // preseed/agents/claude/ paths.
-  if (/co-authored-by|noreply@anthropic|generated with[^\n]*claude|🤖|🧠|ChatGPT/i.test(command)) {
-    return "Codeflare blocks AI attribution in commits, PRs, issues, releases, and tags. Remove Co-Authored-By, generated-by text, model-name attribution, and emoji attribution.";
-  }
-  return undefined;
-}
-
-function ensureNoLocalBuild(command: string): string | undefined {
-  const isBuild = /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|dev)\b/.test(command)
-    || /\b(pytest|vitest|go\s+test|swift\s+test|cargo\s+test|tsc|eslint|oxlint|prettier|wrangler\s+dev)\b/.test(command);
-  if (!isBuild) return undefined;
-  // User-only escape hatch (consume-on-use), mirrors Claude's /tmp/local-build-bypass.
-  if (existsSync(LOCAL_BUILD_BYPASS)) {
-    try {
-      unlinkSync(LOCAL_BUILD_BYPASS);
-      return undefined;
-    } catch { /* could not consume the sentinel; keep blocking so a stuck file cannot permanently disable the gate */ }
-  }
-  return "Local builds/tests/linters/dev servers are blocked in the 1-CPU container. Push and verify with CI instead. User override: create /tmp/local-build-bypass.";
 }
 
 function sddRepoState(repo: string): SddRepoState {
@@ -389,8 +357,6 @@ function newestVaultMtime(): number | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
-  let searchCountThisTurn = 0;
-  let graphifyCountThisTurn = 0;
   const toolStartArgs = new Map<string, any>();
   const gatedToolIds = new Set<string>();
 
@@ -506,7 +472,6 @@ export default function (pi: ExtensionAPI) {
     const command = commandText(event);
 
     if (isGraphifyTool(toolName) || isGraphifyQuery(command)) {
-      graphifyCountThisTurn++;
       return;
     }
 
@@ -518,35 +483,19 @@ export default function (pi: ExtensionAPI) {
       try {
         updateActiveRepoFromPath(effectivePathForCommand(command, ctx.sessionManager.getCwd()));
       } catch { /* active-repo tracking must never block the tool */ }
-      const attributionReason = ensureNoAttributedCommit(command);
+      const attributionReason = attributionBlockReason(command);
       if (attributionReason) return { block: true, reason: attributionReason };
-      const buildReason = ensureNoLocalBuild(command);
+      const buildReason = localBuildBlockReason(command, { existsSync, unlinkSync });
       if (buildReason) return { block: true, reason: buildReason };
-    }
-
-    if (command && isStructuralSearch(command)) {
-      searchCountThisTurn++;
-      try {
-        if (existsSync(GRAPHIFY_BYPASS)) {
-          try {
-            unlinkSync(GRAPHIFY_BYPASS);
-            return;
-          } catch { /* could not consume the sentinel; fall through to the normal graph-first gate */ }
-        }
-        const repo = activeRepo(ctx);
-        if (repo && hasGraph(repo) && searchCountThisTurn >= 3 && graphifyCountThisTurn === 0) {
-          return { block: true, reason: `Graphify graph exists for ${basename(repo)}. Query graphify_query, graphify_path, or graphify_explain before more structural searches, or ask the user to create ${GRAPHIFY_BYPASS}.` };
-        }
-      } catch { /* fail open: never block a tool call on an internal gate error */ }
     }
   };
 
   // onToolStart is the pre-execution gate. Pi can surface one tool invocation as both
-  // `tool_call` and `tool_execution_start`; running the gate (with its consume-on-use bypass and
-  // per-turn counters) on both passes would double-count searches and consume a bypass on the
-  // first pass only to block on the second. Gate exactly once per invocation, keyed by tool id,
-  // while still gating tools that surface only one of the two events. Monotonic: this only
-  // suppresses a redundant second pass, it never skips gating an invocation.
+  // `tool_call` and `tool_execution_start`; running the build-block and attribution-block
+  // checks on both passes would evaluate them twice for a single invocation. Gate exactly
+  // once per invocation, keyed by tool id, while still gating tools that surface only one of
+  // the two events. Monotonic: this only suppresses a redundant second pass, it never skips
+  // gating an invocation.
   pi.on("tool_call", (event: any, ctx: any) => {
     const id = toolEventId(event);
     if (id) gatedToolIds.add(id);
@@ -592,8 +541,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_execution_end", (event: any, ctx: any) => onToolEnd(withStartArgs(event), ctx));
 
   pi.on("agent_end", (_event, _ctx) => {
-    searchCountThisTurn = 0;
-    graphifyCountThisTurn = 0;
     gatedToolIds.clear();
   });
 }

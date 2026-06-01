@@ -1,5 +1,21 @@
 export const ALL_REVIEW_LANES = ["code-reviewer", "spec-reviewer", "doc-updater"];
 
+export function isGhPrCreateCommand(command: string): boolean {
+  return /(^|[;&|]\s*)gh\s+pr\s+create\b/.test(command);
+}
+
+export function ghPrCreateBase(command: string): string | undefined {
+  const match = command.match(/(?:^|\s)(?:--base|-B)(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._\/-]+))/);
+  return match?.[1] || match?.[2] || match?.[3];
+}
+
+export function prCreateBoundaryBase(command: string, knownBase?: string): string | undefined {
+  if (!isGhPrCreateCommand(command)) return undefined;
+  const base = ghPrCreateBase(command) || knownBase || "";
+  if (base && base !== "main" && base !== "master") return undefined;
+  return base || "main";
+}
+
 export function isPrBoundaryCommand(command: string): boolean {
   return /(^|[;&|]\s*)git(?:\s+-C\s+\S+)?\s+push\b/.test(command)
     || /(^|[;&|]\s*)gh\s+repo\s+sync\b/.test(command)
@@ -10,7 +26,13 @@ export function isFailedToolExecution(event: any): boolean {
   return event?.isError === true || event?.error === true || String(event?.status ?? "").toLowerCase() === "error";
 }
 
-export type ReviewHeadStatus = "current" | "stale" | "unknown";
+export type ReviewHeadStatus = "current" | "advanced" | "stale" | "unknown";
+
+export function bypassAckHeadForStatus(params: { status: ReviewHeadStatus; pendingHead: string; currentHead?: string }): string | undefined {
+  if (params.status === "current") return params.pendingHead;
+  if (params.status === "advanced") return params.currentHead || undefined;
+  return undefined;
+}
 
 // Decide whether a pending review window still applies to the live PR head.
 // Critically separates a PR that has definitively moved on / closed ("stale",
@@ -24,10 +46,16 @@ export function classifyReviewHead(params: {
   prOpenAtBase: boolean;
   prHead: string | undefined;
   prQueryFailed: boolean;
+  localHeadDescendsFromPending?: boolean;
+  prHeadDescendsFromPending?: boolean;
 }): ReviewHeadStatus {
   if (params.localHead === params.pendingHead) return "current";
   if (params.prQueryFailed) return "unknown";
-  if (params.prOpenAtBase && params.prHead === params.pendingHead) return "current";
+  if (params.prOpenAtBase) {
+    if (params.prHead === params.pendingHead) return "current";
+    if (params.prHead) return params.prHeadDescendsFromPending ? "advanced" : "stale";
+    if (params.localHead && params.localHeadDescendsFromPending) return "advanced";
+  }
   return "stale";
 }
 
@@ -97,7 +125,10 @@ export function selectReviewBase(params: {
 }): string | undefined {
   const priorIncomplete = params.previous?.lanes.some((lane) => !params.previous?.completed.includes(lane));
   if (priorIncomplete) return params.previous?.reviewBase;
-  return params.previous?.head || params.lastAck || params.previousRemoteHead;
+  // A remote-tracking reflog entry is only an optimization hint, not proof that
+  // everything before it was reviewed. If no explicit ack or completed previous
+  // review exists, return undefined so the next review covers the full PR diff.
+  return params.previous?.head || params.lastAck;
 }
 
 export function classifyReviewFiles(files: string[] | undefined): string[] | undefined {

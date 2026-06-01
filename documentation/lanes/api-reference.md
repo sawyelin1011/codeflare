@@ -64,8 +64,8 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 |--------|----------|------|------------|-------------|
 | POST | `/api/container/start` | Session cookie | [REQ-SESSION-007](../../sdd/spec/session-lifecycle.md#req-session-007-running-session-count-limited-per-tier) | Start container (non-blocking) |
 | POST | `/api/container/destroy` | Session cookie | [REQ-SESSION-014](../../sdd/spec/session-lifecycle.md#req-session-014-user-configurable-auto-sleep-timeout-in-settings) | Destroy container (SIGKILL) |
-| GET | `/api/container/startup-status` | Session cookie | [REQ-SESSION-007](../../sdd/spec/session-lifecycle.md#req-session-007-running-session-count-limited-per-tier), [REQ-OPS-006](../../sdd/spec/operations.md#req-ops-006-idle-containers-hibernate-and-cost-zero) | Poll startup progress |
-| GET | `/api/container/health` | Session cookie | [REQ-OPS-006](../../sdd/spec/operations.md#req-ops-006-idle-containers-hibernate-and-cost-zero) | Health check |
+| GET | `/api/container/startup-status` | Session cookie | [REQ-SESSION-017](../../sdd/spec/session-lifecycle.md#req-session-017-container-health-and-startup-status-api) AC2, AC3 | Poll startup progress |
+| GET | `/api/container/health` | Session cookie | [REQ-SESSION-017](../../sdd/spec/session-lifecycle.md#req-session-017-container-health-and-startup-status-api) AC1 | Health check |
 
 ### Terminal
 
@@ -78,10 +78,10 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 | Method | Endpoint | Auth | Implements | Description |
 |--------|----------|------|------------|-------------|
-| GET | `/api/user` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-018](../../sdd/spec/authentication.md#req-auth-018-user-management-admin-panel) | Authenticated user info (includes `onboardingActive`, `onboardingComplete`) |
-| POST | `/api/user/onboarding-complete` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-006](../../sdd/spec/authentication.md#req-auth-006-user-email-normalized) | Mark guided setup as visited (sets KV flag) |
-| GET | `/api/user/r2-status` | Session cookie (admin-only routes require admin role) | [REQ-STOR-001](../../sdd/spec/storage.md#req-stor-001-dedicated-per-user-r2-bucket) | R2 credential status for current user |
-| POST | `/api/user/ensure-r2-token` | Session cookie (admin-only routes require admin role) | [REQ-STOR-001](../../sdd/spec/storage.md#req-stor-001-dedicated-per-user-r2-bucket) | Create scoped R2 token if missing (rate limited) |
+| GET | `/api/user` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-019](../../sdd/spec/authentication.md#req-auth-019-user-identity-and-account-status-api) AC1 | Authenticated user info (includes `onboardingActive`, `onboardingComplete`) |
+| POST | `/api/user/onboarding-complete` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-019](../../sdd/spec/authentication.md#req-auth-019-user-identity-and-account-status-api) AC2 | Mark guided setup as visited (sets KV flag) |
+| GET | `/api/user/r2-status` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-019](../../sdd/spec/authentication.md#req-auth-019-user-identity-and-account-status-api) AC3 | R2 credential status for current user |
+| POST | `/api/user/ensure-r2-token` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-019](../../sdd/spec/authentication.md#req-auth-019-user-identity-and-account-status-api) AC4, AC6 | Create scoped R2 token if missing (rate limited) |
 | GET | `/api/users` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-018](../../sdd/spec/authentication.md#req-auth-018-user-management-admin-panel) | List allowed users (admin only) |
 | DELETE | `/api/users/:email` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-018](../../sdd/spec/authentication.md#req-auth-018-user-management-admin-panel) | Remove allowed user (admin only) |
 | PATCH | `/api/users/:email` | Session cookie (admin-only routes require admin role) | [REQ-AUTH-018](../../sdd/spec/authentication.md#req-auth-018-user-management-admin-panel), [REQ-SUB-009](../../sdd/spec/subscription.md#req-sub-009-admin-configurable-tiers-via-management-panel) | Update user tier/role (admin only) |
@@ -118,9 +118,9 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 |--------|----------|------|------------|-------------|
 | POST | `/api/billing/checkout` | Session cookie | [REQ-SUB-003](../../sdd/spec/subscription.md#req-sub-003-free-tier-requires-no-payment), [REQ-SUB-004](../../sdd/spec/subscription.md#req-sub-004-paid-tiers-integrate-with-stripe-checkout) | Create Stripe Checkout Session for paid tier (rate-limited 5/min) |
 | GET | `/api/billing/status` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching), [REQ-SUB-018](../../sdd/spec/subscription.md#req-sub-018-usage-dashboard-page) | Live billing state from Stripe (subscription, period, status) |
-| POST | `/api/billing/portal` | Session cookie | [REQ-SUB-011](../../sdd/spec/subscription.md#req-sub-011-graceful-degradation-without-stripe) | Create Stripe Customer Portal session (rate-limited 5/min) |
-| POST | `/api/billing/switch` | Session cookie | [REQ-SUB-011](../../sdd/spec/subscription.md#req-sub-011-graceful-degradation-without-stripe) | Deep-link portal for plan change confirmation (rate-limited 5/min) |
-| POST | `/public/stripe/webhook` | Session cookie | [REQ-SUB-005](../../sdd/spec/subscription.md#req-sub-005-trial-is-compute-based-not-time-based), [REQ-SUB-015](../../sdd/spec/subscription.md#req-sub-015-stripe-webhook-signal-and-sync-pattern), [REQ-SUB-021](../../sdd/spec/subscription.md#req-sub-021-billing-cycle-alignment) | Stripe webhook handler (unauthenticated, HMAC-verified, rate-limited 100/min) |
+| POST | `/api/billing/portal` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching) | Create Stripe Customer Portal session (rate-limited 5/min) |
+| POST | `/api/billing/switch` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching) | Deep-link portal for plan change confirmation (rate-limited 5/min) |
+| POST | `/public/stripe/webhook` | None (Stripe HMAC) | [REQ-SUB-005](../../sdd/spec/subscription.md#req-sub-005-trial-is-compute-based-not-time-based), [REQ-SUB-015](../../sdd/spec/subscription.md#req-sub-015-stripe-webhook-signal-and-sync-pattern), [REQ-SUB-021](../../sdd/spec/subscription.md#req-sub-021-billing-cycle-alignment) | Stripe webhook handler (unauthenticated, HMAC-verified, rate-limited 100/min) |
 
 ### Deploy Keys
 
@@ -150,7 +150,7 @@ The setup wizard configures a fresh Codeflare deployment. It provisions Cloudfla
 | GET | `/api/setup/detect-token` | Public (pre-setup); admin (post-setup) | [REQ-SETUP-005](../../sdd/spec/setup.md#req-setup-005-post-setup-reconfiguration-requires-admin-auth), [REQ-SETUP-008](../../sdd/spec/setup.md#req-setup-008-setup-helper-endpoints-support-prefill-and-detection) | Detect and verify the Cloudflare API token |
 | GET | `/api/setup/prefill` | Public (pre-setup); admin (post-setup) | [REQ-SETUP-005](../../sdd/spec/setup.md#req-setup-005-post-setup-reconfiguration-requires-admin-auth), [REQ-SETUP-008](../../sdd/spec/setup.md#req-setup-008-setup-helper-endpoints-support-prefill-and-detection) | Prefill setup form from existing Access groups |
 
-Conditional auth: before `setup:complete` is set in KV, every Setup endpoint except `/api/setup/status` is publicly reachable through the CSRF-gated bootstrap window (see AD10). Once setup is marked complete, the same endpoints require an admin-role session.
+Conditional auth: before `setup:complete` is set in KV, every Setup endpoint except `/api/setup/status` is publicly reachable through the CSRF-gated bootstrap window (see [AD10](../decisions/README.md#ad10-bootstrap-window-pre-setup-endpoints-csrf-and-worker-name-derivation)). Once setup is marked complete, the same endpoints require an admin-role session.
 
 #### When Setup Runs
 
@@ -237,7 +237,7 @@ Runs only when reconfiguring and the new `allowedUsers` list has removed previou
 5. Stores Access configuration in KV (audience tag, group IDs, auth domain).
 
 **When GitHub OIDC IS configured** (`SAAS_MODE=active` + `OAUTH_CLIENT_ID`):
-CF Access groups and policies are not created — the Worker handles authentication directly via GitHub OAuth session cookies. Admin users created via allowedUsers are assigned the Custom tier automatically.
+CF Access groups and policies are not created - the Worker handles authentication directly via GitHub OAuth session cookies. Admin users created via allowedUsers are assigned the Custom tier automatically.
 
 **Step 6 -- `configure_turnstile` (conditional)**
 
@@ -418,7 +418,7 @@ Checks whether `CLOUDFLARE_API_TOKEN` is present in the environment, verifies it
 
 Best-effort prefill for the setup form. Reads existing admin and user lists from Cloudflare Access groups (scoped by worker name). Does not prefill the custom domain.
 
-In SaaS mode, returns empty arrays — admin enters everything manually.
+In SaaS mode, returns empty arrays - admin enters everything manually.
 
 ```json
 {"adminUsers": ["alice@example.com"], "allowedUsers": ["bob@example.com"]}
@@ -460,13 +460,13 @@ GET `/api/presets`, POST `/api/presets`, PATCH `/api/presets/:id` (rename), DELE
 
 GET `/api/preferences`, PATCH `/api/preferences`
 
-`UserPreferences` fields: `lastAgentType` (AgentType, optional — last selected agent), `lastPresetId` (string, optional — last used preset), `workspaceSyncEnabled` (boolean, default: `false` — workspace sync toggle, disabled by default), `fastStartEnabled` (boolean, default: `true` — fast CLI start toggle), `sessionMode` (SessionMode, optional — default/advanced), `sleepAfter` (SleepAfterOption, optional — auto-sleep duration, see [Auto-sleep](container.md#auto-sleep-configurable-sleepafter)), `userTimezone` (string, optional — valid IANA timezone, max 64 chars; validated via `Intl.DateTimeFormat` round-trip, invalid zones return `ValidationError`; persisted to DO storage and forwarded to the container as `USER_TIMEZONE` env var so memory-capture filenames reflect the user's local time; takes effect on next session start — see [REQ-SESSION-016](../../sdd/spec/session-lifecycle.md#req-session-016-user-timezone-propagated-from-preferences-to-container-env) and [REQ-MEM-001](../../sdd/spec/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault) AC9). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](container.md#fast-start). **Side effect:** when `sessionMode` changes, `PATCH /api/preferences` calls `reconcileAgentConfigs(overwrite: true, cleanup: true)` to seed the correct preseed set for the new mode. Non-fatal — failure does not block the preference save. Implements [REQ-AGENT-004](../../sdd/spec/agents.md#req-agent-004-two-session-modes-standard-and-pro) AC4-AC5. `lastPreseedHash` (string, optional - SHA-256 prefix of preseed content at last successful reconcile; compared against the build-time preseed content hash on dashboard load to detect release upgrades; see [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release)).
+`UserPreferences` fields: `lastAgentType` (AgentType, optional - last selected agent), `lastPresetId` (string, optional - last used preset), `workspaceSyncEnabled` (boolean, default: `false` - workspace sync toggle, disabled by default), `fastStartEnabled` (boolean, default: `true` - fast CLI start toggle), `sessionMode` (SessionMode, optional - default/advanced), `sleepAfter` (SleepAfterOption, optional - auto-sleep duration, see [Auto-sleep](container.md#auto-sleep-configurable-sleepafter)), `userTimezone` (string, optional - valid IANA timezone, max 64 chars; validated via `Intl.DateTimeFormat` round-trip, invalid zones return `ValidationError`; persisted to DO storage and forwarded to the container as `USER_TIMEZONE` env var so memory-capture filenames reflect the user's local time; takes effect on next session start - see [REQ-SESSION-016](../../sdd/spec/session-lifecycle.md#req-session-016-user-timezone-propagated-from-preferences-to-container-env) and [REQ-MEM-001](../../sdd/spec/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault) AC9). The `fastStartEnabled` preference maps to `FAST_CLI_START` env var in the container DO -- see [Fast Start](container.md#fast-start). **Side effect:** when `sessionMode` changes, `PATCH /api/preferences` calls `reconcileAgentConfigs(overwrite: true, cleanup: true)` to seed the correct preseed set for the new mode. Non-fatal - failure does not block the preference save. Implements [REQ-AGENT-004](../../sdd/spec/agents.md#req-agent-004-two-session-modes-standard-and-pro) AC4-AC5. `lastPreseedHash` (string, optional - SHA-256 prefix of preseed content at last successful reconcile; compared against the build-time preseed content hash on dashboard load to detect release upgrades; see [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release)).
 
 ### LLM API Keys
 
-GET `/api/llm-keys` — returns masked keys (`****` + last 4 chars), never full keys.
-PUT `/api/llm-keys` — set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys. When `ENCRYPTION_KEY` is set, values are encrypted with AES-256-GCM before KV storage.
-DELETE `/api/llm-keys` — removes all LLM keys from KV.
+GET `/api/llm-keys` - returns masked keys (`****` + last 4 chars), never full keys.
+PUT `/api/llm-keys` - set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys. When `ENCRYPTION_KEY` is set, values are encrypted with AES-256-GCM before KV storage.
+DELETE `/api/llm-keys` - removes all LLM keys from KV.
 
 Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`. The LLM Keys accordion in Settings is only visible when the user can use advanced mode (`canUseAdvanced()`) AND has selected advanced session mode (`currentSessionMode() === 'advanced'`). Admins always qualify for advanced mode but must still select it.
 
@@ -478,7 +478,7 @@ GET `/public/onboarding-config`, POST `/public/waitlist` (rate limited)
 
 | Method | Endpoint | Auth | Implements | Description |
 |--------|----------|------|------------|-------------|
-| GET | `/health` | None (auth-exempt — no `CONTAINER_AUTH_TOKEN` required) | [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) AC1, AC2 | Direct host health check; available before CONTAINER_AUTH_TOKEN is wired up |
+| GET | `/health` | None (auth-exempt - no `CONTAINER_AUTH_TOKEN` required) | [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) AC1, AC2 | Direct host health check; available before CONTAINER_AUTH_TOKEN is wired up |
 | GET | `/api/health` | Session cookie | [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) AC1, AC2 | Worker-proxied alias for `/health` |
 
 Both endpoints return the same JSON body:
@@ -500,9 +500,9 @@ Both endpoints return the same JSON body:
 }
 ```
 
-**`initFlagObserved`** — `true` once the server has seen `/tmp/codeflare-init-complete` written by `entrypoint.sh` at the end of R2 sync. A session where `prewarmReady: false` and `initFlagObserved: false` indicates the init-complete flag was never written (sync hung, `jq` merge failed, etc.). See [Container Startup](container.md#startup-sequence) and [Troubleshooting](troubleshooting.md#container-stuck-at-waiting-for-services).
+**`initFlagObserved`** - `true` once the server has seen `/tmp/codeflare-init-complete` written by `entrypoint.sh` at the end of R2 sync. A session where `prewarmReady: false` and `initFlagObserved: false` indicates the init-complete flag was never written (sync hung, `jq` merge failed, etc.). See [Container Startup](container.md#startup-sequence) and [Troubleshooting](troubleshooting.md#container-stuck-at-waiting-for-services).
 
-**`prewarmReady`** — `true` once the tab-1 PTY session has produced its first output (pre-warm complete).
+**`prewarmReady`** - `true` once the tab-1 PTY session has produced its first output (pre-warm complete).
 
 ---
 
@@ -510,3 +510,52 @@ Both endpoints return the same JSON body:
 - [Authentication](authentication.md#three-tier-auth-middleware) - Auth middleware details
 - [Security](security.md#rate-limiting) - Rate limits per endpoint
 - [Configuration](configuration.md#worker-environment) - Environment variables
+
+---
+
+## Specification Coverage
+
+- [REQ-AGENT-004](../../sdd/spec/agents.md#req-agent-004-two-session-modes-standard-and-pro) - Two Session Modes: Standard and Pro
+- [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token) - Deploy Credential Storage (GitHub PAT, CF API Token)
+- [REQ-AGENT-011](../../sdd/spec/agents.md#req-agent-011-agent-skills-rules-manually-recreatable-from-settings) - Agent Skills & Rules Manually Recreatable from Settings
+- [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push-deploy-credential-management-ui) - Push & Deploy credential management UI
+- [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release) - Auto-upgrade preseed on release
+- [REQ-AUTH-002](../../sdd/spec/authentication.md#req-auth-002-saas-mode-uses-direct-github-oauth) - SaaS mode uses Direct GitHub OAuth
+- [REQ-AUTH-006](../../sdd/spec/authentication.md#req-auth-006-user-email-normalized) - User email normalized
+- [REQ-AUTH-008](../../sdd/spec/authentication.md#req-auth-008-session-cookie-auto-refresh) - Session cookie auto-refresh
+- [REQ-AUTH-018](../../sdd/spec/authentication.md#req-auth-018-user-management-admin-panel) - User management admin panel
+- [REQ-AUTH-019](../../sdd/spec/authentication.md#req-auth-019-user-identity-and-account-status-api) - User identity and account-status API
+- [REQ-MEM-001](../../sdd/spec/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault) - Conversation context automatically captured to vault
+- [REQ-OPS-006](../../sdd/spec/operations.md#req-ops-006-idle-containers-hibernate-and-cost-zero) - Idle containers hibernate and cost zero
+- [REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure) - Rate-limiting infrastructure
+- [REQ-SEC-013](../../sdd/spec/security.md#req-sec-013-content-disposition-hardening-on-downloads) - Content-Disposition hardening on downloads
+- [REQ-SESSION-001](../../sdd/spec/session-lifecycle.md#req-session-001-session-creation-with-name-and-agent-type) - Session creation with name and agent type
+- [REQ-SESSION-006](../../sdd/spec/session-lifecycle.md#req-session-006-user-can-stop-restart-and-delete-sessions) - User can stop, restart, and delete sessions
+- [REQ-SESSION-007](../../sdd/spec/session-lifecycle.md#req-session-007-running-session-count-limited-per-tier) - Running session count limited per tier
+- [REQ-SESSION-010](../../sdd/spec/session-lifecycle.md#req-session-010-session-status-observable-from-dashboard) - Session status observable from dashboard
+- [REQ-SESSION-012](../../sdd/spec/session-lifecycle.md#req-session-012-wake-loop-prevention) - Wake-loop prevention
+- [REQ-SESSION-014](../../sdd/spec/session-lifecycle.md#req-session-014-user-configurable-auto-sleep-timeout-in-settings) - User-configurable auto-sleep timeout in Settings
+- [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) - Container Port-Readiness Gating with Pre-Warm Pre-Condition
+- [REQ-SESSION-016](../../sdd/spec/session-lifecycle.md#req-session-016-user-timezone-propagated-from-preferences-to-container-env) - User timezone propagated from preferences to container env
+- [REQ-SESSION-017](../../sdd/spec/session-lifecycle.md#req-session-017-container-health-and-startup-status-api) - Container health and startup-status API
+- [REQ-SETUP-001](../../sdd/spec/setup.md#req-setup-001-first-time-setup-requires-zero-pre-configuration) - First-time setup requires zero pre-configuration
+- [REQ-SETUP-005](../../sdd/spec/setup.md#req-setup-005-post-setup-reconfiguration-requires-admin-auth) - Post-setup reconfiguration requires admin auth
+- [REQ-SETUP-008](../../sdd/spec/setup.md#req-setup-008-setup-helper-endpoints-support-prefill-and-detection) - Setup helper endpoints support prefill and detection
+- [REQ-SETUP-012](../../sdd/spec/setup.md#req-setup-012-setup-wizard-step-sequence) - Setup wizard step sequence
+- [REQ-STOR-006](../../sdd/spec/storage.md#req-stor-006-storage-quota-enforced-per-tier-at-session-start) - Storage Quota Enforced Per Tier at Session Start
+- [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser) - Web File Browser
+- [REQ-STOR-008](../../sdd/spec/storage.md#req-stor-008-multipart-upload-for-large-files) - Multipart Upload for Large Files
+- [REQ-STOR-009](../../sdd/spec/storage.md#req-stor-009-getting-started-docs-auto-seeded-on-first-session) - Getting-Started Docs Auto-Seeded on First Session
+- [REQ-STOR-014](../../sdd/spec/storage.md#req-stor-014-r2-storage-stats-caching) - R2 Storage Stats Caching
+- [REQ-SUB-003](../../sdd/spec/subscription.md#req-sub-003-free-tier-requires-no-payment) - Free Tier Requires No Payment
+- [REQ-SUB-004](../../sdd/spec/subscription.md#req-sub-004-paid-tiers-integrate-with-stripe-checkout) - Paid Tiers Integrate with Stripe Checkout
+- [REQ-SUB-005](../../sdd/spec/subscription.md#req-sub-005-trial-is-compute-based-not-time-based) - Trial Is Compute-Based, Not Time-Based
+- [REQ-SUB-009](../../sdd/spec/subscription.md#req-sub-009-admin-configurable-tiers-via-management-panel) - Admin-Configurable Tiers via Management Panel
+- [REQ-SUB-011](../../sdd/spec/subscription.md#req-sub-011-graceful-degradation-without-stripe) - Graceful Degradation Without Stripe
+- [REQ-SUB-015](../../sdd/spec/subscription.md#req-sub-015-stripe-webhook-signal-and-sync-pattern) - Stripe Webhook Signal-and-Sync Pattern
+- [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching) - Customer Portal and Plan Switching
+- [REQ-SUB-018](../../sdd/spec/subscription.md#req-sub-018-usage-dashboard-page) - Usage dashboard page
+- [REQ-SUB-021](../../sdd/spec/subscription.md#req-sub-021-billing-cycle-alignment) - Billing Cycle Alignment
+- [REQ-TERM-001](../../sdd/spec/terminal.md#req-term-001-up-to-6-terminal-tabs-per-session) - Up to 6 terminal tabs per session
+- [REQ-TERM-002](../../sdd/spec/terminal.md#req-term-002-websocket-connection-to-container-pty) - WebSocket connection to container PTY
+- [REQ-TERM-004](../../sdd/spec/terminal.md#req-term-004-close-code-4503-is-authoritative-no-retry) - Close code 4503 is authoritative (no retry)

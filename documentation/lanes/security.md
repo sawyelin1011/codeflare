@@ -21,7 +21,6 @@ For authentication modes and user identity flow, see [Authentication](authentica
 - [Security Headers](#security-headers)
 - [Session ID Validation](#session-id-validation)
 - [Static-Analyzer False Positives](#static-analyzer-false-positives)
-- [Context-Mode Enforcement Bypass](#context-mode-enforcement-bypass)
 - [Body Limit](#body-limit)
 - [Credential Encryption at Rest](#credential-encryption-at-rest)
 - [Rate Limiting](#rate-limiting)
@@ -38,7 +37,7 @@ The `CLOUDFLARE_API_TOKEN` never enters the container. It stays in the Worker/DO
 
 **Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `r2-admin.ts` (called from `lifecycle.ts`), which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` (encrypted via AES-256-GCM when `ENCRYPTION_KEY` is set) and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
 
-**R2 token verification:** Cached tokens are validated before use via `verifyTokenExists()` in `r2-admin.ts`. This calls `GET /accounts/{accountId}/tokens/{tokenId}` through the circuit breaker. Only a 404 response (token definitively deleted) invalidates the cache and triggers fresh token creation. Transient errors (429, 500, 502, network errors, circuit breaker open) assume the token is still valid — this prevents a Cloudflare API blip from unnecessarily deleting a valid KV entry and causing rclone 401 errors. The verification runs on every `getOrCreateScopedR2Token()` cache hit.
+**R2 token verification:** Cached tokens are validated before use via `verifyTokenExists()` in `r2-admin.ts`. This calls `GET /accounts/{accountId}/tokens/{tokenId}` through the circuit breaker. Only a 404 response (token definitively deleted) invalidates the cache and triggers fresh token creation. Transient errors (429, 500, 502, network errors, circuit breaker open) assume the token is still valid - this prevents a Cloudflare API blip from unnecessarily deleting a valid KV entry and causing rclone 401 errors. The verification runs on every `getOrCreateScopedR2Token()` cache hit.
 
 ## Container Auth Token (REQ-SEC-012)
 
@@ -56,21 +55,21 @@ Two types of R2 credentials serve different purposes:
 - Created during `POST /configure` step 2 (`handleDeriveR2Credentials`)
 - `R2_ACCESS_KEY_ID` = API token ID (from `/user/tokens/verify`)
 - `R2_SECRET_ACCESS_KEY` = SHA-256(API token value)
-- Stored as worker secrets — used for bucket admin operations (create, empty, delete)
+- Stored as worker secrets - used for bucket admin operations (create, empty, delete)
 - If API token rotated, must re-run setup to regenerate
 
 **Per-user scoped R2 tokens** (first login):
 - Created via `getOrCreateScopedR2Token()` in `src/routes/container/lifecycle.ts`
 - Calls `POST /accounts/{accountId}/tokens` with bucket-specific Object Read + Write policy
 - Token ID = S3 Access Key ID, SHA-256(token value) = S3 Secret Access Key
-- Cached in KV as `r2token:{email}` — survives container restarts
+- Cached in KV as `r2token:{email}` - survives container restarts
 - Passed to container via `setBucketName` → container env vars → rclone config
 - Revoked via `deleteScopedR2Token()` on user deletion
 - Requires `API Tokens: Edit` permission on the deploy token
 
 ## Graceful Shutdown
 
-`STOPSIGNAL SIGINT` in the Dockerfile. The `entrypoint.sh` trap handler catches SIGINT/SIGTERM, kills the sync daemon via PID file at `/tmp/sync-daemon.pid` (PID file is the sole mechanism — no in-memory PID variable fallback), runs a final `rclone bisync` (with `--ignore-checksum --max-delete 100`) to R2, and kills the terminal server. The bisync-initialized flag is touched on the timeout path as well (was previously missing, which caused shutdown to skip final bisync when initial sync timed out). This ensures no data loss on container stop.
+`STOPSIGNAL SIGINT` in the Dockerfile. The `entrypoint.sh` trap handler catches SIGINT/SIGTERM, kills the sync daemon via PID file at `/tmp/sync-daemon.pid` (PID file is the sole mechanism - no in-memory PID variable fallback), runs a final `rclone bisync` (with `--ignore-checksum --max-delete 100`) to R2, and kills the terminal server. The bisync-initialized flag is touched on the timeout path as well (was previously missing, which caused shutdown to skip final bisync when initial sync timed out). This ensures no data loss on container stop.
 
 ## Security Hardening (Pre-Launch Review)
 
@@ -78,9 +77,9 @@ Fixes from 6 rounds of automated code review before 1500-user launch:
 
 **Auth bypass prevention (CF-005):** `authConfigFetched` boolean sentinel in `access.ts` prevents KV transient errors from permanently degrading a post-setup deployment to the pre-setup header-trust model. Once KV auth config has been successfully fetched with real data (auth domain + aud), the pre-setup fallback that trusts `cf-access-authenticated-user-email` headers is permanently disabled for the isolate's lifetime. `resetAuthConfigCache()` clears the sentinel.
 
-**STRESS_TEST_MODE enforcement (CF-001):** Global middleware in `src/index.ts` returns 503 when both `SAAS_MODE=active` and `STRESS_TEST_MODE=active` — a hard block, not just a warning. `STRESS_TEST_MODE` is only valid in integration/staging (where `SAAS_MODE` is unset); the rate-limit middleware also logs a one-time warning per isolate when the bypass activates, but production safety relies on the 503 here. See [REQ-OPS-008](../../sdd/spec/operations.md#req-ops-008-stress-testing-validates-rate-limits-and-concurrency) (AC6).
+**STRESS_TEST_MODE enforcement (CF-001):** Global middleware in `src/index.ts` returns 503 when both `SAAS_MODE=active` and `STRESS_TEST_MODE=active` - a hard block, not just a warning. `STRESS_TEST_MODE` is only valid in integration/staging (where `SAAS_MODE` is unset); the rate-limit middleware also logs a one-time warning per isolate when the bypass activates, but production safety relies on the 503 here. See [REQ-OPS-008](../../sdd/spec/operations.md#req-ops-008-stress-testing-validates-rate-limits-and-concurrency) (AC6).
 
-**Rate limiter fail-closed (CF-003/011):** `checkRateLimit` in `rate-limit-core.ts` accepts a `failClosed: boolean` parameter. When `true`, KV failure denies the request (503) instead of failing open via in-memory fallback. Applied to security-critical endpoints (Turnstile CAPTCHA verification, access-request). General resource-protection endpoints retain fail-open per AD6.
+**Rate limiter fail-closed (CF-003/011):** `checkRateLimit` in `rate-limit-core.ts` accepts a `failClosed: boolean` parameter. When `true`, KV failure denies the request (503) instead of failing open via in-memory fallback. Applied to security-critical endpoints (Turnstile CAPTCHA verification, access-request). General resource-protection endpoints retain fail-open per [AD6](../decisions/README.md#ad6-kv-read-modify-write-races-and-collectmetrics-atomicity).
 
 **Encryption key warning (CF-017):** `warnIfNoEncryptionKey()` in `kv-crypto.ts` emits a CRITICAL structured log on first request when `ENCRYPTION_KEY` is absent. User credentials (LLM API keys, GitHub tokens, Cloudflare tokens) are stored as plaintext KV when the key is missing.
 
@@ -123,19 +122,7 @@ Codeflare's threat model places several patterns in scope for static-analysis to
 | Predictable-looking session ID pattern | `src/lib/constants.ts` (`SESSION_ID_PATTERN`) | Session IDs are namespace keys, not auth tokens. JWT is the auth gate. |
 | Hardcoded test email `e2e-service@codeflare.local` | `src/lib/access.ts` (service-token branch) | Test fixture using RFC 6762 reserved `.local` TLD. Auth gate is the worker secret, not the email string. |
 
-Each row's rationale is also captured at the source site as an inline comment. To find every entry: `grep -rn "SAST-false-positive" .` — the literal token is the durable anchor, not the line numbers. New SAST findings that match one of these patterns can be silenced via the inline-comment convention rather than escalating to an ADR.
-
-## Context-Mode Enforcement Bypass
-
-When the context-mode plugin folder is active (Custom tier, Pro mode), a PreToolUse enforcement hook (REQ-AGENT-005 AC6) restricts Bash to a whitelist and denies WebFetch and Grep. The hook checks for `/tmp/ctx-bypass` before enforcing: if the file exists the hook exits 0 and the call proceeds normally.
-
-`/tmp/ctx-bypass` is a **user-only** sentinel. Agents must never create it. Creating it from inside an agent turn defeats the enforcement layer the user opted into. Only the user, running a command in a separate terminal tab, may create it:
-
-```bash
-touch /tmp/ctx-bypass
-```
-
-Same sentinel model as `/tmp/review-bypass` (see [Resetting the Review-Spawn Checkpoint](preseed.md#resetting-the-review-spawn-checkpoint)).
+Each row's rationale is also captured at the source site as an inline comment. To find every entry: `grep -rn "SAST-false-positive" .` - the literal token is the durable anchor, not the line numbers. New SAST findings that match one of these patterns can be silenced via the inline-comment convention rather than escalating to an ADR.
 
 ## Body Limit
 
@@ -143,7 +130,7 @@ Same sentinel model as `/tmp/review-bypass` (see [Resetting the Review-Spawn Che
 
 ## Credential Encryption at Rest
 
-Optional encryption for all user secrets and workspace files, enabled by setting `ENCRYPTION_KEY` (base64-encoded 256-bit key). Generate with `openssl rand -base64 32`. Set as a GitHub Actions repository secret named `ENCRYPTION_KEY` — the deploy workflow passes it to the Worker via `wrangler secret put`.
+Optional encryption for all user secrets and workspace files, enabled by setting `ENCRYPTION_KEY` (base64-encoded 256-bit key). Generate with `openssl rand -base64 32`. Set as a GitHub Actions repository secret named `ENCRYPTION_KEY` - the deploy workflow passes it to the Worker via `wrangler secret put`.
 
 ### Key generation and setup
 
@@ -168,7 +155,7 @@ The key must decode to exactly 32 bytes. Arbitrary strings, passwords, or non-ba
 | KV | `r2token:{email}` | Scoped R2 access key, secret key, token ID | AES-256-GCM |
 | R2 | All objects in user buckets | Workspace files, agent configs, credentials | SSE-C (AES-256) |
 
-Everything else (`user-prefs:*`, `session:*`, `user:*`, `setup:*`, `storage-stats:*`) stays plaintext — no secrets in those entries.
+Everything else (`user-prefs:*`, `session:*`, `user:*`, `setup:*`, `storage-stats:*`) stays plaintext - no secrets in those entries.
 
 ### KV encryption (AES-256-GCM via Web Crypto API)
 
@@ -176,13 +163,13 @@ Implementation: `src/lib/kv-crypto.ts`
 
 **Ciphertext format:** `v1:` + base64(12-byte random IV + AES-256-GCM ciphertext + 16-byte auth tag). The `v1:` prefix distinguishes encrypted values from plaintext JSON, enabling format evolution without breaking existing data.
 
-**AAD (Additional Authenticated Data):** The KV key name (e.g., `llm-keys:codeflare-user-example-com`) is bound to the ciphertext as AAD. This prevents ciphertext from being copied between KV keys — decryption fails if the key name doesn't match.
+**AAD (Additional Authenticated Data):** The KV key name (e.g., `llm-keys:codeflare-user-example-com`) is bound to the ciphertext as AAD. This prevents ciphertext from being copied between KV keys - decryption fails if the key name doesn't match.
 
 **Key caching:** The CryptoKey is imported once per Worker isolate lifetime and cached in module-level state. Subsequent requests reuse the cached key without re-importing.
 
-**API responses** always return masked values (`****` + last 4 chars), never plaintext keys — regardless of whether encryption is enabled.
+**API responses** always return masked values (`****` + last 4 chars), never plaintext keys - regardless of whether encryption is enabled.
 
-### Transparent KV migration
+### Transparent KV migration ([REQ-SEC-006](../../sdd/spec/security.md#req-sec-006-transparent-kv-encryption-migration))
 
 When `ENCRYPTION_KEY` is enabled on an existing deployment with plaintext KV entries:
 
@@ -192,9 +179,9 @@ When `ENCRYPTION_KEY` is enabled on an existing deployment with plaintext KV ent
 4. Fire-and-forget: re-encrypt the plaintext value and write back to KV (`kv.put` runs asynchronously, never blocks the response)
 5. Subsequent reads hit the fast decrypt path (step 2)
 
-The write-back is fire-and-forget — if the KV write fails (transient error, rate limit), the caller still gets the correct data. Migration retries automatically on the next read. No data loss, no downtime.
+The write-back is fire-and-forget - if the KV write fails (transient error, rate limit), the caller still gets the correct data. Migration retries automatically on the next read. No data loss, no downtime.
 
-**Race condition safety:** Two concurrent requests can both read the same plaintext entry and both write encrypted copies. This is safe because both workers encrypt the same plaintext — whichever write wins is equally valid. Real updates go through `encryptAndStore()` which always encrypts directly.
+**Race condition safety:** Two concurrent requests can both read the same plaintext entry and both write encrypted copies. This is safe because both workers encrypt the same plaintext - whichever write wins is equally valid. Real updates go through `encryptAndStore()` which always encrypts directly.
 
 ### R2 SSE-C encryption
 
@@ -214,7 +201,7 @@ SSE-C headers: `x-amz-server-side-encryption-customer-algorithm: AES256`, `x-amz
 
 **Rclone integration:** `ENCRYPTION_KEY` is passed from Worker → Durable Object → container env var. In `entrypoint.sh`, when present, `sse_customer_key_base64` and `sse_customer_algorithm = AES256` are appended to `rclone.conf`. Rclone auto-computes the MD5 from the base64 key. All bisync operations (initial restore, periodic sync, shutdown sync) transparently encrypt/decrypt.
 
-**Cloudflare dashboard impact:** With SSE-C enabled, files are visible in the R2 dashboard (names, sizes, metadata) but contents are unreadable — the dashboard doesn't have the encryption key. Downloads through the app work normally (Worker decrypts transparently).
+**Cloudflare dashboard impact:** With SSE-C enabled, files are visible in the R2 dashboard (names, sizes, metadata) but contents are unreadable - the dashboard doesn't have the encryption key. Downloads through the app work normally (Worker decrypts transparently).
 
 ## Rate Limiting
 
@@ -228,7 +215,7 @@ Per-user rate limiting via `createRateLimiter()` factory in `src/middleware/rate
 
 When the limit is exceeded: HTTP 429 with `{ code: "RATE_LIMIT_ERROR", message: "Rate limit exceeded. Try again in N seconds." }`
 
-**KV Key Pattern:** `{keyPrefix}:{userId}` — e.g., `storage-upload:codeflare-user-john-example-com`. Use `rl-` prefix when the key prefix would collide with application cache keys (e.g., `storage-stats` collides with the stats cache key `storage-stats:{bucketName}`, so the rate limiter uses `rl-storage-stats`).
+**KV Key Pattern:** `{keyPrefix}:{userId}` - e.g., `storage-upload:codeflare-user-john-example-com`. Use `rl-` prefix when the key prefix would collide with application cache keys (e.g., `storage-stats` collides with the stats cache key `storage-stats:{bucketName}`, so the rate limiter uses `rl-storage-stats`).
 
 **Rate limits per endpoint:**
 
@@ -292,11 +279,11 @@ Base64-encoded inputs are validated with try/catch around `atob()`. Invalid base
 
 **Check order in `handleWebSocketUpgrade`** (three pre-rate-limit gates, executed in this sequence):
 
-1. **Session-stopped gate (REQ-SEC-020 AC1):** WebSocket upgrade requests for sessions whose KV status is `stopped` are rejected immediately with close code 4503 (`container-stopped`) before the rate-limit counter is consulted. A browser reconnect storm against a hibernated or crashed container does not consume the user's 30-connection budget.
+1. **Session-stopped gate ([REQ-SEC-020](../../sdd/spec/security.md#req-sec-020-ws-upgrade-rate-limit-short-circuits) AC1):** WebSocket upgrade requests for sessions whose KV status is `stopped` are rejected immediately with close code 4503 (`container-stopped`) before the rate-limit counter is consulted. A browser reconnect storm against a hibernated or crashed container does not consume the user's 30-connection budget.
 
-2. **Warm-up gate (REQ-SEC-020 AC2):** After the stopped check, the worker peeks the container `/health` endpoint. If the container is up but still initializing (port 8080 bound but R2 sync and `.bashrc` autostart writes not yet complete), the host sets `terminalServiceReady=false` in the health response. The worker rejects the upgrade with close code 1013 (`container-warming-up`) before the rate-limit counter is consulted. This prevents reconnect storms during the ~10s cold-start window from consuming rate-limit budget and from spawning PTYs against pre-sync state (bare bash, no agent autostart). The `/health` probe is fail-open: any probe error or missing `terminalServiceReady` field falls through to the normal rate-limit path. The host server applies the same gate directly at the WebSocket accept layer (REQ-SESSION-015 AC2).
+2. **Warm-up gate ([REQ-SEC-020](../../sdd/spec/security.md#req-sec-020-ws-upgrade-rate-limit-short-circuits) AC2):** After the stopped check, the worker peeks the container `/health` endpoint. If the container is up but still initializing (port 8080 bound but R2 sync and `.bashrc` autostart writes not yet complete), the host sets `terminalServiceReady=false` in the health response. The worker rejects the upgrade with close code 1013 (`container-warming-up`) before the rate-limit counter is consulted. This prevents reconnect storms during the ~10s cold-start window from consuming rate-limit budget and from spawning PTYs against pre-sync state (bare bash, no agent autostart). The `/health` probe is fail-open: any probe error or missing `terminalServiceReady` field falls through to the normal rate-limit path. The host server applies the same gate directly at the WebSocket accept layer ([REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) AC2).
 
-3. **Rate-limit check (REQ-SEC-007):** The 30 connections/60s window counter is only consulted after both gates above pass.
+3. **Rate-limit check ([REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure)):** The 30 connections/60s window counter is only consulted after both gates above pass.
 
 Implements [REQ-SEC-020](../../sdd/spec/security.md#req-sec-020-ws-upgrade-rate-limit-short-circuits) (with [REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure) providing the underlying rate-limit infrastructure).
 
@@ -306,7 +293,7 @@ The vault editor proxy at `/api/vault/:sid/*` runs through `validateVaultRoute` 
 
 Surface: [REQ-VAULT-005](../../sdd/spec/vault.md#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor) (proxy exists). Rate-limit infrastructure: [REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure) (shared bucket and 30/60s window).
 
-### Session Limits
+### Session Limits ([REQ-SUB-013](../../sdd/spec/subscription.md#req-sub-013-concurrent-session-limits))
 
 Per-user cap on concurrent running sessions, configurable by role via `MAX_SESSIONS_USER` (default: 3) and `MAX_SESSIONS_ADMIN` (default: 10) in `wrangler.toml`.
 
@@ -316,17 +303,17 @@ Per-user cap on concurrent running sessions, configurable by role via `MAX_SESSI
 
 **`GET /api/sessions/batch-status`** returns `maxSessions` alongside `statuses` so the frontend stays in sync with the server-side limit without hardcoding defaults.
 
-### Path Traversal Prevention
+### Path Traversal Prevention ([REQ-SEC-010](../../sdd/spec/security.md#req-sec-010-path-traversal-prevention-on-storage-endpoints))
 
 Browse endpoint validates prefix parameter against directory traversal (`..` rejection) and protected path access via `validateKey()` in `src/routes/storage/validation.ts`.
 
-### Container Image Scanning
+### Container Image Scanning ([REQ-SEC-011](../../sdd/spec/security.md#req-sec-011-container-image-scanned-for-cves-before-deploy))
 
 Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (in `deploy.yml`).
 
 ### Protected R2 Paths
 
-**`PROTECTED_PATHS` is now empty** (`[]` in `src/lib/constants.ts`). Previously, paths like `.claude/`, `.anthropic/`, `.ssh/`, `.config/`, `.claude.json` were blocked from the web storage API. The protection was removed — all R2 paths are now accessible via browse, upload, and delete. The `validateKey()` function in `src/routes/storage/validation.ts` still checks the array but it's a no-op with an empty list.
+**`PROTECTED_PATHS` is now empty** (`[]` in `src/lib/constants.ts`). Previously, paths like `.claude/`, `.anthropic/`, `.ssh/`, `.config/`, `.claude.json` were blocked from the web storage API. The protection was removed - all R2 paths are now accessible via browse, upload, and delete. The `validateKey()` function in `src/routes/storage/validation.ts` still checks the array but it's a no-op with an empty list.
 
 ---
 
@@ -349,9 +336,9 @@ Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (i
 ---
 
 ## Related Documentation
-- [Authentication — Auth Modes](authentication.md#authentication-modes) - CF Access vs Direct GitHub OAuth
-- [Billing — Subscription Tiers](billing.md) - Tier-based access control
-- [API Reference — Common Headers](api-reference.md#common-response-headers) - Security headers on responses
+- [Authentication - Auth Modes](authentication.md#authentication-modes) - CF Access vs Direct GitHub OAuth
+- [Billing - Subscription Tiers](billing.md) - Tier-based access control
+- [API Reference - Common Headers](api-reference.md#common-response-headers) - Security headers on responses
 - [pentest.md](pentest.md) - Penetration testing results
 - [stress-test.md](stress-test.md) - Load testing and rate limit validation
 - [Troubleshooting](troubleshooting.md#common-failure-modes) - Common failure modes

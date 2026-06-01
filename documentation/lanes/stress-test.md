@@ -1,6 +1,6 @@
 # Stress Testing
 
-k6-based load testing against the integration worker. Four test suites run in parallel via the `stress-test.yml` GitHub Actions workflow.
+k6-based load testing against the integration worker. Three load suites run in parallel via the `stress-test.yml` GitHub Actions workflow; a fourth suite (`rate-limit-validation`) runs separately because it requires rate limits enabled rather than bypassed.
 
 Implements [REQ-OPS-008](../../sdd/spec/operations.md#req-ops-008-stress-testing-validates-rate-limits-and-concurrency) (rate-limit + concurrency validation under high VU load).
 
@@ -22,7 +22,7 @@ Implements [REQ-OPS-008](../../sdd/spec/operations.md#req-ops-008-stress-testing
 
 ## Prerequisites
 
-1. **Integration worker deployed** with `STRESS_TEST_MODE=active` (disables all rate limits — required because all VUs share one service identity)
+1. **Integration worker deployed** with `STRESS_TEST_MODE=active` (disables all rate limits - required because all VUs share one service identity)
 2. **GitHub `integration` environment** with secrets (`CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`) and variables (`E2E_BASE_URL`, `CLOUDFLARE_WORKER_NAME`)
 3. **Repository-level secrets** `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (used by setup job to push `SERVICE_AUTH_SECRET` and seed KV via wrangler)
 4. **`STRESS_TEST_CONCURRENCY`** variable set in the `integration` environment (optional, defaults to `0` which uses baseline VU counts)
@@ -60,7 +60,7 @@ Sustained load + spike test across read-only API endpoints simulating dashboard 
 | `errors` | <10% |
 | `session_list_duration` p95 | <5s |
 
-**Think time:** `think(4, 6)` seconds between poll cycles — matches real frontend's ~5s poll interval. Per cycle: user/preferences (30% chance), storage/browse (20% chance). Remaining 50% of cycles are dashboard-only polling.
+**Think time:** `think(4, 6)` seconds between poll cycles - matches real frontend's ~5s poll interval. Per cycle: user/preferences (30% chance), storage/browse (20% chance). Remaining 50% of cycles are dashboard-only polling.
 
 ### Session Lifecycle (`session-lifecycle.js`)
 
@@ -121,7 +121,7 @@ Folder delete testing: ~20% of iterations also test server-side prefix delete by
 
 Validates that rate limits ARE enforced when `STRESS_TEST_MODE` is **not** set. Runs a single VU that bursts session creates past the configured limit and verifies 429 responses.
 
-**Must be run separately** — select `rate-limit-validation` from the suite dropdown. Not included in `all` because the load test suites require rate limits to be off.
+**Must be run separately** - select `rate-limit-validation` from the suite dropdown. Not included in `all` because the load test suites require rate limits to be off.
 
 | Check | Pass condition |
 |-------|---------------|
@@ -136,9 +136,9 @@ Validates that rate limits ARE enforced when `STRESS_TEST_MODE` is **not** set. 
 
 The session lifecycle suite hits multiple 10/min rate limits:
 
-1. **Session create** (`POST /api/sessions`) — 10/min
-2. **Session delete** (`DELETE /api/sessions/:id`) — 10/min
-3. **Session stop** (`POST /api/sessions/:id/stop`) — 10/min
+1. **Session create** (`POST /api/sessions`) - 10/min
+2. **Session delete** (`DELETE /api/sessions/:id`) - 10/min
+3. **Session stop** (`POST /api/sessions/:id/stop`) - 10/min
 
 With 3 base VUs and each cycle taking ~20-60 seconds, the VUs are throttled by the 10/min cap (max ~1.6 VUs per operation). `STRESS_TEST_MODE=active` is essential for testing beyond this limit.
 
@@ -159,17 +159,17 @@ function think(min, max) {
 }
 ```
 
-This produces uniformly distributed delays between `min` and `max` seconds, simulating real user behavior (reading output, deciding next action). When `STRESS_TEST_CONCURRENCY` is set and rate limits are bypassed, think times are reduced but not eliminated — the goal is sustained throughput, not a burst attack.
+This produces uniformly distributed delays between `min` and `max` seconds, simulating real user behavior (reading output, deciding next action). When `STRESS_TEST_CONCURRENCY` is set and rate limits are bypassed, think times are reduced but not eliminated - the goal is sustained throughput, not a burst attack.
 
-**Per-user behavior stays constant regardless of VU count.** Scaling `STRESS_TEST_CONCURRENCY` adds more virtual users running the same realistic interaction pattern. A single VU's think times, request sequences, and file sizes don't change — only the number of concurrent users increases.
+**Per-user behavior stays constant regardless of VU count.** Scaling `STRESS_TEST_CONCURRENCY` adds more virtual users running the same realistic interaction pattern. A single VU's think times, request sequences, and file sizes don't change - only the number of concurrent users increases.
 
 ## VU-to-Real-User Mapping
 
 **50 VUs with realistic think times approximate 1 000-5 000 real concurrent users.**
 
-The math: with think times of 4-15s between actions, each VU's effective request rate is ~0.1-0.2 req/s — matching real human behavior (load dashboard, read output, think, act). The multiplier comes from VUs hitting all endpoint types on every iteration while real users only touch 1-2 endpoints per interaction.
+The math: with think times of 4-15s between actions, each VU's effective request rate is ~0.1-0.2 req/s - matching real human behavior (load dashboard, read output, think, act). The multiplier comes from VUs hitting all endpoint types on every iteration while real users only touch 1-2 endpoints per interaction.
 
-Each k6 virtual user generates more traffic than a real Codeflare user. A real user typically loads the dashboard (a few API calls), then works in a terminal (one WebSocket held for minutes), with occasional storage operations — roughly 1 request every 5-10 seconds during active use.
+Each k6 virtual user generates more traffic than a real Codeflare user. A real user typically loads the dashboard (a few API calls), then works in a terminal (one WebSocket held for minutes), with occasional storage operations - roughly 1 request every 5-10 seconds during active use.
 
 k6 VUs use realistic think times (4-15s between actions) but hit all endpoint types on every iteration. Real users only interact with 1-2 endpoints per session.
 
@@ -194,7 +194,7 @@ function scaled(vus) { return Math.max(1, Math.round(vus * SCALE)); }
 
 When `STRESS_TEST_CONCURRENCY=0` (default), `SCALE=1` and all VU targets remain at baseline. When set to a positive number, VU targets scale proportionally. Example: `STRESS_TEST_CONCURRENCY=50` with `BASE_VUS=10` gives `SCALE=5`, so `scaled(10)=50` VUs.
 
-Think times stay constant regardless of concurrency — scaling adds more users running the same realistic behavior, not faster robots.
+Think times stay constant regardless of concurrency - scaling adds more users running the same realistic behavior, not faster robots.
 
 ## Rate Limit Bypass
 
@@ -212,12 +212,12 @@ All VUs share a single CF Access service token (single identity). Without bypass
 
 Setting `STRESS_TEST_MODE=active` on the integration worker disables all rate-limit checks. The bypass:
 
-- Requires the exact string `"active"` as an environment variable/secret — any other value keeps limits enforced
+- Requires the exact string `"active"` as an environment variable/secret - any other value keeps limits enforced
 - Skips rate-limit KV reads/writes before they are checked, with zero overhead
-- Logs a one-time warning per isolate when activated (`STRESS_TEST_MODE is active — all HTTP rate limits bypassed`)
+- Logs a one-time warning per isolate when activated (`STRESS_TEST_MODE is active - all HTTP rate limits bypassed`)
 - Is implemented at:
-  - **HTTP requests:** `src/middleware/rate-limit.ts` line 54 (checkRateLimit skipped)
-  - **WebSocket connections:** `src/routes/terminal.ts` line 178 (checkRateLimit skipped)
+  - **HTTP requests:** `src/middleware/rate-limit.ts` (checkRateLimit skipped)
+  - **WebSocket connections:** `src/routes/terminal.ts` (checkRateLimit skipped)
 
 **Production must never have `STRESS_TEST_MODE` set.** The flag should only be enabled on integration workers used for load testing.
 
@@ -227,7 +227,7 @@ Setting `STRESS_TEST_MODE=active` on the integration worker disables all rate-li
 
 | Variable | Where | Value | Purpose | Must be exact |
 |----------|-------|-------|---------|---------------|
-| `STRESS_TEST_MODE` | Integration worker only | `"active"` | Disables all rate limits | Yes — any other value (e.g., `"true"`, `"enabled"`) keeps limits enforced |
+| `STRESS_TEST_MODE` | Integration worker only | `"active"` | Disables all rate limits | Yes - any other value (e.g., `"true"`, `"enabled"`) keeps limits enforced |
 
 Set via one of:
 ```bash
@@ -337,10 +337,10 @@ At 50 VUs with realistic think times, this represents approximately **1 000-5 00
 | `e2e/stress/storage-operations.js` | R2 storage upload/download/delete cycle |
 | `e2e/stress/rate-limit-validation.js` | Rate limit enforcement validation |
 | `.github/workflows/stress-test.yml` | CI workflow orchestration |
-| `src/middleware/rate-limit.ts` | HTTP rate-limit middleware; `STRESS_TEST_MODE` bypass at line 54 |
-| `src/routes/terminal.ts` | WebSocket auth + rate-limit; `STRESS_TEST_MODE` bypass at line 178 |
+| `src/middleware/rate-limit.ts` | HTTP rate-limit middleware; `STRESS_TEST_MODE` bypass |
+| `src/routes/terminal.ts` | WebSocket auth + rate-limit; `STRESS_TEST_MODE` bypass |
 | `src/lib/rate-limit-core.ts` | Core rate-limit logic (KV + in-memory fallback) |
-| `src/lib/constants.ts` | `WS_RATE_LIMIT_*` constants (lines 47-53) |
+| `src/lib/constants.ts` | `WS_RATE_LIMIT_*` constants |
 
 ### Subscription and Timekeeper Considerations
 
@@ -373,8 +373,14 @@ The Timekeeper DO receives pings every 60 seconds from each active container ses
 
 ## Related Documentation
 
-- [Security Reference — Rate Limiting](security.md#rate-limiting) - Rate limits per endpoint
+- [Security Reference - Rate Limiting](security.md#rate-limiting) - Rate limits per endpoint
 - [Security Policy](../../SECURITY.md) - Vulnerability reporting
 - [pentest.md](pentest.md) - Security scan results
-- [Configuration — Worker Environment](configuration.md#worker-environment) - Environment variables
-- [CI/CD — E2E Infrastructure](ci-cd.md#e2e-infrastructure) - E2E test setup
+- [Configuration - Worker Environment](configuration.md#worker-environment) - Environment variables
+- [CI/CD - E2E Infrastructure](ci-cd.md#e2e-infrastructure) - E2E test setup
+
+---
+
+## Specification Coverage
+
+- [REQ-OPS-008](../../sdd/spec/operations.md#req-ops-008-stress-testing-validates-rate-limits-and-concurrency) - Stress testing validates rate limits and concurrency

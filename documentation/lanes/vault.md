@@ -25,6 +25,7 @@ Persistent user-note vault, automatic conversation capture, unified graphify gra
   - [SilverBullet plug preinstall](#silverbullet-plug-preinstall-req-vault-007)
 - [First-session Expectations](#first-session-expectations)
 - [Attachment Cost Caveat](#attachment-cost-caveat-req-vault-011-ac1)
+- [PDF-Ingestion E2E Plan](#pdf-ingestion-e2e-plan-req-vault-011)
 - [Memory Capture System](#memory-capture-system)
 - [Troubleshooting](#troubleshooting)
 
@@ -32,7 +33,7 @@ Persistent user-note vault, automatic conversation capture, unified graphify gra
 
 ## Overview (REQ-VAULT-001)
 
-The vault lives at `/home/user/Vault/` inside every advanced-mode session container. It is rclone-bisynced to R2 alongside the rest of `/home/user/`, so anything written here is on the next session you start.
+The vault lives at `/home/user/Vault/` inside every advanced-mode session container. It is rclone-bisynced to R2 alongside the rest of `/home/user/`, so anything written here is available on the next session you start.
 
 Two parties write to the vault:
 
@@ -96,7 +97,7 @@ Inside the container, three sibling directories live under `/home/user/` alongsi
 
 ## Capture Path (REQ-VAULT-002)
 
-The `memory-capture.sh` UserPromptSubmit hook fires every 15 user messages, writes a `.vars` marker, and emits `additionalContext` instructing the main agent to dispatch the **memory-capture** named subagent (Task tool with `subagent_type="memory-capture"`). The subagent's frontmatter (`preseed/agents/claude/agents/memory-capture.md`) pins `model: sonnet` per AD58; the hook directive instructs the main agent not to pass a model override so the pin cannot be silently downgraded. The subagent runs `memory-agent-prompt.md` end to end:
+The `memory-capture.sh` UserPromptSubmit hook fires every 15 user messages, writes a `.vars` marker, and emits `additionalContext` instructing the main agent to dispatch the **memory-capture** named subagent (Task tool with `subagent_type="memory-capture"`). The subagent's frontmatter (`preseed/agents/claude/agents/memory-capture.md`) pins `model: sonnet` per [AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad); the hook directive instructs the main agent not to pass a model override so the pin cannot be silently downgraded. The subagent runs `memory-agent-prompt.md` end to end:
 
 1. Deletes the `.vars` marker (dedup gate so a concurrent prompt cannot spawn a duplicate).
 2. Reads the new transcript range.
@@ -122,20 +123,20 @@ A second daemon, `start_vault_monitor_daemon` in entrypoint.sh, polls the vault 
 
 If extraction fails mid-flight, `vault-extract.last` is NOT advanced, the next tick re-discovers the same files, and the system converges. Eventual consistency, no work lost.
 
-A complementary guard in `vault-monitor-hook.sh` covers the daemon-vs-extract overlap case: the daemon ticks every 60s and an extraction run typically takes ~90s on sonnet (was 30-60s on haiku before AD58), so the daemon may re-write `vault-extract.vars` after the agent's step-1 delete. When the agent finishes and advances `vault-extract.last`, that re-written `.vars` is left behind, older than `.last`. The hook detects this on the next prompt (`! "$VARS_FILE" -nt "$LAST_MARKER"`), silently deletes the stale marker, and exits 0 instead of triggering a redundant agent spawn.
+A complementary guard in `vault-monitor-hook.sh` covers the daemon-vs-extract overlap case: the daemon ticks every 60s and an extraction run typically takes ~90s on sonnet (was 30-60s on haiku before [AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad)), so the daemon may re-write `vault-extract.vars` after the agent's step-1 delete. When the agent finishes and advances `vault-extract.last`, that re-written `.vars` is left behind, older than `.last`. The hook detects this on the next prompt (`! "$VARS_FILE" -nt "$LAST_MARKER"`), silently deletes the stale marker, and exits 0 instead of triggering a redundant agent spawn.
 
-The daemon excludes `Raw/Sessions/`, `graphify-out/`, and `.silverbullet/` from the find (agent-owned, derived, editor-config). It also excludes the four preseed-managed root pages (`Index.md`, `CONFIG.md`, `README.md`, `STYLES.md`): `init_user_vault()` overwrites these on every boot when content drifts, so their mtimes reflect a codeflare action rather than a user edit, and including them produced perpetual extract-agent spawns after the always-overwrite tier (REQ-VAULT-010 AC1) landed.
+The daemon excludes `Raw/Sessions/`, `graphify-out/`, and `.silverbullet/` from the find (agent-owned, derived, editor-config). It also excludes the four preseed-managed root pages (`Index.md`, `CONFIG.md`, `README.md`, `STYLES.md`): `init_user_vault()` overwrites these on every boot when content drifts, so their mtimes reflect a codeflare action rather than a user edit, and including them produced perpetual extract-agent spawns after the always-overwrite tier ([REQ-VAULT-010](../../sdd/spec/vault.md#req-vault-010-codeflare-authoritative-files-preseeded-into-the-vault-on-every-boot) AC1) landed.
 
 On boots where at least one preseed page was rewritten, `init_user_vault()` also touches `vault-extract.last` before the daemon starts. This advances the high-water mark past the preseed-page mtimes so the very first daemon tick finds nothing and no spurious extraction is triggered. The two guards are layered for defence-in-depth: the AC1 exclusion handles the four pages by name, and the AC6 marker-bump covers any future preseed page added without an exclusion-list update.
 
-`vault-monitor-hook.sh` is the UserPromptSubmit hook for the user-edit path. It exits 0 immediately when `vault-extract.vars` is absent (~99% of prompts), keeping token cost at zero on idle. When the marker is present it emits `additionalContext` instructing the main agent to dispatch the **vault-extract** named subagent (Task tool with `subagent_type="vault-extract"`). The subagent's frontmatter (`preseed/agents/claude/agents/vault-extract.md`) pins `model: sonnet` per AD58; the hook directive instructs the main agent not to pass a model override.
+`vault-monitor-hook.sh` is the UserPromptSubmit hook for the user-edit path. It exits 0 immediately when `vault-extract.vars` is absent (~99% of prompts), keeping token cost at zero on idle. When the marker is present it emits `additionalContext` instructing the main agent to dispatch the **vault-extract** named subagent (Task tool with `subagent_type="vault-extract"`). The subagent's frontmatter (`preseed/agents/claude/agents/vault-extract.md`) pins `model: sonnet` per [AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad); the hook directive instructs the main agent not to pass a model override.
 
-The vault-extract agent's contract (REQ-MEM-009):
+The vault-extract agent's contract ([REQ-MEM-009](../../sdd/spec/memory.md#req-mem-009-vault-graph-accumulates-monotonically-across-extractions)):
 
 1. Delete `vault-extract.vars` (dedup gate).
 2. `find` files newer than `vault-extract.last`, excluding the agent-owned subtrees.
 3. Acts as the LLM extractor for each changed file: reads the file, produces a chunk JSON (nodes / edges / hyperedges matching graphify's schema; `[[wikilinks]]` become concept nodes with `source_file: null` for cross-repo dedup).
-4. Loads the persistent vault graph at `/home/user/Vault/graphify-out/vault-graph.json` (starting from an empty graph if absent), merges the new chunk's nodes/edges using a hash-keyed union (existing IDs dedupe, new IDs append), and writes the updated cumulative graph back to `vault-graph.json`. This is what `graphify global add ... --as user_vault` consumes, so the global graph's `user_vault` tag always reflects cumulative vault content rather than only the most recent extraction. Prior to REQ-MEM-009, each pass replaced the entire `user_vault` entry with the chunk graph, causing vault knowledge to shrink on every extraction (observed: 17 nodes -> 2 nodes after two stub files were extracted).
+4. Loads the persistent vault graph at `/home/user/Vault/graphify-out/vault-graph.json` (starting from an empty graph if absent), merges the new chunk's nodes/edges using a hash-keyed union (existing IDs dedupe, new IDs append), and writes the updated cumulative graph back to `vault-graph.json`. This is what `graphify global add ... --as user_vault` consumes, so the global graph's `user_vault` tag always reflects cumulative vault content rather than only the most recent extraction. Prior to [REQ-MEM-009](../../sdd/spec/memory.md#req-mem-009-vault-graph-accumulates-monotonically-across-extractions), each pass replaced the entire `user_vault` entry with the chunk graph, causing vault knowledge to shrink on every extraction (observed: 17 nodes -> 2 nodes after two stub files were extracted).
 5. Run `flock -w 5 /tmp/graphify-global.lock graphify global add ... --as user_vault`.
 6. Re-render the vault viz HTML: run `graphify cluster-only .` (cwd `/home/user/Vault`) against the per-run `graph.json` and copy `graph.html` into `Raw/Graphs/vault-graph.html` so the `Vault Graph.md` index page link resolves. Non-fatal: failure here does not set `EXTRACT_FAILED` because graph data is already persisted by steps 4-5; the only loss is a stale viz HTML and the next successful extraction re-renders.
 7. Touch `vault-extract.last` -- FINAL step only.
@@ -146,8 +147,8 @@ The vault-extract agent's contract (REQ-MEM-009):
 
 Write sites that touch the global graph:
 
-- The capture agent, after writing a vault file (REQ-VAULT-002).
-- The vault-extract agent, after user-edit extraction (REQ-VAULT-003).
+- The capture agent, after writing a vault file ([REQ-VAULT-002](../../sdd/spec/vault.md#req-vault-002-conversation-captures-land-in-the-vault-as-markdown)).
+- The vault-extract agent, after user-edit extraction ([REQ-VAULT-003](../../sdd/spec/vault.md#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s)).
 - `graphify-active-repo.sh`, on every active-repo transition where a per-repo graph exists or its `source_hash` differs from the manifest (single-active-repo invariant; see below).
 - The `/graphify` skill, on commit, after building a repo's graph.
 
@@ -158,8 +159,8 @@ All four serialise via `flock -w 5 /tmp/graphify-global.lock`. The locking is ne
 `graphify-active-repo.sh` enforces a single-active-repo invariant for the per-repo side of the global graph: at any time the manifest holds the vault entry plus exactly one per-repo entry (the user's currently active repo). The hook is structured around a sentinel at `~/.cache/codeflare-hooks/graphify-active-cwd`:
 
 1. **Fast-path skip**: if the resolved active-repo path equals the prior sentinel value AND `graphify-out/graph.json`'s mtime is not newer than the sentinel's mtime, the hook returns immediately. This avoids spawning the graphify CLI (hundreds of MB of Python imports) on every Bash/Edit/Write/ctx_execute tool call.
-2. **Vault skip (REQ-VAULT-004 AC3)**: when the walk-up loop resolves to `$HOME/Vault`, the hook exits 0 without writing the sentinel or invoking `graphify global add`. Comparison canonicalizes `$HOME` via `cd && pwd` (matching how `REPO` is resolved) and also matches on basename `Vault` as a belt-and-suspenders guard against symlink paths into the vault from outside `$HOME`. The vault is registered exclusively by entrypoint init under the tag `user_vault`; this skip prevents a tool call that touches a vault file from re-tagging it as `Vault` (basename) and exposing it to the prune-on-switch logic in step 3.
-3. **Repo switch (REQ-VAULT-014 AC1)** (OLD path differs from NEW path with a different basename, and OLD is still in the manifest): `flock -w 5 ... graphify global remove <OLD-basename>` prunes the prior repo's nodes. Same-basename transitions (two clones with identical directory names, or branch switches within the same repo) skip the explicit remove because the add below replaces the existing entry via graphify's source_hash dedup.
+2. **Vault skip ([REQ-VAULT-004](../../sdd/spec/vault.md#req-vault-004-unified-global-graph-merges-vault-and-active-repos) AC3)**: when the walk-up loop resolves to `$HOME/Vault`, the hook exits 0 without writing the sentinel or invoking `graphify global add`. Comparison canonicalizes `$HOME` via `cd && pwd` (matching how `REPO` is resolved) and also matches on basename `Vault` as a belt-and-suspenders guard against symlink paths into the vault from outside `$HOME`. The vault is registered exclusively by entrypoint init under the tag `user_vault`; this skip prevents a tool call that touches a vault file from re-tagging it as `Vault` (basename) and exposing it to the prune-on-switch logic in step 3.
+3. **Repo switch ([REQ-VAULT-014](../../sdd/spec/vault.md#req-vault-014-graphify-active-repo-invariant-and-lock-serialisation) AC1)** (OLD path differs from NEW path with a different basename, and OLD is still in the manifest): `flock -w 5 ... graphify global remove <OLD-basename>` prunes the prior repo's nodes. Same-basename transitions (two clones with identical directory names, or branch switches within the same repo) skip the explicit remove because the add below replaces the existing entry via graphify's source_hash dedup.
 4. **Add/refresh**: pre-checks the manifest's recorded `source_hash` against `sha256sum` of the current `graph.json` (truncated to graphify's 16-hex format, with a length sanity-guard so a future format change does not silently degrade to "always re-add"). If the hash differs or the tag is new, `flock -w 5 ... graphify global add --as <basename>` adds or replaces the entry.
 5. **Sentinel mtime bump**: `touch`-bumps the sentinel after every non-fast-path fire so subsequent fires can short-circuit until the next graph rebuild.
 
@@ -171,9 +172,9 @@ The Dockerfile installs the `silverbullet-server-linux-x86_64` binary at `/usr/l
 
 The editor is reached from the codeflare UI through the Worker proxy at `/api/vault/:sid/`. Auth, tier check, and rate-limiting are enforced at the Worker -- see [security.md](./security.md). The in-container HTTP server (`host/src/server.ts`) has a `/vault/*` HTTP branch and a WS upgrade passthrough that proxies to `127.0.0.1:3030`.
 
-The Vault button in `Header.tsx` (`mdiChartGantt` icon, between Bookmarks and Storage) opens the editor in a new tab via `window.open`. It only renders when an active session exists and the layout passes `onVaultOpen` -- terminal view only. The button is rendered `disabled` with a "Vault initializing…" tooltip until `Layout.tsx` confirms vault readiness via a client-side probe: `Layout.tsx` issues `HEAD /api/vault/:sid/` and flips a per-session `vaultReady` flag on the first 200 response, retrying every 3s otherwise (REQ-VAULT-012 AC4). The probe tests the actual vault proxy path, so it also catches SB-crashed scenarios that a startup-stage flag check would miss. This prevents the user from hitting the proxy before SilverBullet has bound 3030 (which would surface `VAULT_UPSTREAM_UNREACHABLE`).
+The Vault button in `Header.tsx` (`mdiChartGantt` icon, between Bookmarks and Storage) opens the editor in a new tab via `window.open`. It only renders when an active session exists and the layout passes `onVaultOpen` -- terminal view only. The button is rendered `disabled` with a "Vault initializing…" tooltip until `Layout.tsx` confirms vault readiness via a client-side probe: `Layout.tsx` issues `HEAD /api/vault/:sid/` and flips a per-session `vaultReady` flag on the first 200 response, retrying every 3s otherwise ([REQ-VAULT-012](../../sdd/spec/vault.md#req-vault-012-vault-button-render-and-readiness-gating) AC4). The probe tests the actual vault proxy path, so it also catches SB-crashed scenarios that a startup-stage flag check would miss. This prevents the user from hitting the proxy before SilverBullet has bound 3030 (which would surface `VAULT_UPSTREAM_UNREACHABLE`).
 
-The landing page on every Vault button click is `Index.md` (the Codeflare dashboard), set by exporting `SB_INDEX_PAGE=Index` in the supervisor before launching the binary (REQ-VAULT-012 AC2). The SilverBullet Go server hardcodes the default to lowercase `"index"` (`server/cmd/server.go:29`) and ignores any `indexPage` key in `.silverbullet/config.yaml` -- the env var is the only override. The README is one click away via a link at the top of the dashboard.
+The landing page on every Vault button click is `Index.md` (the Codeflare dashboard), set by exporting `SB_INDEX_PAGE=Index` in the supervisor before launching the binary ([REQ-VAULT-012](../../sdd/spec/vault.md#req-vault-012-vault-button-render-and-readiness-gating) AC2). The SilverBullet Go server hardcodes the default to lowercase `"index"` (`server/cmd/server.go:29`) and ignores any `indexPage` key in `.silverbullet/config.yaml` -- the env var is the only override. The README is one click away via a link at the top of the dashboard.
 
 ### Per-session `<base href>` rewrite (REQ-VAULT-013 AC1)
 
@@ -201,11 +202,11 @@ The shim SW JS is identical across sessions and contains zero user data (the enc
 
 ## Vault encryption and per-session IDB lifecycle (REQ-VAULT-008, REQ-VAULT-015)
 
-SilverBullet 2.8 ships full client-side IDB encryption via `EncryptedKvPrimitives` (`client/data/encrypted_kv_primitives.ts`). Activation requires three independent conditions checked in `client/boot.ts:96-143`:
+SilverBullet 2.8 ships full client-side IDB encryption via `EncryptedKvPrimitives` (`client/data/encrypted_kv_primitives.ts`). Activation requires three independent conditions checked in `client/boot.ts`:
 
-1. `localStorage["enableEncryption"]` is truthy — set by the bootstrap-hop page (below).
-2. `bootConfig.enableClientEncryption === true` — set by the Worker's `injectVaultEncryptionConfig` (`src/routes/vault.ts:191`), which rewrites the upstream `/.config` JSON before it reaches the SB client. The same rewrite also injects `bootConfig.vaultEncryptionKey` (the raw AES-CTR base64 from the DO), so the key reaches the SB client through two independent channels: the bootstrap-hop's SW `postMessage` (condition 3, the runtime path SB actually uses) and the bootConfig JSON read at boot. Both must stay in sync — a key rotation that updates one channel without the other will surface as "encryption flag set but SW has no key" and SB will abort the encrypted open.
-3. A `CryptoKey` is held in the per-origin service worker's `encryptionKeyMemoryStore`, postMessage'd in via `{type: "set-encryption-key"}` — done by the bootstrap-hop page (below).
+1. `localStorage["enableEncryption"]` is truthy - set by the bootstrap-hop page (below).
+2. `bootConfig.enableClientEncryption === true` - set by the Worker's `injectVaultEncryptionConfig` (`src/routes/vault.ts`), which rewrites the upstream `/.config` JSON before it reaches the SB client. The same rewrite also injects `bootConfig.vaultEncryptionKey` (the raw AES-CTR base64 from the DO), so the key reaches the SB client through two independent channels: the bootstrap-hop's SW `postMessage` (condition 3, the runtime path SB actually uses) and the bootConfig JSON read at boot. Both must stay in sync - a key rotation that updates one channel without the other will surface as "encryption flag set but SW has no key" and SB will abort the encrypted open.
+3. A `CryptoKey` is held in the per-origin service worker's `encryptionKeyMemoryStore`, postMessage'd in via `{type: "set-encryption-key"}` - done by the bootstrap-hop page (below).
 
 The two injection points are distinct: `injectVaultEncryptionConfig` handles condition 2 (a JSON rewrite on the `/.config` proxy response), while the bootstrap-hop page handles conditions 1 and 3 (localStorage flag + SW key transport). Both must fire for SB to enable encryption.
 
@@ -217,7 +218,7 @@ The Worker bridges the gap between codeflare's auth model (no SB passphrase, key
 - `GET /api/vault/<sid>/.vault-key` is an auth-gated endpoint that returns `{key}` JSON via the DO's `ensureVaultKey()`. Used by the key-shim SW to recover the encryption key after browser idle termination ([REQ-VAULT-008](../../sdd/spec/vault.md#req-vault-008-zero-ui-vault-encryption) AC7). Same auth chain as `.codeflare-bootstrap`; `Cache-Control: no-store`.
 - The service worker (`VAULT_KEY_SHIM_SERVICE_WORKER_JS`) is a minimal handler that responds to `set-encryption-key` / `get-encryption-key` messages. It is NOT the full SilverBullet sync engine; browsers that strip cookies on the SW registration GET would get a 401 from the auth-gated upstream, and browsers that do send cookies would get SB's real 97KB SW whose install hangs. The shim bypasses both paths. It holds the key in module memory, and recovers it automatically when the browser terminates and re-activates the SW after idle: on activate (and as a fallback on get-encryption-key with no key in memory), the SW fetches `GET /api/vault/<sid>/.vault-key` (auth-gated, returns `{key}` JSON via the DO's `ensureVaultKey()`). This makes vault reopen seamless without re-running the bootstrap-hop.
 
-SilverBullet maintains two IndexedDB databases per (spaceFolderPath, baseURI, encryptionKeyPart) tuple: `sb_data_<hash>` (client-context, opened by `client/client.ts:167-178`) and `sb_files_<hash>` (SW-context, opened by `client/service_worker.ts:191-211`). With the shim SW in place the `sb_files_*` IDB is never created — file fetches fall back to network through the auth-gated Worker proxy. Only `sb_data_*` exists, and that is what gets encrypted.
+SilverBullet maintains two IndexedDB databases per (spaceFolderPath, baseURI, encryptionKeyPart) tuple: `sb_data_<hash>` (client-context, opened by `client/client.ts`) and `sb_files_<hash>` (SW-context, opened by `client/service_worker.ts`). With the shim SW in place the `sb_files_*` IDB is never created - file fetches fall back to network through the auth-gated Worker proxy. Only `sb_data_*` exists, and that is what gets encrypted.
 
 Cleanup runs at two surfaces (`web-ui/src/lib/vault-cache.ts`):
 
@@ -234,7 +235,7 @@ The vault's persistence guarantee depends on the final bisync running to complet
 
 Two paired fixes bundled with the vault PR:
 
-- `shutdown_handler` in entrypoint.sh wraps the final `bisync_with_r2` call in a background subshell with a watchdog that hard-kills at 120s (raised from 60s in AD57 because the 15-minute cadence from AD56 lets a single bisync accumulate up to 15 minutes of writes). Vault-monitor and SilverBullet supervisor PIDs are also terminated.
+- `shutdown_handler` in entrypoint.sh wraps the final `bisync_with_r2` call in a background subshell with a watchdog that hard-kills at 120s (raised from 60s in [AD57](../decisions/README.md#ad57-135-second-shutdown-budget-for-final-bisync) because the 15-minute cadence from [AD56](../decisions/README.md#ad56-15-minute-bisync-cadence-with-manual-triggers) lets a single bisync accumulate up to 15 minutes of writes). Vault-monitor and SilverBullet supervisor PIDs are also terminated.
 - `Container.destroy()` in `src/container/index.ts` uses `timeoutMs = 135_000` (120s for bisync + 15s buffer). `onStop()` logs `shutdownElapsedMs` and a `logger.warn` fires at 110 s elapsed so any session approaching the budget surfaces in logs and the budget can be tuned again if needed.
 
 If the bisync exceeds 120s, the log records `TIMED OUT after 120s` -- a recognisable string for operators triaging stale-session reports.
@@ -243,8 +244,8 @@ If the bisync exceeds 120s, the log records `TIMED OUT after 120s` -- a recognis
 
 The vault plugin and supporting rule ship as preseed entries that land in every advanced-mode session at container boot:
 
-- `preseed/agents/claude/plugins/codeflare-vault/` -- plugin descriptor, `vault-monitor-hook.sh` UserPromptSubmit hook, `vault-extract-prompt.md` (the 5-step contract for the vault-extract subagent), and `merge-vault-graph.py` (Step 4 load+compose+cluster+persist helper invoked under flock; REQ-MEM-009). Registered in `preseed/agents/claude/manifest.json`.
-- `preseed/agents/claude/agents/vault-extract.md` -- named subagent definition; frontmatter pins `model: sonnet` per AD58 so the model cannot be silently downgraded via a Task tool override. Registered in the manifest's top-level `agents/` section and delivered via `reconcileAgentConfigs()` (same pipeline as architect, code-reviewer, etc.).
+- `preseed/agents/claude/plugins/codeflare-vault/` -- plugin descriptor, `vault-monitor-hook.sh` UserPromptSubmit hook, `vault-extract-prompt.md` (the 5-step contract for the vault-extract subagent), and `merge-vault-graph.py` (Step 4 load+compose+cluster+persist helper invoked under flock; [REQ-MEM-009](../../sdd/spec/memory.md#req-mem-009-vault-graph-accumulates-monotonically-across-extractions)). Registered in `preseed/agents/claude/manifest.json`.
+- `preseed/agents/claude/agents/vault-extract.md` -- named subagent definition; frontmatter pins `model: sonnet` per [AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad) so the model cannot be silently downgraded via a Task tool override. Registered in the manifest's top-level `agents/` section and delivered via `reconcileAgentConfigs()` (same pipeline as architect, code-reviewer, etc.).
 - Vault trigger/route content lives in `preseed/agents/claude/rules/memory.md` under the "Vault operations" and "Vault-edit hook" subsections (folded in rather than carried as a separate `rules/vault.md`). Vault layout, wikilink conventions, and the NEVER list live in `preseed/agents/claude/skills/vault-operations/SKILL.md` (advanced-mode only).
 - `preseed/agents/claude/rules/vault-note-capture.md` + `preseed/agents/claude/skills/vault-note-capture/SKILL.md` -- minimal trigger rule + on-demand skill that captures "take a note" / "note this down" requests into `Notes/<Category>/`. Advanced-mode only. The rule stays small to keep always-in-context bloat minimal; the skill loads on demand with category inference, filename format, body template, and wikilink convention.
 - `preseed/silverbullet/` -- optional `atlas.plug.js`, the four preseeded plug files (`pdf`, `treeview`, `github`, `graph` -- see `preseed/silverbullet/plugs/MANIFEST.md`), and the four preseed-managed pages (`Index.md`, `README.md`, `CONFIG.md`, `STYLES.md`). The Dockerfile copies this directory to `/opt/silverbullet-preseed/`; `init_user_vault()` syncs from there on every boot. (`config.yaml` was removed -- SilverBullet 2.x ignores `.silverbullet/config.yaml` entirely; runtime config goes through `CONFIG.md` and env vars only.)
@@ -274,7 +275,7 @@ The contract closes failure modes that surfaced in earlier releases:
 
 `CONFIG.md` is a SilverBullet 2.x `#meta` page with an optional `space-lua` config block (built-in keys defined in `Library/Std/Config.md`; see [SilverBullet docs](https://silverbullet.md/Configuration)). Earlier releases used a yaml block with `libraries:` and `pageBlackList:` -- both keys are unrecognized by SB 2.x and were always no-ops.
 
-The preseed `CONFIG.md` includes a `space-lua` block that configures treeview navigation exclusions (REQ-VAULT-015 AC2). The upstream silverbullet-treeview plug v2 schema requires the top-level key `treeview` (not `plug.treeview`) and the field `exclusions` (not `exclude`), where each entry is `{ type = "regex", rule = "<regex>" }`. Bare-string glob patterns are silently dropped by the plug. The block hides `Library/`, `Repositories/`, `graphify-out/`, and the four top-level preseed pages (`CONFIG`, `Index`, `README`, `STYLES`). `Repositories/` is SilverBullet's own library-manager mirror created at runtime by the Library Manager plug; users do not curate it. `.silverbullet/` is dot-prefixed and hidden by SilverBullet's default behaviour without an explicit rule. This exclusion list is the UI-side complement to the server-side `/.fs` filter (REQ-VAULT-015 AC1) that strips `graphify-out/**` from raw listings.
+The preseed `CONFIG.md` includes a `space-lua` block that configures treeview navigation exclusions ([REQ-VAULT-015](../../sdd/spec/vault.md#req-vault-015-vault-idb-lifecycle-and-listing-filters) AC2). The upstream silverbullet-treeview plug v2 schema requires the top-level key `treeview` (not `plug.treeview`) and the field `exclusions` (not `exclude`), where each entry is `{ type = "regex", rule = "<regex>" }`. Bare-string glob patterns are silently dropped by the plug. The block hides `Library/`, `Repositories/`, `graphify-out/`, and the four top-level preseed pages (`CONFIG`, `Index`, `README`, `STYLES`). `Repositories/` is SilverBullet's own library-manager mirror created at runtime by the Library Manager plug; users do not curate it. `.silverbullet/` is dot-prefixed and hidden by SilverBullet's default behaviour without an explicit rule. This exclusion list is the UI-side complement to the server-side `/.fs` filter ([REQ-VAULT-015](../../sdd/spec/vault.md#req-vault-015-vault-idb-lifecycle-and-listing-filters) AC1) that strips `graphify-out/**` from raw listings.
 
 `Library/Std` (and its compiled `Plugs/*.plug.js`) is served by the SilverBullet binary from its built-in `client_bundle/base_fs` overlay. There is nothing to federate at runtime and nothing to preseed onto disk. The dashboard's `widgets.commandButton`, `templates.fullPageItem`, `templates.pageItem`, `templates.taskItem`, `index.contentPages()`, and `tags.page` all resolve through that overlay automatically. The first-load delay (~30 s on a fresh browser) is the SilverBullet client building its IndexedDB index of Library/Std files; subsequent loads are instant from cache.
 
@@ -301,7 +302,7 @@ A brand-new session boots with a pre-populated vault: `Index.md`, `README.md`, `
 
 `init_user_vault()` runs AFTER `establish_bisync_baseline()` so we never run the per-boot sync over a half-restored vault. If the baseline fails for any reason, the init function still runs (`(init_user_vault) || echo ...`) and the critical-dir + preseed-page tiers are created locally; the next successful bisync reconciles user content.
 
-On first browser open after a fresh vault, the dashboard widgets ("Quick Note" button, "Journal: Today" button, "Recently modified pages") take ~30 seconds to populate while the SilverBullet client builds its IndexedDB index of `Library/Std` (served from the binary's base_fs overlay). The Vault button in the header is rendered `disabled` with a "Vault initializing…" tooltip until `Layout.tsx` receives a 200 from `HEAD /api/vault/:sid/` (the `vaultReady` probe; REQ-VAULT-012 AC4), so the user cannot hit the proxy before SilverBullet has bound 3030. Subsequent loads in the same browser are instant from cache.
+On first browser open after a fresh vault, the dashboard widgets ("Quick Note" button, "Journal: Today" button, "Recently modified pages") take ~30 seconds to populate while the SilverBullet client builds its IndexedDB index of `Library/Std` (served from the binary's base_fs overlay). The Vault button in the header is rendered `disabled` with a "Vault initializing…" tooltip until `Layout.tsx` receives a 200 from `HEAD /api/vault/:sid/` (the `vaultReady` probe; [REQ-VAULT-012](../../sdd/spec/vault.md#req-vault-012-vault-button-render-and-readiness-gating) AC4), so the user cannot hit the proxy before SilverBullet has bound 3030. Subsequent loads in the same browser are instant from cache.
 
 Visual confirmation that the preseed theme is wired correctly: the editor renders on a zinc-950 base (`#09090b`), wikilinks and modal selection use a blue-500 accent (`hsl(217, 91%, 60%)`), body type is Inter and code spans are JetBrains Mono. If the editor shows SilverBullet's default white/cream palette, `STYLES.md` is missing or targeting variables SB does not consume (the previous `--cf-*`-only regression).
 
@@ -311,9 +312,17 @@ The vault-monitor daemon does not fire a spurious extraction on first boot or af
 
 SilverBullet writes pasted / drag-dropped attachments next to the note that referenced them (a Quick Note at `Inbox/2026-05-18/16-59-59.md` produces attachments at `Inbox/2026-05-18/*.pdf`, `.png`, etc.). The vault-extract agent reads PDFs via the Read tool (rendering pages as images, capped at 20 pages per PDF) and emits a `document` node plus `concept` nodes for whatever titles / headings / entities are visible. Image-only PDFs and screenshots cost vision tokens per page on every ingestion pass; be aware when pasting many images into notes you expect to query frequently. Move attachments to `Raw/Pasted/` manually if you want them grouped outside the date-folder rhythm.
 
+## PDF-Ingestion E2E Plan (REQ-VAULT-011)
+
+Manual verification for PDF ingestion. PDF ingestion is agent-prompt behaviour driven by `vault-extract-prompt.md`; it has no automated test, so this is the manual sign-off path.
+
+1. AC1/AC2 - healthy PDF: drop a multi-page text PDF into `Raw/Pasted/`, wait one 60s daemon tick, then confirm the global graph gained a `document` node for the file plus `concept` nodes for its visible titles, headings, and named entities (not skipped as opaque binary).
+2. AC3 - citation edge: add a sibling markdown note that wikilinks the same PDF, tick again, and confirm a citation edge connects the PDF's document node to the wikilink concept so the two unify.
+3. AC4 - corrupt-file isolation: drop a corrupt or password-protected PDF alongside a healthy changed file, tick once, and confirm the corrupt PDF emits only a bare document node while the healthy file still ingests and the high-water marker advances (one unreadable PDF does not block the batch).
+
 ## Memory Capture System
 
-Cross-session memory in codeflare lives entirely in the vault. Graphify ingests every vault file into the unified global graph; agents query it via `mcp__graphify__*`. The former MCP `@modelcontextprotocol/server-memory` subsystem has been removed. Conversation context (decisions, debugging insights, observations) survives across sessions and devices. Every 15 user prompts the agent auto-captures a structured note into `Raw/Sessions/`. Cross-device persistence requires Pro mode (the "Pro" / advanced session mode, gated by REQ-MEM-006): only Pro sessions bisync the vault subtree to R2. Default-mode sessions still run the capture hook for in-session context, but the vault never leaves the container.
+Cross-session memory in codeflare lives entirely in the vault. Graphify ingests every vault file into the unified global graph; agents query it via `mcp__graphify__*`. The former MCP `@modelcontextprotocol/server-memory` subsystem has been removed. Conversation context (decisions, debugging insights, observations) survives across sessions and devices. Every 15 user prompts the agent auto-captures a structured note into `Raw/Sessions/`. Cross-device persistence requires Pro mode (the "Pro" / advanced session mode, gated by [REQ-MEM-006](../../sdd/spec/memory.md#req-mem-006-memory-available-only-in-pro-advanced-mode)): only Pro sessions bisync the vault subtree to R2. Default-mode sessions still run the capture hook for in-session context, but the vault never leaves the container.
 
 Implements [REQ-MEM-001](../../sdd/spec/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault), [REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages), [REQ-MEM-004](../../sdd/spec/memory.md#req-mem-004-vault-contents-synced-to-r2-across-sessions), [REQ-MEM-006](../../sdd/spec/memory.md#req-mem-006-memory-available-only-in-pro-advanced-mode), [REQ-MEM-008](../../sdd/spec/memory.md#req-mem-008-memory-prompt-files-preseeded-via-manifest-pipeline), [REQ-MEM-010](../../sdd/spec/memory.md#req-mem-010-memory-capture-hook-plumbing).
 
@@ -342,7 +351,7 @@ The `memory-capture.sh` script runs as a **UserPromptSubmit hook**.
    - **`CURRENT_COUNT == 1`** (brand-new session): baseline at the current
      transcript size, write the counter, emit the first-message
      graphify-query nudge, exit without capture.
-   - **`CURRENT_COUNT > 1`** (resumed session per REQ-MEM-002 AC6): the
+   - **`CURRENT_COUNT > 1`** (resumed session per [REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages) AC6): the
      container was recycled but the transcript was restored on disk, so
      prior-session prompts are still there. Force-fire a capture covering
      the transcript from line 1 (flushing any tail from the prior session
@@ -358,7 +367,7 @@ The `memory-capture.sh` script runs as a **UserPromptSubmit hook**.
    subagent (Task tool, `subagent_type="memory-capture"`, `run_in_background=true`)
    before any other work. The companion `memory-capture-block.sh` PreToolUse hook
    hard-blocks all tool calls until the subagent is spawned. The subagent's
-   frontmatter pins `model: sonnet` (AD58); the main agent must not pass a model
+   frontmatter pins `model: sonnet` ([AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad)); the main agent must not pass a model
    override.
 
 The capture agent deletes the `.vars` file as its first step (dedup
@@ -371,7 +380,7 @@ for the rationale (recency bias + haiku confabulation that motivated the
 switch from haiku to sonnet).
 
 Between the dedup-gate step and the prefilter step, the agent invokes
-`assert-iso-ts.sh` (Step 1.5 in the prompt; REQ-MEM-010 AC5/AC6/AC7).
+`assert-iso-ts.sh` (Step 1.5 in the prompt; [REQ-MEM-010](../../sdd/spec/memory.md#req-mem-010-memory-capture-hook-plumbing) AC5/AC6/AC7).
 The script resolves the user's timezone, runs `date` to produce a stamp
 like `2026-05-23T22-11-09+0200`, then runs three assertions and exits
 non-zero if any fail: (a) the stamp must end with a four-digit `[+-]NNNN`
@@ -395,7 +404,7 @@ string is the single source of truth for the filename and the
 The counter directory lives under `/tmp` by design: Cloudflare Containers
 guarantees that `/tmp` (and all non-R2-backed disk) is fresh on every
 container start, which is what makes the counter's absence on the first
-hook fire a reliable "fresh container" signal for REQ-MEM-002 AC6
+hook fire a reliable "fresh container" signal for [REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages) AC6
 resume detection. No bisync filter is required because `/tmp` is not
 synced in the first place. The `MEMCAP_COUNTER_DIR` env var overrides
 the default for hermetic tests; production never sets it.
@@ -420,7 +429,7 @@ in the user's vault.
 | Stale session state on reopen after stop | Shutdown bisync was killed mid-write | Look for `TIMED OUT after 120s` (or the `logger.warn` at 110 s elapsed) in Durable Object logs (`wrangler tail <SCRIPT_NAME>`); raise the watchdog budget in `shutdown_handler` if it fires routinely. |
 | `/api/vault/:sid/` returns 503 | SilverBullet supervisor not ready | The Vault button is disabled until `Layout.tsx` receives a 200 from `HEAD /api/vault/:sid/` (the `vaultReady` probe). Wait 3-5 s and retry; the probe re-enables the button automatically once SilverBullet binds port 3030. |
 | Clicking "Quick Note" shows `You are not authenticated, going to reload...` alert, then reloads to a blank/white page | SilverBullet's client.js writes via PUT/DELETE/PATCH without `X-Requested-With`, which `authenticateRequest`'s CSRF guard required (fixed by the Origin-validated synthesis in `src/routes/vault.ts`) | Redeploy the container image to pick up the fix. As a temporary workaround, open the vault in a fresh browser tab (clears any stale ServiceWorker scope that may compound the loop). |
-| Drag-dropping a PDF or image into SilverBullet returns 401; attachment never saves | Older image: `maybeSynthesizeCsrfHeader` skipped synthesis when `Origin` was absent (SilverBullet's same-origin fetch and SW-controlled paths omit it), so the PUT landed at `authenticateRequest` without `X-Requested-With` (REQ-VAULT-009). | Redeploy. After the fix, a missing `Origin` header is treated as same-origin and synthesis proceeds. A present-but-disallowed `Origin` still returns 403. |
+| Drag-dropping a PDF or image into SilverBullet returns 401; attachment never saves | Older image: `maybeSynthesizeCsrfHeader` skipped synthesis when `Origin` was absent (SilverBullet's same-origin fetch and SW-controlled paths omit it), so the PUT landed at `authenticateRequest` without `X-Requested-With` ([REQ-VAULT-009](../../sdd/spec/vault.md#req-vault-009-vault-writes-succeed-end-to-end-for-silverbullet-attachment-uploads)). | Redeploy. After the fix, a missing `Origin` header is treated as same-origin and synthesis proceeds. A present-but-disallowed `Origin` still returns 403. |
 | SilverBullet opens lowercase "index" (empty editor) instead of the Codeflare dashboard | Supervisor not exporting `SB_INDEX_PAGE=Index` before launching the binary | Confirm the env var is set in `entrypoint.sh start_silverbullet_supervisor`. SB's Go server hardcodes the default to `"index"` (`server/cmd/server.go:29`); the env var is the only override. |
 | Vault button clickable during boot returns `VAULT_UPSTREAM_UNREACHABLE` | UI is not gating on vault readiness | The button should be disabled until `Layout.tsx` receives a 200 from `HEAD /api/vault/:sid/`. If you see it clickable too early, the `vaultReady` probe loop in `Layout.tsx` has regressed -- check that the `HEAD` fetch is running and the 3s retry is wired correctly. |
 | Dashboard widgets render as raw `${query[[...]]}` text or nothing | Someone copied a partial `Library/Std/` onto disk, shadowing the binary's `base_fs` overlay | `rm -rf ~/Vault/Library/Std` and restart SB. Library/Std is shipped inside the SilverBullet binary; **never** seed it from disk. |
@@ -433,7 +442,7 @@ in the user's vault.
 | Capture not firing | Counter file present at `/tmp/.memory-counter/{session_id}` and transcript has `<15` new prompts since last capture | Send more prompts to reach the 15-message threshold; or verify the hook is registered (`cat ~/.claude/settings.json`) |
 | Capture not firing after a resume | Counter file present despite the container appearing to be a fresh start (would indicate `/tmp` somehow survived recycle, which Cloudflare's ephemerality contract forbids) | Inspect `ls -la /tmp/.memory-counter/`; if the counter mtime predates the current container's start time, file an issue - the platform contract is being violated. Workaround: `rm /tmp/.memory-counter/{session_id}` |
 | Capture spawns but no vault file | Capture agent failed mid-write | Check the agent's transcript for errors; the `.vars` file is gone but the counter has advanced - next 15-prompt window will try again |
-| Capture spawns, no vault file, agent transcript shows `ISO_TS_ASSERTION_FAILED:` | Step 1.5 Bash block rejected the timestamp (REQ-MEM-010 AC5) | Read the agent transcript for the exact failure: `missing TZ offset` (Assertion 1 - bad stamp shape), `offset X does not match TZ=Y` (Assertion 2 - dropped TZ wrapper, the #416 symptom), or `drifts Ns from current clock` (Assertion 3 - agent fabricated the timestamp instead of running `date`). Fail-closed is intentional: the capture halts rather than write a wrong timestamp to the vault. Next 15-prompt window retries |
+| Capture spawns, no vault file, agent transcript shows `ISO_TS_ASSERTION_FAILED:` | Step 1.5 Bash block rejected the timestamp ([REQ-MEM-010](../../sdd/spec/memory.md#req-mem-010-memory-capture-hook-plumbing) AC5) | Read the agent transcript for the exact failure: `missing TZ offset` (Assertion 1 - bad stamp shape), `offset X does not match TZ=Y` (Assertion 2 - dropped TZ wrapper, the #416 symptom), or `drifts Ns from current clock` (Assertion 3 - agent fabricated the timestamp instead of running `date`). Fail-closed is intentional: the capture halts rather than write a wrong timestamp to the vault. Next 15-prompt window retries |
 | Same file extracted twice | Concurrent capture + vault-monitor tick | Both serialise via `flock -w 5 /tmp/graphify-global.lock`; safe, but the last writer wins for that specific file's nodes |
 
 For hook registration, attribution-blocking, review-spawn enforcement,
@@ -445,11 +454,14 @@ or session-mode gating issues, see [Troubleshooting in preseed.md](preseed.md#tr
 - [REQ-VAULT-002](../../sdd/spec/vault.md#req-vault-002-conversation-captures-land-in-the-vault-as-markdown) - Conversation captures land in the vault as markdown
 - [REQ-VAULT-003](../../sdd/spec/vault.md#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s) - User-curated edits are detected and ingested within ~60s
 - [REQ-VAULT-004](../../sdd/spec/vault.md#req-vault-004-unified-global-graph-merges-vault-and-active-repos) - Unified global graph merges vault and active repos
+- [REQ-VAULT-005](../../sdd/spec/vault.md#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor) - Worker proxy exposes the in-container vault editor
 - [REQ-VAULT-006](../../sdd/spec/vault.md#req-vault-006-shutdown-bisync-completes-vault-writes-before-sigkill) - Shutdown bisync completes vault writes before SIGKILL
+- [REQ-VAULT-007](../../sdd/spec/vault.md#req-vault-007-vault-rules-and-plugin-are-preseeded-into-every-advanced-session) - Vault rules and plugin are preseeded into every advanced session
 - [REQ-VAULT-008](../../sdd/spec/vault.md#req-vault-008-zero-ui-vault-encryption) - Zero-UI vault encryption
 - [REQ-VAULT-009](../../sdd/spec/vault.md#req-vault-009-vault-writes-succeed-end-to-end-for-silverbullet-attachment-uploads) - Vault writes succeed end-to-end for SilverBullet attachment uploads
 - [REQ-VAULT-010](../../sdd/spec/vault.md#req-vault-010-codeflare-authoritative-files-preseeded-into-the-vault-on-every-boot) - Codeflare-authoritative files preseeded into the vault on every boot
 - [REQ-VAULT-011](../../sdd/spec/vault.md#req-vault-011-vault-extract-ingests-pdf-files) - Vault-extract ingests PDF files
+- [REQ-VAULT-012](../../sdd/spec/vault.md#req-vault-012-vault-button-render-and-readiness-gating) - Vault button render and readiness gating
 - [REQ-VAULT-013](../../sdd/spec/vault.md#req-vault-013-silverbullet-subpath-adapter) - SilverBullet subpath adapter
 - [REQ-VAULT-014](../../sdd/spec/vault.md#req-vault-014-graphify-active-repo-invariant-and-lock-serialisation) - Graphify active-repo invariant and lock serialisation
 - [REQ-VAULT-015](../../sdd/spec/vault.md#req-vault-015-vault-idb-lifecycle-and-listing-filters) - Vault IDB lifecycle and listing filters

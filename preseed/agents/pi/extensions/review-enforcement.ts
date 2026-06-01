@@ -5,7 +5,7 @@
  * It watches pushes/PR creation/PR merges for SDD projects with an open PR to
  * main/master, computes the minimal required review lanes, spawns Pi subagents
  * for only those lanes, persists progress under .git/, and acknowledges the PR
- * head only after the required lanes complete.
+ * head after the required lanes complete or after an explicit user bypass.
  */
 
 import { execFileSync } from "node:child_process";
@@ -13,8 +13,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, join } from "node:path";
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { ALL_REVIEW_LANES, classifyReviewFiles, classifyReviewHead, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
-import { compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewMessageKey, durableReviewRecommendation, formatMergedReviewSummary, requestReviewAutofixForRows, type DurableReviewSummaryRecord, type DurableReviewSummaryRow, type ReviewSeverityCounts } from "./review-job-helpers";
+import { ALL_REVIEW_LANES, bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
+import { compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewMessageKey, durableReviewRecommendation, formatMergedReviewSummary, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, type DurableReviewSummaryRecord, type DurableReviewSummaryRow, type ReviewSeverityCounts } from "./review-job-helpers";
 import { completedDurableReviewLanes, failedDurableReviewLanes, readDurableReviewJob, REVIEW_JOBS_EVENT_LANE_COMPLETED, REVIEW_JOBS_EVENT_LANE_FAILED, reviewJobDir, reviewResultPath, reviewResultsDir, runningDurableReviewLanes, startDurableReviewLanes } from "./review-jobs";
 
 const REVIEW_BYPASS = "/tmp/review-bypass";
@@ -286,23 +286,48 @@ function isGitPushCommand(command: string): boolean {
   return isLocalGitPushCommand(command) || /(^|[;&|]\s*)gh\s+repo\s+sync\b/.test(command);
 }
 
+function prForBoundaryCommand(repo: string, command: string, pr: PrState | undefined): PrState | undefined {
+  if (isEnforcedPr(pr)) return pr;
+  const base = prCreateBoundaryBase(command, pr?.baseRefName);
+  if (!base) return pr;
+  const head = localHead(repo) || pr?.headRefOid;
+  if (!head) return pr;
+  // GitHub may not make a just-created PR visible to `gh pr view` immediately.
+  // Mirror Claude's PR-open fail-open behavior: for an SDD `gh pr create` whose
+  // base is main/master (or temporarily unreadable), arm review for local HEAD.
+  const basePr: PrState = pr || {};
+  return { ...basePr, state: "OPEN", baseRefName: base, headRefOid: head };
+}
+
 function reviewCandidateHead(repo: string, pr: PrState, command?: string): string {
   if (command && isLocalGitPushCommand(command)) return localHead(repo) || pr.headRefOid || "";
   return pr.headRefOid || "";
 }
 
 function mergeLaneState(repo: string, currentHead: string, previous?: PendingReview): { lanes: string[]; completed: Set<string> } {
-  const base = previous?.head || lastAckHead(repo);
-  const changed = classifyReviewFiles(changedFiles(repo, base, currentHead));
-  const changedLanes = changed || ALL_REVIEW_LANES;
-  if (!previous) return { lanes: changedLanes, completed: new Set() };
+  const lastAck = lastAckHead(repo);
+  if (!previous) {
+    const changed = classifyReviewFiles(changedFiles(repo, lastAck, currentHead));
+    return { lanes: changed || ALL_REVIEW_LANES, completed: new Set() };
+  }
 
   const incompletePrevious = previous.lanes.filter((lane) => !previous.completed.has(lane));
-  const lanes = [...new Set([...incompletePrevious, ...changedLanes])];
+  if (incompletePrevious.length > 0) {
+    // Claude's Stop hook keeps a running_ack pointer: if a new push lands before
+    // the prior review completes, the next review must cover the whole unacked
+    // window, not only previous.head..currentHead. Do not carry completed lanes
+    // forward because their results were for a superseded head.
+    const base = previous.reviewBase || lastAck;
+    const changed = classifyReviewFiles(changedFiles(repo, base, currentHead));
+    return { lanes: changed || ALL_REVIEW_LANES, completed: new Set() };
+  }
+
+  const changed = classifyReviewFiles(changedFiles(repo, previous.head || lastAck, currentHead));
+  const changedLanes = changed || ALL_REVIEW_LANES;
   const completed = new Set(
-    previous.lanes.filter((lane) => previous.completed.has(lane) && lanes.includes(lane) && !changedLanes.includes(lane)),
+    previous.lanes.filter((lane) => previous.completed.has(lane) && changedLanes.includes(lane) === false),
   );
-  return { lanes, completed };
+  return { lanes: changedLanes, completed };
 }
 
 function isRealSessionCtx(ctx: unknown): boolean {
@@ -362,6 +387,40 @@ function clearReviewStatus(ctx: any): void {
   try { ctx.ui.setStatus("codeflare-review", undefined); } catch { /* best effort */ }
 }
 
+function textFromContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(textFromContent).filter(Boolean).join("\n");
+  if (content && typeof content === "object") {
+    const record = content as Record<string, unknown>;
+    if (typeof record.text === "string") return record.text;
+    if (typeof record.content === "string") return record.content;
+  }
+  return "";
+}
+
+function sessionUserMessages(ctx: any): string[] {
+  try {
+    const file = ctx?.sessionManager?.getSessionFile?.();
+    if (!file || !existsSync(file)) return [];
+    return readFileSync(file, "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .flatMap((line) => {
+        try {
+          const entry = JSON.parse(line);
+          const message = entry?.message || entry;
+          if (message?.role !== "user") return [];
+          const text = textFromContent(message.content);
+          return text ? [text] : [];
+        } catch {
+          return [];
+        }
+      });
+  } catch {
+    return [];
+  }
+}
+
 async function spawnReviewLanes(pending: PendingReview, pr: PrState, lanes: string[], ctx: any, reason: string): Promise<void> {
   if (lanes.length === 0) return;
 
@@ -395,13 +454,23 @@ async function spawnReviewLanes(pending: PendingReview, pr: PrState, lanes: stri
 
 function reviewHeadStatus(pending: PendingReview): ReviewHeadStatus {
   const current = prState(pending.repo);
+  const local = localHead(pending.repo);
+  const prHead = current?.headRefOid;
   return classifyReviewHead({
     pendingHead: pending.head,
-    localHead: localHead(pending.repo),
+    localHead: local,
     prOpenAtBase: isEnforcedPr(current),
-    prHead: current?.headRefOid,
+    prHead,
     prQueryFailed: current === undefined,
+    localHeadDescendsFromPending: Boolean(local && local !== pending.head && isAncestor(pending.repo, pending.head, local)),
+    prHeadDescendsFromPending: Boolean(prHead && prHead !== pending.head && isAncestor(pending.repo, pending.head, prHead)),
   });
+}
+
+function currentEnforcedPrHead(repo: string): string {
+  const current = prState(repo);
+  if (!isEnforcedPr(current)) return "";
+  return reviewCandidateHead(repo, current);
 }
 
 function installReviewMessageDedupe(pi: ExtensionAPI): void {
@@ -488,6 +557,62 @@ export default function (pi: ExtensionAPI) {
     pending = undefined;
     clearReviewStatus(ctx);
     ctx.ui.notify(`PR-boundary review state for ${basename(state.repo)} at ${state.head.slice(0, 12)} discarded: the open PR no longer points at this head.`, "warning");
+  };
+
+  const acknowledgeBypass = (repo: string, head: string, ctx: any): void => {
+    writeAck(repo, head);
+    resetBlockCount(repo);
+    clearBreaker(repo);
+    clearPending(repo);
+    pending = undefined;
+    clearReviewStatus(ctx);
+    ctx.ui.notify(`PR-boundary review bypass acknowledged for ${basename(repo)} at ${head.slice(0, 12)}.`, "warning");
+  };
+
+  const rollForwardAdvancedReview = async (state: PendingReview, ctx: any, reason: string): Promise<boolean> => {
+    const currentPr = prState(state.repo);
+    if (!isEnforcedPr(currentPr)) return false;
+    const head = reviewCandidateHead(state.repo, currentPr);
+    if (!head || head === state.head || !isAncestor(state.repo, state.head, head)) return false;
+
+    const review = mergeLaneState(state.repo, head, state);
+    if (review.lanes.length === 0) {
+      resetBlockCount(state.repo);
+      clearBreaker(state.repo);
+      writeAck(state.repo, head);
+      clearPending(state.repo);
+      clearReviewStatus(ctx);
+      pending = undefined;
+      return true;
+    }
+
+    resetBlockCount(state.repo);
+    clearBreaker(state.repo);
+    const reviewBase = selectReviewBase({
+      previous: { ...state, completed: [...state.completed] },
+      lastAck: lastAckHead(state.repo) || undefined,
+    });
+    const validBase = reviewBase && isAncestor(state.repo, reviewBase, head) ? reviewBase : undefined;
+    pending = {
+      repo: state.repo,
+      prNumber: currentPr.number,
+      baseRefName: currentPr.baseRefName,
+      head,
+      reviewBase: validBase,
+      lanes: review.lanes,
+      completed: review.completed,
+      docPromptSent: false,
+      spawned: false,
+      spawnedIds: {},
+      fallbackLanes: new Set(),
+      requestedAt: {},
+      reviewStartedAt: Date.now(),
+    };
+    savePending(pending);
+    updateReviewStatus(pending, ctx);
+    ctx.ui.notify(`PR-boundary review rolled forward for ${basename(state.repo)} from ${state.head.slice(0, 12)} to ${head.slice(0, 12)} (${reason}). Lanes: ${review.lanes.join(", ")}.`, "warning");
+    await spawnReviewLanes(pending, currentPr, durableReviewInitialLanes(pending.lanes), ctx, "advanced PR head roll-forward");
+    return true;
   };
 
   function toolEventId(event: any): string | undefined {
@@ -613,7 +738,7 @@ export default function (pi: ExtensionAPI) {
     const state = completedStateFromDurableJob(repo, head);
     if (!state) return;
     publishReviewSummary(state, ctx);
-    requestReviewAutofix(state);
+    requestReviewAutofix(state, ctx);
   }
 
   function publishSummaryForCurrentPr(ctx: any): boolean {
@@ -627,7 +752,7 @@ export default function (pi: ExtensionAPI) {
     return true;
   }
 
-  function requestReviewAutofix(state: PendingReview): void {
+  function requestReviewAutofix(state: PendingReview, ctx: any): void {
     const marker = join(reviewJobDir(state.repo, state.head), "autofix.requested");
     try {
       requestReviewAutofixForRows({
@@ -635,6 +760,7 @@ export default function (pi: ExtensionAPI) {
         repo: state.repo,
         head: state.head,
         rows: reviewSummaryRows(state),
+        suppress: reviewAutofixModeFromUserMessages(sessionUserMessages(ctx)) === "manual",
         claim: () => {
           mkdirSync(dirname(marker), { recursive: true });
           try {
@@ -662,9 +788,18 @@ export default function (pi: ExtensionAPI) {
     if (state.completed.has(type)) return;
     // Only a definitively-moved PR ("stale") discards the window; "unknown" (gh
     // failed) falls through so the completion is still recorded and acked rather
-    // than the whole review window being lost on a transient query failure.
-    if (reviewHeadStatus(state) === "stale") {
+    // than the whole review window being lost on a transient query failure. If
+    // the PR head advanced along the same branch, roll the gate forward to a
+    // cumulative review instead of dropping the earlier in-flight result.
+    const headStatus = reviewHeadStatus(state);
+    if (headStatus === "stale") {
       discardStale(state, ctx);
+      return;
+    }
+    if (headStatus === "advanced") {
+      if (result !== undefined) publishReviewResult(state, type, result, ctx);
+      else if (existsSync(reviewResultPath(state.repo, state.head, type))) publishReviewResultFile(state, type, ctx);
+      await rollForwardAdvancedReview(state, ctx, `${type} completed after PR head advanced`);
       return;
     }
     if (result !== undefined) publishReviewResult(state, type, result, ctx);
@@ -687,7 +822,7 @@ export default function (pi: ExtensionAPI) {
       clearBreaker(state.repo);
       clearPending(state.repo);
       publishReviewSummary(state, ctx);
-      requestReviewAutofix(state);
+      requestReviewAutofix(state, ctx);
       clearReviewStatus(ctx);
       pending = undefined;
     }
@@ -703,10 +838,14 @@ export default function (pi: ExtensionAPI) {
     // the ctx_* tools (code/commands). Gate on the command itself, never the tool name.
     if (isGhPrMerge(command)) {
       const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
-      if (!repo || !isSddProject(repo) || consumeBypass()) return;
+      if (!repo || !isSddProject(repo)) return;
       const pr = prState(repo);
       if (!isEnforcedPr(pr)) return;
       const head = pr.headRefOid;
+      if (consumeBypass()) {
+        acknowledgeBypass(repo, head, ctx);
+        return;
+      }
       if (!acked(repo, head)) {
         return { block: true, reason: `PR-boundary review required before merge for ${basename(repo)} at ${head.slice(0, 12)}. Complete required reviewers or use the user-only ${REVIEW_BYPASS} bypass.` };
       }
@@ -731,7 +870,9 @@ export default function (pi: ExtensionAPI) {
     remember(ctx);
     const state = hydratePending(ctx);
     if (state) {
-      if (reviewHeadStatus(state) === "stale") discardStale(state, ctx);
+      const status = reviewHeadStatus(state);
+      if (status === "stale") discardStale(state, ctx);
+      else if (status === "advanced") void rollForwardAdvancedReview(state, ctx, "session_start detected advanced PR head");
       else updateReviewStatus(state, ctx);
     }
     publishSummaryForCurrentPr(ctx);
@@ -790,12 +931,16 @@ export default function (pi: ExtensionAPI) {
     if (!isPrBoundaryCommand(command)) return;
 
     const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
-    if (!repo || !isSddProject(repo) || consumeBypass()) return;
+    if (!repo || !isSddProject(repo)) return;
 
-    const pr = prState(repo);
+    const pr = prForBoundaryCommand(repo, command, prState(repo));
     if (!isEnforcedPr(pr)) return;
     const head = reviewCandidateHead(repo, pr, command);
     if (!head) return;
+    if (consumeBypass()) {
+      acknowledgeBypass(repo, head, ctx);
+      return;
+    }
     const effectivePr = { ...pr, headRefOid: head };
     if (acked(repo, head)) return;
     if (isBreakerOpen(repo, head)) return; // breaker already gave up on this exact head; push a new commit to retry
@@ -825,7 +970,6 @@ export default function (pi: ExtensionAPI) {
     const initialLanes = durableReviewInitialLanes(pending.lanes);
     savePending(pending);
     updateReviewStatus(pending, ctx);
-    pruneReviewResults(repo, head); // a new head is under review; drop stale prior-head result dirs
     ctx.ui.notify(`PR-boundary review required for ${basename(repo)} at ${head.slice(0, 12)}. Lanes: ${review.lanes.join(", ")}.`, "warning");
     await spawnReviewLanes(pending, effectivePr, initialLanes, ctx, "initial PR-boundary trigger");
   };
@@ -867,11 +1011,15 @@ export default function (pi: ExtensionAPI) {
     if (!state) {
       if (publishSummaryForCurrentPr(ctx)) return;
       const repo = activeRepoFallback() || findGitRoot(ctx.sessionManager.getCwd());
-      if (!repo || !isSddProject(repo) || consumeBypass()) return;
+      if (!repo || !isSddProject(repo)) return;
       const pr = prState(repo);
       if (!isEnforcedPr(pr)) return;
       const head = reviewCandidateHead(repo, pr);
       if (!head) return;
+      if (consumeBypass()) {
+        acknowledgeBypass(repo, head, ctx);
+        return;
+      }
       const effectivePr = { ...pr, headRefOid: head };
       if (acked(repo, head)) {
         publishFinalSummaryIfReady(repo, head, ctx);
@@ -893,21 +1041,8 @@ export default function (pi: ExtensionAPI) {
       const initialLanes = durableReviewInitialLanes(pending.lanes);
       savePending(pending);
       updateReviewStatus(pending, ctx);
-      pruneReviewResults(repo, head);
       ctx.ui.notify(`PR-boundary review catch-up required for ${basename(repo)} at ${head.slice(0, 12)}. Lanes: ${review.lanes.join(", ")}.`, "warning");
       await spawnReviewLanes(pending, effectivePr, initialLanes, ctx, "agent_end catch-up");
-      return;
-    }
-    if (isBreakerOpen(state.repo, state.head)) { pending = undefined; return; } // latched: do no further work for this head
-    if (acked(state.repo, state.head)) {
-      publishFinalSummaryIfReady(state.repo, state.head, ctx);
-      clearPending(state.repo);
-      pending = undefined;
-      return;
-    }
-    if (consumeBypass()) {
-      clearPending(state.repo);
-      pending = undefined;
       return;
     }
     const headStatus = reviewHeadStatus(state);
@@ -920,6 +1055,28 @@ export default function (pi: ExtensionAPI) {
       // (merge gate stays fail-closed) and retry on the next agent_end instead of
       // discarding review state on a transient failure.
       pending = undefined;
+      return;
+    }
+
+    const activeHead = bypassAckHeadForStatus({
+      status: headStatus,
+      pendingHead: state.head,
+      currentHead: headStatus === "advanced" ? currentEnforcedPrHead(state.repo) : undefined,
+    });
+    if (!activeHead) { pending = undefined; return; }
+    if (isBreakerOpen(state.repo, activeHead)) { pending = undefined; return; } // latched: do no further work for this head
+    if (acked(state.repo, activeHead)) {
+      publishFinalSummaryIfReady(state.repo, activeHead, ctx);
+      clearPending(state.repo);
+      pending = undefined;
+      return;
+    }
+    if (consumeBypass()) {
+      acknowledgeBypass(state.repo, activeHead, ctx);
+      return;
+    }
+    if (headStatus === "advanced") {
+      await rollForwardAdvancedReview(state, ctx, "agent_end detected advanced PR head");
       return;
     }
 

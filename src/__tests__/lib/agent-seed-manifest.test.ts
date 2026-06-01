@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
 import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution } from '../../../preseed/agents/pi/extensions/graphify-helpers';
-import { classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
-import { actionableReviewCount, allDurableReviewLanesComplete, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
-import { captureFilename, captureTimestamp, compactMessages, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, stableId, titleFor, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
+import { bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { actionableReviewCount, allDurableReviewLanesComplete, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
+import { buildSpawnOptions, captureFilename, captureTimestamp, compactMessages, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, stableId, titleFor, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
+import { attributionBlockReason, isLocalBuildCommand, localBuildBlockReason } from '../../../preseed/agents/pi/extensions/guard-helpers';
+import { DEBUG_WORKFLOW, DEPLOY_WORKFLOW, BRAINSTORM_WORKFLOW, commandInstructions, deployTarget } from '../../../preseed/agents/pi/extensions/commands-helpers';
 
 /**
  * Validates invariants of the generated agent seed configs.
@@ -170,7 +172,9 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(extensions.map((d) => d.key).sort()).toEqual([
       '.pi/agent/extensions/codeflare-commands.ts',
       '.pi/agent/extensions/codeflare-pi.ts',
+      '.pi/agent/extensions/commands-helpers.ts',
       '.pi/agent/extensions/graphify-helpers.ts',
+      '.pi/agent/extensions/guard-helpers.ts',
       '.pi/agent/extensions/memory-vault-helpers.ts',
       '.pi/agent/extensions/memory-vault.ts',
       '.pi/agent/extensions/review-command.ts',
@@ -294,23 +298,45 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isFailedToolExecution({ isError: true })).toBe(true);
     expect(isFailedToolExecution({ status: 'error' })).toBe(true);
     expect(isFailedToolExecution({ isError: false, status: 'success' })).toBe(false);
+    expect(prCreateBoundaryBase('gh pr create --base main')).toBe('main');
+    expect(prCreateBoundaryBase('gh pr create -B master')).toBe('master');
+    expect(prCreateBoundaryBase('gh pr create --base "main"')).toBe('main');
+    expect(prCreateBoundaryBase("gh pr create -B 'master'")).toBe('master');
+    // A just-created PR can be temporarily invisible to `gh pr view`; without a known base,
+    // fail open to the protected default so review enforcement still arms for local HEAD.
+    expect(prCreateBoundaryBase('gh pr create --title test')).toBe('main');
+    expect(prCreateBoundaryBase('gh pr create --base develop')).toBeUndefined();
+    expect(prCreateBoundaryBase('gh pr create --base "develop"')).toBeUndefined();
   });
 
-  it('REQ-AGENT-036 AC6: review head classification separates a moved-on PR from an unreadable gh query', () => {
+  it('REQ-AGENT-055 AC1-AC3: review head classification separates stale, unreadable, and advanced PR heads', () => {
     // Local HEAD still at the reviewed head -> current, even if GitHub lags or gh fails.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h1', prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('current');
     // PR is open at main and still names the pending head -> current.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: true, prHead: 'h1', prQueryFailed: false })).toBe('current');
-    // PR is open but now names a different head, and local moved on too -> definitively stale.
+    // PR is open but now names a different unrelated head, and local moved on too -> definitively stale.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: true, prHead: 'h2', prQueryFailed: false })).toBe('stale');
+    // PR head advanced along the same branch -> advanced, so the review window rolls forward instead of being discarded.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: true, prHead: 'h2', prQueryFailed: false, prHeadDescendsFromPending: true })).toBe('advanced');
+    // A readable PR head is authoritative; an unrelated PR head stays stale even if local HEAD descends from the pending head.
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h3', prOpenAtBase: true, prHead: 'h2', prQueryFailed: false, localHeadDescendsFromPending: true })).toBe('stale');
     // PR is no longer open at main (closed/merged/retargeted) and local moved on -> stale.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: false, prHead: undefined, prQueryFailed: false })).toBe('stale');
+    expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: false, prHead: undefined, prQueryFailed: false, localHeadDescendsFromPending: true })).toBe('stale');
     // failure #13: gh pr view failed and local moved on; the PR may still be open at h1.
     // This MUST be "unknown" (preserve pending, retry), never "stale" -- discarding here
     // would drop the merge gate and leave the reviewed head un-acked.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: 'h2', prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('unknown');
     // gh failed and local HEAD is also unreadable -> still unknown, not stale.
     expect(classifyReviewHead({ pendingHead: 'h1', localHead: undefined, prOpenAtBase: false, prHead: undefined, prQueryFailed: true })).toBe('unknown');
+  });
+
+  it('REQ-AGENT-041 / REQ-AGENT-055: Pi review bypass acknowledges only the current live PR head', () => {
+    expect(bypassAckHeadForStatus({ status: 'current', pendingHead: 'h1' })).toBe('h1');
+    expect(bypassAckHeadForStatus({ status: 'advanced', pendingHead: 'h1', currentHead: 'h2' })).toBe('h2');
+    expect(bypassAckHeadForStatus({ status: 'advanced', pendingHead: 'h1' })).toBeUndefined();
+    expect(bypassAckHeadForStatus({ status: 'stale', pendingHead: 'h1', currentHead: 'h2' })).toBeUndefined();
+    expect(bypassAckHeadForStatus({ status: 'unknown', pendingHead: 'h1', currentHead: 'h2' })).toBeUndefined();
   });
 
   it('REQ-AGENT-040: Pi review enforcement extracts visible background Agent IDs for pending lanes', () => {
@@ -579,7 +605,8 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
           content: [
             'Fix legitimate PR-boundary review findings for codeflare at abc123.',
             'Use the merged review summary immediately above as the actionable finding list.',
-            'Fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.',
+            'If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.',
+            'Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.',
             'Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.',
             'Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.',
           ].join('\n'),
@@ -615,7 +642,21 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
       claim: () => false,
     })).toBe(false);
+    expect(requestReviewAutofixForRows({
+      sender,
+      repo: '/repo/codeflare',
+      head: 'abc123',
+      rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
+      suppress: true,
+      claim: () => true,
+    })).toBe(false);
     expect(sent).toHaveLength(0);
+  });
+
+  it('REQ-AGENT-053: review autofix follows the latest explicit user auto/manual directive', () => {
+    expect(reviewAutofixModeFromUserMessages(['do not auto fix next round', 'review summary arrived'])).toBe('manual');
+    expect(reviewAutofixModeFromUserMessages(['do not automatically implement', 'GO, implement findings'])).toBe('auto');
+    expect(reviewAutofixModeFromUserMessages(['ordinary review discussion'])).toBe('unset');
   });
 
   it('REQ-AGENT-053: durable Pi review severity helpers identify actionable findings for the fix loop', () => {
@@ -678,7 +719,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(laneExtensionSources(['npm:@gotgenes/pi-subagents@7.8.1', '', { source: '' }])).toEqual([]);
   });
 
-  it('REQ-AGENT-040: Pi review enforcement selects the unreviewed incremental review base', () => {
+  it('REQ-AGENT-055 AC4-AC5: Pi review enforcement selects the unreviewed incremental review base', () => {
     const previous = {
       head: 'old-head',
       reviewBase: 'first-unreviewed-base',
@@ -698,7 +739,9 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       previousRemoteHead: 'remote-prev',
     })).toBe('old-head');
     expect(reusablePendingReview(previous, 'rebased-head', () => false)).toBeUndefined();
-    expect(selectReviewBase({ previous: undefined, lastAck: undefined, previousRemoteHead: 'remote-prev' })).toBe('remote-prev');
+    // A remote-tracking reflog entry alone is not evidence that the prior PR contents were reviewed.
+    // Without an ack or completed previous review, keep reviewBase undefined so the next review covers the full PR diff.
+    expect(selectReviewBase({ previous: undefined, lastAck: undefined, previousRemoteHead: 'remote-prev' })).toBeUndefined();
   });
 
   it('REQ-AGENT-023: Pi native runtime assets include graphify package, MCP config, and skill override', () => {
@@ -1160,32 +1203,118 @@ describe('REQ-AGENT-027 AC1 context-mode wired as a tool only (no Bash deny-gate
   });
 });
 
-describe('REQ-AGENT-040 AC8 review dispatch is backgrounded with a bounded in-flight guard', () => {
-  it('the seeded enforce-review-spawn.sh carries the in-flight guard, a staleness bound, and the background-dispatch directive', () => {
-    const hook = AGENTS_SEEDED_CONFIGS.find((d) =>
-      d.key.endsWith('codeflare-hooks/scripts/enforce-review-spawn.sh')
-    );
-    expect(hook, 'enforce-review-spawn.sh must be bundled in the Claude seed').toBeTruthy();
-    const body = hook!.content;
-    expect(body).toContain('lane_in_flight');
-    expect(body).toContain('IN_FLIGHT_STALE_LINES');
-    expect(body).toContain('run_in_background');
+// Behavioral tests for the Pi-native extension logic: each imports a pi-package-free helper
+// (guard-helpers, commands-helpers, memory-vault-helpers) and executes the real logic that the
+// side-effectful extension modules compose - not source-string matching. The extension modules
+// themselves import the Pi package / node:child_process and cannot load in the Workers test
+// pool, so the executable logic lives in these helpers. Command registration (AC1) is the one
+// exception: it is wiring inside codeflare-commands.ts, which cannot be loaded here, so it is
+// asserted against the shipped extension content.
+
+describe('Pi /debug, /deploy, /brainstorm commands / REQ-AGENT-051 (Claude-only slash commands reimplemented as Pi native command handlers)', () => {
+  it('AC1: the extension registers exactly the debug, deploy, and brainstorm commands', () => {
+    const doc = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/codeflare-commands.ts');
+    expect(doc, 'codeflare-commands.ts must be seeded').toBeTruthy();
+    const registered = [...doc!.content.matchAll(/registerCommand\("([^"]+)"/g)].map((m) => m[1]).sort();
+    expect(registered).toEqual(['brainstorm', 'debug', 'deploy']);
   });
 
-  it('applies in-flight suppression PER-LANE, not as a blanket whole-gate exit', () => {
-    const hook = AGENTS_SEEDED_CONFIGS.find((d) =>
-      d.key.endsWith('codeflare-hooks/scripts/enforce-review-spawn.sh')
-    );
-    expect(hook, 'enforce-review-spawn.sh must be bundled in the Claude seed').toBeTruthy();
-    const body = hook!.content;
-    // The blanket "any required lane in flight -> exit 0" loop must be gone: it
-    // masked the whole gate while one slow lane ran, so the sequential
-    // doc-updater demand never fired.
-    expect(body).not.toContain('a required review lane is still running');
-    // Each lane demand is guarded by its own lane_in_flight check so a lane
-    // already running is skipped without suppressing the others.
-    expect(body).toContain('! spawned_after_push "code-reviewer" && ! lane_in_flight "code-reviewer"');
-    expect(body).toContain('! spawned_after_push "spec-reviewer" && ! lane_in_flight "spec-reviewer"');
-    expect(body).toContain('! lane_in_flight "doc-updater"');
+  it('AC2: commandInstructions assembles the dispatched message as slash + workflow + user input', () => {
+    const out = commandInstructions('/debug', DEBUG_WORKFLOW, 'my failing test');
+    expect(out.startsWith('/debug\n')).toBe(true);
+    expect(out).toContain(DEBUG_WORKFLOW);
+    expect(out.endsWith('User input: my failing test')).toBe(true);
+  });
+
+  it('AC3: the assembled /debug instruction is root-cause-first and carries the 3-Fix Rule', () => {
+    const out = commandInstructions('/debug', DEBUG_WORKFLOW, 'x');
+    expect(out).toMatch(/Root Cause Investigation/i);
+    expect(out).toMatch(/No fixes before root-cause/i);
+    expect(out).toContain('3-Fix Rule');
+  });
+
+  it('AC4: /deploy defaults to integration and the assembled instruction runs push/stale-CI/monitor/deploy/verify', () => {
+    expect(deployTarget('')).toBe('integration');
+    expect(deployTarget('production')).toBe('production');
+    const out = commandInstructions('/deploy', DEPLOY_WORKFLOW, deployTarget(''));
+    expect(out).toContain('User input: integration');
+    expect(out).toMatch(/Cancel stale CI/i);
+    expect(out).toMatch(/Monitor CI/i);
+    expect(out).toMatch(/git push/);
+    expect(out).toMatch(/wrangler deploy/);
+    expect(out).toMatch(/Verify the live URL/i);
+  });
+
+  it('AC5: the assembled /brainstorm instruction generates options with trade-offs and a recommendation', () => {
+    const out = commandInstructions('/brainstorm', BRAINSTORM_WORKFLOW, 'an idea');
+    expect(out).toMatch(/Generate options/i);
+    expect(out).toMatch(/Trade-off/i);
+    expect(out).toMatch(/Recommendation/i);
+  });
+});
+
+describe('Pi commit-attribution and local-build guards / REQ-AGENT-052 (Pi PreToolUse guards match the canonical Claude detection sets)', () => {
+  // guard-helpers holds the executable guard logic that codeflare-pi.ts composes; it has no
+  // node:child_process dependency, so it runs in the Workers test pool (codeflare-pi.ts cannot).
+  it('AC1: attribution fires across git commit/merge/tag/notes and gh pr/issue/release', () => {
+    const trailer = '\n\nCo-Authored-By: Bot <bot@example.com>';
+    for (const base of ['git commit -m "x"', 'git merge feature', 'git tag v1 -m "x"', 'git notes add -m "x"', 'gh pr create --body "x"', 'gh issue create --body "x"', 'gh release create v1 --notes "x"']) {
+      expect(attributionBlockReason(`${base}${trailer}`), base).toBeTruthy();
+    }
+  });
+
+  it('AC2: matches the six attribution signatures including the Pi superset (brain emoji + ChatGPT)', () => {
+    for (const sig of ['Co-Authored-By: x <x@y>', 'noreply@anthropic.com', 'Generated with Claude Code', '🤖 generated', '🧠 thought', 'made by ChatGPT']) {
+      expect(attributionBlockReason(`git commit -m "msg ${sig}"`), sig).toBeTruthy();
+    }
+  });
+
+  it('AC3: bare Claude product names and preseed/agents/claude paths are not false positives', () => {
+    expect(attributionBlockReason('git add preseed/agents/claude/skills/review/SKILL.md')).toBeUndefined();
+    expect(attributionBlockReason('git commit -m "Claude Code parity for Pi"')).toBeUndefined();
+  });
+
+  it('AC4: detects the package-manager verbs plus the standalone tool set, and allows the rest', () => {
+    for (const cmd of ['npm run build', 'pnpm test', 'yarn lint', 'bun run typecheck', 'npm run dev', 'pytest -q', 'vitest run', 'go test ./...', 'cargo test', 'tsc -p .', 'eslint .', 'oxlint', 'prettier -w .', 'wrangler dev']) {
+      expect(isLocalBuildCommand(cmd), cmd).toBe(true);
+    }
+    expect(isLocalBuildCommand('git status')).toBe(false);
+    expect(isLocalBuildCommand('npm run deploy')).toBe(false);
+  });
+
+  it('AC5: the /tmp/local-build-bypass sentinel is consumed once, then the guard re-blocks', () => {
+    let present = true;
+    const fs = { existsSync: () => present, unlinkSync: () => { present = false; } };
+    expect(localBuildBlockReason('npm run build', fs)).toBeUndefined();  // sentinel present -> consumed, allowed
+    expect(present).toBe(false);                                          // consume-on-use deleted it
+    expect(localBuildBlockReason('npm run build', fs)).toMatch(/create \/tmp\/local-build-bypass/);  // re-blocks once gone
+  });
+
+  it('AC5: a non-build command is never blocked regardless of the sentinel', () => {
+    const fs = { existsSync: () => false, unlinkSync: () => { throw new Error('should not be called'); } };
+    expect(localBuildBlockReason('git status', fs)).toBeUndefined();
+  });
+});
+
+describe('Pi memory model-fidelity lever / REQ-MEM-014 AC5 (buildSpawnOptions applies the model only when set; no hardcoded model)', () => {
+  it('applies the model option only when a model argument is provided', () => {
+    expect(buildSpawnOptions('Capture session memory', 'higher-fidelity-model').model).toBe('higher-fidelity-model');
+    expect('model' in buildSpawnOptions('Capture session memory', undefined)).toBe(false);
+  });
+
+  it('passes no model when CODEFLARE_MEMORY_MODEL is unset (no hardcoded default)', () => {
+    const saved = process.env.CODEFLARE_MEMORY_MODEL;
+    delete process.env.CODEFLARE_MEMORY_MODEL;
+    try {
+      expect('model' in buildSpawnOptions('Extract Vault graph changes', process.env.CODEFLARE_MEMORY_MODEL)).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env.CODEFLARE_MEMORY_MODEL = saved;
+    }
+  });
+
+  it('always carries the description and inheritContext:false base options', () => {
+    const opts = buildSpawnOptions('Capture resumed session memory', 'm');
+    expect(opts.description).toBe('Capture resumed session memory');
+    expect(opts.inheritContext).toBe(false);
   });
 });

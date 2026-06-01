@@ -17,7 +17,7 @@ it gets there" content. Memory-system specifics live in
 - [Settings.json Merge](#settingsjson-merge)
 - [Plugin Enablement](#plugin-enablement)
 - [Third-party plugin: context-mode](#third-party-plugin-context-mode)
-- [Graphify](#graphify)
+- [Graphify](#graphify-req-agent-023)
 - [/sdd init Modes](#sdd-init-modes)
 - [Troubleshooting](#troubleshooting)
 
@@ -34,15 +34,15 @@ deployed on Recreate or new bucket creation.
 | Cloudflare-stack, github-cloudflare-ship (+ refs), ci-monitoring, pr-workflow, deploy-credentials skills | Yes | Yes | Yes |
 | `consult-llm` skill (CC only) | No | Yes | Yes |
 | CC hooks: `block-attributed-commits`, `git-push-review-reminder`, `enforce-review-spawn` | No | Yes | Yes |
-| Language rules (18 files: common, TS, Python, Go, Swift) | No | Yes | Yes |
-| Agent definitions (9: architect, code-reviewer, deep-reviewer, spec-reviewer, etc.) | No | Yes | Yes |
-| Commands (5: /brainstorm, /debug, /deploy, /review, /sdd) | No | Yes | Yes |
-| Cherry-picked skills (8: api-design, backend-patterns, etc.) | No | Yes | Yes |
-| `spec-discipline` rule + spec-enforce skill family (3 skills: spine, AC, truth) | No | Yes | Yes |
-| `documentation-discipline` rule + doc-enforce skill family (4 skills: spine, lanes, shape, truth) | No | Yes | Yes |
+| Language rules (common, TS, Python, Go, Swift) | No | Yes | Yes |
+| Agent definitions (architect, code-reviewer, deep-reviewer, spec-reviewer, etc.) | No | Yes | Yes |
+| Commands (/brainstorm, /debug, /deploy, /review, /sdd) | No | Yes | Yes |
+| Cherry-picked skills (api-design, backend-patterns, etc.) | No | Yes | Yes |
+| `spec-discipline` rule + spec-enforce skill family (spine, AC, truth) | No | Yes | Yes |
+| `documentation-discipline` rule + doc-enforce skill family (spine, lanes, shape, truth) | No | Yes | Yes |
 | `tdd-discipline` rule + tdd-enforce skill | No | Yes | Yes |
 | git-review-pipeline skill (SDD PR-boundary review pipeline) | No | Yes | Yes |
-| SDD template scaffolding (12 files for `/sdd init`) | No | Yes | Yes |
+| SDD template scaffolding for `/sdd init` | No | Yes | Yes |
 | Known marketplaces plugin config | Yes | Yes | Yes |
 | context-mode helper package (`ctx_*` tools) | Disabled by default in Pi; optional `/ctx on` for current session | Disabled by default in Pi; optional `/ctx on` for current session | Disabled by default in Pi; optional `/ctx on` for current session |
 | context-mode plugin folder (Claude Code auto-routing hooks for context-window reduction) | No | No | Yes |
@@ -94,7 +94,7 @@ on explicit action.
 ECC-derived rules, agents, commands, and skills are preseeded directly
 to the agent config filesystem. No external plugins are installed.
 
-**Agents (9)**: `architect`, `build-error-resolver`, `code-reviewer`,
+**Agents**: `architect`, `build-error-resolver`, `code-reviewer`,
 `deep-reviewer`, `doc-updater`, `refactor-cleaner`, `security-reviewer`,
 `spec-reviewer`, `tdd-guide`. Preseeded to `~/.claude/agents/*.md`
 (and adapted equivalents for other agents) via the manifest pipeline
@@ -105,7 +105,7 @@ frontmatter with `name`, `description`, `tools` (emitted as a record
 `{read: true, write: true}` for OpenCode, instead of array format),
 and `model` (CC only).
 
-**Commands (5)**: `brainstorm`, `debug`, `deploy`, `review`, `sdd`.
+**Commands**: `brainstorm`, `debug`, `deploy`, `review`, `sdd`.
 Preseeded to `~/.claude/commands/*.md` (CC only -- other agents don't
 support slash commands). Planning transitions are handled via Plan
 Mode (a built-in Claude Code primitive), not a slash command. `/review`
@@ -115,31 +115,30 @@ deep-reviewer agents) and `--verify-high` (Phase 7 external-LLM
 second-opinion); invoking it with no arguments prints a CLI help
 screen and exits without running.
 
-**Skills (29 SKILL.md files, 46 manifest entries including
-reference files)**: `cloudflare-stack`, `github-cloudflare-ship`
-(+ 2 reference files), `consult-llm`, `api-design`,
+**Skills** (each preseeded as `<name>/SKILL.md`): `cloudflare-stack`, `github-cloudflare-ship`
+(+ reference files), `consult-llm`, `api-design`,
 `backend-patterns`, `content-hash-cache-pattern`,
 `database-migrations`, `deployment-patterns`, `frontend-patterns`,
 `iterative-retrieval`, `search-first`, `spec-driven-development`
-(+ 12 reference templates for `/sdd init` scaffolding; covers the
-three Import/Resume modes for legacy-codebase transition documented
+(+ reference templates for `/sdd init` scaffolding; covers the
+Import/Resume modes for legacy-codebase transition documented
 below), `sdd-init`, `sdd-clean` (sub-command skills the `/sdd`
 dispatch table routes to for `init` and `clean`), `vault-operations`
 (layout, wikilink conventions, NEVER list - surfaced when an agent
 touches `~/Vault/`), `vault-note-capture` (writes "take a note"
 phrases to `~/Vault/Notes/<Category>/`), `graphify`. SDD
-enforcement family (8 skills, advanced-only):
+enforcement family (advanced-only):
 `spec-enforce` + `spec-enforce-ac` + `spec-enforce-truth`,
 `doc-enforce` + `doc-enforce-lanes` + `doc-enforce-shape` +
-`doc-enforce-truth`, `tdd-enforce`. Git-workflow family (4 skills):
+`doc-enforce-truth`, `tdd-enforce`. Git-workflow family:
 `ci-monitoring`, `git-review-pipeline` (advanced-only),
 `pr-workflow`, `deploy-credentials`. Preseeded to
 `~/.claude/skills/<name>/SKILL.md` (and adapted equivalents for
 agents that support skills). `consult-llm` is CC-only (depends on
 MCP tool).
 
-**Rules (27 files, 3 in both modes + 24 advanced-only)** (REQ-MEM-006,
-REQ-VAULT-007): Core environment rules (`cloudflare-environment`,
+**Rules** (core environment rules in both modes; the rest advanced-only) ([REQ-MEM-006](../../sdd/spec/memory.md#req-mem-006-memory-available-only-in-pro-advanced-mode),
+[REQ-VAULT-007](../../sdd/spec/vault.md#req-vault-007-vault-rules-and-plugin-are-preseeded-into-every-advanced-session)): Core environment rules (`cloudflare-environment`,
 `no-local-builds`, `git-workflow`) in both modes - `git-workflow` is
 the umbrella core rule that delegates branched mechanics to the
 `ci-monitoring`, `git-review-pipeline`, `pr-workflow`, and
@@ -155,10 +154,10 @@ carries the folded vault trigger/route content (references CC-specific
 `mcp__graphify__*` tools and the vault hook system).
 `vault-note-capture` rule is advanced-only and routes "take a note"
 phrases to the `vault-note-capture` skill. `graph-first` rule is
-advanced-only (graphify discipline, REQ-AGENT-023). `karpathy` rule
+advanced-only (graphify discipline, [REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify)). `karpathy` rule
 is advanced-only (LLM coding-mistakes principles). ECC-derived
 language rules in `{common,typescript,python,golang,swift}/` subdirs
-(1 + 4*4 = 17 files, advanced only). `common/coding-style.md`
+(advanced only). `common/coding-style.md`
 covers shared style; the per-language `security.md` files stand
 alone after the `common/security.md` removal. Language-specific
 rules provide conventions for TypeScript, Python, Go, and Swift.
@@ -203,50 +202,48 @@ All preseed content is deployed via the manifest pipeline:
    `~/.config/opencode/`, `~/.pi/agent/`)
 
 **Manifest structure** (Claude configs plus Pi-native assets; exact counts live in the manifests, not here):
-- `rules/` (27): core (3 default+advanced: cloudflare-environment,
-  no-local-builds, git-workflow; + 7 advanced-only top-level: memory,
+- `rules/`: core (both modes: cloudflare-environment,
+  no-local-builds, git-workflow; advanced-only top-level: memory,
   spec-discipline, documentation-discipline, tdd-discipline,
-  graph-first, karpathy, vault-note-capture), common (1: coding-style;
-  per-language security rules stand alone), typescript (4), python (4),
-  golang (4), swift (4)
-- `agents/` (11): architect, build-error-resolver, code-reviewer,
+  graph-first, karpathy, vault-note-capture), common (coding-style;
+  per-language security rules stand alone), typescript, python,
+  golang, swift
+- `agents/`: architect, build-error-resolver, code-reviewer,
   deep-reviewer, doc-updater, memory-capture, refactor-cleaner,
   security-reviewer, spec-reviewer, tdd-guide, vault-extract
   (advanced only)
-- `commands/` (5): brainstorm, debug, deploy, review, sdd
+- `commands/`: brainstorm, debug, deploy, review, sdd
   (advanced only)
-- `skills/` (46): cloudflare-stack, github-cloudflare-ship (+2
-  refs), ci-monitoring, pr-workflow, deploy-credentials (the five
+- `skills/`: cloudflare-stack, github-cloudflare-ship (+
+  refs), ci-monitoring, pr-workflow, deploy-credentials (the
   default+advanced skills), consult-llm, api-design,
   backend-patterns, content-hash-cache-pattern, database-migrations,
   deployment-patterns, frontend-patterns, iterative-retrieval,
-  search-first, spec-driven-development (+12 reference templates
+  search-first, spec-driven-development (+ reference templates
   for /sdd init scaffolding), sdd-init, sdd-clean (sub-command
   skills), vault-operations, vault-note-capture, spec-enforce,
   spec-enforce-ac, spec-enforce-truth, doc-enforce, doc-enforce-lanes,
   doc-enforce-shape, doc-enforce-truth, tdd-enforce,
   git-review-pipeline, graphify
-- `plugins/` (31): known_marketplaces.json (default+advanced),
-  codeflare-memory plugin (7 files, advanced only: plugin.json,
+- `plugins/`: known_marketplaces.json (default+advanced),
+  codeflare-memory plugin (advanced only: plugin.json,
   memory-capture.sh, memory-capture-block.sh, memory-agent-prompt.md,
   prefilter-transcript.sh, assert-iso-ts.sh, memory-context-inject.sh),
-  codeflare-vault plugin (4 files, advanced only: plugin.json,
+  codeflare-vault plugin (advanced only: plugin.json,
   vault-monitor-hook.sh, vault-extract-prompt.md, merge-vault-graph.py),
-  codeflare-hooks
-  plugin (7 files, advanced only: plugin.json,
+  codeflare-hooks plugin (advanced only: plugin.json,
   block-attributed-commits.sh, block-local-builds.sh,
   git-push-review-reminder.sh, enforce-review-spawn.sh,
   scripts/lib/gh-pr-state.sh - shared gh CLI invocation sourced by
   both PR-aware hooks, scripts/lib/lane-classifier.sh - shared diff-
   classification helper sourced by both PR-aware hooks so the in-turn
   nudge and the turn-end gate agree on which lanes a push requires),
-  context-mode plugin (3 files, advanced only: plugin.json,
-  README.md, scripts/enforce-ctx-mode.sh - admin-only Custom-tier
-  routing enforcement, see Third-party plugin section below),
-  graphify plugin (9 files, default+advanced for plugin.json + README
+  context-mode plugin (advanced only:
+  README.md - MCP/indexing registration only; stale deny-gates are pruned),
+  graphify plugin (default+advanced for plugin.json + README
   + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
   graphify-session-start.sh, graphify-clone-prompt.sh,
-  graph-first-nudge.sh, enforce-graphify.sh, safe-graphify-update.sh)
+  graph-first-nudge.sh, safe-graphify-update.sh)
 - Pi-native runtime assets: package config, package lock, MCP
   config, extension files (including `codeflare-commands.ts`, which
   provides the Pi `/debug`, `/deploy`, and `/brainstorm` commands since
@@ -288,8 +285,9 @@ All preseed content is deployed via the manifest pipeline:
   chat summary aggregates severity counts across code/spec/docs, lists all
   findings sorted by criticality, and avoids per-lane result-file links; the
   per-lane `.md` files remain the durable evidence store. If legitimate
-  MEDIUM/HIGH/CRITICAL findings remain, Pi then requests a fix-and-push pass.
-  Implements
+  MEDIUM/HIGH/CRITICAL findings remain, Pi then requests a fix-and-push pass,
+  unless the latest explicit user directive opts out of auto-fixing for the
+  round (in which case Pi presents the findings and waits). Implements
   [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop).
 
   Timed-out or failed durable lanes are recorded as failed and do not produce
@@ -304,7 +302,7 @@ All preseed content is deployed via the manifest pipeline:
   `git-review-pipeline` enforcement skill. Pi memory capture is driven by
   two deployed contracts - `prompts/memory-agent-prompt.md` (the
   capture-agent contract) and `prompts/vault-extract-prompt.md` (the
-  Vault-graph extraction contract) - which carry the full AD58-grade
+  Vault-graph extraction contract) - which carry the full [AD58](../decisions/README.md#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad)-grade
   capture instructions; `memory-vault.ts` reads them from
   `~/.pi/agent/prompts/*.md`, reads the conversation from the durable
   on-disk session transcript Pi persists for `/resume`
@@ -313,11 +311,13 @@ All preseed content is deployed via the manifest pipeline:
   user prompts (synthetic `<task-notification>` / command wrappers are
   ignored), and prefilters to user/assistant text (dropping tool and
   thinking blocks) before spawning the capture subagent once the delta
-  since the last capture reaches 15 real user prompts (`delta >= 15`); an
+  since the last capture reaches 15 real user prompts (`delta >= 15`,
+  [REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages)); an
   empty resolved transcript skips capture instead of writing a hollow note.
   A missing `/tmp` counter with more than one real user prompt force-fires
   resumed-session capture, matching Claude. Vault indexing uses the shared
-  `vault-extract.last` high-water marker and excludes `Raw/Sessions/`,
+  `vault-extract.last` high-water marker
+  ([REQ-VAULT-007](../../sdd/spec/vault.md#req-vault-007-vault-rules-and-plugin-are-preseeded-into-every-advanced-session)) and excludes `Raw/Sessions/`,
   `graphify-out/`, `.silverbullet/`, and the four preseed root pages, so the
   Vault indexing agent only runs after user-curated Vault changes.
   Pi subagents are provided by `@gotgenes/pi-subagents`; the generator
@@ -353,16 +353,7 @@ files exist on disk.
 | Grep | grep | search | search | grep |
 | Glob | glob | search | glob | find |
 
-**What each agent gets:**
-
-| Agent | Total Documents |
-|-------|-----------------|
-| CC | 120 |
-| Codex | 47 |
-| Copilot | 13 |
-| OpenCode | 58 |
-| Pi | 74 |
-| **Total** | **312** |
+**What each agent gets:** Claude Code and Pi both receive the full capability set - Claude Code through its native rules/agents/commands/skills/hooks/plugins, and Pi through adapted rules/skills/agents plus native TypeScript extensions that reimplement the CC-only surfaces (slash commands, hooks, memory capture, review enforcement) on Pi primitives. Codex, Copilot, and OpenCode receive a reduced, runtime-appropriate subset: adapted rules and - where the runtime supports them - skills and agents, but none of the CC-only surfaces. The exact per-agent document counts are emitted by `scripts/generate-agent-seed.mjs` from `manifest.json` - read the generated output, not a hardcoded total here.
 
 **Excluded from non-CC transformed assets**: hooks (CC hook system),
 commands (CC slash commands), plugins (CC plugin system, including
@@ -399,14 +390,17 @@ to `.pi/agent/extensions/`, `.pi/agent/scripts/`, `.pi/agent/mcp.json`,
 `.pi/agent/npm/package.json`, `.pi/agent/npm/package-lock.json`,
 capture-contract prompts to `.pi/agent/prompts/`, and
 native Pi skill overrides under `~/.pi/agent/skills/`, and adapts Claude agent definitions into
-`.pi/agent/agents/*.md` for `@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops context-mode tools so those `@gotgenes/pi-subagents` subagents run against the native Pi tool surface. This applies to subagent frontmatter only; the durable PR-boundary review lanes are a separate `createAgentSession` path that loads context-mode additively when it is enabled (see AD64), so "review runs without ctx tools" is not categorical.
+`.pi/agent/agents/*.md` for `@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops context-mode tools so those `@gotgenes/pi-subagents` subagents run against the native Pi tool surface. This applies to subagent frontmatter only; the durable PR-boundary review lanes are a separate `createAgentSession` path that loads context-mode additively when it is enabled (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so "review runs without ctx tools" is not categorical.
 
-**Per-mode counts**: Default mode seeds 53 files, advanced mode
-seeds 365 files. Total array size is 370 (includes variant-per-mode
-duplicates for instructions files).
+**Per-mode seeding**: Default mode seeds the core rules plus the
+universal skills; advanced mode seeds the full set (memory, ECC
+language rules, discipline triad, enforcement skill families, agents,
+commands, plugins). The generated array carries variant-per-mode
+duplicates for instructions files (see below); the exact per-mode
+file counts live in the generated `agent-seed.generated.ts`, not here.
 
 **Variant-per-mode keys**: Instructions files appear twice in the
-generated array -- once for default mode (3 rules) and once for
+generated array -- once for default mode (core rules only) and once for
 advanced mode (all rules including memory, ECC), with the same R2
 key but different content. `getPreseedKeysNotInMode()` handles this
 correctly by excluding keys that have a variant in the target mode.
@@ -470,33 +464,34 @@ is done via `settings.json` (see above).
   responds ([REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt)).
   `memory-capture.sh` handles the ongoing 15-prompt capture cadence
 - **codeflare-hooks**: Scripts for commit attribution blocking,
-  git-push review reminders, and SDD review-agent non-blocking
-  enforcement - `code-reviewer` and `spec-reviewer` spawn in parallel
-  in the background (`run_in_background: true`), then `doc-updater`
-  follows `spec-reviewer` sequentially, also in the background, so the
-  main session stays usable throughout. The Stop hook suppresses
-  re-summoning per lane (a lane already in flight is skipped, but does
-  not mask the demand for the other lanes). The PostToolUse nudge and
-  the Stop hook share
-  `scripts/lib/lane-classifier.sh` and emit lane-aware directives so a
-  doc-only push spawns only `doc-updater`, an `sdd/`-only push spawns
-  `spec-reviewer` then `doc-updater` sequentially, and source pushes
-  spawn all three; on non-SDD projects (no `sdd/`) no agents fire and
-  the push is friction-free (vibe-coding mode). Each tool-gated hook
-  is registered on two matcher entries covering three tool names: the
-  `Bash` matcher (with `Bash(git *)` and `Bash(gh *)` predicates) and
-  the pipe-alternated MCP matcher
-  `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute`.
-  This keeps attribution blocking and push detection effective whether
-  context-mode is active or not (context-mode is advisory routing only;
-  the Bash deny-gate was removed in AD65-era cleanup). Implements
-  [REQ-AGENT-021](../../sdd/spec/agents.md#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability) AC3 (tool-surface portability) and [REQ-AGENT-036](../../sdd/spec/agents.md#req-agent-036-pr-boundary-review-trigger-conditions) AC1+AC2 (PR-boundary trigger + dual-matcher PUSH_LINE detection). Hooks
-  registered in settings.json, scripts delivered via plugin.
+  git-push review reminders, and SDD review-agent enforcement.
+
+Review dispatch is non-blocking: `code-reviewer` and `spec-reviewer`
+spawn in parallel in the background (`run_in_background: true`), then
+`doc-updater` follows `spec-reviewer` sequentially, also in the background.
+
+In-flight suppression is per lane. A fresh in-flight lane is skipped
+without masking other required lanes, while a stale uncompleted lane past
+the transcript recency bound is demanded again.
+
+The PostToolUse nudge and Stop hook share `scripts/lib/lane-classifier.sh`.
+Doc-only pushes spawn only `doc-updater`; `sdd/`-only pushes spawn
+`spec-reviewer` then `doc-updater`; source pushes spawn all three; non-SDD
+projects fire no review agents.
+
+Each tool-gated hook is registered on two matcher entries covering three
+tool names: the `Bash` matcher (with `Bash(git *)` and `Bash(gh *)`
+predicates) and the pipe-alternated MCP matcher
+`mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute`.
+This keeps attribution blocking and push detection effective whether
+context-mode is active or not. Implements
+[REQ-AGENT-021](../../sdd/spec/agents.md#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability) AC3, [REQ-AGENT-036](../../sdd/spec/agents.md#req-agent-036-pr-boundary-review-trigger-conditions) AC1+AC2, and [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) AC4-AC7. Hooks
+registered in settings.json, scripts delivered via plugin.
 
 ## Third-party plugin: context-mode
 
 [context-mode](https://github.com/mksglu/context-mode) is registered
-as an optional Claude Code MCP server (`ctx_*` helper tools) where that runtime enables it. Pi does not load context-mode by default; `/ctx on` enables the package for the current running Pi session and reloads resources, while `/ctx off` disables it again. Durable PR-boundary review lanes inherit this state: when context-mode is enabled in Pi settings, `runDurableLane` additively loads it into the lane via `additionalExtensionPaths` (see AD64), so reviewers gain `ctx_*` tools only when the main session has `/ctx on`; with it off, lanes run without them.
+as an optional Claude Code MCP server (`ctx_*` helper tools) where that runtime enables it. Pi does not load context-mode by default; `/ctx on` enables the package for the current running Pi session and reloads resources, while `/ctx off` disables it again. Durable PR-boundary review lanes inherit this state: when context-mode is enabled in Pi settings, `runDurableLane` additively loads it into the lane via `additionalExtensionPaths` (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so reviewers gain `ctx_*` tools only when the main session has `/ctx on`; with it off, lanes run without them.
 The npm package is fetched by the user's own container from the npm
 registry on first invocation; Codeflare does not redistribute the
 source. Commercial users receive only the MCP server registration:
@@ -504,25 +499,19 @@ no skill, rule, hook, or system-prompt nudge in our preseed
 instructs Claude to invoke `ctx_*` tools. The agent's tool-selection
 is its own, identical to how it picks any other listed MCP tool.
 
-The full plugin folder containing the auto-routing hooks (PreToolUse
-routing, PostToolUse indexing, PreCompact, SessionStart) plus the
-context-mode enforcement hook is reserved for the admin-only Custom
-(`unlimited`) tier sandbox. The enforcement hook is a fifth PreToolUse
-handler that hard-enforces context-mode routing: Bash calls are
-restricted to a whitelist (`git`, `mkdir`, `rm`, `mv`, `cd`, `ls`,
-`npm install`, `pip install`); WebFetch and Grep are denied entirely
-and redirected to the equivalent `ctx_*` tools. Per-call bypass via
-`/tmp/ctx-bypass` (user-only sentinel - see
-[Security](security.md#context-mode-enforcement-bypass)). Routing is
-active by default from session start with no boot-time sentinel file
-created by the container. Users who want native Bash routing create
-the sentinel themselves in a separate terminal.
+Codeflare no longer ships the former Bash/WebFetch/Grep deny-gate
+(`enforce-ctx-mode.sh`) in the context-mode plugin. Context-mode is
+MCP/indexing only: agents may call the `ctx_*` tools when available, but
+native Bash, WebFetch, and grep-class tools are not blocked by a
+context-mode routing hook. Entrypoint reconciliation prunes stale copies
+of the old deny-gate from managed hook settings so restored containers do
+not retain obsolete hard-routing behavior.
 
 context-mode is licensed under [Elastic License 2.0](https://github.com/mksglu/context-mode/blob/main/LICENSE).
 The integration is sized to stay within ELv2's permitted-use envelope.
 See [AD49](../decisions/README.md#ad49-context-mode-delivered-as-preseed-plugin-not-runtime-install) for the full design + license analysis.
 
-## Graphify
+## Graphify ([REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify))
 
 ### SessionStart context injection ([REQ-AGENT-024](../../sdd/spec/agents.md#req-agent-024-advanced-session-mode-graph-first-discipline) AC1)
 
@@ -533,21 +522,6 @@ In advanced session mode, `graphify-session-start.sh` injects structural context
 3. **Tier 3 (build suggestion):** If no graph exists but the cwd contains code files, injects a suggestion to build one via `/graphify`.
 
 All tiers append tool guidance (pointing at `mcp__graphify__query_graph`, `mcp__graphify__get_node`, etc.). The hook never auto-builds a graph.
-
-### Hard-block PreToolUse hook ([REQ-AGENT-042](../../sdd/spec/agents.md#req-agent-042-graphify-hard-block-enforcement))
-
-In advanced session mode, `enforce-graphify.sh` is a second PreToolUse hook on the graphify plugin that complements the existing `graph-first-nudge.sh` soft nudge. The soft nudge fires on every grep-class call with an `additionalContext` reminder; the hard-block fires only after the pattern persists.
-
-Mechanics:
-
-- **Matchers**: `Grep`, `Bash`, `mcp__context-mode__ctx_execute`, `mcp__context-mode__ctx_batch_execute`, `mcp__context-mode__ctx_execute_file`. Covers both plain-Bash sessions (where `Grep`/`Bash` fire natively) and context-mode sessions (where agents route grep-class calls through the `ctx_execute*` family as advisory best-practice; the Bash deny-gate was removed).
-- **Gating**: two-step active-repo resolution. The hook first reads `~/.cache/codeflare-hooks/graphify-active-cwd` (the sentinel `graphify-active-repo.sh` maintains on every Bash/Edit/Write/ctx_execute tool call) and checks `<active-repo>/graphify-out/graph.json`. If the sentinel is absent or stale, it falls back to the tool-call envelope `.cwd`. In codeflare the session cwd is always `~/workspace` (parent of all repos, never a sub-repo), so the sentinel is the load-bearing signal; the envelope-cwd fallback exists for vanilla graphify usage outside codeflare. Pi updates the same sentinel from command-local `cd ... &&` and `git -C ...` forms and injects the active repo as `<repo>:<branch>@<head>` in session context. Vault-only-in-global is intentionally NOT enforcement-eligible: a session whose active repo has no graph triggers no hard-block, so the user can grep freely in repos they have not yet graphified.
-- **Threshold**: blocks the next structural search after 3 grep-class tool calls in the same turn (counted by walking the transcript backward to the last real user prompt) when no `mcp__graphify__*` call (or `graphify query|path|explain` CLI invocation) has been made.
-- **Classification**: SEARCH = first-word `grep|rg|ag|ack`, `git grep`, `find` with `-name|-path|-iname|-ipath|-regex`, or `awk` with `/regex/` body. The shell parser reuses `extract_subs` + `normalize_command` + chain-op splitter from `enforce-ctx-mode.sh`, so command/process substitution, heredocs, quoted regions, and pipeline segments cannot slip past.
-- **User-only bypass**: `touch /tmp/graphify-bypass` (one-shot, auto-deleted on use) or include `skip graph` (case-insensitive) in a user message. The agent must never create the sentinel.
-- **Fail-safe**: any unexpected error returns exit 0 with no output. Never locks the user out.
-
-The hook surfaces blocks as `hookSpecificOutput.permissionDecision: deny` with a `BLOCKED: <N> structural searches since last user prompt, 0 graphify queries...` reason so the agent's next-turn context carries the directive to consult the graph.
 
 ### Pi active-repo query fallback ([REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify) AC4-AC5)
 
@@ -570,7 +544,7 @@ The Claude `/graphify` skill and the dedicated Pi graphify skill both dispatch s
 
 Subagents run on **Sonnet** (`model: "sonnet"`). Haiku was the original choice (cost-matching with vault-extract economics) but produced 57% malformed nodes on the codeflare corpus - missing `id` fields, numeric IDs instead of strings, missing `source_file`. The extraction prompt requires reliable schema compliance across complex document types (spec files with REQ anchors, skill instructions with cross-references, ADR ledgers). Sonnet at ~3x per-agent cost with near-zero malformation is cheaper per valid node. Opus is never used from this skill.
 
-Subagents are dispatched in waves of up to 10 (configurable via `GRAPHIFY_SEMANTIC_MAX_PARALLEL`) to avoid flooding Task-tool concurrency. Each wave runs in parallel; waves are sequential. Typical codeflare build: 8 doc chunks + 16 image chunks = 24 agents across 3 waves (~135s).
+Subagents are dispatched in waves of up to `GRAPHIFY_SEMANTIC_MAX_PARALLEL` (default 10) to avoid flooding Task-tool concurrency. Each wave runs in parallel; waves are sequential. Chunk count scales with the size of the non-code corpus.
 
 ## /sdd init Modes
 
@@ -582,7 +556,7 @@ Subagents are dispatched in waves of up to 10 (configurable via `GRAPHIFY_SEMANT
 
 **Interaction flow.** Both Greenfield and Import Mode run as a lean two-confirm flow: the agent asks one vision question (or accepts inline `$ARGUMENTS`), drafts the entire spec in memory (actors, domains, design principles, REQs in canonical shape, CON-* constraints, founding ADRs, glossary terms), presents the full draft as one review surface, and applies edits in place until the user accepts. The 10-15-turn one-domain-at-a-time confirmation chain is not used.
 
-**Enrichment pass.** After the draft is accepted, before any files are written, three passes run automatically in one in-memory cycle. All three query the project's `graphify-out/graph.json` for structural inputs; the post-clone PostToolUse hook (REQ-AGENT-025) prompts the user to build a graph immediately after `git clone`, so the graph is normally already in place by the time `/sdd init` runs:
+**Enrichment pass.** After the draft is accepted, before any files are written, three passes run automatically in one in-memory cycle. All three query the project's `graphify-out/graph.json` for structural inputs; the post-clone PostToolUse hook ([REQ-AGENT-025](../../sdd/spec/agents.md#req-agent-025-post-clone-graph-triage)) prompts the user to build a graph immediately after `git clone`, so the graph is normally already in place by the time `/sdd init` runs:
 
 - **Cross-link pass** - `mcp__graphify__get_neighbors` returns every node that shares an edge with a referenced REQ / CON / concept; every drafted REQ that names another REQ in its body also gains it in `Dependencies:` as an anchor link `[REQ-X-NNN](#req-x-nnn-title-slug)`.
 - **ADR-seed pass** - `mcp__graphify__god_nodes(top_n=20)` returns the most-connected nodes (architectural pillars). 3-8 surviving candidates (tech stack, framework, deployment target, auth pattern, data store, key middleware) become founding ADRs in `documentation/decisions/README.md` with an index table and per-ADR sections. Candidates that fail the "What is NOT an ADR" test (no real alternative considered) are dropped.
@@ -621,7 +595,7 @@ Full SDD discipline applies on the next push; autonomous agentic development is 
 
 - **Attribution blocking not working**: Check `~/.claude/settings.json` has `PreToolUse` hook entries pointing to `block-attributed-commits.sh` on two matcher entries covering three tool names: a `Bash` matcher (with `"if": "Bash(git *)"` and `"if": "Bash(gh *)"` predicates) AND a pipe-alternated MCP matcher `"matcher": "mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute"`. Verify the script exists at `~/.claude/plugins/codeflare-hooks/scripts/block-attributed-commits.sh`. If attribution appears via `gh pr create` in a context-mode session, the MCP matcher entry is missing - re-run the entrypoint or check the `SETTINGS_CONFIG` merge in `entrypoint.sh`.
 
-- **Review-spawn enforcement not firing on push**: see [Resetting the review-spawn checkpoint](#resetting-the-review-spawn-checkpoint) below.
+- **Review-spawn enforcement not firing on push**: see [Resetting Review-Spawn Checkpoints](#resetting-review-spawn-checkpoints) below.
 
 - **Default mode has hooks**: If `settings.json` has hook entries in default mode, the entrypoint `SESSION_MODE` gating may have failed. Remove them:
   `jq 'del(.hooks)' ~/.claude/settings.json > /tmp/s.json && mv /tmp/s.json ~/.claude/settings.json`.
@@ -634,9 +608,13 @@ Full SDD discipline applies on the next push; autonomous agentic development is 
 
 The Claude `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode when `sdd/` and `sdd/README.md` are present. Its transcript-based trigger surface is `git push` and `gh pr merge`; `git-push-review-reminder.sh` handles the in-turn `git push` / `gh pr create` reminder path. Pi native enforcement covers the wider local command set (`git push`, `git -C <repo> push`, `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`) and ignores metadata-only PR commands such as `gh pr edit`. All surfaces enforce only when the open PR targets `main` or `master`. PRs into intermediate branches (`develop`, `staging`) are silently deferred until that branch's own PR-to-`main` opens.
 
-The Claude hook and Pi native enforcement both track the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Pi also persists compatibility pending state in `.git/sdd-review-pending.json` and durable runner state in `.git/codeflare-review-jobs/<head>/`. Acknowledgment advances only when result files exist for the full required pipeline (code-reviewer + spec-reviewer + doc-updater, or the reduced lane set for doc/spec-only changes) for the current PR HEAD.
+The Claude hook and Pi native enforcement both track the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Claude advances that checkpoint only after every required lane has a current-head Agent spawn with a `completed</status>` marker. A recent in-flight Claude lane suppresses re-summon noise only; it does not satisfy final acknowledgement.
 
-Three USER-ONLY bypass methods exist (the agent must never invoke these autonomously): the user runs `touch /tmp/review-bypass` (one-shot sentinel; per-session, not committed, auto-deleted on use), the user says "skip review" in a message, or the user waits for the 3-strike circuit breaker to clear after 3 blocks on the same un-acknowledged PR HEAD.
+Pi also persists compatibility pending state in `.git/sdd-review-pending.json` and durable runner state in `.git/codeflare-review-jobs/<head>/`. Without a user bypass, Pi acknowledgement advances only when result files exist for the full required pipeline (code-reviewer + spec-reviewer + doc-updater, or the reduced lane set for doc/spec-only changes) for the current PR HEAD.
+
+When a new push lands while review is still in flight, Pi rolls the pending review window forward if the new PR head descends from the pending head, keeps the first unreviewed base for cumulative review, and does not treat a remote-tracking previous head as reviewed unless an explicit ack or completed prior review proves that coverage. This preserves earlier findings during fix-push cascades while keeping intermediate-branch PRs deferred until their PR-to-`main` review. See [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) for lane dispatch and in-flight gating, and [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement) for review-window roll-forward semantics.
+
+Three USER-ONLY bypass methods exist (the agent must never invoke these autonomously): the user runs `touch /tmp/review-bypass`, the user says "skip review" in a message, or the user waits for the 3-strike circuit breaker to clear after 3 blocks on the same un-acknowledged PR HEAD. The sentinel is one-shot, per-session, not committed, and auto-deleted on use. Runtime semantics differ intentionally: Claude treats the sentinel as a one-turn Stop-hook escape that does not advance `.git/sdd-last-ack-pr-head`, while Pi consumes it as an explicit acknowledgement of the current protected PR HEAD. Before consuming it, Pi checks pending-state freshness: stale pending state is discarded without using the sentinel, and an advanced pending window acknowledges the live PR head rather than the superseded pending head.
 
 If enforcement fires spuriously after a legitimate pipeline completed and local `HEAD` is the current PR head, preserve the acknowledgement and clear only transient runtime state:
 
@@ -657,7 +635,6 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 - [REQ-AGENT-014](../../sdd/spec/agents.md#req-agent-014-manifest-driven-preseed-pipeline) - Manifest-Driven Preseed Pipeline
 - [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release) - Auto-upgrade preseed on release
 - [REQ-AGENT-015](../../sdd/spec/agents.md#req-agent-015-review-command-for-multi-perspective-codebase-review) - /review command for multi-perspective codebase review
-- [REQ-AGENT-016](../../sdd/spec/agents.md#req-agent-016-consult-llm-preference-toggle) - consult-llm preference toggle
 - [REQ-AGENT-017](../../sdd/spec/agents.md#req-agent-017-bubblewrap-sandbox-for-codex) - Bubblewrap sandbox for Codex
 - [REQ-AGENT-019](../../sdd/spec/agents.md#req-agent-019-branded-settings-ui) - Branded settings UI
 - [REQ-AGENT-020](../../sdd/spec/agents.md#req-agent-020-llm-api-key-management-ui) - LLM API key management UI
@@ -675,11 +652,11 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 - [REQ-AGENT-039](../../sdd/spec/agents.md#req-agent-039-sdd-init-phase-7b-enumeration-coverage-verifier-gate) - `/sdd init` Phase 7b Enumeration-Coverage Verifier Gate
 - [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) - PR-Boundary Lane Classification and Agent Dispatch
 - [REQ-AGENT-041](../../sdd/spec/agents.md#req-agent-041-pr-boundary-review-bypass-surfaces) - PR-Boundary Review Bypass Surfaces
-- [REQ-AGENT-042](../../sdd/spec/agents.md#req-agent-042-graphify-hard-block-enforcement) - Graphify Hard-Block Enforcement
 - [REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch) - Graphify Build Mode Dispatch
 - [REQ-AGENT-044](../../sdd/spec/agents.md#req-agent-044-review-agent-discipline-enforcement) - Review-Agent Discipline Enforcement
 - [REQ-AGENT-047](../../sdd/spec/agents.md#req-agent-047-resume-mode-closure-and-review-pipeline-gate) - Resume Mode closure and review-pipeline gate
 - [REQ-AGENT-048](../../sdd/spec/agents.md#req-agent-048-audit-accumulator-surfaces) - Audit accumulator surfaces
+- [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement) - Pi PR-Boundary Review Window Advancement
 - [REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt) - Proactive memory injection on first prompt
 
 ---
