@@ -31,13 +31,13 @@ All authenticated surfaces (`/app`, `/api`, `/setup`) are protected by one of tw
 - **Default/onboarding mode:** Cloudflare Access JWT verification (see [Authentication](authentication.md#authentication-modes) for Access application destination strategy)
 - **SaaS mode (GitHub OIDC):** Worker-managed session cookies (`codeflare_session`, HMAC-SHA256). CF Access is bypassed at runtime when `OAUTH_CLIENT_ID` is configured.
 
-In SaaS mode the Cloudflare service token (`CF-Access-Client-Id`/`CF-Access-Client-Secret`) is accepted only for unattended admin automation and is never treated as a user identity (see [AD68](decisions/README.md#ad68-service-token-admin-bypass-must-be-environment-gated-and-hostname-restricted) and [REQ-AUTH-004](../../sdd/spec/authentication.md#req-auth-004-service-token-authentication-for-e2e-testing), [REQ-AUTH-011](../../sdd/spec/authentication.md#req-auth-011-auth-resolution-order)); user-facing surfaces still require a session cookie.
+In SaaS mode the Cloudflare service token (`CF-Access-Client-Id`/`CF-Access-Client-Secret`) is accepted only for unattended admin automation and is never treated as a user identity (see [AD68](../decisions/README.md#ad68-service-token-admin-bypass-must-be-environment-gated-and-hostname-restricted) and [REQ-AUTH-004](../../sdd/spec/authentication.md#req-auth-004-service-token-authentication-for-e2e-testing), [REQ-AUTH-011](../../sdd/spec/authentication.md#req-auth-011-auth-resolution-order)); user-facing surfaces still require a session cookie.
 
 ## API Token Containment
 
 The `CLOUDFLARE_API_TOKEN` never enters the container. It stays in the Worker/DO environment (GitHub Secrets -> Worker secrets). Containers only receive R2 credentials (scoped key pair), never the master API token.
 
-**Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `r2-admin.ts` (called from `lifecycle.ts`), which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` (encrypted via AES-256-GCM when `ENCRYPTION_KEY` is set) and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
+**Per-user scoped R2 tokens:** Each container receives a scoped R2 API token restricted to its owner's bucket. Tokens are created on first login via `getOrCreateScopedR2Token()` in `r2-admin.ts` (called from `lifecycle-init.ts`), which calls `POST /accounts/{accountId}/tokens` with a bucket-specific Object Read + Write policy. Tokens are cached in KV as `r2token:{email}` (encrypted via AES-256-GCM when `ENCRYPTION_KEY` is set) and revoked on user deletion via `deleteScopedR2Token()`. This requires the `API Tokens: Edit` permission on the deploy token.
 
 **R2 token verification:** Cached tokens are validated before use via `verifyTokenExists()` in `r2-admin.ts`. This calls `GET /accounts/{accountId}/tokens/{tokenId}` through the circuit breaker. Only a 404 response (token definitively deleted) invalidates the cache and triggers fresh token creation. Transient errors (429, 500, 502, network errors, circuit breaker open) assume the token is still valid - this prevents a Cloudflare API blip from unnecessarily deleting a valid KV entry and causing rclone 401 errors. The verification runs on every `getOrCreateScopedR2Token()` cache hit.
 
@@ -61,7 +61,7 @@ Two types of R2 credentials serve different purposes:
 - If API token rotated, must re-run setup to regenerate
 
 **Per-user scoped R2 tokens** (first login):
-- Created via `getOrCreateScopedR2Token()` in `src/routes/container/lifecycle.ts`
+- Created via `getOrCreateScopedR2Token()` in `src/routes/container/lifecycle-init.ts`
 - Calls `POST /accounts/{accountId}/tokens` with bucket-specific Object Read + Write policy
 - Token ID = S3 Access Key ID, SHA-256(token value) = S3 Secret Access Key
 - Cached in KV as `r2token:{email}` - survives container restarts
@@ -106,6 +106,8 @@ Applied to every response in `src/index.ts`:
 - `Permissions-Policy`
 
 HSTS is also applied to all redirect responses via `redirectWithHeaders()` helper in `src/index.ts`, including root redirect and setup redirect, ensuring browsers upgrade to HTTPS even on redirect hops. Preflight (OPTIONS) responses receive HSTS directly in the CORS middleware.
+
+**Vault proxy exemption (CSP only):** Proxied SilverBullet responses under `/api/vault/:sid/*` carry every header above except `Content-Security-Policy`. SilverBullet serves its own HTML with inline scripts/styles, web workers, and `eval`, which a `default-src 'none'` CSP would block. The exemption covers proxied content only: vault validation/error responses and the `/api/vault/:sid/status` JSON endpoint still receive the full set including CSP. Implemented via `withSecurityHeaders(response, { csp: false })` in `src/index.ts`; see [REQ-SEC-008](../../sdd/spec/security.md#req-sec-008-security-headers-on-every-response).
 
 ## Session ID Validation
 

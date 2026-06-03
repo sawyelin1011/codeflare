@@ -148,6 +148,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 <!-- @impl: preseed/agents/claude/plugins/codeflare-vault/scripts/vault-monitor-hook.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-vault/scripts/vault-extract-prompt.md -->
 <!-- @impl: preseed/agents/pi/extensions/memory-vault.ts -->
+<!-- @impl: preseed/agents/pi/prompts/vault-extract-prompt.md -->
 <!-- @test: host/__audits__/entrypoint-vault.audit.js (three-marker pattern presence → AC2/AC6) -->
 <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (Pi memory-vault shares Claude vault-extract.last marker semantics and vault-monitor exclusions → AC1/AC4) -->
 
@@ -251,7 +252,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 ### REQ-VAULT-005: Worker proxy exposes the in-container vault editor
 
 <!-- @impl: src/routes/vault.ts::handleVaultRequest -->
-<!-- @impl: src/routes/vault.ts::validateVaultRoute -->
+<!-- @impl: src/routes/vault-validation.ts::validateVaultRoute -->
 <!-- @impl: entrypoint.sh::start_silverbullet_supervisor -->
 <!-- @test: src/__tests__/routes/vault.test.ts (validateVaultRoute boundary cases describe → AC3/AC5) -->
 <!-- @test: host/__audits__/entrypoint-vault.audit.js (vault WS rate-limit key contract describe → AC4) -->
@@ -290,6 +291,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 <!-- @impl: web-ui/src/components/Layout.tsx -->
 <!-- @impl: web-ui/src/lib/vault-readiness.ts::startVaultReadinessProbe -->
 <!-- @test: web-ui/src/__tests__/components/Header.test.tsx (Header describe → Vault button gating + readiness probe state machine → AC1-AC5) -->
+<!-- @test: web-ui/src/__tests__/components/Layout.test.tsx (Vault button gating (CF-075 / REQ-VAULT-012) describe → onVaultOpen wired only for advanced-mode active sessions → AC1) -->
 <!-- @test: web-ui/src/__tests__/lib/vault-readiness.test.ts (startVaultReadinessProbe describe → no-give-up retry / first-success latch / SB-crash recovery / cancel / mid-probe cancel → AC5) -->
 
 **Intent:** The Vault button only appears when usable and only enables after a per-session probe confirms the in-container editor is actually reachable, so users never land on `VAULT_UPSTREAM_UNREACHABLE`. SilverBullet's landing page is the codeflare dashboard. SilverBullet subpath asset adaptation lives in [REQ-VAULT-013](#req-vault-013-silverbullet-subpath-adapter).
@@ -298,7 +300,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Acceptance Criteria:**
 
-1. The Vault control in the header renders only when an active session exists and the parent surface has wired up the vault-open handler; the control is scoped to the terminal view alongside the related Bookmarks and Storage entrypoints.
+1. The Vault control in the header renders only when an active session exists, the session is in advanced mode, and the parent surface has wired up the vault-open handler; the control is scoped to the terminal view alongside the related Bookmarks and Storage entrypoints. In default mode the handler is not wired up, so the control does not render.
 2. The editor opens to the codeflare dashboard page on every Vault click; the supervisor explicitly pins the dashboard as the editor's index page before launching the binary.
 3. The README page is reachable from the dashboard via a link at the top.
 4. The Vault control is rendered disabled with an "initializing" tooltip until a per-session readiness probe against the vault proxy succeeds.
@@ -321,14 +323,11 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 ### REQ-VAULT-013: SilverBullet subpath adapter
 
 <!-- @impl: src/routes/vault.ts::handleVaultRequest -->
-<!-- @impl: src/routes/vault.ts::rewriteVaultBaseHref -->
-<!-- @impl: src/routes/vault.ts::rewriteVaultHtmlResponse -->
-<!-- @impl: src/routes/vault-native-sw.ts::VAULT_NATIVE_SERVICE_WORKER_JS -->
-<!-- @impl: src/routes/vault-html.ts::isServiceWorkerContextFetch -->
-<!-- @test: src/__tests__/routes/vault.test.ts (rewriteVaultBaseHref / rewriteVaultHtmlResponse (REQ-VAULT-013 AC1-AC4) + isServiceWorkerRegistration / REQ-VAULT-013 (SilverBullet subpath adapter) + VAULT_NATIVE_SERVICE_WORKER_JS / REQ-VAULT-013 AC5 + isServiceWorkerContextFetch / REQ-VAULT-013 AC8 → AC1-AC8) -->
-<!-- @test: src/__tests__/routes/vault-auth-chain.test.ts (native SW + shell-302 suppression (REQ-VAULT-013 AC5/AC8, AD69) → AC5/AC8) -->
+<!-- @impl: src/routes/vault-html.ts::rewriteVaultBaseHref -->
+<!-- @impl: src/routes/vault-html.ts::rewriteVaultHtmlResponse -->
+<!-- @test: src/__tests__/routes/vault.test.ts (rewriteVaultBaseHref / rewriteVaultHtmlResponse (REQ-VAULT-013 AC1-AC4) → AC1-AC4) -->
 
-**Intent:** SilverBullet ships an SPA shell with `<base href="/" />` and assumes it owns its origin; under the `/api/vault/:sid/` per-session proxy, every relative asset request would otherwise resolve against the Worker root and 404. The Worker injects a per-session base href on every text/html response and short-circuits Service Worker registration so the browser's SW fetch does not return 401. It serves SilverBullet's native service worker (not a stripped shim) so the editor keeps its persistent local file-sync store and indexes incrementally (AD69).
+**Intent:** SilverBullet ships an SPA shell with `<base href="/" />` and assumes it owns its origin; under the `/api/vault/:sid/` per-session proxy, every relative asset request would otherwise resolve against the Worker root and 404. The Worker injects a per-session base href on every text/html response so the editor's relative asset references resolve back through the subpath proxy. The companion native-service-worker contract (registration short-circuit, key delivery, precache) is [REQ-VAULT-017](#req-vault-017-silverbullet-native-service-worker).
 
 **Applies To:** User
 
@@ -338,23 +337,52 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 2. Non-HTML responses (JS bundles, images, manifests, markdown page bodies, JSON API replies, binary assets) pass through unchanged; the HTML-only guard is sufficient because the editor's API endpoints return non-HTML content types.
 3. When the body is rewritten, both the content-length and content-encoding headers are dropped because the rewrite path auto-decompresses upstream compression, and the original headers would otherwise trigger a browser decoding failure.
 4. When the rewrite runs but the body did not contain the expected base-href substring (no-op rewrite), a warning is logged so a future editor-template change surfaces as a logged signal instead of a silent white-screen regression.
-5. Browser-initiated Service Worker registration GETs for the editor's service-worker script short-circuit the auth chain and receive SilverBullet's native service worker from the Worker (vendored verbatim, AD69), so the editor keeps its persistent local file-sync store and indexes incrementally. Cold-boot encryption rides the native worker's own `set-encryption-key`/`get-encryption-key` handlers, fed by the bootstrap-hop page (see [REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5 for the key-delivery contract).
-6. The short-circuit selector requires all of: GET method, exact path match for the service-worker script, and the browser-only Service-Worker request header (a Fetch-spec forbidden header name not settable from page JavaScript). Cookie presence is intentionally not checked because Samsung Internet and other Chromium forks may send cookies on SW registration fetches; rejecting those requests would force the registration through the cookie-gated proxy chain and 401.
-7. The native service-worker script body is identical across sessions (version-locked to the SilverBullet binary, guarded by a recorded SHA-256 drift hash); the per-session vault encryption key is delivered to it via postMessage from the bootstrap-hop page ([REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5), never baked into the script.
-8. The native worker precaches the shell `/` via `cache.addAll` during install, BEFORE the bootstrap-hop sets the bootstrap cookie. The shell-path redirect to the bootstrap-hop is suppressed for Service-Worker-context fetches (identified by a `Sec-Fetch-Mode` header present and not equal to `navigate`) so the precache resolves against the real shell instead of a 302 that would make `cache.addAll` reject and hang the SW install. Top-level navigations (`Sec-Fetch-Mode: navigate`) and clients with no `Sec-Fetch-Mode` header still receive the redirect (fail-safe), so a real first navigation never boots without the encryption key wired.
-
-**Notes:** Serving the native worker (AD69) restores the editor's persistent `sb_files_*` local-sync store, the fix for the per-cold-load full re-index regression (codeflare#445). Verified end-to-end on the integration deploy (mobile, 2026-06-01): the native SW installs through the proxy ("47 client files cached"), the SW-context `sb_files_*` IndexedDB store is created (it never existed under the shim), the `.vault-key` recovery graft fires ("Recovered encryption key from codeflare") so there is no `.auth` bounce, and the sync engine runs incremental 0-operation cycles. The one-time first-load index that populates `sb_files_*` is expected; the store now persists, so subsequent cold loads are incremental. The `/.client/*` precache-auth exemption (reserved AC9) is NOT needed - the deploy showed `cache.addAll` resolves, i.e. the precache fetches carry the session cookie.
 
 **Constraints:**
 
 - The editor honors a URL-prefix environment variable for rendering the base tag, but the prefix is per-session (the Worker knows the session ID, the container does not); baking it in at supervisor start is not viable, so the per-response Worker rewrite is the per-session adapter.
-- Browsers omit credentials on service-worker script fetches (Chrome 76+ per spec, Samsung Internet and other Chromium forks may not), so the normal cookie-auth path would return 401 and service-worker registration would fail permanently without this short-circuit. The selector is browser-agnostic: it works regardless of whether cookies are present.
 
 **Priority:** P0
 
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor)
 
 **Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
+
+**Status:** Implemented
+
+---
+
+<!-- @test: src/__tests__/routes/vault.test.ts (isServiceWorkerRegistration / REQ-VAULT-017 (native SW short-circuit selector) + VAULT_NATIVE_SERVICE_WORKER_JS / REQ-VAULT-017 AC1 (native SW served, AD69) + isServiceWorkerContextFetch / REQ-VAULT-017 AC4 (SW precache vs navigation) → AC1-AC4) -->
+<!-- @test: src/__tests__/routes/vault-auth-chain.test.ts (native SW + shell-302 suppression (REQ-VAULT-017 AC1/AC4, AD69) → AC1/AC4) -->
+<!-- @cites: REQ-VAULT-013 (split-prose: the native-service-worker contract foreshadowed in REQ-VAULT-013's Intent - registration short-circuit, key delivery, precache - is specified here) -->
+### REQ-VAULT-017: SilverBullet native service worker
+
+<!-- @impl: src/routes/vault.ts::handleVaultRequest -->
+<!-- @impl: src/routes/vault-native-sw.ts::VAULT_NATIVE_SERVICE_WORKER_JS -->
+<!-- @impl: src/routes/vault-html.ts::isServiceWorkerContextFetch -->
+
+**Intent:** SilverBullet's native service worker (not a stripped shim) is served for the editor's service-worker registration fetch so the editor keeps its persistent local file-sync store and indexes incrementally (AD69). The Worker short-circuits the auth chain for the registration GET (the browser sends no credentials on that fetch, so the cookie-gated path would 401), serves the version-locked native worker body, and suppresses the bootstrap-hop redirect for Service-Worker-context fetches so the worker's precache resolves. The per-session encryption key reaches the worker via postMessage from the bootstrap-hop page ([REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5).
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. Browser-initiated Service Worker registration GETs for the editor's service-worker script short-circuit the auth chain and receive SilverBullet's native service worker from the Worker (vendored verbatim, AD69), so the editor keeps its persistent local file-sync store and indexes incrementally. Cold-boot encryption rides the native worker's own `set-encryption-key`/`get-encryption-key` handlers, fed by the bootstrap-hop page (see [REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5 for the key-delivery contract).
+2. The short-circuit selector requires all of: GET method, exact path match for the service-worker script, and the browser-only Service-Worker request header (a Fetch-spec forbidden header name not settable from page JavaScript). Cookie presence is intentionally not checked because Samsung Internet and other Chromium forks may send cookies on SW registration fetches; rejecting those requests would force the registration through the cookie-gated proxy chain and 401.
+3. The native service-worker script body is identical across sessions (version-locked to the SilverBullet binary, guarded by a recorded SHA-256 drift hash); the per-session vault encryption key is delivered to it via postMessage from the bootstrap-hop page ([REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption) AC5), never baked into the script.
+4. The native worker precaches the shell `/` via `cache.addAll` during install, BEFORE the bootstrap-hop sets the bootstrap cookie. The shell-path redirect to the bootstrap-hop is suppressed for Service-Worker-context fetches (identified by a `Sec-Fetch-Mode` header present and not equal to `navigate`) so the precache resolves against the real shell instead of a 302 that would make `cache.addAll` reject and hang the SW install. Top-level navigations (`Sec-Fetch-Mode: navigate`) and clients with no `Sec-Fetch-Mode` header still receive the redirect (fail-safe), so a real first navigation never boots without the encryption key wired.
+
+**Notes:** Documented in [AD69](../../documentation/decisions/README.md) and the [vault lane](../../documentation/lanes/vault.md#service-worker-registration-noop-bypass). The `/.client/*` precache-auth exemption was evaluated and left unimplemented (the integration deploy showed `cache.addAll` resolves because the precache fetches carry the session cookie); it is reserved only as a future fallback if a browser strips credentials on precache fetches.
+
+**Constraints:**
+
+- Browsers omit credentials on service-worker script fetches (Chrome 76+ per spec, Samsung Internet and other Chromium forks may not), so the normal cookie-auth path would return 401 and service-worker registration would fail permanently without this short-circuit. The selector is browser-agnostic: it works regardless of whether cookies are present.
+
+**Priority:** P0
+
+**Dependencies:** [REQ-VAULT-013](#req-vault-013-silverbullet-subpath-adapter), [REQ-VAULT-008](#req-vault-008-zero-ui-vault-encryption)
+
+**Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts), [Auth-chain test](../../src/__tests__/routes/vault-auth-chain.test.ts)
 
 **Status:** Implemented
 
@@ -461,13 +489,13 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 ### REQ-VAULT-008: Zero-UI vault encryption
 
-<!-- @impl: src/container/index.ts::ensureVaultKey -->
+<!-- @impl: src/container/container-config.ts::ensureVaultKey -->
 <!-- @impl: src/routes/vault-native-sw.ts::VAULT_NATIVE_SERVICE_WORKER_JS -->
 <!-- @impl: src/routes/vault-native-sw.ts::graftVaultKeyRecovery -->
-<!-- @impl: src/routes/vault.ts::injectVaultBootstrapHopHtml -->
-<!-- @impl: src/routes/vault.ts::injectVaultIdbRecorder -->
-<!-- @impl: src/routes/vault.ts::VAULT_BOOTSTRAP_COOKIE -->
-<!-- @impl: src/routes/vault.ts::VAULT_SW_ACTIVATION_TIMEOUT_MS -->
+<!-- @impl: src/routes/vault-html.ts::injectVaultBootstrapHopHtml -->
+<!-- @impl: src/routes/vault-html.ts::injectVaultIdbRecorder -->
+<!-- @impl: src/routes/vault-html.ts::VAULT_BOOTSTRAP_COOKIE -->
+<!-- @impl: src/routes/vault-html.ts::VAULT_SW_ACTIVATION_TIMEOUT_MS -->
 <!-- @impl: src/routes/vault.ts::handleVaultRequest (.vault-key sub-path) -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::cleanupSessionVaultCache -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::sweepOrphanVaultCaches -->
@@ -512,9 +540,9 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 ### REQ-VAULT-015: Vault IDB lifecycle and listing filters
 
-<!-- @impl: src/routes/vault.ts::filterVaultFsListing -->
-<!-- @impl: src/routes/vault.ts::injectVaultIdbRecorder -->
-<!-- @impl: src/routes/vault.ts::VAULT_IDB_RECORDER_MARKER -->
+<!-- @impl: src/routes/vault-html.ts::filterVaultFsListing -->
+<!-- @impl: src/routes/vault-html.ts::injectVaultIdbRecorder -->
+<!-- @impl: src/routes/vault-html.ts::VAULT_IDB_RECORDER_MARKER -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::cleanupSessionVaultCache -->
 <!-- @impl: web-ui/src/lib/vault-cache.ts::sweepOrphanVaultCaches -->
 <!-- @test: src/__tests__/routes/vault.test.ts (filterVaultFsListing + injectVaultIdbRecorder describes → AC1/AC3) -->
@@ -574,6 +602,37 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 **Dependencies:** [REQ-VAULT-005](#req-vault-005-worker-proxy-exposes-the-in-container-vault-editor) (Worker proxy exposes vault editor)
 
 **Verification:** [Automated test](../../src/__tests__/routes/vault.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-VAULT-016: Vault graph extraction emits the canonical shared schema
+
+<!-- @impl: preseed/agents/pi/extensions/memory-vault-helpers.ts::deterministicVaultGraph -->
+<!-- @impl: preseed/agents/pi/prompts/vault-extract-prompt.md -->
+<!-- @impl: preseed/agents/claude/plugins/codeflare-vault/scripts/vault-extract-prompt.md -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (deterministicVaultGraph emits canonical file_type/source_file/relation nodes + heading sub-sections → AC1; vault-extract prompt publishes viz to Raw/Graphs → AC2) -->
+<!-- @cites: REQ-VAULT-003 (split-prose: the canonical-schema output contract foreshadowed in REQ-VAULT-003 AC4's extract-merge-advance step lands here) -->
+
+**Intent:** The graph produced by vault extraction is structurally interchangeable with the repo and global graphs, and the re-rendered visualization is published where the vault index page can link to it. This is the output-shape contract; detection and dispatch latency are [REQ-VAULT-003](#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s).
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. The extracted graph uses the canonical graphify node/edge schema shared with the repo and global graphs: document and code nodes carry `file_type` and a truthy `source_file` so the global merge preserves their identity rather than label-merging them; concept nodes carry `file_type: "concept"` with `source_file: null` so the global merge dedupes them by label; edges carry a canonical `relation` plus `confidence`/`confidence_score`. The Pi deterministic baseline additionally emits a sub-section node for each markdown heading (level 2 and deeper) linked to its document by a `contains` edge. The Pi extension baseline and its vault-extract subagent both emit this schema, matching the Claude runtime; the legacy `type`/`path`/`mentions` shape is never written.
+2. After merging, the extraction re-renders the vault viz HTML (`graphify cluster-only .` from the vault root) and copies `graph.html` to `Raw/Graphs/vault-graph.html` so the `Vault Graph.md` index-page link resolves through the SilverBullet `.fs/` route (`graphify-out/` is excluded from R2 bisync and the `.fs/` route). This publish step is non-fatal: a failure leaves a stale viz HTML but never blocks high-water-marker advancement, since the graph data is already persisted.
+
+**Constraints:**
+
+- The canonical-schema baseline (AC1) is verified by the `deterministicVaultGraph` unit test; the viz publish (AC2) is verified by manual check (the cluster-only render + copy is prompt-driven prose, like [REQ-VAULT-011](#req-vault-011-vault-extract-ingests-pdf-files)), with the Pi prompt's publish step additionally source-asserted in `agent-seed-manifest.test.ts`.
+
+**Priority:** P0
+
+**Dependencies:** [REQ-VAULT-003](#req-vault-003-user-curated-edits-are-detected-and-ingested-within-60s)
+
+**Verification:** [Automated test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 

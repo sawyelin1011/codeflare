@@ -34,7 +34,7 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: Dockerfile -->
 <!-- @impl: entrypoint.sh -->
-<!-- @impl: src/lib/schemas.ts -->
+<!-- @impl: src/types.ts::AgentTypeSchema -->
 <!-- @test: src/__tests__/lib/agent-config.test.ts (AGENT_COMMANDS exhaustiveness describe → AC1/AC2) -->
 <!-- @test: host/__tests__/dockerfile-graphify.test.js (npm install + V8 warm-up + Pi npm warm-cache behavior → AC3/AC4/AC5) -->
 
@@ -69,7 +69,7 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-002: Agent Selection at Session Creation
 
 <!-- @impl: src/routes/session/crud.ts -->
-<!-- @impl: src/lib/schemas.ts -->
+<!-- @impl: src/types.ts::AgentTypeSchema -->
 <!-- @test: src/__tests__/lib/agent-config.test.ts (getDefaultTabConfig describe → AC1/AC2/AC5) -->
 
 **Intent:** Users must be able to choose which AI agent to use when creating a session.
@@ -185,7 +185,7 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. Pro mode delivers a strict superset of the content Standard mode delivers, covering memory persistence, language rules, agent definitions, slash commands, cherry-picked skills, the discipline triad (spec, docs, tests), and the commit-attribution and PR-boundary review hooks. The canonical per-content-category matrix lives in [documentation/preseed.md](../../documentation/lanes/preseed.md#session-modes); the spec lane documents the user-observable contract only.
-2. Pro mode enables persistent memory by syncing the user's Vault directory tree to their R2 bucket; Standard mode excludes the Vault tree so memory does not persist across container restarts. The legacy `.memory/` directory is no longer written.
+2. Pro mode enables persistent memory by including the user's Vault directory tree in the R2 sync filters so it syncs to their bucket; Standard mode explicitly excludes the Vault tree from those filters so memory does not persist across container restarts. The legacy `.memory/` directory is no longer written.
 3. Pro-mode hooks fire uniformly regardless of which tool surface invoked the underlying command, so coverage is identical whether the user is on Custom tier (commands route through context-mode) or any other tier (commands run directly): commit attribution is blocked before the commit lands, the SDD review pipeline is triggered at every PR-to-`main` boundary event, the turn cannot end while a PR HEAD remains unreviewed, and memory capture runs on the user-prompt cadence.
 4. Pi agents remain fully functional without context-mode: native Bash/Read/Grep/Find/Edit/Write plus graphify tools are sufficient on their own, and no context-mode MCP registration is required. The shared agent definitions' context-mode helper tools are remapped to their Pi-native names (`ctx_execute`, `ctx_batch_execute`, `ctx_execute_file`, `ctx_search`, `ctx_fetch_and_index`) and kept in the Pi agent frontmatter rather than stripped: they are absent at runtime when context-mode is disabled (Pi drops the unavailable tools) and usable when `/ctx on` enables it, with no Pi-specific agent variants.
 5. Pi always starts with context-mode disabled. The Codeflare Pi extension provides `/ctx status`, `/ctx on`, and `/ctx off`; `/ctx on` enables the context-mode package for the current running session and reloads resources, while the next Codeflare container start resets Pi back to disabled.
@@ -1012,7 +1012,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4, gh pr create metadata-lag base inference -> AC6, seeded Pi review enforcement has no passive agent_end catch-up -> AC8) -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4, gh pr create metadata-lag base inference -> AC6, seeded Pi review enforcement has no passive agent_end catch-up -> AC7) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -1026,8 +1026,7 @@ None.
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 6. During a `gh pr create` metadata-visibility race, Pi may infer a protected base (`main` or `master`, including quoted CLI values or the default when no base is supplied) and synthesize an open PR from local HEAD; non-protected bases remain ignored. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prCreateBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prForBoundaryCommand -->
-7. On non-SDD projects (no `sdd/` folder) no review agents run at all; every hook exits silently and the workflow proceeds friction-free (vibe-coding mode). <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject -->
-8. Passive Pi lifecycle events such as session start, reload, branch checkout, or a normal assistant turn end do not create a review window solely because the current branch already has an open PR to `main` or `master`; Pi starts PR-boundary review only from the explicit head-moving commands in AC2/AC3 or from already-persisted pending review state. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+7. No review window is created from non-triggering states: on non-SDD projects (no `sdd/` folder) no review agents run at all and every hook exits silently (vibe-coding mode), and passive Pi lifecycle events such as session start, reload, branch checkout, or a normal assistant turn end do not create a review window solely because the current branch already has an open PR to `main` or `master`. Pi starts PR-boundary review only from the explicit head-moving commands in AC2/AC3 or from already-persisted pending review state. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 
 **Constraints:**
 
@@ -1425,6 +1424,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-active-repo.sh -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/safe-graphify-update.sh -->
 <!-- @impl: preseed/agents/pi/scripts/build-graphify-ast.sh -->
+<!-- @impl: preseed/agents/pi/scripts/build-graphify-architecture.sh -->
 <!-- @impl: preseed/agents/pi/scripts/safe-graphify-update.sh -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @impl: Dockerfile -->
@@ -1445,10 +1445,10 @@ None.
 
 **Acceptance Criteria:**
 
-1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep.
+1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep. Provider/backend extras such as Gemini are not installed for Graphify; interactive semantic extraction and community labeling remain agent-driven.
 2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package in every session; the Pi graphify workflow skill, clone triage helper, and build/update scripts are advanced-mode preseed surfaces. MCP parity in Pi is optional and not required for the Pi graphify workflow.
 3. AC1 and AC2 hold across all paid tiers for ambient query/build capability; advanced-mode agent orchestration keeps `/graphify` extraction context bounded via subagent chunking.
-4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while advanced-mode Pi prompts for AST-only or Full graph creation after clone and answers queries against the active repository's `graphify-out/graph.json` once it exists.
+4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while advanced-mode Pi prompts after clone and offers Architecture graph, Full repo AST-only, Full repo semantic, or no graph creation; query tools answer against the active repository's `graphify-out/graph.json` once it exists.
 5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact. Pi tracks the same active repo from command-local `cd ... &&` and `git -C ...` forms, and its session context identifies the active repo by basename, checked-out branch, and HEAD prefix.
 6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
 
@@ -1458,8 +1458,8 @@ None.
 - When Pi's packaged native graphify tool resolves the session cwd (`/home/user/workspace`) and reports its `graphify-out/graph.json` missing, the Codeflare Pi adapter retries `graphify_query`, `graphify_path`, and `graphify_explain` against `<active-repo>/graphify-out/graph.json` via the graphify CLI and returns the retry as the tool result.
 - The ambient MCP/native graphify capability is available in every session mode; the graph-first agent discipline ([REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)), Pi graphify workflow skill/scripts, clone triage helper, and active-repo tracking (AC5) are mode-gated to advanced.
 - Per-branch graphs are not supported; users refresh the graph after a branch checkout.
-- Optional backend-provider and office extras are not installed by default; users who need them install upstream extras manually.
-- Preseed surfaces that refresh an existing graph call the bounded update wrapper rather than bare `graphify update`, so a runaway rebuild cannot OOM-kill the container session. The Pi-owned update wrapper fails closed: it aborts before running graphify if the target directory is missing, if the `RLIMIT_AS` cap cannot be applied, or if the `graphify` CLI is not on PATH, and it re-exports `GRAPHIFY_VIZ_NODE_LIMIT` so the HTML visualization is always generated even when the inherited env was scrubbed by a sandboxed exec. Pi first-time AST graph creation uses `build-graphify-ast.sh`, not `graphify update`.
+- Optional office/video/Neo4j/local-backend/provider extras are not installed by default; users who need them install upstream extras manually. Codeflare's interactive Graphify workflow does not use provider extras for community labeling.
+- Preseed surfaces that refresh an existing graph call the bounded update wrapper rather than bare `graphify update`, so a runaway rebuild cannot OOM-kill the container session. The Pi-owned update wrapper is a thin safety wrapper around upstream `graphify update`: it applies `RLIMIT_AS`, sets `GRAPHIFY_MAX_WORKERS`, preserves `GRAPHIFY_VIZ_NODE_LIMIT`, and does not rewrite graph output. Pi first-time full AST graph creation uses `build-graphify-ast.sh`, which calls Graphify's own detect/extract/build/cluster/report/export modules without Codeflare-specific file allowlists or import normalization. Pi architecture graph creation uses `build-graphify-architecture.sh`, which applies generic noise filters before Graphify extraction and projects the resulting symbol graph into a file/module dependency graph for navigation.
 - The Pi session-start graph summary is bounded against blocking: graphs larger than 30MB report availability without a synchronous parse, the git probes are wrapped with a short timeout, and the structural-search gate is fail-open (any unexpected error never locks the user out of search).
 - The container entrypoint ensures `/dev/shm` is present and tmpfs-mounted at boot. Graphify's AST extractor uses Python's `concurrent.futures.ProcessPoolExecutor`, which allocates a `multiprocessing.Lock` that requires POSIX shared memory at `/dev/shm`; on a cold Firecracker microVM boot the rootfs ships without the mountpoint directory and the executor fails at startup. The same prerequisite covers the memory-capture hook's chunker and the vault-extract subagent's writer.
 
@@ -1498,7 +1498,7 @@ None.
 3. In advanced session mode only, the graphify skill is preseeded for Claude Code, with per-agent adapted variants emitted for Codex, Copilot, OpenCode, and Antigravity by the seed generator.
 4. The skill documents the safe build path for large repos (more than 2000 files).
 5. The skill instructs the agent on first build to add canonical ignore and attribute rules so regenerable graph build outputs and working-tree intermediates are not committed while the queryable graph remains under git merge control.
-6. The committed knowledge-graph surface includes the queryable graph artefact, a human-readable report, a visual exploration page, and an optional wiki tree.
+6. The committed knowledge-graph surface includes the queryable graph artefact, a human-readable report, a visual exploration page, the generated `callflow.html`, `.graphify_labels.json`, and an optional wiki tree.
 7. In advanced session mode only, a soft-nudge hook fires on grep-class tool calls and emits a reminder to prefer the graph MCP tools when a graph exists for the cwd; the hook never blocks.
 
 **Constraints:**
@@ -1521,21 +1521,21 @@ None.
 
 <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md -->
 <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md -->
-<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC4-AC5) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-043 Pi graphify skill override avoids headless DeepSeek and routes Full mode to Pi Agent subagents -> AC7) -->
+<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC4-AC5) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-043 Pi graphify skill override avoids headless semantic extraction and routes uncached Full mode files to Pi Agent subagents -> AC7) -->
 
-**Intent:** Before a `/graphify` build dispatches semantic-extraction subagents, the user must explicitly choose between a free AST-only build and a full build that costs LLM tokens. In Pi, this must use local AST extraction plus running-session Pi `Agent` subagents that inherit the current main-session model rather than headless extraction or hardcoded model names.
+**Intent:** Before a `/graphify` build dispatches extraction work, the user must explicitly choose whether to build a graph and which scope to build. Claude keeps the upstream AST-only vs Full semantic choice. Pi offers Architecture graph, Full repo AST-only, Full repo semantic, or no graph update. In Pi, uncached semantic extraction must use running-session Pi `Agent` subagents that inherit the current main-session model; community labels are written by the active Pi main session to `.graphify_labels.json`; official Graphify CLI/module flows own AST extraction, cache merge, graph build, clustering, report generation, and visualization, while label application regenerates report/html from existing graph community assignments.
 
 **Applies To:** Agent
 
 **Acceptance Criteria:**
 
-1. Before dispatching semantic-extraction subagents in a `/graphify` build (Step B2 of the upstream protocol), the agent presents an `AskUserQuestion` with exactly two modes: AST-only (free, structural edges only) and Full (AST plus parallel semantic-extraction subagents processing docs/papers/images).
-2. The mode question includes both the actual subagent count and a wall-time estimate.
-3. The question is skipped only when the corpus contains zero docs/papers/images (code-only repos go straight to Part C with nothing for Part B to do).
+1. Before dispatching semantic-extraction subagents in a Claude `/graphify` build (Step B2 of the upstream protocol), the agent presents an `AskUserQuestion` with exactly two modes: AST-only (free, structural edges only) and Full (AST plus parallel semantic-extraction subagents processing docs/papers/images). In Pi, after detection, the graph refresh choice offers Architecture graph, Full repo AST-only, Full repo semantic, and an explicit no-graph option that stops without modifying `graphify-out`.
+2. The semantic mode question includes both the actual subagent count and a wall-time estimate.
+3. The semantic option is hidden when the corpus contains zero docs/papers/images; code-only repos still offer the Pi Architecture graph, Full repo AST-only, and no-graph options.
 4. In advanced session mode only, Claude Code Part B semantic subagents use the Claude graphify skill's configured reliable extraction model, while Pi Part B semantic subagents omit `model` overrides so they inherit the current main-session model.
 5. Claude's graphify skill never escalates to Opus from this workflow, and Pi's native graphify skill does not name or pin any provider-specific model.
-6. The Part C merge step preserves all data structures produced by Part B subagents - including hyperedges - in the merged output; no field present in the semantic extraction result is silently dropped.
-7. Pi's native graphify skill does not instruct the agent to run headless `graphify extract --backend deepseek` for the interactive workflow; AST-only initial build uses the Pi-owned first-build script, AST-only refresh uses the bounded update wrapper, and Full mode uses Pi `Agent` subagents that inherit the current main-session model.
+6. The Part C merge step preserves all data structures produced by Part B subagents - including hyperedges - by saving subagent chunks into Graphify's semantic cache before official Graphify extraction/build consumes the cache.
+7. Pi's native graphify skill does not instruct the agent to run headless semantic extraction or Graphify provider labeling. Architecture mode uses the Pi-owned module-graph script, AST-only initial build uses the Pi-owned first-build script built from Graphify's own modules, AST-only refresh uses the bounded upstream-update wrapper, Full mode uses Pi `Agent` subagents for uncached semantic chunks, the Pi main session writes community labels into `.graphify_labels.json`, and local Graphify module calls regenerate the final report/html from existing graph community assignments. Full semantic merge starts from a freshly recreated AST-only baseline and must not pass semantic source files as `prune_sources`, because Graphify prunes after adding. The final user-facing `graphify-out/graph.html` and `graphify-out/callflow.html` are generated after labels are applied.
 
 **Constraints:**
 
@@ -1568,13 +1568,13 @@ None.
 
 1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects real `git clone` and `gh repo clone` invocations (anchored token regex, not substring; rejects echoed false positives) and injects a directive. Pi implements the same behavior with native tool lifecycle events and Pi follow-up messages.
 2. Clone destination resolution prefers the tool result's `Cloning into '...'` line before falling back to command parsing, so shell variables such as `$repo` never surface as literal user-facing paths.
-3. The directive branches on whether `<cloned-dir>/graphify-out/graph.json` already exists: if absent, the directive instructs the agent to prompt the user to choose `1. Create AST-only Graphify graph` or `2. Create full semantic + AST Graphify graph`; if present, the directive tells the agent to check freshness and either print information only when fresh or prompt for `1. AST-only update` / `2. Full semantic + AST refresh` when stale or unknown.
+3. The directive branches on whether `<cloned-dir>/graphify-out/graph.json` already exists: if absent, the directive asks a single YES/NO question about building a graph and defers AST-only vs Full mode selection to the graphify skill after detection; if present, the directive tells the agent to check freshness, use the existing graph when fresh, or refresh the AST portion with the bounded upstream-update wrapper when stale or unknown. Full semantic refresh is owned by the graphify skill after corpus detection.
 4. The hook is idempotent per cloned directory per session via a marker key that includes both the session identifier and cloned repository path. A fresh session re-triages the same clone and stale markers do not persist across container restarts.
 5. Pi clone triage suppresses follow-up prompts for failed clone commands, skipped/already-cloned targets, and durable PR-boundary review lanes.
 
 **Constraints:**
 
-- The hook never invokes graphify directly. It only injects a directive instructing the agent to prompt the user via AskUserQuestion (or Pi follow-up message) for the selected build/update mode.
+- The hook never invokes graphify directly. It only injects a directive instructing the agent to ask a clone-time YES/NO graph-build question for missing graphs; build-mode choice is owned by the graphify skill after detection.
 
 **Priority:** P1
 

@@ -6,7 +6,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { getContainer } from '@cloudflare/containers';
 import { AgentTypeSchema, type Env, type Session } from '../../types';
-import { getSessionKey, getSessionPrefix, generateSessionId, getSessionOrThrow, listAllKvKeys, sanitizeSessionName, putSessionWithMetadata, reconcileStaleStatus, buildSessionMetadata } from '../../lib/kv-keys';
+import { getSessionKey, getSessionPrefix, generateSessionId, getSessionOrThrow, listAllKvKeys, sanitizeSessionName, putSessionWithMetadata } from '../../lib/kv-keys';
 import { AuthVariables } from '../../middleware/auth';
 import { createRateLimiter } from '../../middleware/rate-limit';
 import { MAX_SESSION_NAME_LENGTH, MAX_TABS } from '../../lib/constants';
@@ -15,7 +15,7 @@ import { createLogger } from '../../lib/logger';
 import { ValidationError } from '../../lib/error-types';
 import { getTierConfig, getUserTier, getEffectiveTier } from '../../lib/subscription';
 import { isSaasModeActive } from '../../lib/onboarding';
-import { parseJsonBody, firstZodError, validateSessionId } from '../../lib/request-helpers';
+import { parseJsonBody, validateSessionId } from '../../lib/request-helpers';
 import { toApiSession } from '../../lib/session-helpers';
 import { TabConfigSchema } from '../../lib/schemas';
 
@@ -80,26 +80,16 @@ app.get('/', async (c) => {
     }
   }
 
-  // Read-side staleness reconciliation: a session KV-marked running whose
-  // metrics heartbeat is stale is reported as 'stopped'. Display-only - not
-  // written back to KV.
-  const now = Date.now();
-  const reconciledSessions = sessions.map((session) => {
-    const meta = reconcileStaleStatus(buildSessionMetadata(session), now);
-    return meta.s === 's' && session.status === 'running'
-      ? { ...session, status: 'stopped' as const }
-      : session;
-  });
-
-  // Sort by lastAccessedAt (most recent first)
-  reconciledSessions.sort(
+  // Sort by lastAccessedAt (most recent first). KV status is authoritative -
+  // the container writes 'stopped' on exit, so no read-side reconciliation.
+  sessions.sort(
     (a, b) =>
       new Date(b.lastAccessedAt).getTime() -
       new Date(a.lastAccessedAt).getTime()
   );
 
   // Omit userId from API responses
-  const sanitizedSessions = reconciledSessions.map(toApiSession);
+  const sanitizedSessions = sessions.map(toApiSession);
 
   return c.json({ sessions: sanitizedSessions });
 });
@@ -111,11 +101,7 @@ app.get('/', async (c) => {
  */
 app.post('/', sessionCreateRateLimiter, async (c) => {
   const bucketName = c.get('bucketName');
-  const raw = await parseJsonBody(c);
-  const parsed = CreateSessionBody.safeParse(raw);
-  if (!parsed.success) {
-    throw new ValidationError(firstZodError(parsed.error));
-  }
+  const body = await parseJsonBody(c, CreateSessionBody);
 
   // Storage quota check — block session start if over quota
   if (isSaasModeActive(c.env.SAAS_MODE)) {
@@ -135,7 +121,7 @@ app.post('/', sessionCreateRateLimiter, async (c) => {
     }
   }
 
-  let sessionName = parsed.data.name?.trim() || 'Terminal';
+  let sessionName = body.name?.trim() || 'Terminal';
   sessionName = sanitizeSessionName(sessionName);
 
   const sessionId = generateSessionId();
@@ -147,8 +133,8 @@ app.post('/', sessionCreateRateLimiter, async (c) => {
     userId: bucketName,
     createdAt: now,
     lastAccessedAt: now,
-    ...(parsed.data.agentType && { agentType: parsed.data.agentType }),
-    ...(parsed.data.tabConfig && { tabConfig: parsed.data.tabConfig }),
+    ...(body.agentType && { agentType: body.agentType }),
+    ...(body.tabConfig && { tabConfig: body.tabConfig }),
   };
 
   // Store session in KV
@@ -187,17 +173,13 @@ app.patch('/:id', async (c) => {
 
   const session = await getSessionOrThrow(c.env.KV, key);
 
-  const raw = await parseJsonBody(c);
-  const parsed = UpdateSessionBody.safeParse(raw);
-  if (!parsed.success) {
-    throw new ValidationError(firstZodError(parsed.error));
-  }
+  const body = await parseJsonBody(c, UpdateSessionBody);
 
   // Update fields (immutable)
   const updated = {
     ...session,
-    ...(parsed.data.name ? { name: sanitizeSessionName(parsed.data.name) } : {}),
-    ...(parsed.data.tabConfig ? { tabConfig: parsed.data.tabConfig } : {}),
+    ...(body.name ? { name: sanitizeSessionName(body.name) } : {}),
+    ...(body.tabConfig ? { tabConfig: body.tabConfig } : {}),
     lastAccessedAt: new Date().toISOString(),
   };
 

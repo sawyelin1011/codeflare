@@ -57,6 +57,18 @@ export interface MetricsCallbacks {
  * (caller logs).
  *
  */
+// DO-storage key holding the wall-clock ms at which the container first read
+// not-running in an unbroken streak. Persisted (not in-memory) so it survives
+// the DO hibernation/reset that itself triggers the transient false reading.
+const NOT_RUNNING_SINCE_KEY = 'metricsNotRunningSince';
+// A container must read not-running continuously for at least this long before
+// collectMetrics writes 'stopped'. Spans more than one 60s alarm tick so a
+// single transient `ctx.container.running === false` (DO hibernation wake or
+// deploy-roll, while the container is actually alive) cannot flip a live
+// session to stopped. onError remains the immediate authority for genuine
+// crashes; this catch-all only covers exits the SDK never surfaces as onError.
+const NOT_RUNNING_CONFIRM_MS = 90_000;
+
 export const SLEEP_AFTER_FALLBACK_MS = 7_200_000; // 2h
 export function parseSleepAfterMs(s: string): number {
   if (s.endsWith('h')) {
@@ -120,6 +132,32 @@ export async function updateKvStatus(
  * Collect health metrics, detect idle state, ping Timekeeper, and re-arm the schedule.
  *
  * Mutates `state` (lastSeenInputAt, _usageSeconds) in place.
+ *
+ * ALARM-LOOP LIFECYCLE: this runs as a one-shot DO alarm that re-arms itself
+ * (callbacks.schedule(60, ...)) ONLY while ctx.container.running. If the
+ * container is not running on entry, the loop marks the session stopped (the
+ * authoritative catch-all for an exit the SDK surfaced as onError, not onStop)
+ * and returns WITHOUT re-arming; onStart() restarts the loop on the next start.
+ * Consequences worth knowing: (a) DO alarms can fire late (observed ~60s drift
+ * in prod); (b) the loop does NOT run while the DO/container is hibernated, so
+ * the metrics heartbeat (m.u) can go stale on a perfectly healthy session.
+ * That staleness is why a heartbeat-age heuristic is NOT a valid liveness
+ * signal - KV status must come from the lifecycle hooks (see the contract above
+ * container/index.ts::onStart). Removing that heuristic is codeflare#153.
+ *
+ * TIMESTAMP TAXONOMY (four distinct clocks - do not conflate):
+ *   lastInputAt        in-container /activity: wall-clock of the last PTY
+ *                      KEYSTROKE (user input) only. Does NOT advance on terminal
+ *                      OUTPUT, WebSocket traffic, vault/SilverBullet activity, or
+ *                      an autonomously-working agent. The idle reference:
+ *                      idleMs = Date.now() - (lastInputAt ?? containerStartedAt).
+ *   lastSeenInputAt    MetricsState's cached copy of lastInputAt for this tick.
+ *   lastActiveAt (KV)  mirrors lastInputAt (input-driven). Feeds the dashboard
+ *                      sleep-timer countdown. NOT a liveness signal.
+ *   metrics.updatedAt  KV meta m.u: wall-clock re-stamped here EVERY tick
+ *     (m.u)            regardless of input. Metrics-staleness display only; it
+ *                      freezes whenever this loop is not running (see above), so
+ *                      it must not be used to infer liveness.
  */
 export async function collectMetrics(
   state: MetricsState,
@@ -127,12 +165,50 @@ export async function collectMetrics(
   env: Env,
   callbacks: MetricsCallbacks,
 ): Promise<void> {
-  // Don't collect or re-arm if container process is dead.
-  // onStart() will restart the schedule loop on next container start.
+  // Container reads as not-running. This is EITHER a genuine exit (crash,
+  // deploy-roll, platform idle-reap) that the SDK never surfaced as onError,
+  // OR a transient false reading: `ctx.container.running` momentarily reports
+  // false when an alarm wakes a hibernated DO or during a deploy-roll, while
+  // the container is actually alive. Writing 'stopped' on a single such tick
+  // both flips a live session to stopped (kicking the user to the dashboard)
+  // AND kills the alarm loop (the re-arm at the foot of this function only
+  // fires while running), freezing metrics until the next onStart. So require
+  // the not-running reading to persist across NOT_RUNNING_CONFIRM_MS before
+  // treating it as a real exit, re-arming meanwhile so the streak can be
+  // observed (REQ-SESSION-018). The marker lives in DO storage so it survives
+  // the hibernation/reset that causes the false reading.
   if (!ctx.container?.running) {
-    logger.info('collectMetrics: container not running, skipping');
+    const now = Date.now();
+    const since = await ctx.storage.get<number>(NOT_RUNNING_SINCE_KEY);
+    // No marker yet (real DO storage returns undefined; some mocks null): open
+    // the window and re-arm without writing stopped.
+    if (typeof since !== 'number') {
+      await ctx.storage.put(NOT_RUNNING_SINCE_KEY, now);
+      logger.info('collectMetrics: container not running, opening confirmation window', {
+        confirmMs: NOT_RUNNING_CONFIRM_MS,
+      });
+      try { await callbacks.schedule(60, 'collectMetrics'); } catch { /* DO shutting down */ }
+      return;
+    }
+    if (now - since < NOT_RUNNING_CONFIRM_MS) {
+      logger.info('collectMetrics: container not running, within confirmation window', {
+        elapsedMs: now - since, confirmMs: NOT_RUNNING_CONFIRM_MS,
+      });
+      // Re-arm so the streak is re-checked; onStart's deleteSchedules dedupes
+      // if the container recovers and restarts the loop concurrently.
+      try { await callbacks.schedule(60, 'collectMetrics'); } catch { /* DO shutting down */ }
+      return;
+    }
+    logger.info('collectMetrics: container not running past confirmation window, marking stopped', {
+      elapsedMs: now - since,
+    });
+    await ctx.storage.delete(NOT_RUNNING_SINCE_KEY);
+    await updateKvStatus(ctx, env, state._bucketName, 'stopped', 'lastActiveAt');
     return;
   }
+  // Container is running - clear any pending not-running confirmation marker so
+  // a future transient blip starts a fresh streak.
+  await ctx.storage.delete(NOT_RUNNING_SINCE_KEY);
 
   // User-input-based idle detection. The SDK's sleepAfter timer is pinned to
   // 24h and refreshes on every WebSocket message (in both directions) in

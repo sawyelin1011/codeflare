@@ -78,7 +78,7 @@ export type { UsageWarningLevel, UsageState } from './session-usage';
 
 // ── Session Metrics ─────────────────────────────────────────────────────────
 
-interface SessionMetrics {
+export interface SessionMetrics {
   bucketName: string;
   syncStatus: 'pending' | 'syncing' | 'success' | 'failed' | 'skipped';
   cpu?: string;
@@ -536,7 +536,6 @@ registerPreferencesDeps({
   api: { getPreferences: api.getPreferences, updatePreferences: api.updatePreferences },
   logger,
   setPreferences: (prefs: UserPreferences) => setState('preferences', prefs),
-  getPreferences: () => state.preferences,
 });
 
 /** Check if user has reached max concurrent running sessions (counts running + initializing). */

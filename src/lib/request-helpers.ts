@@ -11,13 +11,29 @@ import { SESSION_ID_PATTERN } from './constants';
  * Parse JSON body from a Hono request, throwing ValidationError on malformed input.
  * Replaces the try/catch c.req.json() boilerplate used across 14+ route handlers.
  * Also fixes 8 routes that were missing JSON error handling entirely (crash with 500).
+ *
+ * When a Zod schema is supplied, the parsed body is validated and the typed,
+ * validated value is returned. Validation failures throw a ValidationError carrying
+ * the first Zod issue message - identical to the safeParse + firstZodError pattern
+ * used at the callsites. When omitted, the body is returned as an unchecked cast (back-compat).
  */
-export async function parseJsonBody<T = unknown>(c: Context): Promise<T> {
+export async function parseJsonBody<T = unknown>(c: Context): Promise<T>;
+export async function parseJsonBody<S extends z.ZodType>(c: Context, schema: S): Promise<z.infer<S>>;
+export async function parseJsonBody<T = unknown>(c: Context, schema?: z.ZodType): Promise<T> {
+  let body: unknown;
   try {
-    return await c.req.json() as T;
+    body = await c.req.json();
   } catch {
     throw new ValidationError('Invalid JSON body');
   }
+  if (!schema) {
+    return body as T;
+  }
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    throw new ValidationError(firstZodError(parsed.error));
+  }
+  return parsed.data as T;
 }
 
 /**
@@ -42,7 +58,7 @@ export function validateSessionId(sessionId: string): void {
  * Mask a sensitive string for safe display (e.g., API keys, tokens).
  * Shows only the last 4 characters: "sk-1234567890" → "****7890"
  */
-export function maskSecret(value: string | undefined): string | undefined {
+export function maskSecret(value: string | null | undefined): string | undefined {
   if (!value) return undefined;
   if (value.length <= 4) return '****';
   return '****' + value.slice(-4);

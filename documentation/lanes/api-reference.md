@@ -120,7 +120,7 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 | GET | `/api/billing/status` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching), [REQ-SUB-018](../../sdd/spec/subscription.md#req-sub-018-usage-dashboard-page) | Live billing state from Stripe (subscription, period, status) |
 | POST | `/api/billing/portal` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching) | Create Stripe Customer Portal session (rate-limited 5/min) |
 | POST | `/api/billing/switch` | Session cookie | [REQ-SUB-016](../../sdd/spec/subscription.md#req-sub-016-customer-portal-and-plan-switching) | Deep-link portal for plan change confirmation (rate-limited 5/min) |
-| POST | `/public/stripe/webhook` | None (Stripe HMAC) | [REQ-SUB-005](../../sdd/spec/subscription.md#req-sub-005-trial-is-compute-based-not-time-based), [REQ-SUB-015](../../sdd/spec/subscription.md#req-sub-015-stripe-webhook-signal-and-sync-pattern), [REQ-SUB-021](../../sdd/spec/subscription.md#req-sub-021-billing-cycle-alignment) | Stripe webhook handler (unauthenticated, HMAC-verified, rate-limited 100/min) |
+| POST | `/public/stripe/webhook` | None (Stripe HMAC) | [REQ-SUB-005](../../sdd/spec/subscription.md#req-sub-005-trial-is-compute-based-not-time-based), [REQ-SUB-015](../../sdd/spec/subscription.md#req-sub-015-stripe-webhook-signal-and-sync-pattern), [REQ-SUB-021](../../sdd/spec/subscription.md#req-sub-021-billing-cycle-alignment) | Stripe webhook handler (unauthenticated, HMAC-verified, rate-limited 100/min, body capped at 1 MiB via `bodyLimit` middleware -- CF-004) |
 
 ### Deploy Keys
 
@@ -538,6 +538,7 @@ Both endpoints return the same JSON body:
 - [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) - Container Port-Readiness Gating with Pre-Warm Pre-Condition
 - [REQ-SESSION-016](../../sdd/spec/session-lifecycle.md#req-session-016-user-timezone-propagated-from-preferences-to-container-env) - User timezone propagated from preferences to container env
 - [REQ-SESSION-017](../../sdd/spec/session-lifecycle.md#req-session-017-container-health-and-startup-status-api) - Container health and startup-status API
+- [REQ-SESSION-018](../../sdd/spec/session-lifecycle.md#req-session-018-persisted-status-is-authoritative-on-container-exit) - Persisted status is authoritative on container exit
 - [REQ-SETUP-001](../../sdd/spec/setup.md#req-setup-001-first-time-setup-requires-zero-pre-configuration) - First-time setup requires zero pre-configuration
 - [REQ-SETUP-005](../../sdd/spec/setup.md#req-setup-005-post-setup-reconfiguration-requires-admin-auth) - Post-setup reconfiguration requires admin auth
 - [REQ-SETUP-008](../../sdd/spec/setup.md#req-setup-008-setup-helper-endpoints-support-prefill-and-detection) - Setup helper endpoints support prefill and detection

@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import { getContainer } from '@cloudflare/containers';
 import type { Env, Session, UserPreferences } from '../../types';
-import { getSessionKey, getSessionPrefix, listAllKvKeys, getSessionOrThrow, getTimekeeperKey, getUtcMonthString, getUtcDateString, putSessionWithMetadata, expandSessionMetadata, reconcileStaleStatus, buildSessionMetadata, getPreferencesKey, type SessionListMetadata } from '../../lib/kv-keys';
+import { getSessionKey, getSessionPrefix, listAllKvKeys, getSessionOrThrow, getTimekeeperKey, getUtcMonthString, getUtcDateString, putSessionWithMetadata, expandSessionMetadata, buildSessionMetadata, getPreferencesKey, type SessionListMetadata } from '../../lib/kv-keys';
 import { PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
 import { getMaxSessions, SESSION_ID_PATTERN } from '../../lib/constants';
 import { AuthVariables } from '../../middleware/auth';
@@ -108,16 +108,13 @@ app.get('/batch-status', async (c) => {
   const statuses: Record<string, { status: string; ptyActive: boolean; lastActiveAt: string | null; lastStartedAt: string | null; metrics?: Session['metrics'] }> = {};
   const fallbackKeys: Array<{ name: string }> = [];
 
-  // Reconcile a phantom-running session (KV says 'r' but the metrics heartbeat
-  // is stale) to 'stopped' for display. Read-side only - never written to KV.
-  const now = Date.now();
-
   for (const key of keys) {
     const meta = key.metadata as SessionListMetadata | null;
     if (meta && meta.s) {
-      // Fast path: read from list metadata (zero KV.get)
+      // Fast path: read status straight from list metadata (zero KV.get).
+      // KV status is authoritative - the container writes 'stopped' on exit.
       const sessionId = key.name.split(':').pop()!;
-      statuses[sessionId] = expandSessionMetadata(reconcileStaleStatus(meta, now));
+      statuses[sessionId] = expandSessionMetadata(meta);
     } else {
       // Pre-migration key without metadata - queue for fallback KV.get
       fallbackKeys.push(key);
@@ -131,15 +128,12 @@ app.get('/batch-status', async (c) => {
     );
     for (const session of fallbackResults) {
       if (!session) continue;
-      // Build equivalent metadata so the fallback path gets the same staleness
-      // reconciliation as the fast path.
-      const reconciled = reconcileStaleStatus(buildSessionMetadata(session), now);
-      statuses[session.id] = expandSessionMetadata(reconciled);
+      statuses[session.id] = expandSessionMetadata(buildSessionMetadata(session));
     }
   }
 
   const user = c.get('user');
-  const maxSessions = getMaxSessions(user.role, c.env);
+  let maxSessions = getMaxSessions(user.role, c.env);
 
   // Include cached storage stats (already in KV from /api/storage/stats, 60s TTL)
   const storageStatsCached = await c.env.KV.get(`storage-stats:${bucketName}`, 'json') as { totalFiles: number; totalFolders: number; totalSizeBytes: number } | null;
@@ -154,6 +148,9 @@ app.get('/batch-status', async (c) => {
         getTierConfig(c.env.KV),
       ]);
       const entitlements = getEffectiveTierForUser(user, tiers);
+      // REQ-SUB-013 AC4: the returned cap is the effective-tier cap in SaaS
+      // mode (role-based cap stays the default outside SaaS mode).
+      maxSessions = entitlements.maxSessions;
       const now = new Date();
       const currentMonth = getUtcMonthString(now);
       const currentDate = getUtcDateString(now);

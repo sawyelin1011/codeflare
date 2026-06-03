@@ -155,7 +155,7 @@ Tiers, billing, usage tracking, and quotas.
 1. When the payment provider is configured, the direct-subscribe endpoint rejects paid tiers with a clear "checkout required" error; only the free tier remains directly subscribable.
 2. The checkout endpoint creates a hosted checkout session pre-populated with the visitor's email and the tier/mode metadata, and returns the externally-hosted checkout URL.
 3. After payment, the provider sends a checkout-completed webhook that records the checkout outcome and triggers an authoritative state sync.
-4. The frontend polls the auth-status endpoint after the checkout redirect with a bounded total wait so subscription activation feels immediate to the user.
+4. The frontend polls the auth-status endpoint after the checkout redirect on a fixed interval with no bounded total wait (the poll has no deadline and continues until activation is observed) so subscription activation feels immediate to the user.
 5. The webhook handler covers the three relevant lifecycle events: checkout completion, subscription update, and subscription deletion.
 6. The webhook endpoint is publicly reachable but enforces signed-payload verification with a short timestamp tolerance.
 7. Webhook events are de-duplicated by event identifier with a multi-day retention window so replayed events do not double-apply.
@@ -357,7 +357,7 @@ Tiers, billing, usage tracking, and quotas.
 ### REQ-SUB-010: Tier Config Cached with 60-Second TTL
 
 <!-- @impl: src/lib/subscription.ts::getTierConfig -->
-<!-- @impl: src/lib/cache-reset.ts -->
+<!-- @impl: src/lib/subscription.ts::resetTierConfigCache -->
 <!-- @test: src/__tests__/lib/subscription.test.ts (getTierConfig describe → KV fallback + module cache single-KV-read + resetTierConfigCache cache-bust → AC1-AC5) -->
 
 **Intent:** Tier configuration reads must be fast (avoid KV round-trip on every request) while still reflecting admin changes within a bounded delay.
@@ -459,7 +459,7 @@ Tiers, billing, usage tracking, and quotas.
 ### REQ-SUB-013: Concurrent Session Limits
 
 <!-- @impl: src/lib/subscription.ts::getMaxSessionsForTier -->
-<!-- @impl: src/routes/container/lifecycle.ts::validateSessionAndCheckLimits -->
+<!-- @impl: src/routes/container/lifecycle-validation.ts::validateSessionAndCheckLimits -->
 <!-- @test: src/__tests__/routes/container-lifecycle.test.ts (Session limits describe → per-tier maxSessions enforcement + STRESS_TEST_MODE bypass → AC1-AC4) -->
 
 **Intent:** Each tier must enforce a maximum number of simultaneously running sessions to control resource consumption.
@@ -520,12 +520,16 @@ Tiers, billing, usage tracking, and quotas.
 
 ---
 
-<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (handleCheckoutCompleted / REQ-SUB-005 / REQ-SUB-015 describe -> webhook treated as signal that triggers syncSubscriptionState refetch from Stripe -> AC1, AC2) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (handleCheckoutCompleted / REQ-SUB-005 (Stripe webhook syncs subscription state) / REQ-SUB-015 (webhook handlers for updated/deleted/canceled) describe -> calls syncSubscriptionState which updates tier from Stripe API -> AC1, AC2) -->
 <!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> skips write when KV lastSyncedAt is newer than current timestamp -> AC3 stale-webhook guard) -->
-<!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> writes complete state from snapshot + preserves tier when metadata is null -> AC4 patch from fetched snapshot) -->
-<!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> preserves existing KV fields (addedBy, onboardingComplete, etc.) via updateUserRecord atomic merge -> AC5) -->
-<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-recreate on downgrade describe -> mode-change triggers reconcileAgentConfigs with new mode -> AC6) -->
-<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-reconcile on subscription.deleted describe -> calls reconcileAgentConfigs with default mode after KV reset to free -> AC7) -->
+<!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> writes complete state to KV from Stripe snapshot -> AC4) -->
+<!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> preserves tier when metadata is null (does not blank it) -> AC4) -->
+<!-- @test: src/__tests__/routes/stripe-webhook-sync.test.ts (syncSubscriptionState describe -> preserves existing KV fields (addedBy, onboardingComplete, etc.) -> AC5) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-recreate on downgrade describe -> calls reconcileAgentConfigs when mode changes from advanced to default -> AC6) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-recreate on downgrade describe -> calls reconcileAgentConfigs on upgrade (default → advanced) -> AC6) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-reconcile on subscription.deleted describe -> calls reconcileAgentConfigs with default mode on subscription deletion -> AC7) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-recreate on downgrade describe -> downgrade Pro→Standard: recovers default mode from the price slot (null metadata) and reconciles -> AC6) -->
+<!-- @test: src/__tests__/routes/stripe-webhook.test.ts (auto-recreate on downgrade describe -> upgrade Standard→Pro: recovers advanced mode from the price slot (null metadata) and reconciles -> AC6) -->
 ### REQ-SUB-015: Stripe Webhook Signal-and-Sync Pattern
 
 <!-- @impl: src/routes/stripe-webhook.ts -->
@@ -540,9 +544,9 @@ Tiers, billing, usage tracking, and quotas.
 1. Webhooks are treated as signals that trigger a fresh fetch from the payment provider, not as the authoritative data source themselves.
 2. The state-sync routine fetches the latest subscription (with price items expanded) directly from the payment provider.
 3. A last-synced timestamp guard prevents stale webhooks from overwriting newer state.
-4. Persisted updates are built from the fetched snapshot; tier and mode are updated only when price metadata is present, so absent metadata preserves the existing values.
+4. Persisted updates are built from the fetched snapshot; the persisted tier is updated only when price tier-metadata is present, so absent metadata preserves the existing tier. The subscribed mode is resolved per AC6.
 5. Writes use an atomic read-merge-write helper to prevent concurrent webhook writes from clobbering unrelated fields.
-6. On any mode change (upgrade or downgrade), the agent-config reconciler runs to seed the correct config set for the new mode.
+6. On any mode change (upgrade or downgrade), the agent-config reconciler runs to seed the new mode's config set - recreating the new mode's skills and removing the previous mode's - and the session-mode preference (the UI mode) flips. The mode is resolved from the Stripe price even when the price carries no `mode` metadata: the price ID is matched against the tier configuration's Standard and Pro price slots (`stripePriceId` / `stripeAdvancedPriceId`) to recover it, so a Standard<->Pro subscription change always updates the subscribed mode and triggers this reconcile even when admins configure prices via slots rather than per-price metadata. The change is lazy: a running session is unaffected until its next start.
 7. On subscription termination, after resetting the persisted tier to free, the agent-config reconciler runs with the default mode to restore Standard configs.
 
 **Constraints:**

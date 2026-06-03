@@ -380,6 +380,7 @@ Security requirements for authentication enforcement, credential isolation, encr
 
 <!-- @impl: src/index.ts -->
 <!-- @test: host/__tests__/workflow-files.test.js (pentest workflow describe → security-headers job verifies all headers) -->
+<!-- @test: src/__tests__/security/early-return-security.test.ts (CF-001 vault early-return describe → proxied vault content has null CSP, error responses carry full CSP → AC2 vault-proxy exemption) -->
 
 **Intent:** Every HTTP response must include standard security headers to prevent common web attacks (clickjacking, MIME sniffing, mixed content, leaked referrer, fingerprintable server software).
 
@@ -400,6 +401,7 @@ Security requirements for authentication enforcement, credential isolation, encr
 - Headers are applied globally; every response path inherits them.
 - Preflight (OPTIONS) responses receive HSTS directly in the CORS middleware.
 - Coverage of non-standard response paths (redirect responses, helper-emitted responses) lives in [REQ-SEC-021](#req-sec-021-hsts-coverage-on-redirect-response-paths).
+- The vault proxy content path is exempt from AC2 only: proxied SilverBullet responses (same-origin, authenticated, user-owned content) carry the transport and clickjacking headers (AC1, AC3-AC7) but not the `default-src 'none'` CSP, which would block SilverBullet's inline scripts/styles, web workers and eval. Vault error/JSON responses still carry the full set including CSP.
 
 **Priority:** P0
 
@@ -594,7 +596,7 @@ Security requirements for authentication enforcement, credential isolation, encr
 
 1. File download responses use `Content-Disposition: attachment` with sanitized filenames.
 2. Special characters are stripped from filenames.
-3. Filenames are truncated to prevent header injection.
+3. Header-injection control characters are stripped from filenames.
 
 **Constraints:**
 

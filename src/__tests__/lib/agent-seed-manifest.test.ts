@@ -3,7 +3,7 @@ import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-see
 import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution, renderGraphifyCloneDirective } from '../../../preseed/agents/pi/extensions/graphify-helpers';
 import { bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
 import { actionableReviewCount, allDurableReviewLanesComplete, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
-import { buildSpawnOptions, captureFilename, captureTimestamp, compactMessages, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, stableId, titleFor, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
+import { buildSpawnOptions, captureFilename, captureTimestamp, compactMessages, deterministicVaultGraph, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, stableId, titleFor, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
 import { attributionBlockReason, isLocalBuildCommand, localBuildBlockReason } from '../../../preseed/agents/pi/extensions/guard-helpers';
 import { DEBUG_WORKFLOW, DEPLOY_WORKFLOW, BRAINSTORM_WORKFLOW, commandInstructions, deployTarget } from '../../../preseed/agents/pi/extensions/commands-helpers';
 
@@ -223,6 +223,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(skills.map((d) => d.key).filter((key) => key === '.pi/agent/skills/graphify/SKILL.md')).toHaveLength(1);
     expect(scripts.map((d) => d.key)).toContain('.pi/agent/scripts/safe-graphify-update.sh');
     expect(scripts.map((d) => d.key)).toContain('.pi/agent/scripts/build-graphify-ast.sh');
+    expect(scripts.map((d) => d.key)).toContain('.pi/agent/scripts/build-graphify-architecture.sh');
     // Pi-native first-class residents: the review skill and codeflare-commands extension
     // are emitted directly (not transformed from Claude), so the Pi manifest -> seed pipeline
     // must surface them.
@@ -286,26 +287,26 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(cloneTargetPath('owner=$(gh api user --jq .login)\ngh repo clone "$owner/codeflare" "$repo"', '/home/user/workspace')).toBeUndefined();
 
     const missingGraphDirective = renderGraphifyCloneDirective(graphifyCloneAction('/repo', false));
-    expect(missingGraphDirective).toContain('ask the user to choose one option');
-    expect(missingGraphDirective).toContain('1. Create AST-only Graphify graph');
-    expect(missingGraphDirective).toContain('build-graphify-ast.sh');
-    expect(missingGraphDirective).toContain('current main-session model');
+    expect(missingGraphDirective).toContain('ask the user a single YES/NO question');
+    expect(missingGraphDirective).toContain('Build a graphify knowledge graph for /repo?');
+    expect(missingGraphDirective).toContain('Do NOT ask about AST-only vs Full at clone time');
+    expect(missingGraphDirective).toContain('Pi Agent subagents from this running session');
     const existingGraphDirective = renderGraphifyCloneDirective(graphifyCloneAction('/repo', true));
-    expect(existingGraphDirective).toContain('If stale or freshness is unknown, ask the user to choose one option');
-    expect(existingGraphDirective).toContain('1. AST-only update');
-    expect(existingGraphDirective).toContain('2. Full semantic + AST refresh');
+    expect(existingGraphDirective).toContain('refresh the AST portion with upstream Graphify via the local safety wrapper');
+    expect(existingGraphDirective).toContain('safe-graphify-update.sh /repo');
+    expect(existingGraphDirective).toContain('Full semantic refresh is owned by the `/graphify` skill');
 
     expect(graphifyCloneAction('/repo', false)).toEqual({
       repo: '/repo',
       hasGraph: false,
       mode: 'missing-graph',
-      choices: ['AST-only build', 'Full semantic + AST build', 'skip'],
+      choices: ['build graph', 'skip'],
     });
     expect(graphifyCloneAction('/repo', true)).toEqual({
       repo: '/repo',
       hasGraph: true,
       mode: 'existing-graph',
-      choices: ['check freshness', 'AST-only update', 'Full semantic + AST refresh', 'skip'],
+      choices: ['use existing graph', 'AST-only update', 'skip'],
     });
     expect(graphifyPromptMarker('/home/user/workspace/r', 'session-1')).toBe('/tmp/codeflare-graphify-prompted-session-1_home_user_workspace_r');
     expect(isFailedGraphifyToolExecution({ status: 'error' })).toBe(true);
@@ -326,7 +327,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
         repo: '/home/user/workspace/r/.git-root',
         hasGraph: true,
         mode: 'existing-graph',
-        choices: ['check freshness', 'AST-only update', 'Full semantic + AST refresh', 'skip'],
+        choices: ['use existing graph', 'AST-only update', 'skip'],
       },
     });
     expect(graphifyClonePromptDecision({
@@ -744,7 +745,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
   it('REQ-AGENT-053 AC8: durable review lanes load graphify always, context-mode only when enabled, never subagents', () => {
     const enabledCtx = [
       'npm:@gaodes/pi-graphify@0.2.2',
-      'npm:@gotgenes/pi-subagents@7.8.1',
+      'npm:@gotgenes/pi-subagents@14.0.0',
       'npm:context-mode@1.0.151',
     ];
     // graphify always; context-mode enabled (bare string); subagents never.
@@ -755,7 +756,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
 
     const disabledCtx = [
       'npm:@gaodes/pi-graphify@0.2.2',
-      'npm:@gotgenes/pi-subagents@7.8.1',
+      'npm:@gotgenes/pi-subagents@14.0.0',
       { source: 'npm:context-mode@1.0.151', extensions: [], skills: [] },
     ];
     // context-mode in disabled filter form -> only graphify.
@@ -768,7 +769,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
 
     // empty / unrelated packages -> nothing.
     expect(laneExtensionSources([])).toEqual([]);
-    expect(laneExtensionSources(['npm:@gotgenes/pi-subagents@7.8.1', '', { source: '' }])).toEqual([]);
+    expect(laneExtensionSources(['npm:@gotgenes/pi-subagents@14.0.0', '', { source: '' }])).toEqual([]);
   });
 
   it('REQ-AGENT-055 AC4-AC5: Pi review enforcement selects the unreviewed incremental review base', () => {
@@ -804,6 +805,8 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(keys.has('.pi/agent/skills/graphify/SKILL.md')).toBe(true);
     expect(keys.has('.pi/agent/scripts/safe-graphify-update.sh')).toBe(true);
     expect(keys.has('.pi/agent/scripts/build-graphify-ast.sh')).toBe(true);
+    expect(keys.has('.pi/agent/scripts/build-graphify-architecture.sh')).toBe(true);
+    expect(keys.has('.pi/agent/scripts/local-graphify-labels.sh')).toBe(true);
     const piPackage = AGENTS_SEEDED_CONFIGS.find((doc) => doc.key === '.pi/agent/npm/package.json');
     expect(piPackage?.content).toContain('"@gaodes/pi-graphify": "0.2.2"');
     for (const key of [
@@ -811,6 +814,8 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       '.pi/agent/skills/graphify/SKILL.md',
       '.pi/agent/scripts/safe-graphify-update.sh',
       '.pi/agent/scripts/build-graphify-ast.sh',
+      '.pi/agent/scripts/build-graphify-architecture.sh',
+      '.pi/agent/scripts/local-graphify-labels.sh',
     ]) {
       const doc = AGENTS_SEEDED_CONFIGS.find((entry) => entry.key === key);
       expect(doc?.modes, `${key} should be advanced-only`).toEqual(['advanced']);
@@ -820,17 +825,21 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
   it('REQ-AGENT-024 AC5-AC6 / REQ-AGENT-043: Pi graphify skill preserves durable graph artifacts and stays model-agnostic', () => {
     const skill = AGENTS_SEEDED_CONFIGS.find((doc) => doc.key === '.pi/agent/skills/graphify/SKILL.md');
     expect(skill?.content).toContain('build-graphify-ast.sh');
+    expect(skill?.content).toContain('build-graphify-architecture.sh');
     expect(skill?.content).toContain('safe-graphify-update.sh');
-    expect(skill?.content).toContain('without a `model` override');
-    expect(skill?.content).toContain('current main-session model');
-    expect(skill?.content).toContain('Graph persistence lives with the repo, not R2');
-    expect(skill?.content).toContain('graphify-out/cache/');
-    expect(skill?.content).toContain('graphify-out/manifest.json');
+    expect(skill?.content).toContain('Do not pass a model override');
+    expect(skill?.content).toContain('running session model');
+    expect(skill?.content).toContain('Pi main session agent');
+    expect(skill?.content).toContain('local-graphify-labels.sh apply .');
+    expect(skill?.content).toContain('existing community assignments');
+    expect(skill?.content).not.toContain('graphify label . --backend=gemini');
+    expect(skill?.content).not.toContain('--backend=gemini');
+    expect(skill?.content).toContain('Do not commit caches, manifests, chunks, or `.graphify_*` intermediates other than `.graphify_labels.json`');
     expect(skill?.content).toContain('graphify-out/graph.json merge=graphify');
     expect(skill?.content).toContain('graphify-out/graph.json');
     expect(skill?.content).toContain('graphify-out/GRAPH_REPORT.md');
     expect(skill?.content).toContain('graphify-out/graph.html');
-    expect(skill?.content).toContain('blanket `graphify-out/`');
+    expect(skill?.content).toContain('graphify-out/callflow.html');
   });
 
   // Pi as a first-class resident: the Pi manifest's prompts/* entries are emitted
@@ -1210,12 +1219,60 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(titleFor('/vault/Docs/report.pdf', '')).toBe('report.pdf');
   });
 
-  it('REQ-VAULT-004: memory-vault.ts extracts wikilink concept nodes and non-text document nodes', () => {
+  it('REQ-VAULT-016: memory-vault.ts builds the baseline via the canonical-schema helper', () => {
     const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
-    expect(mv?.content).toContain('concept:');
-    expect(mv?.content).toContain('mentions');
-    expect(mv?.content).toContain('"document"');
-    expect(mv?.content).toContain('isText ? "note" : "document"');
+    expect(mv?.content).toContain('deterministicVaultGraph');
+    const helpers = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault-helpers.ts');
+    // Canonical graphify schema (file_type/source_file/relation/confidence), not the legacy type/path/mentions shape.
+    // (relation values are passed to addLink as arguments, so assert the literal strings, not `relation: "..."`.)
+    expect(helpers?.content).toContain('file_type: "concept"');
+    expect(helpers?.content).toContain('source_file: null');
+    expect(helpers?.content).toContain('"references"');
+    expect(helpers?.content).toContain('"contains"');
+    expect(helpers?.content).toContain('confidence_score: 1.0');
+    expect(helpers?.content).not.toContain('type: "mentions"');
+  });
+
+  it('REQ-VAULT-003 AC7: Pi vault-extract prompt publishes the viz to Raw/Graphs', () => {
+    const prompt = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/prompts/vault-extract-prompt.md');
+    expect(prompt?.content).toContain('graphify cluster-only .');
+    expect(prompt?.content).toContain('Raw/Graphs/vault-graph.html');
+  });
+
+  it('REQ-VAULT-003 AC8: deterministicVaultGraph emits canonical document/concept/heading nodes and edges', () => {
+    const { nodes, links } = deterministicVaultGraph(
+      [{ rel: 'Notes/a.md', path: '/home/user/Vault/Notes/a.md', content: '# Title\n## Section\nSee [[Foo]].', isText: true }],
+      { nodes: [], links: [] },
+    );
+    const doc = nodes.find((n) => n.label === 'Title');
+    expect(doc.file_type).toBe('document');
+    expect(doc.source_file).toBe('/home/user/Vault/Notes/a.md');
+    const concept = nodes.find((n) => n.label === 'Foo');
+    expect(concept.file_type).toBe('concept');
+    expect(concept.source_file).toBeNull();
+    const section = nodes.find((n) => n.label === 'Section');
+    expect(section.file_type).toBe('document');
+    expect(links.some((l) => l.relation === 'references' && l.target === concept.id)).toBe(true);
+    expect(links.some((l) => l.relation === 'contains' && l.target === section.id)).toBe(true);
+    expect(links.every((l) => l.confidence === 'EXTRACTED' && l.confidence_score === 1)).toBe(true);
+  });
+
+  it('REQ-VAULT-003 AC8: deterministicVaultGraph maps non-text files to document nodes with a source_file', () => {
+    const { nodes } = deterministicVaultGraph(
+      [{ rel: 'Raw/Pasted/x.pdf', path: '/home/user/Vault/Raw/Pasted/x.pdf', content: '', isText: false }],
+      { nodes: [], links: [] },
+    );
+    expect(nodes[0].file_type).toBe('document');
+    expect(nodes[0].source_file).toBe('/home/user/Vault/Raw/Pasted/x.pdf');
+  });
+
+  it('REQ-VAULT-003 AC8: re-extraction drops a changed doc\'s stale links but keeps the monotonic node set', () => {
+    const first = deterministicVaultGraph([{ rel: 'a.md', path: '/v/a.md', content: '[[Foo]]', isText: true }], { nodes: [], links: [] });
+    const second = deterministicVaultGraph([{ rel: 'a.md', path: '/v/a.md', content: '[[Bar]]', isText: true }], first);
+    expect(second.links.some((l) => l.target === stableId('concept:Bar'))).toBe(true);
+    expect(second.links.some((l) => l.target === stableId('concept:Foo'))).toBe(false);
+    // The Foo concept node persists (graph grows monotonically) even though its link was re-derived away.
+    expect(second.nodes.some((n) => n.id === stableId('concept:Foo'))).toBe(true);
   });
 
   it('REQ-AGENT-023 AC4: codeflare-pi.ts tolerates missing graph and reports present graph', () => {
@@ -1233,13 +1290,19 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(updateScript?.content).toContain('ulimit -v');
     expect(updateScript?.content).toContain('GRAPHIFY_SAFE_RLIMIT_KB');
     expect(updateScript?.content).toContain('graphify update');
-    expect(updateScript?.content).toContain('First-time graph');
+    expect(updateScript?.content).toContain('thin safety wrapper around upstream');
 
     const buildScript = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/scripts/build-graphify-ast.sh');
-    expect(buildScript?.content).toContain('detect -> AST extract -> build -> cluster -> report -> HTML');
-    expect(buildScript?.content).toContain('normalize_import_targets');
-    expect(buildScript?.content).toContain('graph health check failed');
+    expect(buildScript?.content).toContain('Graphify primitives only');
+    expect(buildScript?.content).toContain('from graphify.detect import detect');
+    expect(buildScript?.content).toContain('from graphify.build import build');
+    expect(buildScript?.content).not.toContain('normalize_import_targets');
     expect(buildScript?.content).toContain('GRAPHIFY_VIZ_NODE_LIMIT');
+
+    const architectureScript = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/scripts/build-graphify-architecture.sh');
+    expect(architectureScript?.content).toContain('architecture-focused module graph build');
+    expect(architectureScript?.content).toContain('GRAPHIFY_ARCH_KEEP_ISOLATES');
+    expect(architectureScript?.content).toContain("'.graphify_scope'");
   });
 
   it('REQ-AGENT-049 AC1: PRESEED_CONTENT_HASH is a deterministic 16-char hex string', () => {

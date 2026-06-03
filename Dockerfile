@@ -186,10 +186,20 @@ RUN AGY_BIN=$(command -v agy || find / -name 'agy' -type f -perm -u+x 2>/dev/nul
 # would run a slow npm install on first launch (~90s on mobile). Entrypoint
 # symlinks node_modules to this cache (instant, zero-copy).
 COPY preseed/agents/pi/package.json preseed/agents/pi/package-lock.json /opt/codeflare/pi-agent/npm/
+# better-sqlite3 / bufferutil / utf-8-validate are native (node-gyp) modules. Their
+# prebuilt-binary fetch is best-effort and falls back to a source compile, which needs
+# make + a C/C++ toolchain. stage-1 ships python3 but not make/gcc/g++ (those live only
+# in the discarded builder), so a prebuilt-fetch miss fails with "not found: make".
+# Install the toolchain just for this npm ci and purge it in the same layer (mirroring
+# the graphify-build pattern below) so the runtime image stays lean.
 RUN cd /opt/codeflare/pi-agent/npm && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends make gcc g++ && \
     npm ci --omit=dev --no-audit --no-fund && \
+    apt-get purge -y make gcc g++ && \
+    apt-get autoremove -y && \
     npm cache clean --force && \
-    rm -rf /root/.npm
+    rm -rf /root/.npm /var/lib/apt/lists/*
 
 # Install Bun for faster context-mode ctx_execute / ctx_batch_execute subprocess
 # starts. Bun is faster than Node for short-lived JS subprocess starts; the
@@ -308,10 +318,10 @@ EOF
 #   - mcp: the MCP stdio server (python -m graphify.serve)
 #   - sql: tree-sitter-sql for SQL schema extraction
 #   - pdf: pypdf + markdownify for PDF docs
-# Omitted: [office] [google] [video] [neo4j] [ollama] [bedrock] [gemini] [openai]
-#   - external backends use the agent's session LLM via the /graphify skill;
-#     no API keys are configured by codeflare for graphify.
-#   - users who need other extras can `uv tool install --upgrade graphifyy[all]`.
+# Omitted: provider/backend extras such as [gemini], plus [office] [google]
+# [video] [neo4j] [ollama] [bedrock]. Interactive semantic extraction and
+# community labels are produced by the active agent session, not Graphify
+# provider backends.
 #
 # Layer cost: ~220MB (Python + 30 tree-sitter wheels). One-time at build, not
 # per-session. The `graphify` shim lands at /root/.local/bin/graphify and the

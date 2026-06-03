@@ -3,7 +3,6 @@ import {
   registerPreferencesDeps,
   loadPreferences,
   updateUserPreferences,
-  getCurrentPreferences,
 } from '../../stores/preferences';
 
 describe('Preferences Store', () => {
@@ -11,14 +10,9 @@ describe('Preferences Store', () => {
   const mockUpdatePreferences = vi.fn();
   const mockLogger = { warn: vi.fn() };
   const mockSetPreferences = vi.fn();
-  let storedPrefs = {};
 
   beforeEach(() => {
     vi.clearAllMocks();
-    storedPrefs = {};
-    mockSetPreferences.mockImplementation((prefs) => {
-      storedPrefs = prefs;
-    });
     registerPreferencesDeps({
       api: {
         getPreferences: mockGetPreferences,
@@ -26,7 +20,6 @@ describe('Preferences Store', () => {
       },
       logger: mockLogger,
       setPreferences: mockSetPreferences,
-      getPreferences: () => storedPrefs,
     });
   });
 
@@ -68,24 +61,6 @@ describe('Preferences Store', () => {
       await updateUserPreferences({ lastAgentType: 'codex' });
 
       expect(mockLogger.warn).toHaveBeenCalled();
-    });
-  });
-
-  describe('getCurrentPreferences', () => {
-    it('returns current preferences', () => {
-      storedPrefs = { lastAgentType: 'bash' as const };
-
-      const result = getCurrentPreferences();
-
-      expect(result).toEqual({ lastAgentType: 'bash' });
-    });
-
-    it('returns empty object when no preferences set', () => {
-      storedPrefs = {};
-
-      const result = getCurrentPreferences();
-
-      expect(result).toEqual({});
     });
   });
 });
