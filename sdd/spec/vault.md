@@ -422,7 +422,7 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 ### REQ-VAULT-006: Shutdown bisync completes vault writes before SIGKILL
 
 <!-- @impl: entrypoint.sh::shutdown_handler -->
-<!-- @impl: src/container/index.ts::destroy -->
+<!-- @impl: src/container/container-lifecycle.ts::destroy -->
 <!-- @test: src/__tests__/container/index.test.ts (135s SIGKILL fallback + shutdownElapsedMs telemetry describe → AC4/AC5) -->
 <!-- @test: host/__audits__/entrypoint-vault.audit.js (120s watchdog + vault-monitor and SilverBullet PID kill in shutdown handler → AC1-AC3) -->
 
@@ -440,7 +440,6 @@ Persistent Obsidian-style note vault: agent-written session captures plus user-c
 
 **Constraints:**
 
-- Bundled with the vault PR because vault edits that have not yet synced when the final bisync watchdog expires are silently lost the same way session state would be; the vault depends on bisync reliability.
 - The bisync-watchdog timeout and the orchestrator's destroy budget must stay coordinated so the destroy budget exceeds the watchdog plus the minimum time required for graceful process termination.
 
 **Priority:** P0

@@ -384,34 +384,43 @@ Container creation, idle detection, auto-sleep, restart, and destroy.
 <!-- @test: host/__tests__/entrypoint-bisync-behavior.test.js (entrypoint.sh bisync daemon behavior (real) describe -> bisync cadence + SIGUSR1 coalesce + failure recovery + --resync fallback -> AC2/AC3 daemon-side runtime behavior) -->
 ### REQ-SESSION-011: Graceful shutdown with final sync
 
+<!-- @impl: src/container/container-lifecycle.ts::destroy -->
+<!-- @impl: src/container/container-metrics.ts::drainFinalSync -->
+<!-- @impl: src/container/container-metrics.ts::collectMetrics -->
+<!-- @impl: host/src/server.ts -->
+<!-- @impl: host/src/final-sync.ts -->
 <!-- @impl: entrypoint.sh::shutdown_handler -->
-<!-- @impl: src/container/index.ts -->
 <!-- @impl: Dockerfile -->
+<!-- @test: src/__tests__/container/index.test.ts (destroy describe -> drains final-sync before stop + best-effort on drain failure -> AC1/AC4/AC5) -->
+<!-- @test: src/__tests__/container-metrics.test.ts (final-sync drain describe -> drainFinalSync no-op/best-effort + idle-stop drains before stop -> AC1/AC6; REQ-SUB-008 describe -> quota-stop drains before stop -> AC6) -->
+<!-- @test: host/__tests__/final-sync-endpoint.test.js (evaluateFinalSync completion detection describe -> in-flight ignored + syncing->success/failed -> AC2/AC3; structural describes -> endpoint wiring + entrypoint signal) -->
 
-**Intent:** When a container stops (idle timeout or user-initiated), a final bidirectional sync to R2 runs before process termination, ensuring no data loss.
+**Intent:** When a container is stopped for any reason (user stop, user delete, idle timeout, quota eviction), its workspace is fully synced to R2 before the container process is terminated, so no data is lost. The platform's grace period between SIGTERM and SIGKILL is far shorter than a bidirectional sync can take, so the final sync is performed as an *awaited live bisync while the container is still running* - the Durable Object triggers it and blocks on its completion before stopping the container - rather than relying on the SIGTERM trap, which is retained only as a best-effort backstop.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. The container entrypoint catches graceful-stop signals.
-2. The trap handler terminates the background sync daemon using a durable PID record.
-3. A final bidirectional sync runs before the terminal server is terminated; deletion safeguards prevent accidental mass deletion.
-4. The shutdown sync runs even when the initial sync timed out.
-5. The container image declares a stop signal the entrypoint can trap.
-6. User-initiated stop and delete reach the trap via a graceful shutdown that polls for the trap to exit before forcing termination.
-7. Idle-timeout and quota-eviction paths reach the trap via the same graceful-shutdown signal.
+1. Before signalling the container to stop, every deliberate stop path runs a live bidirectional R2 sync to completion while the container is still fully running. <!-- @impl: src/container/container-lifecycle.ts::destroy --> <!-- @impl: src/container/container-metrics.ts::drainFinalSync -->
+2. The container exposes an awaitable final-sync endpoint that triggers a fresh bisync and responds only once that bisync has completed (success or failure) or an internal timeout elapses, distinguishing completion from failure and timeout. <!-- @impl: host/src/server.ts --> <!-- @impl: host/src/final-sync.ts -->
+3. The sync-status record carries a monotonic timestamp and a `syncing`->`success`/`failed` transition, and the endpoint accepts a terminal status only after observing its own run's `syncing` (stamped strictly after the trigger), never a bare `success`. <!-- @impl: host/src/final-sync.ts --> <!-- @impl: entrypoint.sh -->
+4. The Durable Object waits up to a bounded sync budget (120s) for the live sync to report completion; a failed or timed-out sync still proceeds to stop rather than blocking teardown. <!-- @impl: src/container/container-lifecycle.ts::destroy -->
+5. Total teardown is hard-capped: the container is force-terminated no later than 135s after teardown begins regardless of sync state, so a hung sync cannot wedge the session. <!-- @impl: src/container/container-lifecycle.ts::destroy -->
+6. User stop and user delete behave identically: both route through the same graceful-destroy path, and idle-timeout and quota-eviction paths drain through the same endpoint before stopping. <!-- @impl: src/container/container-metrics.ts::collectMetrics -->
+7. The SIGTERM trap is retained as a best-effort backstop final sync for paths that bypass the orchestrated drain, but is no longer the primary guarantee (see [REQ-STOR-005](storage.md#req-stor-005-graceful-shutdown-performs-final-sync) for the trap's own constraints). <!-- @impl: entrypoint.sh::shutdown_handler -->
 
 **Constraints:**
 
-- The sync daemon's PID record is the sole mechanism for shutdown; no in-memory fallback exists.
-- No invocation path goes straight to forced termination while the container is still running; the graceful signal + poll is always the precursor.
+- The platform's post-SIGTERM kill grace is never relied on for sync completion; the authoritative sync runs while the container is alive and the DO holds teardown open awaiting it.
+- A failed or timed-out drain proceeds to stop (135s hard force-kill ceiling) rather than blocking teardown indefinitely; liveness is preserved over a guaranteed-complete sync in the pathological case.
+- Completion detection accepts a terminal status only after observing the triggered run's `syncing` stamped strictly after the trigger, so an in-flight or same-millisecond stamp is never mistaken for it and the rare missed-sample case degrades to a benign timeout, not data loss (rationale in [AD57](../../documentation/decisions/README.md#ad57-135-second-shutdown-budget-for-final-bisync)).
+- The container image still declares a trappable stop signal so the backstop trap stays reachable.
 
 **Priority:** P0
 
 **Dependencies:** [REQ-SESSION-003](#req-session-003-r2-bucket-mounted-and-synced-on-start), [REQ-SESSION-004](#req-session-004-idle-containers-sleep-after-configurable-timeout)
 
-**Verification:** [Integration test](../../host/__tests__/entrypoint-shutdown.test.js)
+**Verification:** [Drain-before-stop ordering + best-effort](../../src/__tests__/container/index.test.ts), [drainFinalSync + idle-stop drain](../../src/__tests__/container-metrics.test.ts), [awaitable endpoint + completion signal](../../host/__tests__/final-sync-endpoint.test.js)
 
 **Status:** Implemented
 
@@ -534,14 +543,15 @@ None.
 
 **Acceptance Criteria:**
 
-1. The terminal server's tab-1 PTY pre-warm is gated on an init-complete signal written by the entrypoint after initial sync, file modifications, and tab autostart configuration complete; this preserves the readiness contract while letting the serving port bind before Cloudflare's container port-wait timeout.
-2. The host terminal server rejects terminal WebSocket upgrades with a retriable close code (the WebSocket "try again later" class) and a human-readable container-warming reason until both the init-complete signal is observed AND the pre-warm session is registered; this is the host-side guard against reconnects landing before shell autostart is in place.
+1. The serving port binds within Cloudflare's container port-wait window even while initialization (R2 sync, MCP config merges) is still in progress. <!-- @impl: entrypoint.sh -->
+2. The entrypoint writes an init-complete signal only after initial sync, file modifications, and tab-autostart configuration have completed. <!-- @impl: entrypoint.sh -->
+3. Tab-1 PTY pre-warm is gated on the init-complete signal, so it never starts before initial state restore is in place. <!-- @impl: host/src/server.ts -->
+4. The host terminal server rejects terminal WebSocket upgrades with a retriable ("try again later") close code and a human-readable container-warming reason until both the init-complete signal is observed and the pre-warm session is registered. <!-- @impl: host/src/server.ts -->
 
 **Constraints:**
 
-- The terminal server must bind its serving port within Cloudflare's container port-wait window; slow initialization (R2 sync, MCP config merges) must not block the port bind.
 - The container must not signal readiness (PTY pre-warm complete) until the initial sync either succeeds or times out.
-- Any best-effort setup step executed before the init-complete flag is written (e.g. agent npm dependency warm-up, fast-start update suppression) must be guarded so that its failure does not abort the entrypoint under `set -euo pipefail`; a degraded warm-up is always preferable to PID 1 dying before the flag is written.
+- Best-effort setup steps that run before the init-complete flag (agent npm warm-up, fast-start suppression) must be guarded so their failure cannot abort the entrypoint under `set -euo pipefail`; a degraded warm-up is preferable to PID 1 dying before the flag is written.
 
 **Priority:** P0
 
@@ -572,7 +582,7 @@ None.
 2. The session persistently stores the user's timezone preference.
 3. Subsequent container starts inject the user's timezone preference into the container environment; if unset, the entrypoint falls back to the container default and finally to UTC.
 4. A timezone change takes effect on the next session start (no live re-injection into a running container).
-5. On Dashboard mount, the frontend reads the browser's IANA timezone and updates the stored preference when the resolved zone differs. The sync is best-effort: failures never block the mount path so a transient API error cannot strand the Dashboard.
+5. On Dashboard mount, the frontend reads the browser's IANA timezone and updates the stored preference (best-effort) when the resolved zone differs; a failed update never blocks the mount.
 
 **Constraints:**
 
@@ -602,7 +612,7 @@ None.
 
 1. `GET /api/container/health` reports whether the user's container is running and healthy, returning its metrics on success and an error with 500 when the health check fails. <!-- @impl: src/routes/container/status.ts -->
 2. `GET /api/container/startup-status` returns the current initialization stage without blocking, carrying a stage label, a 0-to-100 progress value, and a human-readable message. <!-- @impl: src/routes/container/status.ts -->
-3. The reported stage reflects real container state: stopped when the container state cannot be determined, starting while the container exists but its services are not yet responding, syncing while the initial R2 sync runs, verifying after sync while terminal sessions are not yet responding, mounting while the terminal pre-warms, and ready when all services are up. <!-- @impl: src/routes/container/status.ts -->
+3. The reported stage reflects real container state: `stopped` when state is indeterminate, `starting` before services respond, `syncing` during the initial R2 sync, `verifying` after sync while terminals are not yet up, `mounting` during terminal pre-warm, and `ready` when all services are up. <!-- @impl: src/routes/container/status.ts -->
 4. A failed initial R2 sync surfaces as an error stage carrying the sync error, while a skipped sync (no R2 credentials) still reaches the ready stage with the skip reason reported. <!-- @impl: src/routes/container/status.ts -->
 5. An unexpected failure while computing startup status is caught and returned as an error stage rather than propagating an unhandled 500. <!-- @impl: src/routes/container/status.ts -->
 
@@ -638,18 +648,17 @@ None.
 
 **Acceptance Criteria:**
 
-1. Persisted status is authoritative: a container that exits for any reason - graceful stop, crash, or an unexpected exit surfaced by the SDK as an error - transitions the persisted status to stopped, so the dashboard reflects reality directly from the KV record with no read-side staleness reconciliation. <!-- @impl: src/container/container-metrics.ts::collectMetrics --> <!-- @impl: src/container/index.ts::onError -->
-2. The `collectMetrics` catch-all does not flip a live session to stopped on a transient not-running reading. The SDK's `ctx.container.running` flag momentarily reads false when an alarm wakes a hibernated DO or during a deploy-roll, while the container is actually alive; the catch-all writes stopped only after the container has read not-running continuously for a confirmation window spanning more than one alarm tick, re-arming the alarm meanwhile so the streak can be observed. A single transient false reading therefore leaves the running session intact rather than both kicking the user to the dashboard and freezing metrics. <!-- @impl: src/container/container-metrics.ts::collectMetrics -->
-3. `onError` does not write stopped on a single not-running reading. The SDK calls `onError` both for genuine crashes and for transient errors (deploy-roll, a brief monitor blip) where the container is actually alive; an immediate stopped write on the transient case sticks, because once KV says stopped the metrics loop refuses to overwrite it and the session hangs falsely-stopped until a real restart. Instead, on a not-running reading `onError` opens the same not-running confirmation window the catch-all uses and re-arms a `collectMetrics` tick, delegating the stopped decision to that window: a container that stays down is confirmed stopped within the window, and one that recovers clears the window with no false stopped. <!-- @impl: src/container/container-lifecycle.ts::onError --> <!-- @impl: src/container/container-metrics.ts::openNotRunningConfirmation -->
-4. `collectMetrics` self-heals a false stopped. When the container is demonstrably running (the running branch reached after a successful in-container `/health` probe) but the KV record reads stopped, the loop re-asserts running rather than leaving a live session showing stopped, bounding any false-stopped to a single alarm tick instead of persisting until the next start. It does not resurrect a deliberate stop: `destroy()` (user Stop/Delete) persists a shutdown-requested marker in DO storage as its first action and drops the metrics alarm, and the self-heal re-reads that marker on every tick - so a container that is mid-shutdown, or one whose DO was evicted mid-shutdown and reconstructed, is left stopped. The marker is cleared on the next `onStart`. The deliberate idle-stop and `onStop` paths never reach this branch (idle-stop returns first; the container is already not-running under `onStop`). <!-- @impl: src/container/container-metrics.ts::collectMetrics --> <!-- @impl: src/container/container-lifecycle.ts::destroy -->
+1. A container that exits for any reason (graceful stop, crash, or an SDK-surfaced error) transitions its KV status to stopped, and the dashboard reads status directly from the record with no read-side staleness reconciliation. <!-- @impl: src/container/container-metrics.ts::collectMetrics --> <!-- @impl: src/container/index.ts::onError -->
+2. The `collectMetrics` catch-all writes stopped only after the container reads not-running across a confirmation window spanning more than one alarm tick, so a single transient not-running reading never flips a live session to stopped. <!-- @impl: src/container/container-metrics.ts::collectMetrics -->
+3. On a not-running reading `onError` does not write stopped; it opens the same confirmation window and re-arms a `collectMetrics` tick, deferring the stopped decision to that window. <!-- @impl: src/container/container-lifecycle.ts::onError --> <!-- @impl: src/container/container-metrics.ts::openNotRunningConfirmation -->
+4. When the container is demonstrably running (running branch after a successful `/health` probe) but KV reads stopped, `collectMetrics` re-asserts running, unless a persisted shutdown-requested marker shows a deliberate stop is in flight. <!-- @impl: src/container/container-metrics.ts::collectMetrics --> <!-- @impl: src/container/container-lifecycle.ts::destroy -->
 
 **Constraints:**
 
+- The not-running confirmation window and the deliberate-stop marker are persisted in DO storage (not in-memory), so a hibernation or mid-shutdown eviction cannot discard them; `destroy()` sets the marker before clearing identifiers and `onStart` clears it.
 - Newly started sessions have a 3-minute startup guard during which only the container-stopped close code can transition them to stopped (anti-flapping).
-- The `collectMetrics` not-running confirmation window is persisted in DO storage (not in-memory), because the hibernation/reset that produces the transient false reading would discard an in-memory streak counter.
-- Deferring the stopped decision to the confirmation window costs `onError` its former immediacy: a genuine crash now transitions to stopped after the confirmation window (one to a few alarm ticks) rather than on the error itself. This latency is accepted as the price of never flipping a live session to stopped; a dashboard that briefly shows a crashed session as running self-corrects within the window, whereas a live session shown as stopped strands the user. Convergence to stopped after a crash therefore depends on DO alarm delivery waking the (possibly hibernated) DO to run the re-armed tick - the same dependency the catch-all already relies on - rather than on a synchronous write inside `onError`.
-- The self-heal's deliberate-stop guard is a DO-storage marker, not an in-memory field, set by `destroy()` before it clears identifiers and cleared by `onStart` - the same durability rule the not-running confirmation window follows, and for the same reason: a DO eviction mid-shutdown would discard an in-memory flag, and the surviving metrics alarm would then resurrect a session the user deliberately stopped. With the persisted marker, a deliberately stopped container is left stopped even across that eviction, while a falsely stopped one (still serving, no marker) is healed.
-- Accepted residual: the user-stop route writes `status: stopped` to KV before it calls `destroy()`, which persists the marker only once the request reaches the DO. In the sub-millisecond worker-to-DO gap the marker is absent while the container still reads running, so a `collectMetrics` tick landing in that exact window would self-heal the just-stopped session for one tick before `destroy()` settles it back to stopped. The window is left open rather than closed (which would need a DO round-trip from the stop route or a second redundant marker): a 60s alarm cadence makes the coincidence negligible, and the worst case is a single-tick dashboard flicker that self-corrects, orders of magnitude milder and rarer than the permanent false-stopped this REQ fixes. The symmetric idle-stop path has the same ordering but is immune (it returns before the self-heal branch and `onStop` drops the alarm).
+- A genuine crash converges to stopped after the confirmation window (one to a few alarm ticks) rather than immediately, accepted as the price of never flipping a live session to stopped.
+- Accepted residual: a tick landing in the sub-millisecond gap between the user-stop KV write and `destroy()` persisting the marker can self-heal the just-stopped session for a single tick before `destroy()` settles it back to stopped; the idle-stop path is immune.
 
 **Priority:** P1
 

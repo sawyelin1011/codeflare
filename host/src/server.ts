@@ -23,6 +23,7 @@ import { createActivityTracker } from './activity-tracker.js';
 import { getPrewarmConfig } from './prewarm-config.js';
 import { getSyncStatus, getSystemMetrics } from './metrics.js';
 import { checkContainerAuth } from './auth-check.js';
+import { evaluateFinalSync } from './final-sync.js';
 import { Session } from './session.js';
 import { SessionManager, PREWARM_SESSION_ID } from './session-manager.js';
 import type { LogLevel, Logger, WsEventLogger, WsEvent, TabConfigEntry, ActivityTracker, SessionOptions } from './types.js';
@@ -340,6 +341,62 @@ const server = http.createServer(async (req: http.IncomingMessage, res: http.Ser
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'not-running', error: 'sync daemon not started' }));
     }
+    return;
+  }
+
+  // Awaited final sync (REQ-SESSION-011 AC2). Triggers a fresh bisync (SIGUSR1
+  // to the daemon, the same proven path as /internal/bisync-trigger) and BLOCKS
+  // until that bisync reaches a terminal status, so the Durable Object can drain
+  // the workspace to R2 while the container is still fully alive instead of
+  // relying on the post-SIGTERM kill grace (far too short for a bisync). The DO
+  // calls this before stopping the container and bounds it with its own budget.
+  //
+  // Completion detection (REQ-SESSION-011 AC3): record the trigger time, then
+  // wait for a `syncing` transition stamped at/after the trigger (our run
+  // started), then for that run's `success`/`failed` transition (newer ts). The
+  // two-phase wait ignores a bisync that was already in flight when we
+  // triggered - the daemon coalesces our SIGUSR1 into a rerun whose `syncing`
+  // ts lands after our trigger.
+  if (pathname === '/internal/final-sync' && method === 'POST') {
+    const triggerTs = Date.now();
+    const readStatus = (): { status?: string; ts?: number } => {
+      try { return JSON.parse(fs.readFileSync('/tmp/sync-status.json', 'utf8')); }
+      catch { return {}; }
+    };
+    try {
+      const pid = Number(fs.readFileSync('/tmp/sync-daemon.pid', 'utf8').trim());
+      if (!Number.isFinite(pid) || pid <= 0) throw new Error('invalid daemon PID');
+      process.kill(pid, 'SIGUSR1');
+    } catch {
+      // No daemon: container is mid-init or already tearing down. Nothing to
+      // drain; let the caller proceed to stop.
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ synced: false, reason: 'daemon-not-running' }));
+      return;
+    }
+    const INTERNAL_TIMEOUT_MS = 115_000; // just under the DO's 120s budget
+    const POLL_MS = 500;
+    // Two-phase completion detection lives in the pure evaluateFinalSync state
+    // machine (final-sync.ts) so the syncing->success/failed discrimination is
+    // unit-testable without spawning the daemon; this loop owns only the I/O.
+    let runStartedTs = -1;
+    while (Date.now() - triggerTs < INTERNAL_TIMEOUT_MS) {
+      const ev = evaluateFinalSync(readStatus(), triggerTs, runStartedTs);
+      runStartedTs = ev.runStartedTs;
+      if (ev.result === 'success') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ synced: true }));
+        return;
+      }
+      if (ev.result === 'failed') {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ synced: false, reason: 'bisync-failed' }));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+    }
+    res.writeHead(504, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ synced: false, reason: 'timeout' }));
     return;
   }
 
