@@ -15,6 +15,8 @@ import { updateEnvVars, type ContainerHost } from './container-config';
 import {
   collectMetrics as doCollectMetrics,
   updateKvStatus,
+  openNotRunningConfirmation,
+  SHUTDOWN_REQUESTED_KEY,
   type MetricsState,
   type MetricsCallbacks,
 } from './container-metrics';
@@ -44,6 +46,10 @@ export interface LifecycleHost extends ContainerHost {
 /** Called when the container starts successfully. */
 export async function onStart(host: LifecycleHost): Promise<void> {
   host.containerStartedAt = Date.now();
+  // A fresh start means no deliberate stop is in flight: clear any stale
+  // shutdown marker a prior destroy() left in storage, so a later transient
+  // false-stopped on this run can self-heal (REQ-SESSION-018 AC4).
+  try { await host.ctx.storage.delete(SHUTDOWN_REQUESTED_KEY); } catch { /* best-effort */ }
   updateEnvVars(host);
   await updateKvStatus(host.ctx, host.env, host._bucketName, 'running', 'lastStartedAt');
   // Also set lastActiveAt to start time so the frontend timer icon
@@ -73,6 +79,14 @@ export async function collectMetrics(host: LifecycleHost): Promise<void> {
  */
 export async function destroy(host: LifecycleHost): Promise<void> {
   host.logger.info('Destroying container, clearing operational storage');
+  // Persist the deliberate-stop marker and drop the metrics alarm BEFORE
+  // clearing identifiers. If a DO eviction interrupts this teardown, the
+  // reconstructed instance (which resets in-memory fields to 0) still reads the
+  // persisted marker, so the surviving collectMetrics alarm cannot self-heal a
+  // session the user is deliberately stopping back to running (REQ-SESSION-018
+  // AC4). onStart() clears the marker on the next fresh start.
+  try { await host.ctx.storage.put(SHUTDOWN_REQUESTED_KEY, Date.now()); } catch { /* storage racing teardown */ }
+  try { host.deleteSchedules('collectMetrics'); } catch { /* no-op if table empty */ }
   try {
     await host.ctx.storage.delete(SESSION_ID_KEY);
     await host.ctx.storage.delete('bucketName');
@@ -166,18 +180,28 @@ export async function onStop(host: LifecycleHost): Promise<void> {
 export async function onError(host: LifecycleHost, error: unknown): Promise<void> {
   host.logger.error('Container error', error instanceof Error ? error : new Error(toErrorMessage(error)));
   // The SDK (@cloudflare/containers v0.3.5) calls onError - and awaits it -
-  // when its monitor detects the container exited unexpectedly (crash,
-  // deploy-roll, platform reap); it does NOT call onStop on that path, so
-  // without this write the session dangles 'running' forever (codeflare#153).
-  // Guard on !running so a transient startup port-check error (onError can
-  // fire while the container is still coming up) cannot flip a live session
-  // to 'stopped'; the collectMetrics not-running branch is the 60s catch-all
-  // if this is skipped. No cross-await serialization is assumed: updateKvStatus
-  // re-reads sessionId/bucketName from storage and the session from KV on
-  // every call, and destroy() clears those first, so a post-destroy write
-  // no-ops instead of resurrecting the record. onStart() re-asserts 'running'
-  // on the next start.
+  // when its monitor flags the container as exited (crash, deploy-roll,
+  // platform reap); it does NOT call onStop on that path, so without a write
+  // here the session could dangle 'running' forever (codeflare#153). But onError
+  // ALSO fires on TRANSIENT errors where the container is actually alive (a
+  // deploy-roll the container survives, a brief monitor blip): observed in prod
+  // a spurious "Container error" fired onError on a live Pi session, the
+  // !running guard passed on a momentary false reading, and an immediate
+  // 'stopped' write then stuck - the collectMetrics clobber guard refused to
+  // correct it and the session hung falsely-stopped for ~14 min until a real
+  // restart. So onError no longer writes 'stopped' itself. On a not-running
+  // reading it opens the SAME confirmation window collectMetrics uses and
+  // re-arms a single tick (deleteSchedules first so onError can't stack a
+  // duplicate alarm onto a still-armed loop), delegating the stopped decision
+  // to that window: a container that stays down is confirmed stopped within
+  // NOT_RUNNING_CONFIRM_MS, and one that recovers clears the window with no
+  // false stopped (REQ-SESSION-018 AC3). openNotRunningConfirmation only writes
+  // DO storage, never KV, so a post-destroy onError cannot resurrect the record;
+  // the re-armed tick bails as a zombie DO once destroy() has cleared the
+  // identifiers. onStart() re-asserts 'running' on the next start.
   if (!host.ctx.container?.running) {
-    await updateKvStatus(host.ctx, host.env, host._bucketName, 'stopped', 'lastActiveAt');
+    await openNotRunningConfirmation(host.ctx);
+    try { host.deleteSchedules('collectMetrics'); } catch { /* no-op if table empty */ }
+    await host.schedule(60, 'collectMetrics');
   }
 }
