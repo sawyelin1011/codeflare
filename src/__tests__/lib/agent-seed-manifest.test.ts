@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { AGENTS_SEEDED_CONFIGS, PRESEED_CONTENT_HASH } from '../../lib/agent-seed.generated';
 import { cloneTargetPath, graphifyCloneAction, graphifyClonePromptDecision, graphifyPromptMarker, isFailedToolExecution as isFailedGraphifyToolExecution, renderGraphifyCloneDirective } from '../../../preseed/agents/pi/extensions/graphify-helpers';
-import { bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, createBoundedOnceTracker, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
-import { actionableReviewCount, allDurableReviewLanesComplete, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
-import { buildSpawnOptions, captureFilename, captureTimestamp, compactMessages, deterministicVaultGraph, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, stableId, titleFor, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
+import { bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, commandTextFromEvent, createBoundedOnceTracker, createReadyOnceTracker, cwdFromBoundaryCommand, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { actionableReviewCount, allDurableReviewLanesComplete, compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewJobDir, durableReviewMessageKey, durableReviewRecommendation, durableReviewResultModel, durableReviewStatusSegments, durableReviewSummaryModel, extractReviewFindings, formatMergedReviewSummary, laneExtensionSources, mergedReviewSummaryModel, recoverDurableReviewLaneState, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, sendReviewAutofixRequest } from '../../../preseed/agents/pi/extensions/review-job-helpers';
+import { buildSpawnOptions, captureFilename, captureTimestamp, compactMessages, isFirstMessage, isRealUserPrompt, isResumedSession, MEMORY_EVERY_N_PROMPTS, parseSessionMessages, realUserPromptCount, sessionId, shouldCapture, withCurrentPrompt } from '../../../preseed/agents/pi/extensions/memory-vault-helpers';
 import { attributionBlockReason, isLocalBuildCommand, localBuildBlockReason } from '../../../preseed/agents/pi/extensions/guard-helpers';
 import { DEBUG_WORKFLOW, DEPLOY_WORKFLOW, BRAINSTORM_WORKFLOW, commandInstructions, deployTarget } from '../../../preseed/agents/pi/extensions/commands-helpers';
+import { shouldHandleClonePrompt } from '../../../preseed/agents/pi/extensions/codeflare-pi';
+import localStatuslineExtension from '../../../preseed/agents/pi/extensions/local-statusline';
 
 /**
  * Validates invariants of the generated agent seed configs.
@@ -207,6 +209,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       '.pi/agent/extensions/commands-helpers.ts',
       '.pi/agent/extensions/graphify-helpers.ts',
       '.pi/agent/extensions/guard-helpers.ts',
+      '.pi/agent/extensions/local-statusline.ts',
       '.pi/agent/extensions/memory-vault-helpers.ts',
       '.pi/agent/extensions/memory-vault.ts',
       '.pi/agent/extensions/review-command.ts',
@@ -229,6 +232,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     // must surface them.
     expect(skills.map((d) => d.key)).toContain('.pi/agent/skills/review/SKILL.md');
     expect(extensions.map((d) => d.key)).toContain('.pi/agent/extensions/codeflare-commands.ts');
+    expect(extensions.map((d) => d.key)).toContain('.pi/agent/extensions/local-statusline.ts');
     const codeReviewer = agents.find((d) => d.key === '.pi/agent/agents/code-reviewer.md');
     expect(codeReviewer?.content).toContain('tools: read, grep, find, bash, write');
     // context-mode helper tools are kept (Pi-native names), inert when context-mode is off
@@ -248,6 +252,74 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(codeflarePi?.content).toContain('pi.registerCommand("ctx"');
     expect(codeflarePi?.content).toContain('context-mode is disabled');
 
+  });
+
+  it('REQ-AGENT-056: Pi local statusline renders model effort and preserves extension statuses', () => {
+    const handlers = new Map<string, Function>();
+    let footerFactory: Function | undefined;
+    const originalSetInterval = globalThis.setInterval;
+    const originalClearInterval = globalThis.clearInterval;
+    const intervals: Function[] = [];
+    const clearedIntervals: unknown[] = [];
+    globalThis.setInterval = ((handler: Function) => {
+      intervals.push(handler);
+      return intervals.length;
+    }) as never;
+    globalThis.clearInterval = ((handle: unknown) => {
+      clearedIntervals.push(handle);
+    }) as never;
+    const pi = {
+      getThinkingLevel: () => 'xhigh',
+      on: (event: string, handler: Function) => handlers.set(event, handler),
+    };
+    const ctx = {
+      hasUI: true,
+      model: { id: 'gpt-5.5' },
+      cwd: '/tmp',
+      sessionManager: { getCwd: () => '/tmp' },
+      getContextUsage: () => ({ percent: 42 }),
+      ui: { setFooter: (factory: Function) => { footerFactory = factory; } },
+    };
+
+    try {
+      localStatuslineExtension(pi as never);
+      handlers.get('session_start')?.({}, ctx);
+
+      let renders = 0;
+      const component = footerFactory?.(
+        { requestRender: () => { renders += 1; } },
+        { fg: (_name: string, text: string) => text },
+        {
+          onBranchChange: () => () => undefined,
+          getExtensionStatuses: () => new Map([['codeflare-review', 'Review code | spec | docs']]),
+        },
+      );
+      const lines = component.render(120);
+
+      expect(lines[0]).toContain('42%');
+      expect(lines[0]).toContain('gpt-5.5:xhigh');
+      expect(lines[1]).toBe('Review code | spec | docs');
+      expect(intervals).toHaveLength(1);
+      intervals[0]();
+      expect(renders).toBe(1);
+      component.dispose();
+      expect(clearedIntervals).toEqual([1]);
+
+      const ansiComponent = footerFactory?.(
+        { requestRender: () => undefined },
+        { fg: (_name: string, text: string) => text },
+        {
+          onBranchChange: () => () => undefined,
+          getExtensionStatuses: () => new Map([['codeflare-review', 'Review \x1b[32mcode\x1b[0m | \x1b[33mspec\x1b[0m | docs']]),
+        },
+      );
+      const ansiLines = ansiComponent.render(20);
+      expect(ansiLines[1].replace(/\x1b\[[0-9;]*m/g, '')).toBe('Review code | spec…');
+      expect(ansiLines[1]).toContain('\x1b[32mcode\x1b[0m');
+    } finally {
+      globalThis.setInterval = originalSetInterval;
+      globalThis.clearInterval = originalClearInterval;
+    }
   });
 
   it('REQ-AGENT-030 / REQ-AGENT-050 / REQ-AGENT-051: Pi command extensions dispatch through both ctx and pi user-message APIs', () => {
@@ -287,30 +359,38 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(cloneTargetPath('owner=$(gh api user --jq .login)\ngh repo clone "$owner/codeflare" "$repo"', '/home/user/workspace')).toBeUndefined();
 
     const missingGraphDirective = renderGraphifyCloneDirective(graphifyCloneAction('/repo', false));
-    expect(missingGraphDirective).toContain('ask the user a single YES/NO question');
-    expect(missingGraphDirective).toContain('Build a graphify knowledge graph for /repo?');
-    expect(missingGraphDirective).toContain('Do NOT ask about AST-only vs Full at clone time');
+    expect(missingGraphDirective).toContain('ask the user which graph action to take');
+    expect(missingGraphDirective).toContain('Full repo AST-only build');
+    expect(missingGraphDirective).toContain('Full repo semantic build');
+    expect(missingGraphDirective).toContain('no graph action');
     expect(missingGraphDirective).toContain('Pi Agent subagents from this running session');
     const existingGraphDirective = renderGraphifyCloneDirective(graphifyCloneAction('/repo', true));
-    expect(existingGraphDirective).toContain('refresh the AST portion with upstream Graphify via the local safety wrapper');
+    expect(existingGraphDirective).toContain('Do not update the graph automatically');
+    expect(existingGraphDirective).toContain('ask the user which graph action to take');
     expect(existingGraphDirective).toContain('safe-graphify-update.sh /repo');
-    expect(existingGraphDirective).toContain('Full semantic refresh is owned by the `/graphify` skill');
+    expect(existingGraphDirective).toContain('Full repo semantic refresh');
+    expect(existingGraphDirective).toContain('Never run the AST update wrapper or a semantic refresh until the user has chosen');
+    expect(existingGraphDirective).not.toContain('No graph action');
 
     expect(graphifyCloneAction('/repo', false)).toEqual({
       repo: '/repo',
       hasGraph: false,
       mode: 'missing-graph',
-      choices: ['build graph', 'skip'],
+      choices: ['Full repo AST-only build', 'Full repo semantic build', 'skip'],
     });
     expect(graphifyCloneAction('/repo', true)).toEqual({
       repo: '/repo',
       hasGraph: true,
       mode: 'existing-graph',
-      choices: ['use existing graph', 'AST-only update', 'skip'],
+      choices: ['use existing graph as-is', 'Full repo AST-only update', 'Full repo semantic refresh'],
     });
     expect(graphifyPromptMarker('/home/user/workspace/r', 'session-1')).toBe('/tmp/codeflare-graphify-prompted-session-1_home_user_workspace_r');
     expect(isFailedGraphifyToolExecution({ status: 'error' })).toBe(true);
     expect(isFailedGraphifyToolExecution({ isError: false })).toBe(false);
+    expect(shouldHandleClonePrompt('git clone https://github.com/foo/bar /tmp/bar', false, 1)).toBe(false);
+    expect(shouldHandleClonePrompt('gh repo clone foo/bar /tmp/bar', false, 2)).toBe(false);
+    expect(shouldHandleClonePrompt('git clone https://github.com/foo/bar /tmp/bar', true, 0)).toBe(false);
+    expect(shouldHandleClonePrompt('git clone https://github.com/foo/bar /tmp/bar', false, 0)).toBe(true);
 
     const decision = graphifyClonePromptDecision({
       command: 'git clone https://github.com/o/r.git',
@@ -327,7 +407,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
         repo: '/home/user/workspace/r/.git-root',
         hasGraph: true,
         mode: 'existing-graph',
-        choices: ['use existing graph', 'AST-only update', 'skip'],
+        choices: ['use existing graph as-is', 'Full repo AST-only update', 'Full repo semantic refresh'],
       },
     });
     expect(graphifyClonePromptDecision({
@@ -411,6 +491,18 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isPrBoundaryCommand('gh pr create --base main')).toBe(true);
     expect(isPrBoundaryCommand('gh pr merge 12')).toBe(true);
     expect(isPrBoundaryCommand('gh pr update-branch 12')).toBe(true);
+    expect(isPrBoundaryCommand('cd /repo/codeflare && gh pr create --base main')).toBe(true);
+    expect(isPrBoundaryCommand('cd /repo/codeflare\ngit push origin develop')).toBe(true);
+    expect(cwdFromBoundaryCommand('cd /repo/codeflare\ngit push origin develop')).toBe('/repo/codeflare');
+    expect(cwdFromBoundaryCommand('cd "/repo/with space" && gh pr create --base main')).toBe('/repo/with space');
+    expect(cwdFromBoundaryCommand('git -C /repo/codeflare push origin develop')).toBe('/repo/codeflare');
+    const batchedDependabotCommand = 'cd /home/user/workspace/codeflare\nset -euo pipefail\ngit status --short --branch\ngit add package.json package-lock.json\ngit commit -m "chore: merge dependabot dependency bumps"\ngit push origin develop\nfor pr in 487 489 490 491; do\n  gh pr close "$pr" --delete-branch --comment "Merged into develop via batched dependency update commit to resolve overlapping package-lock conflicts." || true\ndone';
+    expect(isPrBoundaryCommand(batchedDependabotCommand)).toBe(true);
+    expect(cwdFromBoundaryCommand(batchedDependabotCommand)).toBe('/home/user/workspace/codeflare');
+    expect(commandTextFromEvent({ toolCall: { input: { command: batchedDependabotCommand } } })).toBe(batchedDependabotCommand);
+    expect(commandTextFromEvent({ input: { command: 'git status' }, toolCall: { arguments: { command: batchedDependabotCommand } } })).toBe(batchedDependabotCommand);
+    expect(isPrBoundaryCommand('rg -n "gh pr create --base main" preseed/agents/pi/extensions/review-enforcement.ts')).toBe(false);
+    expect(isPrBoundaryCommand("printf '%s' 'git push origin develop'")).toBe(false);
     expect(isPrBoundaryCommand('gh pr edit 12 --title metadata-only')).toBe(false);
     expect(isPrBoundaryCommand('gh pr view --json number')).toBe(false);
   });
@@ -657,7 +749,9 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
           customType: 'codeflare-review-autofix-request',
           content: [
             'Fix legitimate PR-boundary review findings for codeflare at abc123.',
-            'Use the merged review summary immediately above as the actionable finding list.',
+            'Use the merged review summary immediately above as the actionable finding list; do not fix from partial lane results.',
+            'Before editing, committing, or pushing, verify the review job for this exact head is complete and every required lane has a result file.',
+            'If any required review lane is still running, pending, missing, or unknown, do not edit, commit, or push; wait for the final merged review summary.',
             'If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.',
             'Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.',
             'Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.',
@@ -676,6 +770,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       repo: '/repo/codeflare',
       head: 'abc123',
       rows: [{ counts: { critical: 0, high: 0, medium: 1, low: 0 } }],
+      reviewComplete: true,
       claim: () => true,
     })).toBe(true);
     expect(sent).toHaveLength(1);
@@ -686,6 +781,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       repo: '/repo/codeflare',
       head: 'abc123',
       rows: [{ counts: { critical: 0, high: 0, medium: 0, low: 1 } }],
+      reviewComplete: true,
       claim: () => true,
     })).toBe(false);
     expect(requestReviewAutofixForRows({
@@ -693,6 +789,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       repo: '/repo/codeflare',
       head: 'abc123',
       rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
+      reviewComplete: true,
       claim: () => false,
     })).toBe(false);
     expect(requestReviewAutofixForRows({
@@ -700,7 +797,16 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       repo: '/repo/codeflare',
       head: 'abc123',
       rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
+      reviewComplete: true,
       suppress: true,
+      claim: () => true,
+    })).toBe(false);
+    expect(requestReviewAutofixForRows({
+      sender,
+      repo: '/repo/codeflare',
+      head: 'abc123',
+      rows: [{ counts: { critical: 0, high: 1, medium: 0, low: 0 } }],
+      reviewComplete: false,
       claim: () => true,
     })).toBe(false);
     expect(sent).toHaveLength(0);
@@ -736,6 +842,12 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       completed: [],
       running: ['doc-updater'],
     })).toEqual([{ lane: 'doc-updater', label: 'docs', state: 'running' }]);
+    expect(compactDurableReviewStatus({
+      head: 'a505655780ea430ef4a82fe5d8b04e58835c3ed5',
+      lanes: ['code-reviewer', 'spec-reviewer', 'doc-updater'],
+      completed: ['code-reviewer'],
+      running: ['spec-reviewer'],
+    })).toBe('Review code | spec | docs');
   });
 
   it('REQ-AGENT-040: durable Pi review job paths are under .git and result paths stay on the existing review surface', () => {
@@ -1199,38 +1311,35 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(isResumedSession(true, 5)).toBe(false);
   });
 
-  it('REQ-VAULT-003: stableId produces deterministic SHA-256 vault IDs', () => {
-    const a = stableId('test/path.md');
-    expect(a).toBe(stableId('test/path.md'));
-    expect(a).not.toBe(stableId('other/path.md'));
-    expect(a).toMatch(/^vault:[0-9a-f]{24}$/);
-  });
-
-  it('REQ-VAULT-003: memory-vault.ts has Claude-compatible in-flight sentinel to prevent double extraction', () => {
+  it('REQ-VAULT-003: Pi vars/in-flight sentinels are namespaced so the Claude vault-monitor daemon cannot wedge Pi', () => {
     const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
+    // The entrypoint vault-monitor daemon (Claude's producer) writes the
+    // shared-namespace ~/.cache/codeflare-hooks/vault-extract.vars on any vault
+    // change; under Pi nothing consumes it. Pi MUST read its OWN sentinels so
+    // the daemon's orphaned file never makes vaultVarsPending() block forever.
+    expect(mv?.content).toContain('vault-extract.pi.vars');
+    expect(mv?.content).toContain('vault-extract.pi.in-flight');
     expect(mv?.content).toContain('VAULT_INFLIGHT');
-    expect(mv?.content).toContain('vault-extract.in-flight');
     expect(mv?.content).toContain('VAULT_EXTRACT_INFLIGHT_TTL_MS');
+    // Regression guard: Pi must NOT read the daemon's shared-namespace files.
+    expect(mv?.content).not.toContain('"vault-extract.vars"');
+    expect(mv?.content).not.toContain('"vault-extract.in-flight"');
+    // The high-water marker stays SHARED (advancing it keeps the daemon quiet).
+    expect(mv?.content).toContain('vault-extract.last');
+    // Self-heal: a stale vars file past the in-flight TTL must clear, not wedge.
+    expect(mv?.content).toContain('Date.now() - statSync(VAULT_VARS_FILE).mtimeMs > VAULT_EXTRACT_INFLIGHT_TTL_MS');
   });
 
-  it('REQ-VAULT-004: titleFor extracts first heading or falls back to filename', () => {
-    expect(titleFor('/vault/Notes/test.md', '# My Title\nsome content')).toBe('My Title');
-    expect(titleFor('/vault/Notes/test.md', 'no heading here')).toBe('test.md');
-    expect(titleFor('/vault/Docs/report.pdf', '')).toBe('report.pdf');
-  });
-
-  it('REQ-VAULT-016: memory-vault.ts builds the baseline via the canonical-schema helper', () => {
+  it('REQ-VAULT-004: memory-vault.ts publishes the cumulative vault graph to the global graph via flock-guarded graphify global add', () => {
     const mv = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault.ts');
-    expect(mv?.content).toContain('deterministicVaultGraph');
-    const helpers = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/extensions/memory-vault-helpers.ts');
-    // Canonical graphify schema (file_type/source_file/relation/confidence), not the legacy type/path/mentions shape.
-    // (relation values are passed to addLink as arguments, so assert the literal strings, not `relation: "..."`.)
-    expect(helpers?.content).toContain('file_type: "concept"');
-    expect(helpers?.content).toContain('source_file: null');
-    expect(helpers?.content).toContain('"references"');
-    expect(helpers?.content).toContain('"contains"');
-    expect(helpers?.content).toContain('confidence_score: 1.0');
-    expect(helpers?.content).not.toContain('type: "mentions"');
+    // Serialised under the shared global-graph lock, tagged user_vault.
+    expect(mv?.content).toContain('/tmp/graphify-global.lock');
+    expect(mv?.content).toContain('user_vault');
+    // The extension re-publishes the cumulative vault-graph.json (written by
+    // merge-vault-graph.py), never a competing per-run graph.json.
+    expect(mv?.content).toContain('vault-graph.json');
+    // It is a pure trigger now: no in-process deterministic graph builder.
+    expect(mv?.content).not.toContain('deterministicVaultGraph');
   });
 
   it('REQ-VAULT-003 AC7: Pi vault-extract prompt publishes the viz to Raw/Graphs', () => {
@@ -1239,40 +1348,23 @@ describe('Pi memory-vault behavioral tests (REQ-MEM-001/002/010, REQ-VAULT-003/0
     expect(prompt?.content).toContain('Raw/Graphs/vault-graph.html');
   });
 
-  it('REQ-VAULT-003 AC8: deterministicVaultGraph emits canonical document/concept/heading nodes and edges', () => {
-    const { nodes, links } = deterministicVaultGraph(
-      [{ rel: 'Notes/a.md', path: '/home/user/Vault/Notes/a.md', content: '# Title\n## Section\nSee [[Foo]].', isText: true }],
-      { nodes: [], links: [] },
-    );
-    const doc = nodes.find((n) => n.label === 'Title');
-    expect(doc.file_type).toBe('document');
-    expect(doc.source_file).toBe('/home/user/Vault/Notes/a.md');
-    const concept = nodes.find((n) => n.label === 'Foo');
-    expect(concept.file_type).toBe('concept');
-    expect(concept.source_file).toBeNull();
-    const section = nodes.find((n) => n.label === 'Section');
-    expect(section.file_type).toBe('document');
-    expect(links.some((l) => l.relation === 'references' && l.target === concept.id)).toBe(true);
-    expect(links.some((l) => l.relation === 'contains' && l.target === section.id)).toBe(true);
-    expect(links.every((l) => l.confidence === 'EXTRACTED' && l.confidence_score === 1)).toBe(true);
+  it('REQ-VAULT-016 / REQ-MEM-009: Pi vault-extract + memory prompts build the cumulative vault graph via the Pi-local merge-vault-graph.py', () => {
+    const vault = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/prompts/vault-extract-prompt.md');
+    const memory = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/prompts/memory-agent-prompt.md');
+    for (const prompt of [vault, memory]) {
+      // Self-contained in .pi: Pi must never reach into the Claude plugin tree.
+      expect(prompt?.content).toContain('/home/user/.pi/agent/scripts/merge-vault-graph.py');
+      expect(prompt?.content).not.toContain('.claude/plugins/codeflare-vault/scripts/merge-vault-graph.py');
+      // Publish the CUMULATIVE vault-graph.json, never the per-run chunk/graph.json (REQ-MEM-009 AC3).
+      expect(prompt?.content).toMatch(/graphify global add[\s\S]{0,160}vault-graph\.json[\s\S]{0,160}--as user_vault/);
+    }
   });
 
-  it('REQ-VAULT-003 AC8: deterministicVaultGraph maps non-text files to document nodes with a source_file', () => {
-    const { nodes } = deterministicVaultGraph(
-      [{ rel: 'Raw/Pasted/x.pdf', path: '/home/user/Vault/Raw/Pasted/x.pdf', content: '', isText: false }],
-      { nodes: [], links: [] },
-    );
-    expect(nodes[0].file_type).toBe('document');
-    expect(nodes[0].source_file).toBe('/home/user/Vault/Raw/Pasted/x.pdf');
-  });
-
-  it('REQ-VAULT-003 AC8: re-extraction drops a changed doc\'s stale links but keeps the monotonic node set', () => {
-    const first = deterministicVaultGraph([{ rel: 'a.md', path: '/v/a.md', content: '[[Foo]]', isText: true }], { nodes: [], links: [] });
-    const second = deterministicVaultGraph([{ rel: 'a.md', path: '/v/a.md', content: '[[Bar]]', isText: true }], first);
-    expect(second.links.some((l) => l.target === stableId('concept:Bar'))).toBe(true);
-    expect(second.links.some((l) => l.target === stableId('concept:Foo'))).toBe(false);
-    // The Foo concept node persists (graph grows monotonically) even though its link was re-derived away.
-    expect(second.nodes.some((n) => n.id === stableId('concept:Foo'))).toBe(true);
+  it('REQ-VAULT-007: Pi is self-contained - merge-vault-graph.py is preseeded into .pi/agent/scripts', () => {
+    const piScript = AGENTS_SEEDED_CONFIGS.find((d) => d.key === '.pi/agent/scripts/merge-vault-graph.py');
+    expect(piScript, 'merge-vault-graph.py must be preseeded for Pi').toBeTruthy();
+    expect(piScript?.content).toContain('REQ-MEM-009');
+    expect(piScript?.content).toContain('nx.compose');
   });
 
   it('REQ-AGENT-023 AC4: codeflare-pi.ts tolerates missing graph and reports present graph', () => {

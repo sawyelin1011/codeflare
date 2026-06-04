@@ -13,7 +13,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, join } from "node:path";
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { ALL_REVIEW_LANES, bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, createReadyOnceTracker, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
+import { ALL_REVIEW_LANES, bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, commandTextFromEvent, createReadyOnceTracker, cwdFromBoundaryCommand, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryCommand, prCreateBoundaryBase, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
 import { compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewMessageKey, durableReviewRecommendation, formatMergedReviewSummary, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, type DurableReviewSummaryRecord, type DurableReviewSummaryRow, type ReviewSeverityCounts } from "./review-job-helpers";
 import { completedDurableReviewLanes, failedDurableReviewLanes, readDurableReviewJob, REVIEW_JOBS_EVENT_LANE_COMPLETED, REVIEW_JOBS_EVENT_LANE_FAILED, reviewJobDir, reviewResultPath, reviewResultsDir, runningDurableReviewLanes, startDurableReviewLanes } from "./review-jobs";
 
@@ -67,11 +67,7 @@ function findGitRoot(startDir: string): string | undefined {
 }
 
 function cwdFromCommand(command: string): string | undefined {
-  const cdMatch = command.match(/(?:^|[;&|]\s*)cd\s+([^;&|]+)\s*&&/);
-  if (cdMatch) return cdMatch[1].trim().replace(/^(["'])(.*)\1$/, "$2");
-  const gitCMatch = command.match(/(?:^|[;&|]\s*)git\s+-C\s+("[^"]+"|'[^']+'|\S+)/);
-  if (gitCMatch) return gitCMatch[1].trim().replace(/^(["'])(.*)\1$/, "$2");
-  return undefined;
+  return cwdFromBoundaryCommand(command);
 }
 
 function activeRepoFallback(): string | undefined {
@@ -85,16 +81,12 @@ function activeRepoFallback(): string | undefined {
 }
 
 function commandText(event: any): string {
-  const input = event?.input || event?.params || event?.args || {};
-  if (typeof input.command === "string") return input.command;
-  if (typeof input.code === "string") return input.code;
-  if (Array.isArray(input.commands)) return input.commands.map((cmd: any) => String(cmd?.command || "")).join("\n");
-  return "";
+  return commandTextFromEvent(event);
 }
 
 
 function isGhPrMerge(command: string): boolean {
-  return /(^|[;&|]\s*)gh\s+pr\s+merge\b/.test(command);
+  return /(^|[;&|\n]\s*)gh\s+pr\s+merge\b/.test(command);
 }
 
 function isSddProject(repo: string): boolean {
@@ -279,11 +271,11 @@ function previousRemoteHead(repo: string, currentHead: string): string | undefin
 }
 
 function isLocalGitPushCommand(command: string): boolean {
-  return /(^|[;&|]\s*)git(?:\s+-C\s+\S+)?\s+push\b/.test(command);
+  return /(^|[;&|\n]\s*)git(?:\s+-C\s+\S+)?\s+push\b/.test(command);
 }
 
 function isGitPushCommand(command: string): boolean {
-  return isLocalGitPushCommand(command) || /(^|[;&|]\s*)gh\s+repo\s+sync\b/.test(command);
+  return isLocalGitPushCommand(command) || /(^|[;&|\n]\s*)gh\s+repo\s+sync\b/.test(command);
 }
 
 function prForBoundaryCommand(repo: string, command: string, pr: PrState | undefined): PrState | undefined {
@@ -368,15 +360,19 @@ function updateReviewStatus(state: PendingReview, ctx: any): void {
   try {
     const completed = state.lanes.filter((lane) => state.completed.has(lane) || existsSync(reviewResultPath(state.repo, state.head, lane)));
     const running = runningDurableReviewLanes(state.repo, state.head, state.lanes).concat(Object.keys(state.spawnedIds));
+    const color = ctx.ui?.theme?.fg;
+    const style = typeof color === "function"
+      ? {
+          done: (label: string) => color.call(ctx.ui.theme, "success", label),
+          running: (label: string) => color.call(ctx.ui.theme, "warning", label),
+        }
+      : undefined;
     ctx.ui.setStatus("codeflare-review", compactDurableReviewStatus({
       head: state.head,
       lanes: state.lanes,
       completed,
       running,
-      style: {
-        done: (label: string) => ctx.ui.theme.fg("success", label),
-        running: (label: string) => ctx.ui.theme.fg("warning", label),
-      },
+      style,
     }));
   } catch {
     // Status display is best-effort; persisted review state is authoritative.
@@ -627,13 +623,14 @@ export default function (pi: ExtensionAPI) {
       if (id && commandText(event)) toolStartArgs.delete(id);
       return event;
     }
-    const current = event?.args || event?.input || event?.params || {};
+    const current = event?.args || event?.input || event?.params || event?.arguments || {};
     const merged = { ...cached, ...current };
     const enriched = {
       ...event,
       args: merged,
       input: { ...(event?.input || {}), ...merged },
       params: { ...(event?.params || {}), ...merged },
+      arguments: { ...(event?.arguments || {}), ...merged },
     };
     if (id && commandText(enriched)) toolStartArgs.delete(id);
     return enriched;
@@ -754,12 +751,15 @@ export default function (pi: ExtensionAPI) {
 
   function requestReviewAutofix(state: PendingReview, ctx: any): void {
     const marker = join(reviewJobDir(state.repo, state.head), "autofix.requested");
+    const resultLanes = completedDurableReviewLanes(state.repo, state.head, state.lanes);
+    const reviewComplete = durableReviewAckReady({ lanes: state.lanes, resultLanes });
     try {
       requestReviewAutofixForRows({
         sender: pi,
         repo: state.repo,
         head: state.head,
         rows: reviewSummaryRows(state),
+        reviewComplete,
         suppress: reviewAutofixModeFromUserMessages(sessionUserMessages(ctx)) === "manual",
         claim: () => {
           mkdirSync(dirname(marker), { recursive: true });
@@ -782,10 +782,47 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(`PR-boundary ${lane} completed for ${basename(state.repo)} at ${state.head.slice(0, 12)}. Findings saved: ${path}`, "info");
   }
 
+  function finalizeCompletedReview(state: PendingReview, ctx: any): void {
+    writeAck(state.repo, state.head);
+    resetBlockCount(state.repo);
+    clearBreaker(state.repo);
+    clearPending(state.repo);
+    publishReviewSummary(state, ctx);
+    requestReviewAutofix(state, ctx);
+    clearReviewStatus(ctx);
+    pending = undefined;
+  }
+
+  function refreshReviewStatusFromDurable(ctx: any): void {
+    const state = hydratePending(ctx);
+    if (!state) {
+      clearReviewStatus(ctx);
+      publishSummaryForCurrentPr(ctx);
+      return;
+    }
+    const headStatus = reviewHeadStatus(state);
+    if (headStatus === "stale") {
+      discardStale(state, ctx);
+      return;
+    }
+    if (headStatus === "advanced" || headStatus === "unknown") {
+      updateReviewStatus(state, ctx);
+      return;
+    }
+    if (durableReviewAckReady({ lanes: state.lanes, resultLanes: completedDurableReviewLanes(state.repo, state.head, state.lanes) })) {
+      finalizeCompletedReview(state, ctx);
+      return;
+    }
+    updateReviewStatus(state, ctx);
+  }
+
   async function markCompleted(type: string, ctx: any, _completionId?: string, _prompt?: string, result?: unknown): Promise<void> {
     const state = hydratePending(ctx);
     if (!state || !state.lanes.includes(type)) return;
-    if (state.completed.has(type)) return;
+    if (state.completed.has(type)) {
+      refreshReviewStatusFromDurable(ctx);
+      return;
+    }
     // Only a definitively-moved PR ("stale") discards the window; "unknown" (gh
     // failed) falls through so the completion is still recorded and acked rather
     // than the whole review window being lost on a transient query failure. If
@@ -817,14 +854,7 @@ export default function (pi: ExtensionAPI) {
     }
     savePending(state);
     if (durableReviewAckReady({ lanes: state.lanes, resultLanes: completedDurableReviewLanes(state.repo, state.head, state.lanes) })) {
-      writeAck(state.repo, state.head);
-      resetBlockCount(state.repo);
-      clearBreaker(state.repo);
-      clearPending(state.repo);
-      publishReviewSummary(state, ctx);
-      requestReviewAutofix(state, ctx);
-      clearReviewStatus(ctx);
-      pending = undefined;
+      finalizeCompletedReview(state, ctx);
     }
   }
 
@@ -832,7 +862,7 @@ export default function (pi: ExtensionAPI) {
     if (!isActiveRun()) return;
     remember(ctx);
     const toolName = String(event?.toolName || "").toLowerCase();
-    const input = event?.input || event?.params || event?.args || {};
+    const input = event?.input || event?.params || event?.args || event?.arguments || {};
     const command = commandText(event);
     // commandText() pulls the command from bash (input.command) or, when context-mode is on,
     // the ctx_* tools (code/commands). Gate on the command itself, never the tool name.
@@ -869,19 +899,24 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event: any, ctx: any) => {
     remember(ctx);
     const state = hydratePending(ctx);
-    if (state) {
-      const status = reviewHeadStatus(state);
-      if (status === "stale") discardStale(state, ctx);
-      else if (status === "advanced") void rollForwardAdvancedReview(state, ctx, "session_start detected advanced PR head");
-      else updateReviewStatus(state, ctx);
-    }
-    publishSummaryForCurrentPr(ctx);
+    if (state && reviewHeadStatus(state) === "advanced") void rollForwardAdvancedReview(state, ctx, "session_start detected advanced PR head");
+    else refreshReviewStatusFromDurable(ctx);
   });
+
+  const onUiRefresh = (_event: any, ctx: any): void => {
+    if (!isActiveRun()) return;
+    remember(ctx);
+    refreshReviewStatusFromDurable(ctx);
+  };
+
+  pi.on("resources_discover", onUiRefresh);
+  pi.on("turn_start", onUiRefresh);
+  pi.on("turn_end", onUiRefresh);
 
   pi.on("tool_call", onAgentStart);
   pi.on("tool_execution_start", (event: any, ctx: any) => {
     const id = toolEventId(event);
-    if (id) toolStartArgs.set(id, event?.args || event?.input || event?.params || {});
+    if (id) toolStartArgs.set(id, event?.args || event?.input || event?.params || event?.arguments || {});
     return onAgentStart(event, ctx);
   });
 
@@ -892,7 +927,7 @@ export default function (pi: ExtensionAPI) {
     if (isFailedToolExecution(event)) return;
 
     if (toolName === "agent") {
-      const input = event?.input || event?.params || event?.args || {};
+      const input = event?.input || event?.params || event?.args || event?.arguments || {};
       const type = String(input.subagent_type || input.subagentType || "");
       const prompt = String(input.prompt || "");
       const state = hydratePending(ctx);
@@ -1014,6 +1049,7 @@ export default function (pi: ExtensionAPI) {
       // existing PR, but review enforcement should start only from explicit PR
       // creation/push/sync commands or from already-persisted pending review
       // state. Keep summary publication passive and do not create catch-up work.
+      clearReviewStatus(ctx);
       publishSummaryForCurrentPr(ctx);
       return;
     }
@@ -1062,7 +1098,10 @@ export default function (pi: ExtensionAPI) {
 
     const running = runningDurableReviewLanes(currentState.repo, currentState.head, currentState.lanes)
       .filter((lane) => !currentState.completed.has(lane));
-    if (running.length > 0) return;
+    if (running.length > 0) {
+      updateReviewStatus(currentState, ctx);
+      return;
+    }
 
     const failed = failedDurableReviewLanes(currentState.repo, currentState.head, currentState.lanes)
       .filter((lane) => !currentState.completed.has(lane));

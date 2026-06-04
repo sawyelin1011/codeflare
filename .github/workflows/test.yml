@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ vars.RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
@@ -87,10 +87,33 @@ jobs:
         working-directory: web-ui
 
       - name: Run backend tests
-        # @cloudflare/vitest-pool-workers hard-codes a `[vpw:info] Starting runtime for ...`
-        # log on every test file (LogLevel.VERBOSE, no config to silence). Filter the spam
-        # so the CI test output stays readable. set -o pipefail keeps the exit code from npm.
-        run: set -o pipefail && npm test 2>&1 | grep -v -F '[vpw:info] Starting runtime for'
+        # @cloudflare/vitest-pool-workers 0.16.x crashes workerd at pool teardown
+        # ("Worker exited unexpectedly") AFTER every test has passed — a known upstream
+        # flake (cloudflare/workers-sdk), not a test failure. `isolate: false` does NOT
+        # fix it (it crashes the pool during collection instead — verified in CI), so the
+        # crash is tolerated here. NO_COLOR keeps the summary plain text so the guard can
+        # read it. The guard accepts a non-zero exit ONLY when all four hold: the pool-crash
+        # fingerprint is present, the summary reports exactly one error (just that crash),
+        # at least one test passed, and nothing failed. No hardcoded counts — a real failure
+        # prints "N failed", and any extra unhandled error makes the summary "Errors 2
+        # errors"; both still fail the job. Keep this guard in sync with deploy.yml.
+        env:
+          NO_COLOR: '1'
+          FORCE_COLOR: '0'
+        run: |
+          set +e
+          npm test 2>&1 | tee /tmp/backend-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 0 ]; then exit 0; fi
+          if grep -Fq '[vitest-pool]: Worker cloudflare-pool emitted error.' /tmp/backend-tests.log \
+            && grep -Eq 'Errors[[:space:]]+1 error' /tmp/backend-tests.log \
+            && grep -Eq 'Tests[[:space:]]+[0-9]+ passed' /tmp/backend-tests.log \
+            && ! grep -Eq '(Test Files|Tests)[[:space:]]+[0-9]+ failed' /tmp/backend-tests.log; then
+            echo "Accepting backend tests: all tests passed; only the known workerd teardown crash remained"
+            exit 0
+          fi
+          exit "$status"
 
       - name: Install host dependencies
         if: steps.cache-host.outputs.cache-hit != 'true'
@@ -138,5 +161,5 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0

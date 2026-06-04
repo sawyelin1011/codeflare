@@ -10,6 +10,12 @@
       "advanced"
     ]
   },
+  "extensions/local-statusline.ts": {
+    "modes": [
+      "default",
+      "advanced"
+    ]
+  },
   "extensions/codeflare-commands.ts": {
     "modes": [
       "advanced"
@@ -94,6 +100,11 @@
     ]
   },
   "scripts/local-graphify-labels.sh": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "scripts/merge-vault-graph.py": {
     "modes": [
       "advanced"
     ]

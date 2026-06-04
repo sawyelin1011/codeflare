@@ -1021,7 +1021,7 @@ None.
 **Acceptance Criteria:**
 
 1. For readable PR metadata, PR-boundary review fires only for open PRs targeting `main` or `master`; the `gh pr create` metadata-lag exception is limited to AC6. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
-2. Local push detection recognises `git push` and `git -C <repo> push` across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
+2. Local push detection recognises `git push`, `git -C <repo> push`, and command-local `cd <repo>` prefixes separated by `&&`, semicolon, or newline across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::cwdFromBoundaryCommand -->
 3. GitHub CLI detection recognises PR-head-moving operations: `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
@@ -1097,11 +1097,11 @@ None.
 **Acceptance Criteria:**
 
 1. Durable PR-boundary result files use a shared `## Findings` plus severity-count Review Summary table format. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatDurableReviewResult -->
-2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus -->
+2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job from the persisted pending review state. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::updateReviewStatus -->
 3. Pi suppresses duplicate PR-boundary review result and summary announcements for the same repo, head, lane, and result path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
 4. After all required lanes complete, Pi publishes a merged chat summary instead of separate per-lane chat result blocks. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewSummaryMarkdown -->
 5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes and renders findings sorted by criticality, without requiring per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
-6. When completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; if the latest explicit user directive says not to automatically fix/implement or to wait for approval, Pi presents the findings and waits instead. The next PR-boundary review uses the pushed fix diff when a fix pass runs. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
+6. After the exact-head durable review job is complete and every required lane has a result file, when those completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; if any required lane is running, pending, missing, stale, or unknown, Pi must not request or start a fix pass from partial lane results. If the latest explicit user directive says not to automatically fix/implement or to wait for approval, Pi presents the findings and waits instead. The next PR-boundary review uses the pushed fix diff when a fix pass runs. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::requestReviewAutofixForRows --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
 7. Durable PR-boundary review lanes additively load the graphify package (always when configured), the context-mode package (only when enabled in Pi settings), and the `codeflare-pi` guard extension (local-build blocker, attribution, graphify gate), while excluding the `review-enforcement` extension and the `@gotgenes/pi-subagents` package from the lane; `codeflare-pi`'s per-session global-graph merge is skipped inside lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
 
 **Constraints:**
@@ -1121,7 +1121,7 @@ None.
 ### REQ-AGENT-054: Pi Durable Review Lane Failure Handling
 
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (durable lane recovery + result-file gating tests -> AC1/AC2/AC3) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (durable lane recovery + result-file gating tests -> AC1/AC2/AC3/AC4) -->
 
 **Intent:** Pi operators need durable PR-boundary review failures to fail closed without falsely acknowledging a PR head.
 
@@ -1132,6 +1132,8 @@ None.
 1. When a durable Pi review lane times out or records a failure, the lane is persisted as failed instead of completed. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
 2. Failed or timed-out durable lanes do not satisfy the required result-file gate. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::completedDurableReviewLanes -->
 3. A PR head remains unacked until a later review run writes every required lane result file. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::markCompleted -->
+4. Persisted-only `running` lane state never suppresses a retry after Pi reloads; only the in-memory durable lane set counts as active retry suppression. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runningDurableReviewLanes -->
+5. If completion callbacks are missed or Pi reloads, persisted exact-head result files are enough to recover, finalize, acknowledge, and publish the review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::refreshReviewStatusFromDurable --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
 
 **Constraints:**
 
@@ -1175,6 +1177,38 @@ None.
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling)
 
 **Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-056: Pi Local Statusline Footer
+
+<!-- @impl: preseed/agents/pi/extensions/local-statusline.ts -->
+<!-- @impl: preseed/agents/pi/manifest.json -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-056 local statusline fake-footer render -> AC1/AC2/AC3/AC4/AC5) -->
+
+**Intent:** Pi users need a compact footer in every session mode that shows session context without hiding extension-owned status rows such as PR-boundary review progress.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. The Pi local statusline extension is preseeded in both Standard and Pro modes. <!-- @impl: preseed/agents/pi/manifest.json::local-statusline.ts -->
+2. The footer's first line renders current context usage, active model ID with thinking effort as `model:effort`, and the active repository label when one can be resolved. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::renderLine --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::contextPercent --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::repositoryLabel -->
+3. Extension-owned statuses are preserved on an additional footer line only while statuses exist; idle sessions do not render an empty second line. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::installFooter -->
+4. Footer lines are truncated by visible width, preserving ANSI color sequences and appending a reset before the ellipsis so colored review statuses do not consume visible width or bleed styling past truncation. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::truncateToWidth -->
+5. The statusline refreshes on session start, resource discovery, turn boundaries, model changes, thinking-effort changes, and cache-TTL repaint intervals. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::refreshFooter --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::CACHE_TTL_MS -->
+
+**Constraints:**
+
+- The statusline is cosmetic and must not block agent execution if repository or context metadata cannot be read.
+
+**Priority:** P2
+
+**Dependencies:** [REQ-AGENT-004](#req-agent-004-two-session-modes-standard-and-pro), [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth)
+
+**Verification:** [Pi local statusline render test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
 
@@ -1448,7 +1482,7 @@ None.
 1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep. Provider/backend extras such as Gemini are not installed for Graphify; interactive semantic extraction and community labeling remain agent-driven.
 2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package in every session; the Pi graphify workflow skill, clone triage helper, and build/update scripts are advanced-mode preseed surfaces. MCP parity in Pi is optional and not required for the Pi graphify workflow.
 3. AC1 and AC2 hold across all paid tiers for ambient query/build capability; advanced-mode agent orchestration keeps `/graphify` extraction context bounded via subagent chunking.
-4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while advanced-mode Pi prompts after clone and offers Architecture graph, Full repo AST-only, Full repo semantic, or no graph creation; query tools answer against the active repository's `graphify-out/graph.json` once it exists.
+4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while advanced-mode Pi clone triage asks before any graph work and offers Full repo AST-only, Full repo semantic intent, or no graph action; query tools answer against the active repository's `graphify-out/graph.json` once it exists. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::graphifyCloneAction --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::fallbackGraphifyToolResult -->
 5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact. Pi tracks the same active repo from command-local `cd ... &&` and `git -C ...` forms, and its session context identifies the active repo by basename, checked-out branch, and HEAD prefix.
 6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
 
@@ -1521,7 +1555,7 @@ None.
 
 <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md -->
 <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md -->
-<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC4-AC5) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-043 Pi graphify skill override avoids headless semantic extraction and routes uncached Full mode files to Pi Agent subagents -> AC7) -->
+<!-- @test: host/__tests__/skill-graphify-content.test.js (graphify SKILL.md content (REQ-AGENT-024 AC4-AC6, REQ-AGENT-026) / REQ-AGENT-043 (build mode dispatch) → AC5) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-043 Pi graphify skill override avoids headless semantic extraction and routes uncached Full mode files to Pi Agent subagents -> AC7) -->
 
 **Intent:** Before a `/graphify` build dispatches extraction work, the user must explicitly choose whether to build a graph and which scope to build. Claude keeps the upstream AST-only vs Full semantic choice. Pi offers Architecture graph, Full repo AST-only, Full repo semantic, or no graph update. In Pi, uncached semantic extraction must use running-session Pi `Agent` subagents that inherit the current main-session model; community labels are written by the active Pi main session to `.graphify_labels.json`; official Graphify CLI/module flows own AST extraction, cache merge, graph build, clustering, report generation, and visualization, while label application regenerates report/html from existing graph community assignments.
 
@@ -1529,11 +1563,11 @@ None.
 
 **Acceptance Criteria:**
 
-1. Before dispatching semantic-extraction subagents in a Claude `/graphify` build (Step B2 of the upstream protocol), the agent presents an `AskUserQuestion` with exactly two modes: AST-only (free, structural edges only) and Full (AST plus parallel semantic-extraction subagents processing docs/papers/images). In Pi, after detection, the graph refresh choice offers Architecture graph, Full repo AST-only, Full repo semantic, and an explicit no-graph option that stops without modifying `graphify-out`.
-2. The semantic mode question includes both the actual subagent count and a wall-time estimate.
-3. The semantic option is hidden when the corpus contains zero docs/papers/images; code-only repos still offer the Pi Architecture graph, Full repo AST-only, and no-graph options.
-4. In advanced session mode only, Claude Code Part B semantic subagents use the Claude graphify skill's configured reliable extraction model, while Pi Part B semantic subagents omit `model` overrides so they inherit the current main-session model.
-5. Claude's graphify skill never escalates to Opus from this workflow, and Pi's native graphify skill does not name or pin any provider-specific model.
+1. Before dispatching semantic-extraction subagents in a Claude `/graphify` build (Step B2 of the upstream protocol), the agent presents an `AskUserQuestion` with exactly two modes: AST-only (free, structural edges only) and Full (AST plus parallel semantic-extraction subagents processing docs/papers/images). The Full option includes the actual subagent count and a wall-time estimate. <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md::AskUserQuestion --> <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md::uncached_doc_paper_files -->
+2. In Pi, after detection, the graph refresh choice offers Architecture graph, Full repo AST-only, Full repo semantic, and an explicit no-graph option that stops without modifying `graphify-out`. <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::Architecture --> <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::graphify-out -->
+3. Clone-time AST-only and no-graph choices suppress the duplicate post-detection mode question; clone-time Full semantic is intent only, and the agent must show the actual uncached file/subagent counts after detection and get confirmation before dispatching semantic subagents. <!-- @impl: preseed/agents/claude/skills/graphify/SKILL.md::uncached --> <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::uncached -->
+4. The semantic option is hidden when the corpus contains zero docs/papers/images; code-only repos still offer the Pi Architecture graph, Full repo AST-only, and no-graph options.
+5. In advanced session mode only, Claude Code Part B semantic subagents use the Claude graphify skill's configured reliable extraction model, while Pi Part B semantic subagents omit `model` overrides so they inherit the current main-session model. Claude's graphify skill never escalates to Opus from this workflow, and Pi's native graphify skill does not name or pin any provider-specific model.
 6. The Part C merge step preserves all data structures produced by Part B subagents - including hyperedges - by saving subagent chunks into Graphify's semantic cache before official Graphify extraction/build consumes the cache.
 7. Pi's native graphify skill does not instruct the agent to run headless semantic extraction or Graphify provider labeling. Architecture mode uses the Pi-owned module-graph script, AST-only initial build uses the Pi-owned first-build script built from Graphify's own modules, AST-only refresh uses the bounded upstream-update wrapper, Full mode uses Pi `Agent` subagents for uncached semantic chunks, the Pi main session writes community labels into `.graphify_labels.json`, and local Graphify module calls regenerate the final report/html from existing graph community assignments. Full semantic merge starts from a freshly recreated AST-only baseline and must not pass semantic source files as `prune_sources`, because Graphify prunes after adding. The final user-facing `graphify-out/graph.html` and `graphify-out/callflow.html` are generated after labels are applied.
 
@@ -1549,7 +1583,7 @@ None.
 
 **Status:** Implemented
 
-<!-- coverage-gap: AC1-AC3 (interactive build-mode AskUserQuestion dialog) and AC6 (Part C merge preserves all Part B fields including hyperedges) are agent-behavioral and verified by manual check, not automatable in the Workers vitest pool. AC4-AC5 are verified by the SKILL.md content test; AC7 is covered by the Pi seed/skill invariant test. -->
+<!-- coverage-gap: AC1-AC4 (interactive build-mode AskUserQuestion dialog and hidden semantic option) and AC6 (Part C merge preserves all Part B fields including hyperedges) are agent-behavioral and verified by manual check, not automatable in the Workers vitest pool. AC5 is verified by the SKILL.md content test; AC7 is covered by the Pi seed/skill invariant test. -->
 
 ---
 
@@ -1558,7 +1592,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-clone-prompt.sh -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts -->
-<!-- @test: host/__tests__/graphify-clone-prompt.test.js (clone-detect + graph-present/absent branch + idempotency marker → AC1-AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi graphify clone triage helper -> AC2) -->
+<!-- @test: host/__tests__/graphify-clone-prompt.test.js (clone-detect + graph-present/absent branch + idempotency marker → AC1/AC3-AC7) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi graphify clone triage helper + durable review-lane suppression -> AC2/AC4-AC7) -->
 
 **Intent:** After the agent clones a repo, it must triage whether to build (or refresh) a knowledge graph for it before doing other work, so users on unfamiliar repos do not start cold.
 
@@ -1566,25 +1600,25 @@ None.
 
 **Acceptance Criteria:**
 
-1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects real `git clone` and `gh repo clone` invocations (anchored token regex, not substring; rejects echoed false positives) and injects a directive. Pi implements the same behavior with native tool lifecycle events and Pi follow-up messages.
-2. Clone destination resolution prefers the tool result's `Cloning into '...'` line before falling back to command parsing, so shell variables such as `$repo` never surface as literal user-facing paths.
-3. The directive branches on whether `<cloned-dir>/graphify-out/graph.json` already exists: if absent, the directive asks a single YES/NO question about building a graph and defers AST-only vs Full mode selection to the graphify skill after detection; if present, the directive tells the agent to check freshness, use the existing graph when fresh, or refresh the AST portion with the bounded upstream-update wrapper when stale or unknown. Full semantic refresh is owned by the graphify skill after corpus detection.
-4. The hook is idempotent per cloned directory per session via a marker key that includes both the session identifier and cloned repository path. A fresh session re-triages the same clone and stale markers do not persist across container restarts.
-5. Pi clone triage suppresses follow-up prompts for failed clone commands, skipped/already-cloned targets, and durable PR-boundary review lanes.
+1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects real `git clone` and `gh repo clone` invocations using anchored token parsing that rejects quoted or echoed false positives. <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-clone-prompt.sh::COMMAND --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::isGitClone -->
+2. Pi implements clone triage with native tool lifecycle events and Pi follow-up messages. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::graphifyClonePromptDecision -->
+3. Clone destination resolution prefers the tool result's `Cloning into '...'` line before falling back to command parsing, so shell variables such as `$repo` never surface as literal user-facing paths. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::cloneTargetPath -->
+4. When `<cloned-dir>/graphify-out/graph.json` is absent, the directive asks which graph action the user wants before any graph work, offering Full repo AST-only, Full repo semantic intent, or no graph action. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::renderGraphifyCloneDirective -->
+5. When `<cloned-dir>/graphify-out/graph.json` exists, fresh graphs are used as-is; stale or unknown graphs ask before update, offering existing-graph-as-is, Full repo AST-only update, or Full repo semantic refresh intent. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::existingGraphCloneNotice --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::renderGraphifyCloneDirective -->
+6. The bounded upstream-update wrapper runs only after the user chooses AST-only, and Full semantic build/refresh must pass through graphify skill detection plus post-detection count confirmation before semantic subagents dispatch. <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::Clone-time triage --> <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::Mandatory graph refresh choice -->
+7. The hook is idempotent per cloned directory per session via a marker key that includes both the session identifier and cloned repository path; Pi clone triage suppresses follow-up prompts for failed clone commands, skipped/already-cloned targets, and durable PR-boundary review lanes. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::shouldHandleClonePrompt -->
 
 **Constraints:**
 
-- The hook never invokes graphify directly. It only injects a directive instructing the agent to ask a clone-time YES/NO graph-build question for missing graphs; build-mode choice is owned by the graphify skill after detection.
+- The hook never invokes graphify directly and never authorizes an automatic update. It only injects a directive instructing the agent to ask for the user's graph-action choice before building or refreshing; a same-turn clone-time AST-only/no-graph choice counts as the graphify skill's mode choice after detection, while clone-time Full semantic remains intent until post-detection count confirmation.
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-023](#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)
 
-**Verification:** [Automated test](../../host/__tests__/graphify-clone-prompt.test.js)
+**Verification:** [Clone prompt hook tests](../../host/__tests__/graphify-clone-prompt.test.js) and [Pi clone triage helper tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
 **Status:** Implemented
-
-<!-- coverage-gap: Claude post-clone hook path is implemented and covered. Pi native codeflare-pi.ts implements clone triage through lifecycle events, but Pi-specific fresh/stale graph prompt routing and durable review-lane suppression need dedicated behavioral coverage. -->
 
 ---
 

@@ -20,6 +20,8 @@ it gets there" content. Memory-system specifics live in
 - [Graphify](#graphify-req-agent-023)
 - [/sdd init Modes](#sdd-init-modes)
 - [Troubleshooting](#troubleshooting)
+- [Specification Coverage](#specification-coverage)
+- [Related Documentation](#related-documentation)
 
 ## Session Modes
 
@@ -31,6 +33,7 @@ deployed on Recreate or new bucket creation.
 |---------|---------|----------|-------------------------|
 | Memory plugin & rule | No | Yes | Yes |
 | Core environment rules (cloudflare-environment, no-local-builds, git-workflow) | Yes | Yes | Yes |
+| Pi startup header and local statusline | Yes | Yes | Yes |
 | Cloudflare-stack, github-cloudflare-ship (+ refs), ci-monitoring, pr-workflow, deploy-credentials skills | Yes | Yes | Yes |
 | `consult-llm` skill (CC only) | No | Yes | Yes |
 | CC hooks: `block-attributed-commits`, `git-push-review-reminder`, `enforce-review-spawn` | No | Yes | Yes |
@@ -244,22 +247,30 @@ All preseed content is deployed via the manifest pipeline:
   + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
   graphify-session-start.sh, graphify-clone-prompt.sh,
   graph-first-nudge.sh, safe-graphify-update.sh)
-- Pi-native runtime assets: package config, package lock, MCP
-  config, extension files (including `codeflare-commands.ts`, which
-  provides the Pi `/debug`, `/deploy`, and `/brainstorm` commands since
-  Claude slash commands do not deploy to Pi, plus durable review-job helpers
-  for PR-boundary enforcement, and `startup-header.ts`, which replaces Pi's
-  built-in startup header with a custom boxed session header), native skill overrides
-  (graphify -
-  [REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch) AC7 - and `review`),
-  capture-contract prompts (`memory-agent-prompt.md`,
-  `vault-extract-prompt.md`), and the Pi graphify scripts
-  (`build-graphify-architecture.sh` for scoped module-level architecture graphs, `build-graphify-ast.sh` for first full AST builds using Graphify's own modules, `safe-graphify-update.sh` as a thin bounded wrapper around upstream `graphify update`, and `local-graphify-labels.sh` for main-session community labels). The
-  generator maps each manifest key to its deployed location by directory
-  prefix: `extensions/` -> `.pi/agent/extensions/`, `skills/` ->
-  `.pi/agent/skills/`, `scripts/` -> `.pi/agent/scripts/`, `prompts/`
-  -> `.pi/agent/prompts/`, with `package.json` / `package-lock.json`
-  -> `.pi/agent/npm/` and `mcp.json` / `settings.json` rooted directly
+- Pi-native runtime assets include package config, package lock, and MCP
+  config.
+
+  Extension files deploy Pi-specific runtime behavior:
+  `codeflare-commands.ts` provides `/debug`, `/deploy`, and `/brainstorm`;
+  durable review-job helpers enforce PR-boundary review; `startup-header.ts`
+  replaces Pi's startup header; `local-statusline.ts` preserves extension
+  status rows in default and advanced modes.
+
+  Native skill overrides include graphify
+  ([REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch)
+  AC7) and `review`.
+
+  Capture-contract prompts include `memory-agent-prompt.md` and
+  `vault-extract-prompt.md`.
+
+  Pi graphify scripts include `build-graphify-architecture.sh`,
+  `build-graphify-ast.sh`, `safe-graphify-update.sh`, and
+  `local-graphify-labels.sh`.
+
+  The generator maps each manifest key by directory prefix:
+  `extensions/` -> `.pi/agent/extensions/`, `skills/` -> `.pi/agent/skills/`,
+  `scripts/` -> `.pi/agent/scripts/`, and `prompts/` -> `.pi/agent/prompts/`.
+  Package files deploy under `.pi/agent/npm/`; `mcp.json` deploys directly
   under `.pi/agent/`.
 
   These assets adapt runtime behavior to Pi primitives while rules and
@@ -275,20 +286,24 @@ All preseed content is deployed via the manifest pipeline:
   `.git/sdd-review-results/<head>/`. Each result file uses a common
   `## Findings` section followed by a severity-count Review Summary table.
   While internal durable lanes run, Pi displays a compact footer status
-  (`Review <head> --> code | spec | docs`, rendering only required lanes and
-  turning a lane label green when that lane finishes). Operators can diagnose
-  background review progress without visible generic Agent tasks. Duplicate
-  lane-result and summary announcements are suppressed for the same
-  repo/head/lane result.
+  (`Review code | spec | docs`, rendering only required lanes and turning a lane
+  label green when that lane finishes). Colored review status rows truncate by
+  visible width, preserve ANSI color sequences, and reset styling before the
+  ellipsis. Operators can diagnose background review progress without visible
+  generic Agent tasks. Duplicate lane-result and summary announcements are
+  suppressed for the same repo/head/lane result.
 
-  After all lanes finish, Pi publishes one merged chat summary with
-  `## Review Summary`, `## Findings`, and `## Finding Details` sections. That
-  chat summary aggregates severity counts across code/spec/docs, lists all
-  findings sorted by criticality, and avoids per-lane result-file links; the
-  per-lane `.md` files remain the durable evidence store. If legitimate
-  MEDIUM/HIGH/CRITICAL findings remain, Pi then requests a fix-and-push pass,
-  unless the latest explicit user directive opts out of auto-fixing for the
-  round (in which case Pi presents the findings and waits). Implements
+  After the exact-head durable review job completes and every required lane has
+  a result file, Pi publishes one merged chat summary with `## Review Summary`,
+  `## Findings`, and `## Finding Details` sections. That chat summary aggregates
+  severity counts across code/spec/docs, lists all findings sorted by
+  criticality, and avoids per-lane result-file links; the per-lane `.md` files
+  remain the durable evidence store. Partial lane results, including any
+  missing, failed, timed-out, or still-running lane, cannot trigger autofix. If
+  legitimate MEDIUM/HIGH/CRITICAL findings remain after the complete exact-head
+  summary, Pi then requests a fix-and-push pass, unless the latest explicit user
+  directive opts out of auto-fixing for the round (in which case Pi presents the
+  findings and waits). Implements
   [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop).
 
   Timed-out or failed durable lanes are recorded as failed and do not produce
@@ -527,7 +542,7 @@ All tiers append tool guidance (pointing at `mcp__graphify__query_graph`, `mcp__
 
 ### Post-clone graph triage ([REQ-AGENT-025](../../sdd/spec/agents.md#req-agent-025-post-clone-graph-triage))
 
-In advanced session mode, clone triage detects real `git clone` / `gh repo clone` operations and resolves the destination from the tool result (`Cloning into '...'`) before falling back to command parsing. If no repo graph exists, the agent asks one YES/NO question about building a graph and then invokes the graphify skill when the user accepts; AST-only vs Full selection is deferred until after Graphify detection has real corpus counts. If a graph exists, the extension compares `graphify-out/graph.json` `built_at_commit` with `git rev-parse HEAD`: fresh graphs produce an information message only; stale or unknown graphs refresh the AST portion through the bounded upstream-update wrapper. Full semantic refresh is owned by the graphify skill after detection. Pi mirrors the same behavior through native lifecycle events and suppresses clone triage inside durable PR-boundary review lanes.
+In advanced session mode, clone triage detects real `git clone` / `gh repo clone` operations and resolves the destination from the tool result (`Cloning into '...'`) before falling back to command parsing. If no repo graph exists, the agent asks the user which graph action to take before doing any graph work: Full repo AST-only, Full repo semantic, or no graph action. Claude's clone hook injects a directive that tells the agent to compare `graphify-out/graph.json` `built_at_commit` with `git rev-parse HEAD`; Pi performs that freshness comparison natively in its lifecycle extension. Fresh graphs produce an information message only. Stale or unknown graphs ask the user before any update, offering existing-graph-as-is, Full repo AST-only update, or Full repo semantic refresh. The AST-only update uses the bounded upstream-update wrapper only after the user chooses it. Full semantic build/refresh records clone-time intent only: after corpus detection, the graphify skill must show actual uncached file/subagent counts and get confirmation before dispatching semantic subagents. Pi mirrors the same behavior through native lifecycle events and suppresses clone triage inside durable PR-boundary review lanes.
 
 ### Pi active-repo query fallback ([REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify) AC4-AC5)
 
@@ -623,7 +638,7 @@ Full SDD discipline applies on the next push; autonomous agentic development is 
 
 ### Resetting Review-Spawn Checkpoints
 
-The Claude `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode when `sdd/` and `sdd/README.md` are present. Its transcript-based trigger surface is `git push` and `gh pr merge`; `git-push-review-reminder.sh` handles the in-turn `git push` / `gh pr create` reminder path. Pi native enforcement covers the wider local command set (`git push`, `git -C <repo> push`, `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`) and ignores metadata-only PR commands such as `gh pr edit`. Passive lifecycle events such as opening a repo, switching branches, reloading Pi, or ending a normal assistant turn do not create a review window solely because the current branch already has an open protected-base PR. All surfaces enforce only when the open PR targets `main` or `master`. PRs into intermediate branches (`develop`, `staging`) are silently deferred until that branch's own PR-to-`main` opens.
+The Claude `Stop` hook (`enforce-review-spawn.sh`) only fires in advanced mode when `sdd/` and `sdd/README.md` are present. Its transcript-based trigger surface is `git push` and `gh pr merge`; `git-push-review-reminder.sh` handles the in-turn `git push` / `gh pr create` reminder path. Pi native enforcement covers the wider local command set (`git push`, `git -C <repo> push`, command-local `cd <repo>` prefixes separated by `&&`, semicolon, or newline, `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`) and ignores metadata-only PR commands such as `gh pr edit`. Passive lifecycle events such as opening a repo, switching branches, reloading Pi, or ending a normal assistant turn do not create a review window solely because the current branch already has an open protected-base PR. All surfaces enforce only when the open PR targets `main` or `master`. PRs into intermediate branches (`develop`, `staging`) are silently deferred until that branch's own PR-to-`main` opens.
 
 The Claude hook and Pi native enforcement both track the most recently acknowledged PR HEAD SHA in `.git/sdd-last-ack-pr-head`. Claude advances that checkpoint only after every required lane has a current-head Agent spawn with a `completed</status>` marker. A recent in-flight Claude lane suppresses re-summon noise only; it does not satisfy final acknowledgement.
 
@@ -674,7 +689,9 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 - [REQ-AGENT-047](../../sdd/spec/agents.md#req-agent-047-resume-mode-closure-and-review-pipeline-gate) - Resume Mode closure and review-pipeline gate
 - [REQ-AGENT-048](../../sdd/spec/agents.md#req-agent-048-audit-accumulator-surfaces) - Audit accumulator surfaces
 - [REQ-AGENT-050](../../sdd/spec/agents.md#req-agent-050-pi-native-review-workflow-skill) - Pi-Native `/review` Workflow Skill
+- [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop) - Pi Durable Review Status, Result Formatting, and Fix Loop
 - [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement) - Pi PR-Boundary Review Window Advancement
+- [REQ-AGENT-056](../../sdd/spec/agents.md#req-agent-056-pi-local-statusline-footer) - Pi Local Statusline Footer
 - [REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt) - Proactive memory injection on first prompt
 
 ---

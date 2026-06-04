@@ -8,10 +8,40 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { cloneTargetPath, effectiveCwdForCommand, graphifyClonePromptDecision, isFailedToolExecution, renderGraphifyCloneDirective } from "./graphify-helpers";
 import { sddCommandDecision, type SddRepoState, SDD_HELP_TEXT } from "./sdd-helpers";
 import { attributionBlockReason, localBuildBlockReason } from "./guard-helpers";
+
+// Pi extension SDK surface, declared inline instead of imported from
+// "@earendil-works/pi-coding-agent" so this file typechecks in Codeflare's
+// build, which does not install the Pi SDK. Mirrors local-statusline.ts.
+// Only the members this extension actually uses are modelled; the real SDK
+// types are richer. The inline signatures contextually type the command and
+// event handlers below, which is what removes the implicit-any errors.
+type NotifyLevel = "info" | "warning" | "error";
+
+type ExtensionContext = {
+  sessionManager: { getCwd(): string };
+  ui: { notify(message: string, level?: NotifyLevel): void };
+};
+
+type ExtensionCommandContext = ExtensionContext & {
+  waitForIdle(): Promise<void>;
+  reload(): Promise<void>;
+};
+
+type ExtensionAPI = {
+  registerCommand(
+    name: string,
+    config: {
+      description: string;
+      getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }>;
+      handler: (args: string, ctx: ExtensionCommandContext) => void | Promise<void>;
+    },
+  ): void;
+  on(event: string, handler: (event: any, ctx: ExtensionContext) => unknown): void;
+  sendUserMessage(message: string, options?: { deliverAs?: string }): void;
+};
 
 const CACHE_DIR = "/home/user/.cache/codeflare-hooks";
 const ACTIVE_REPO_FILE = join(CACHE_DIR, "graphify-active-cwd");
@@ -290,6 +320,10 @@ function fallbackGraphifyToolResult(event: any, ctx: ExtensionContext): { conten
 
 function isGitClone(command: string): boolean {
   return /(^|[;&|\n]\s*)git\s+clone\b/.test(command) || /(^|[;&|\n]\s*)gh\s+repo\s+clone\b/.test(command);
+}
+
+export function shouldHandleClonePrompt(command: string, targetWasAlreadyCloned: boolean, reviewLaneDepth: number): boolean {
+  return isGitClone(command) && !targetWasAlreadyCloned && reviewLaneDepth <= 0;
 }
 
 function isGitPush(command: string): boolean {
@@ -585,7 +619,7 @@ export default function (pi: ExtensionAPI) {
     const cwd = ctx.sessionManager.getCwd();
     const id = toolEventId(event);
     const targetWasAlreadyCloned = id ? cloneTargetHadGit.get(id) === true : false;
-    const shouldHandleClone = isGitClone(command) && !targetWasAlreadyCloned && !reviewLaneActive();
+    const shouldHandleClone = shouldHandleClonePrompt(command, targetWasAlreadyCloned, (globalThis as { __codeflareReviewLaneDepth?: number }).__codeflareReviewLaneDepth ?? 0);
     const decision = shouldHandleClone
       ? graphifyClonePromptDecision({
         command,

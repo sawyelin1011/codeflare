@@ -6,9 +6,9 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildSpawnOptions, captureTimestamp, compactMessages as compactMessagesHelper, deterministicVaultGraph, isFirstMessage, isResumedSession, parseSessionMessages as parseSessionMessagesHelper, realUserPromptCount, sessionId as sessionIdHelper, shouldCapture, withCurrentPrompt } from "./memory-vault-helpers";
+import { buildSpawnOptions, captureTimestamp, compactMessages as compactMessagesHelper, isFirstMessage, isResumedSession, parseSessionMessages as parseSessionMessagesHelper, realUserPromptCount, sessionId as sessionIdHelper, shouldCapture, withCurrentPrompt } from "./memory-vault-helpers";
 
 const USER_HOME = "/home/user";
 const VAULT_ROOT = join(USER_HOME, "Vault");
@@ -20,8 +20,17 @@ const VAULT_PROMPT_FILE = join(PROMPTS_DIR, "vault-extract-prompt.md");
 // Share Claude's high-water marker name and mtime semantics: the marker's mtime,
 // not file contents, is the source of truth for vault-change detection.
 const VAULT_MARKER_FILE = join(CACHE_DIR, "vault-extract.last");
-const VAULT_VARS_FILE = join(CACHE_DIR, "vault-extract.vars");
-const VAULT_INFLIGHT = join(CACHE_DIR, "vault-extract.in-flight");
+// Pi-namespaced sentinels. The Claude vault-monitor daemon (entrypoint.sh,
+// runs whenever SESSION_MODE=advanced, NOT runtime-gated) writes the
+// shared-namespace ~/.cache/codeflare-hooks/vault-extract.vars on any vault
+// change. Under Claude its UserPromptSubmit hook consumes that file; under Pi
+// nothing does, so if Pi read the same path the daemon's orphaned vars would
+// wedge vaultVarsPending() forever. Pi therefore owns its own vars/in-flight
+// files and only SHARES vault-extract.last (above) — advancing that marker
+// each turn makes the daemon's own `find -newer` come up empty, so it stays
+// quiet instead of fighting Pi for the sentinel.
+const VAULT_VARS_FILE = join(CACHE_DIR, "vault-extract.pi.vars");
+const VAULT_INFLIGHT = join(CACHE_DIR, "vault-extract.pi.in-flight");
 const GLOBAL_GRAPH_LOCK = "/tmp/graphify-global.lock";
 const VAULT_EXTRACT_INFLIGHT_TTL_MS = 5 * 60 * 1000;
 const VAULT_PRESEED_ROOT_FILES = new Set(["Index.md", "README.md", "CONFIG.md", "STYLES.md"]);
@@ -117,30 +126,12 @@ function touchVaultMarker(): void {
   writeFileSync(VAULT_MARKER_FILE, "", "utf8");
 }
 
+// The durable cumulative vault graph. It is written ONLY by merge-vault-graph.py
+// (under flock) from the vault-extract / memory-capture subagent pipelines, so it
+// stays byte-compatible with Claude. The extension never writes it; it only
+// re-publishes it to the global graph on session boundaries (bestEffortMergeGraphs).
 function vaultGraphPath(): string {
-  return join(VAULT_ROOT, "graphify-out", "graph.json");
-}
-
-function readGraph(): { nodes: any[]; links: any[] } {
-  try {
-    const graph = JSON.parse(readFileSync(vaultGraphPath(), "utf8"));
-    return {
-      nodes: Array.isArray(graph.nodes) ? graph.nodes : [],
-      links: Array.isArray(graph.links) ? graph.links : Array.isArray(graph.edges) ? graph.edges : [],
-    };
-  } catch {
-    return { nodes: [], links: [] };
-  }
-}
-
-function writeDeterministicVaultGraph(changed: string[]): void {
-  const items = changed.map((path) => {
-    const isText = /\.(md|txt|json|yaml|yml)$/i.test(path);
-    return { rel: relative(VAULT_ROOT, path), path, content: isText ? readFileSync(path, "utf8") : "", isText };
-  });
-  const graph = deterministicVaultGraph(items, readGraph());
-  mkdirSync(dirname(vaultGraphPath()), { recursive: true });
-  writeFileSync(vaultGraphPath(), JSON.stringify(graph, null, 2) + "\n", "utf8");
+  return join(VAULT_ROOT, "graphify-out", "vault-graph.json");
 }
 
 function bestEffortMergeGraphs(): void {
@@ -183,6 +174,13 @@ function vaultVarsPending(): boolean {
   if (!existsSync(VAULT_VARS_FILE)) return false;
   try {
     if (existsSync(VAULT_MARKER_FILE) && statSync(VAULT_VARS_FILE).mtimeMs <= statSync(VAULT_MARKER_FILE).mtimeMs) {
+      unlinkSync(VAULT_VARS_FILE);
+      return false;
+    }
+    // Self-heal a crashed extraction: the subagent deletes vars in step 1, so a
+    // vars file older than the in-flight TTL has no live consumer. Treat it as
+    // orphaned and clear it rather than letting it wedge the gate indefinitely.
+    if (Date.now() - statSync(VAULT_VARS_FILE).mtimeMs > VAULT_EXTRACT_INFLIGHT_TTL_MS) {
       unlinkSync(VAULT_VARS_FILE);
       return false;
     }
@@ -272,7 +270,10 @@ export default function (pi: ExtensionAPI) {
     if (changed.length === 0) return;
 
     try {
-      writeDeterministicVaultGraph(changed);
+      // The subagent (spawned below) owns graph construction via the canonical
+      // chunk -> merge-vault-graph.py -> vault-graph.json pipeline, exactly like
+      // Claude. Here we only re-publish the existing cumulative vault graph and
+      // advance the marker; merge-vault-graph.py is the sole writer of vault-graph.json.
       bestEffortMergeGraphs();
       touchVaultMarker();
     } catch {
@@ -291,7 +292,7 @@ export default function (pi: ExtensionAPI) {
       inflightFile: VAULT_INFLIGHT,
     }, null, 2), "utf8");
 
-    const vaultPrompt = `PROMPT_FILE=${VAULT_PROMPT_FILE}\nVARS_FILE=${VAULT_VARS_FILE}\nChanged files:\n${changed.slice(0, 80).join("\n")}\nThe Pi extension already wrote the deterministic Vault graph and touched ${VAULT_MARKER_FILE}. Run the Pi vault-extract contract only for optional semantic enrichment; do not run Python/processing shell commands and do not update the marker.`;
+    const vaultPrompt = `PROMPT_FILE=${VAULT_PROMPT_FILE}\nVARS_FILE=${VAULT_VARS_FILE}\nChanged files:\n${changed.slice(0, 80).join("\n")}\nThe Pi extension already touched ${VAULT_MARKER_FILE}. Run the Pi vault-extract contract end to end: read the changed files, author a chunk, run merge-vault-graph.py to fold it into the cumulative vault-graph.json, publish that to the global graph, and re-render the viz. Do not update the marker (the extension owns it).`;
     const spawned = spawn("vault-extract", vaultPrompt, "Extract Vault graph changes", process.env.CODEFLARE_MEMORY_MODEL);
     if (!spawned) pi.sendUserMessage(`Agent({ subagent_type: "vault-extract", prompt: ${JSON.stringify(vaultPrompt)}, description: "Extract Vault graph changes", run_in_background: true })`, { deliverAs: "followUp" });
     bestEffortMergeGraphs();
