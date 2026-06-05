@@ -1,11 +1,20 @@
 # Codeflare - Browser-based cloud IDE on Cloudflare
 name = "codeflare"
-# Locked down to the custom domain only (codeflare.ch). The workers.dev
-# fallback URL is disabled because it created OAuth host-mismatch risk
-# and enlarged the auth surface unnecessarily.
-workers_dev = false
+# workers.dev is enabled on every deployment: the setup wizard bootstraps on the
+# <worker>.<account>.workers.dev URL before any custom domain exists, so a fresh
+# deploy (a new account / enterprise tenant) is unreachable without it — setup is
+# impossible. The wizard then adds a custom domain (codeflare.ch, etc.) which
+# fronts traffic afterward; in CF Access mode, gate the workers.dev URL behind
+# Access in the Cloudflare dashboard.
+workers_dev = true
 main = "src/index.ts"
 compatibility_date = "2026-02-05"
+# ctx.exports + container outbound-HTTPS interception (interceptOutboundHttps),
+# used for enterprise LLM routing (REQ-ENTERPRISE-004; see container/index.ts
+# setupEnterpriseInterception + src/llm-interceptor.ts), are ON by default at
+# this compatibility_date — the enable_ctx_exports flag became the default on
+# 2025-11-17, and specifying a now-default flag is a hard workerd config error
+# (it crashes the vitest-pool-workers runtime). So no extra flag is needed.
 compatibility_flags = ["nodejs_compat"]
 
 # Enable container logs in Cloudflare dashboard
@@ -27,6 +36,13 @@ MAX_SESSIONS_ADMIN = "10"
 # Extra IdP UUIDs for custom OIDC providers on login page (comma-separated)
 # Set via GitHub Actions variable; only relevant when SAAS_MODE = "active"
 # SAAS_EXTRA_IDPS = ""
+# Enterprise mode: deployed inside a customer's Cloudflare account; all users
+# become unlimited + advanced, agent set restricted, and LLM traffic is routed
+# to the customer's AI Gateway via platform outbound-HTTPS interception (the
+# LlmInterceptor WorkerEntrypoint). isEnterpriseMode() checks === "active".
+# Set to "active" via GitHub Actions variable to enable (paired with the
+# AIG_GATEWAY_URL / AIG_TOKEN secrets). Left off by default — like SAAS_MODE.
+# ENTERPRISE_MODE = "active"
 
 # KV namespace for session metadata
 # The id "placeholder" is for local dev/tests (vitest-pool-workers creates in-memory KV).

@@ -194,7 +194,7 @@ app.use('*', async (c, next) => {
   }
 });
 
-// Body size limit on API routes (64 KiB) - storage routes define their own limits
+// Body size limit on API routes (64 KiB) - storage routes define their own limits.
 app.use('/api/*', async (c, next) => {
   if (c.req.path.startsWith('/api/storage/')) {
     return next();
@@ -368,8 +368,10 @@ export default {
       if (saasActive) {
         try {
           const { user } = await authenticateRequest(request, env);
-          // HIGH-1: Use billing-aware tier resolution, not raw tier field
-          const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd);
+          // HIGH-1: Use billing-aware tier resolution, not raw tier field.
+          // Enterprise resolves to unlimited (active), so enterprise users land on
+          // /app/ and are never redirected to the hidden subscribe page.
+          const effectiveTier = getEffectiveTier(user.subscriptionTier, user.accessTier, user.billingStatus, user.billingPeriodEnd, env);
           if (isActiveUser(effectiveTier)) {
             return redirectWithHeaders('/app/');
           }
@@ -415,3 +417,9 @@ export default {
 // Export container class for Durable Objects
 export { container } from './container';
 export { Timekeeper as timekeeper } from './timekeeper/index';
+
+// Enterprise-mode LLM interceptor (REQ-ENTERPRISE-004). A WorkerEntrypoint the
+// container DO wires into container egress via ctx.exports.LlmInterceptor +
+// ctx.container.interceptOutboundHttps. Exported here (the Worker entry module)
+// so ctx.exports resolves it. Inert unless ENTERPRISE_MODE=active.
+export { LlmInterceptor } from './llm-interceptor';

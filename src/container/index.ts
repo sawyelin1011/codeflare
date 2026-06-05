@@ -27,8 +27,10 @@
 import { Container } from '@cloudflare/containers';
 import type { Env, TabConfig } from '../types';
 import { getR2Config } from '../lib/r2-config';
-import { toErrorMessage } from '../lib/error-types';
+import { toError, toErrorMessage } from '../lib/error-types';
 import { createLogger } from '../lib/logger';
+import { isEnterpriseMode } from '../lib/subscription';
+import { INTERCEPTED_LLM_HOSTS } from '../llm-interceptor';
 import {
   validateBucketNameInput,
   type ContainerEnvState,
@@ -360,7 +362,53 @@ export class container extends Container<Env> implements ContainerEnvState {
    */
   /** Called when the container starts successfully. */
   override async onStart(): Promise<void> {
+    this.setupEnterpriseInterception();
     await lifecycleOnStart(this.lifecycleHost);
+  }
+
+  /**
+   * Enterprise-mode (REQ-ENTERPRISE-004): route the container's outbound HTTPS to
+   * the LLM provider hosts through the LlmInterceptor WorkerEntrypoint, which
+   * holds the AI Gateway secrets and stamps per-user attribution. No credential,
+   * gateway URL, or token is ever placed inside the container; the interception
+   * is platform-internal so it never traverses Cloudflare Access. The per-session
+   * `user` prop is the opaque bucket id (never an email). bucketName is set via
+   * setBucketName BEFORE the container is started, so it is populated by onStart.
+   *
+   * No-op unless ENTERPRISE_MODE=active and the gateway is configured, so a
+   * non-enterprise container's egress is byte-identical to today. interceptOutbound*
+   * + ctx.exports are on by default at this worker's compatibility_date (the
+   * enable_ctx_exports flag became the default on 2025-11-17, so no flag is set —
+   * see wrangler.toml); the cast isolates the runtime surface from the generated
+   * types.
+   */
+  private setupEnterpriseInterception(): void {
+    if (!isEnterpriseMode(this.env)) return;
+    if (!this.env.AIG_GATEWAY_URL) {
+      this.logger.warn('Enterprise mode active but AIG_GATEWAY_URL unset; skipping LLM interception');
+      return;
+    }
+    if (!this.env.AIG_TOKEN) {
+      // Wire interception anyway, but warn loudly: without the gateway token the
+      // interceptor cannot stamp cf-aig-authorization, so the customer's AI
+      // Gateway will reject every request unless it is configured for unauthenticated
+      // access. This is almost always a deploy-secret omission.
+      this.logger.warn('Enterprise mode active and gateway configured but AIG_TOKEN unset; gateway requests will be unauthenticated');
+    }
+    const user = this._bucketName ?? 'unknown';
+    try {
+      const ictx = this.ctx as unknown as {
+        exports: { LlmInterceptor(opts: { props: { user: string } }): Fetcher };
+        container?: { interceptOutboundHttps(pattern: string, worker: Fetcher): void };
+      };
+      const interceptor = ictx.exports.LlmInterceptor({ props: { user } });
+      for (const host of INTERCEPTED_LLM_HOSTS) {
+        ictx.container?.interceptOutboundHttps(host, interceptor);
+      }
+      this.logger.info('Enterprise LLM interception wired', { hostCount: INTERCEPTED_LLM_HOSTS.length });
+    } catch (err) {
+      this.logger.error('Failed to wire enterprise LLM interception', toError(err));
+    }
   }
 
   async collectMetrics(): Promise<void> {
