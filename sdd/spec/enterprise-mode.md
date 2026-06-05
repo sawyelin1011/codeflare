@@ -161,7 +161,7 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 - Interception uses the Cloudflare Containers platform mechanism (`interceptOutboundHttps` + `ctx.exports`, on by default at this project's compat date — the `enable_ctx_exports` flag became the default on 2025-11-17, so no flag is set); HTTPS interception requires the container to trust the CA at `/etc/cloudflare/certs/cloudflare-containers-ca.crt` ([REQ-ENTERPRISE-005](#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls)).
 - The opaque per-user id is the deterministic bucket id so requests from one user are correlatable in the gateway without revealing the identity.
 - The set of intercepted provider hosts is fixed in code; adding a provider requires a code change, not a request parameter.
-- The transport target is the AI Gateway REST API (`api.cloudflare.com`), not the deprecated `gateway.ai.cloudflare.com` `/compat` + provider-native paths ([AD74](../../documentation/decisions/README.md)). Because the enterprise agents are OpenAI-wire-format only ([REQ-ENTERPRISE-003](#req-enterprise-003-agent-allowlist-in-enterprise-mode)), the interceptor forwards the request body unchanged — no model rewrite. Backend selection (native provider, Amazon Bedrock, Workers AI, or a dynamic route) is gateway-side via the agent's configured model id.
+- The transport target is the AI Gateway REST API (`api.cloudflare.com`); the deprecated `gateway.ai.cloudflare.com` compat paths are not used ([AD74](../../documentation/decisions/README.md)). Backend selection is gateway-side via the route id stamped by the interceptor ([REQ-ENTERPRISE-007](#req-enterprise-007-gateway-route-pinning)); agents carry only a fixed slash-free handle.
 
 **Priority:** P1
 
@@ -173,7 +173,7 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 
 ---
 
-<!-- @test: src/__tests__/container/container-env-llm.test.ts (enterprise env injection describe -> ENTERPRISE_MODE emitted from env when active + COPILOT_MODEL/PI_MODEL both fanned out from AIG_LANGUAGE_MODEL when set + no gateway URL/token/base-URL ever injected + all omitted when flag unset/non-active -> AC1..AC5) -->
+<!-- @test: src/__tests__/container/container-env-llm.test.ts (enterprise env injection describe -> ENTERPRISE_MODE emitted from env when active + COPILOT_MODEL/PI_MODEL never fanned into the container (route id is Worker-only) + no gateway URL/token/route/base-URL ever injected + ENTERPRISE_MODE omitted when flag unset/non-active -> AC1..AC6) -->
 ### REQ-ENTERPRISE-005: Container-Side Enterprise Routing (CA Trust + Constant Base-URLs)
 
 <!-- @impl: src/container/container-env.ts::buildEnvVars -->
@@ -186,22 +186,23 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 
 **Acceptance Criteria:**
 
-1. When `ENTERPRISE_MODE` is set, the container env pipeline emits the enterprise flag `ENTERPRISE_MODE=active` plus, when the operator deploy var `AIG_LANGUAGE_MODEL` is set, the non-secret container model ids `COPILOT_MODEL` / `PI_MODEL` (both fanned out from that single var) — all derived directly from Worker deploy vars. No per-session base-URL or token is ever injected.
-2. When `ENTERPRISE_MODE=active`, entrypoint.sh installs the Cloudflare containers CA (`/etc/cloudflare/certs/cloudflare-containers-ca.crt`) into the system trust store and exports the Node/Python CA env hooks so the agents' HTTPS clients trust the intercepted (TLS-terminated) connections.
-3. When `ENTERPRISE_MODE=active`, entrypoint.sh points each enterprise agent at the constant real provider base-URL (`api.openai.com`) with a non-secret placeholder credential: Copilot via `COPILOT_PROVIDER_BASE_URL`/`COPILOT_PROVIDER_API_KEY`, Pi via its `models.json` provider — so each CLI enters API mode without a login step. When the operator sets `AIG_LANGUAGE_MODEL` (fanned out to the container's `COPILOT_MODEL` / `PI_MODEL`), each agent is pinned to that gateway model/route (e.g. `dynamic/<route>`); when unset, each agent uses its own default model id. Claude Code is not configured (excluded from the enterprise agent set — [REQ-ENTERPRISE-003](#req-enterprise-003-agent-allowlist-in-enterprise-mode)).
-4. The container never receives the AI Gateway URL, the gateway token, or any per-session secret; routing to the gateway is done entirely by the DO's outbound interception ([REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway)).
-5. When `ENTERPRISE_MODE` is unset, neither `ENTERPRISE_MODE` nor `COPILOT_MODEL` / `PI_MODEL` is emitted (even if `AIG_LANGUAGE_MODEL` is set), the entrypoint.sh block is skipped, and the container env is byte-identical to current behavior.
+1. When `ENTERPRISE_MODE` is set, the container env pipeline emits exactly one enterprise var — `ENTERPRISE_MODE=active`; no gateway route id, agent model id, base-URL, or token is ever injected into the container.
+2. When `ENTERPRISE_MODE=active`, the Cloudflare containers CA is installed into the system trust store and the Node/Python CA env hooks are exported so the agents' HTTPS clients trust the intercepted (TLS-terminated) connections.
+3. When `ENTERPRISE_MODE=active`, Copilot is configured via the complete BYOK 3-var contract pointing at the constant real provider base-URL (`api.openai.com`) with a non-secret placeholder credential and a fixed, slash-free model handle (`codeflare`); the interceptor rewrites the model to the gateway route on egress ([REQ-ENTERPRISE-007](#req-enterprise-007-gateway-route-pinning) AC1).
+4. When `ENTERPRISE_MODE=active`, Pi is configured with a custom provider entry pointing at `api.openai.com` with the same placeholder credential and the same slash-free handle, and its default provider and model are pinned so it reaches the gateway without any manual login step.
+5. The container never receives the AI Gateway URL, the gateway token, or any per-session secret; routing to the gateway is done entirely by the DO's outbound interception ([REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway)).
+6. When `ENTERPRISE_MODE` is unset, `ENTERPRISE_MODE` is not emitted, no agent configuration block runs, and the container env is byte-identical to current behavior.
 
 **Constraints:**
 
 - The placeholder credential is a fixed non-secret constant; the interceptor strips it before forwarding ([REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway) AC5), so it never reaches the gateway.
 - `ENTERPRISE_MODE` rides the existing container env pipeline ([REQ-AGENT-031](agents.md#req-agent-031-llm-api-key-propagation-to-container)); no per-agent login step is added.
-- `AIG_LANGUAGE_MODEL` (fanned out to the container's `COPILOT_MODEL` / `PI_MODEL`) is a non-secret routing hint (a gateway model id / dynamic-route name), not a credential; it selects which backend the gateway uses but carries no secret. Backend keys stay in the gateway (BYOK).
+- `AIG_LANGUAGE_MODEL` is a non-secret Worker-only routing hint; it is never injected into the container. Backend keys stay in the gateway (BYOK).
 - Only the allowlisted enterprise agents ([REQ-ENTERPRISE-003](#req-enterprise-003-agent-allowlist-in-enterprise-mode)) are configured; `bash` needs no LLM configuration.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-ENTERPRISE-001](#req-enterprise-001-enterprise_mode-forces-unlimited-tier-and-pro-mode), [REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway), [REQ-AGENT-031](agents.md#req-agent-031-llm-api-key-propagation-to-container)
+**Dependencies:** [REQ-ENTERPRISE-001](#req-enterprise-001-enterprise_mode-forces-unlimited-tier-and-pro-mode), [REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway), [REQ-ENTERPRISE-007](#req-enterprise-007-gateway-route-pinning), [REQ-AGENT-031](agents.md#req-agent-031-llm-api-key-propagation-to-container)
 
 **Verification:** [Automated test](../../src/__tests__/container/container-env-llm.test.ts)
 
@@ -210,11 +211,13 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 ---
 
 <!-- @test: src/__tests__/lib/enterprise-mode.test.ts (deploy-time plumbing describe -> AIG_GATEWAY_URL + AIG_TOKEN read as secrets + ENTERPRISE_MODE read as var + off by default when binding absent -> AC1..AC4) -->
+<!-- @test: src/__tests__/routes/setup/access.test.ts (handleCreateAccessApp describe -> enterprise mode creates a host-scoped app (bare host domain + whole-host destination) AC5 + default/SaaS app stays path-scoped (/app/* primary + path destinations) regression) -->
 ### REQ-ENTERPRISE-006: Deploy-Time AIG Secrets and ENTERPRISE_MODE Var
 
 <!-- @impl: wrangler.toml -->
 <!-- @impl: .github/workflows/deploy.yml -->
 <!-- @impl: src/lib/subscription.ts::isEnterpriseMode -->
+<!-- @impl: src/routes/setup/access.ts::getManagedAppDomain -->
 
 **Intent:** Enterprise configuration must be supplied at deploy time through Worker bindings, kept secret where appropriate, and default to off.
 
@@ -223,14 +226,15 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 **Acceptance Criteria:**
 
 1. `AIG_GATEWAY_URL` and `AIG_TOKEN` are configured as Worker secrets so they are not stored in plaintext config or exposed to the container.
-2. `ENTERPRISE_MODE` is configured as a Worker var (non-secret) read by the enterprise-mode resolver. The optional model id `AIG_LANGUAGE_MODEL` is likewise a non-secret Worker var, passed at deploy time and fanned out to the container's `COPILOT_MODEL` / `PI_MODEL` only in enterprise mode ([REQ-ENTERPRISE-005](#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls) AC1).
+2. `ENTERPRISE_MODE` and the optional `AIG_LANGUAGE_MODEL` (gateway route id) are configured as non-secret Worker vars; `AIG_LANGUAGE_MODEL` is read only by the interceptor for route-pinning (see [REQ-ENTERPRISE-007](#req-enterprise-007-gateway-route-pinning)) and is never injected into the container.
 3. Enterprise Mode is off by default: an absent or empty `ENTERPRISE_MODE` binding resolves to disabled.
 4. When `ENTERPRISE_MODE` is enabled, the interceptor fails closed (503) if the `AIG_GATEWAY_URL` secret is missing or unparseable (no `/v1/{account_id}/{gateway_id}` segments), rather than silently routing to nowhere, and the DO logs a warning when it skips interception wiring.
+5. When `ENTERPRISE_MODE` is configured, the CF Access application created by the setup wizard is host-scoped (bare custom domain, no path suffix) so the session cookie covers all paths uniformly; non-enterprise deployments retain the path-scoped (`/app/*`) application.
 
 **Constraints:**
 
 - The flag is evaluated at deploy time from bindings, consistent with the deployment-mode determination in [REQ-SETUP-003](setup.md#req-setup-003-three-deployment-modes).
-- Secrets are never written to the container env; the enterprise env vars the container receives are the `ENTERPRISE_MODE` flag and, when `AIG_LANGUAGE_MODEL` is set, the non-secret model-id vars `COPILOT_MODEL` / `PI_MODEL` — all derived from Worker deploy vars, never from session state ([REQ-ENTERPRISE-005](#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls) AC1).
+- Secrets are never written to the container env; the only enterprise env var the container receives is the `ENTERPRISE_MODE` flag, derived from a Worker deploy var, never from session state ([REQ-ENTERPRISE-005](#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls) AC1). The gateway route id stays Worker-only.
 - `AIG_GATEWAY_URL` is the single source for the gateway coordinates: the interceptor parses the account id and gateway id from it for the REST API call ([REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway) AC2), so no separate account-id binding is required.
 
 **Priority:** P1
@@ -238,5 +242,36 @@ Deploy-time enterprise configuration: single-tenant unlimited access, subscripti
 **Dependencies:** [REQ-ENTERPRISE-001](#req-enterprise-001-enterprise_mode-forces-unlimited-tier-and-pro-mode), [REQ-SETUP-003](setup.md#req-setup-003-three-deployment-modes)
 
 **Verification:** [Automated test](../../src/__tests__/lib/enterprise-mode.test.ts)
+
+**Status:** Planned
+
+---
+
+<!-- @test: src/__tests__/llm-interceptor.test.ts (REQ-ENTERPRISE-007: gateway route-pinning (model rewrite) describe -> request model rewritten to AIG_LANGUAGE_MODEL on /chat/completions & /responses AC1 + passthrough when unset/non-routable/non-JSON/model-less AC2 -> AC1..AC2) -->
+### REQ-ENTERPRISE-007: Gateway Route-Pinning
+
+<!-- @impl: src/llm-interceptor.ts::LlmInterceptor -->
+<!-- @impl: src/lib/subscription.ts::isEnterpriseMode -->
+
+**Intent:** The gateway route must be selected Worker-side so agents carry only a fixed slash-free model handle, eliminating agent-side model-string parsing (e.g. Pi reading a `dynamic/<route>` slash as `provider/model`) that would misroute traffic away from the interceptor.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. When `AIG_LANGUAGE_MODEL` is set, the interceptor rewrites the request body's `model` field to that route id before forwarding, on the model-routable endpoints `/chat/completions` and `/responses`.
+2. When `AIG_LANGUAGE_MODEL` is unset, or the body is non-JSON, has no `model` field, or the path is not model-routable, the request body is forwarded unchanged.
+
+**Constraints:**
+
+- `AIG_LANGUAGE_MODEL` is a non-secret Worker-only var ([REQ-ENTERPRISE-006](#req-enterprise-006-deploy-time-aig-secrets-and-enterprise_mode-var) AC2); it is never injected into the container, and agents carry only a fixed slash-free handle (`codeflare`) ([REQ-ENTERPRISE-005](#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls) AC3, AC4).
+- Only the request `model` field is rewritten; no other request field and no response byte is altered.
+- Route-pinning runs only when interception is active ([REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway)); when `ENTERPRISE_MODE` is unset the interceptor is never instantiated.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-ENTERPRISE-004](#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway), [REQ-ENTERPRISE-006](#req-enterprise-006-deploy-time-aig-secrets-and-enterprise_mode-var)
+
+**Verification:** [Automated test](../../src/__tests__/llm-interceptor.test.ts)
 
 **Status:** Planned

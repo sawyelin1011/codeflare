@@ -36,11 +36,27 @@ function getManagedAppName(workerName?: string): string {
   return trimmedWorkerName && trimmedWorkerName.length > 0 ? trimmedWorkerName : 'codeflare';
 }
 
-function getManagedAppDomain(customDomain: string): string {
-  return `${customDomain}${PRIMARY_PROTECTED_SUFFIX}`;
+function getManagedAppDomain(customDomain: string, enterprise = false): string {
+  // Enterprise: host-scoped app (bare host). A path-scoped primary domain
+  // (`/app/*`) scopes the CF Access session cookie to /app, so it is never sent
+  // on /api/* sibling requests -> those 401 and the SPA redirect-loops. The bare
+  // host makes the cookie host-wide so one login covers /app + /api uniformly.
+  return enterprise ? customDomain : `${customDomain}${PRIMARY_PROTECTED_SUFFIX}`;
 }
 
-function getManagedDestinations(customDomain: string): Array<{ type: 'public'; uri: string }> {
+function getManagedDestinations(customDomain: string, enterprise = false): Array<{ type: 'public'; uri: string }> {
+  // Enterprise protects the whole host: there are no public paths on an
+  // enterprise custom domain (no Stripe webhook, no public landing; `/` just
+  // redirects to /app), so a single host-wide Access session is correct and
+  // safe. Default/SaaS keep the path scoping so `/`, `/public/*` (Stripe
+  // webhook), and `/auth/*` stay reachable without Access.
+  if (enterprise) {
+    // Enterprise supersedes SaaS: if both flags are ever set, the whole-host
+    // scope wins (SaaS still governs *who* may authenticate via its IdP list,
+    // but the Access session covers the full host). Enterprise is single-tenant,
+    // so this co-activation is not expected — the precedence is made explicit.
+    return [{ type: 'public', uri: customDomain }];
+  }
   return PROTECTED_DESTINATION_SUFFIXES.map((suffix) => ({
     type: 'public',
     uri: `${customDomain}${suffix}`,
@@ -70,7 +86,8 @@ async function resolveManagedAccessApp(
   kv: KVNamespace,
   customDomain: string,
   existingApps: AccessApp[],
-  managedAppName: string
+  managedAppName: string,
+  enterprise = false
 ): Promise<AccessApp | null> {
   // 4-tier fallback strategy to find existing Access app:
   // 1. Exact domain match (highest specificity)
@@ -78,7 +95,7 @@ async function resolveManagedAccessApp(
   // 3. Name match + domain validation (prevent cross-env collision)
   // 4. /app/* suffix + domain validation (prevent cross-env collision)
 
-  const desiredDomain = getManagedAppDomain(customDomain);
+  const desiredDomain = getManagedAppDomain(customDomain, enterprise);
   const byDesiredDomain = existingApps.find((app) => app.domain === desiredDomain) ?? null;
   if (byDesiredDomain) {
     return byDesiredDomain;
@@ -153,9 +170,10 @@ async function upsertAccessApp(
   managedAppName: string,
   steps: SetupStep[],
   stepIndex: number,
-  saasIdpIds?: string[]
+  saasIdpIds?: string[],
+  enterprise = false
 ): Promise<AccessAppResult | null> {
-  const appDomain = getManagedAppDomain(customDomain);
+  const appDomain = getManagedAppDomain(customDomain, enterprise);
   const method = existingAppId ? 'PUT' : 'POST';
   const url = existingAppId
     ? `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingAppId}`
@@ -168,7 +186,7 @@ async function upsertAccessApp(
   const appBody: Record<string, unknown> = {
     name: managedAppName,
     domain: appDomain,
-    destinations: getManagedDestinations(customDomain),
+    destinations: getManagedDestinations(customDomain, enterprise),
     type: 'self_hosted',
     session_duration: '24h',
     skip_interstitial: true,
@@ -334,9 +352,10 @@ async function pruneLegacyAccessApps(
   accountId: string,
   customDomain: string,
   existingApps: AccessApp[],
-  managedAppName: string
+  managedAppName: string,
+  enterprise = false
 ): Promise<AccessApp[]> {
-  const desiredDomain = getManagedAppDomain(customDomain);
+  const desiredDomain = getManagedAppDomain(customDomain, enterprise);
   const legacyDomains = getLegacyManagedDomains(customDomain);
   const sameDomainApps = existingApps.filter((app) => app.domain === desiredDomain);
   const preferredManagedId = sameDomainApps.find((app) => app.name === managedAppName)?.id
@@ -520,7 +539,8 @@ export async function handleCreateAccessApp(
   steps: SetupStep[],
   kv: KVNamespace,
   workerName?: string,
-  saasMode?: boolean
+  saasMode?: boolean,
+  enterprise = false
 ): Promise<void> {
   const stepIndex = addStep(steps, 'create_access_app');
 
@@ -572,9 +592,9 @@ export async function handleCreateAccessApp(
     }
 
     const listedApps = await listAccessApps(token, accountId);
-    const existingApps = await pruneLegacyAccessApps(token, accountId, customDomain, listedApps, managedAppName);
+    const existingApps = await pruneLegacyAccessApps(token, accountId, customDomain, listedApps, managedAppName, enterprise);
     const audienceTags: string[] = [];
-    const existingManagedApp = await resolveManagedAccessApp(kv, customDomain, existingApps, managedAppName);
+    const existingManagedApp = await resolveManagedAccessApp(kv, customDomain, existingApps, managedAppName, enterprise);
 
     // In SaaS mode, restrict the Access app to GitHub IdP only.
     // With exactly one IdP, auto_redirect_to_identity=true skips the CF Access login interstitial.
@@ -590,7 +610,8 @@ export async function handleCreateAccessApp(
       managedAppName,
       steps,
       stepIndex,
-      saasIdpIds
+      saasIdpIds,
+      enterprise
     );
     if (!appResult) {
       throw new SetupError('Failed to create or update Access application', steps);
