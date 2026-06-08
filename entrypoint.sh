@@ -1810,6 +1810,37 @@ if [ "${ENTERPRISE_MODE:-}" = "active" ]; then
         export NODE_EXTRA_CA_CERTS="$CF_CA_SRC"
         export SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
         export REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+
+        # Persist the CA-trust env into .bashrc so the AGENTS inherit it.
+        # The exports above live only in THIS (entrypoint) process. Pi/Copilot
+        # run in PTYs the terminal server spawns after init, and those shells
+        # source .bashrc — they do NOT inherit entrypoint's env. Without this
+        # the agents launch with NODE_EXTRA_CA_CERTS unset, Node falls back to
+        # its bundled CA list (which lacks the ephemeral containers CA), and the
+        # intercepted TLS handshake to api.openai.com fails as an opaque
+        # "Connection error" before the request ever reaches the interceptor
+        # (curl works only because it reads the system store).
+        # PREPENDED (not appended): the terminal-autostart block already in
+        # .bashrc launches the agent inline and blocks, so anything after it is
+        # never sourced before the agent starts — the exports must come first.
+        BASHRC_FILE="$USER_HOME/.bashrc"
+        if ! grep -q "# enterprise-ca-trust" "$BASHRC_FILE" 2>/dev/null; then
+            touch "$BASHRC_FILE"
+            CA_TRUST_TMP=$(mktemp)
+            cat > "$CA_TRUST_TMP" << CA_TRUST_EOF
+# enterprise-ca-trust
+# Trust the Cloudflare containers CA in agent runtimes (Node/Python) so outbound
+# LLM-interception TLS validates. Set before terminal-autostart launches an agent.
+export NODE_EXTRA_CA_CERTS="$CF_CA_SRC"
+export SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
+export REQUESTS_CA_BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+
+CA_TRUST_EOF
+            cat "$BASHRC_FILE" >> "$CA_TRUST_TMP"
+            mv "$CA_TRUST_TMP" "$BASHRC_FILE"
+            chmod 644 "$BASHRC_FILE"
+            echo "[entrypoint] Enterprise Mode: CA-trust env prepended to .bashrc (agent PTYs inherit NODE_EXTRA_CA_CERTS)"
+        fi
     else
         echo "[entrypoint] WARNING: $CF_CA_SRC not found; outbound HTTPS interception is unavailable (LLM calls will fail)"
     fi
@@ -1853,7 +1884,46 @@ if [ "${ENTERPRISE_MODE:-}" = "active" ]; then
     export COPILOT_PROVIDER_BASE_URL="https://api.openai.com/v1"
     export COPILOT_PROVIDER_API_KEY="$ENTERPRISE_PLACEHOLDER_TOKEN"
     export COPILOT_MODEL="$ENTERPRISE_MODEL_HANDLE"
+    # The custom model handle is not in Copilot's built-in catalog, so Copilot warns
+    # ("Model ... not in the built-in catalog. Using defaults for ...") and falls back
+    # to default token limits. Advertise gpt-5.5's real window (1,050,000 ctx / 128,000
+    # max output; prompt = ctx - output headroom) so context is not under-sized.
+    # codeflare is a dynamic route — gpt-5.5 is the primary Copilot always hits (it
+    # cannot send reasoning_effort to trigger the gemini fallback, which supports more).
+    export COPILOT_PROVIDER_MAX_PROMPT_TOKENS="920000"
+    export COPILOT_PROVIDER_MAX_OUTPUT_TOKENS="128000"
     echo "[entrypoint] Enterprise Mode: Copilot BYOK active (base_url + key + model=$ENTERPRISE_MODEL_HANDLE) via interception"
+
+    # Persist the Copilot BYOK env into .bashrc so the COPILOT AGENT inherits it.
+    # Same propagation failure as the CA-trust block above: the exports just above
+    # live only in THIS (entrypoint) process, and the Worker deliberately omits
+    # these from the container env (see container-env-llm.test.ts). Copilot has NO
+    # config file — its entire BYOK config is env-only — so a copilot PTY that does
+    # not inherit these launches with no provider/url/model at all and falls back
+    # to GitHub-hosted models (asks for GitHub login, ignores the custom base URL).
+    # PREPENDED before the terminal-autostart block, same rationale as CA-trust.
+    BASHRC_FILE="$USER_HOME/.bashrc"
+    if ! grep -q "# enterprise-copilot-byok" "$BASHRC_FILE" 2>/dev/null; then
+        touch "$BASHRC_FILE"
+        COPILOT_BYOK_TMP=$(mktemp)
+        cat > "$COPILOT_BYOK_TMP" << COPILOT_BYOK_EOF
+# enterprise-copilot-byok
+# Copilot BYOK contract (base URL + key + model + token limits), persisted so the
+# copilot PTY inherits it; without this Copilot ignores the gateway and asks for GitHub
+# login. The MAX_*_TOKENS vars silence the "model not in catalog" warning and right-size
+# context to gpt-5.5's real 1,050,000 / 128,000 window (prompt = ctx - output headroom).
+export COPILOT_PROVIDER_BASE_URL="https://api.openai.com/v1"
+export COPILOT_PROVIDER_API_KEY="$ENTERPRISE_PLACEHOLDER_TOKEN"
+export COPILOT_MODEL="$ENTERPRISE_MODEL_HANDLE"
+export COPILOT_PROVIDER_MAX_PROMPT_TOKENS="920000"
+export COPILOT_PROVIDER_MAX_OUTPUT_TOKENS="128000"
+
+COPILOT_BYOK_EOF
+        cat "$BASHRC_FILE" >> "$COPILOT_BYOK_TMP"
+        mv "$COPILOT_BYOK_TMP" "$BASHRC_FILE"
+        chmod 644 "$BASHRC_FILE"
+        echo "[entrypoint] Enterprise Mode: Copilot BYOK env prepended to .bashrc (copilot PTY inherits provider/url/model)"
+    fi
 
     # --- Pi ----------------------------------------------------------------
     # Pi reads custom provider config from ~/.pi/agent/models.json. Register a
@@ -1877,6 +1947,19 @@ if [ "${ENTERPRISE_MODE:-}" = "active" ]; then
 
     # models.json: codeflare-gateway provider with one fixed model. Always register
     # the model — a provider with zero models is invisible in Pi's picker/login.
+    # api="openai-completions": the AI Gateway REST endpoint /ai/v1/responses is
+    # currently broken on this gateway -- it rejects a valid Responses `input` body
+    # with "Required value missing: messages" (it validates as chat/completions),
+    # confirmed by synthetic test and gateway logs. So Pi must use the chat/completions
+    # adapter, which works (200). Caveat: gpt-5.5 rejects function tools +
+    # reasoning_effort together on /v1/chat/completions. So the model advertises
+    # reasoning:true (the thinking selector stays available -- Shift+Tab / /settings),
+    # but settings.json pins defaultThinkingLevel:"off" so every session STARTS with
+    # thinking off: Pi sends no reasoning_effort by default (tools-only works, 200,
+    # and the dynamic route can fall back to a reasoning-capable chat/completions
+    # model). The user can raise the level when a route model supports reasoning over
+    # chat/completions (e.g. Gemini); gpt-5.5 stays 400 at levels above off until CF
+    # fixes /ai/v1/responses -- that is the documented, user-visible tradeoff.
     PI_PROVIDER_CONFIG=$(jq -n \
         --arg baseUrl "$PI_GATEWAY_BASE_URL" \
         --arg apiKey "$ENTERPRISE_PLACEHOLDER_TOKEN" \
@@ -1908,7 +1991,7 @@ if [ "${ENTERPRISE_MODE:-}" = "active" ]; then
     PI_SETTINGS_CFG=$(jq -n \
         --arg provider "codeflare-gateway" \
         --arg model "$ENTERPRISE_MODEL_HANDLE" \
-        '{defaultProvider: $provider, defaultModel: $model}')
+        '{defaultProvider: $provider, defaultModel: $model, defaultThinkingLevel: "off"}')
     if [ -f "$PI_SETTINGS_JSON" ]; then
         TMP_SET=$(mktemp)
         if jq --argjson cfg "$PI_SETTINGS_CFG" '. * $cfg' "$PI_SETTINGS_JSON" > "$TMP_SET" 2>/dev/null; then

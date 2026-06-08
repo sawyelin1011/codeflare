@@ -12,9 +12,12 @@
  *
  * This entrypoint holds the AI Gateway secrets (AIG_GATEWAY_URL + AIG_TOKEN,
  * from the Worker env) and forwards each request to the customer's AI Gateway
- * **REST API** (`api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/*`) with the
+ * over two transports — the REST API (`api.cloudflare.com/.../ai/v1/*`) first,
+ * falling back to the deprecated-but-functional compat path
+ * (`gateway.ai.cloudflare.com/v1/{acct}/{gw}/compat/*`) on a 404 — with the
  * gateway authorization + per-user attribution stamped on. The user id comes
- * from the per-session DO props — the opaque bucket id, never an email.
+ * from the per-session DO props — the user's email, so the gateway's per-user
+ * analytics attribute usage to the real identity (an enterprise requirement).
  *
  * The enterprise agent set (REQ-ENTERPRISE-003) is OpenAI-wire-format only
  * (Copilot, Pi): they call api.openai.com and their requests map onto the
@@ -25,9 +28,12 @@
  * id to reach this host, and the gateway route name never enters the container.
  * This sidesteps Pi parsing a `dynamic/<route>` model id as `provider/id` and
  * misrouting to a built-in provider (the request would never reach this host).
- * Auth is the standard `Authorization: Bearer <AIG_TOKEN>` header (the AI Gateway
- * REST API; the legacy `gateway.ai.cloudflare.com` `/compat` + `/anthropic` paths
- * it replaces are deprecated — see AD74).
+ * Auth is per transport: the REST API takes `Authorization: Bearer <AIG_TOKEN>`
+ * (the token's Workers AI scope); the compat fallback takes `cf-aig-authorization:
+ * Bearer <AIG_TOKEN>` (the token's AI Gateway Run scope) — so AIG_TOKEN must hold
+ * BOTH scopes. The REST API does not carry every provider (google-ai-studio 404s),
+ * so compat — which carries all providers + dynamic routing — backstops it until
+ * CF migrates them onto the REST API (see AD74, dual transport).
  *
  * Dormant on non-enterprise deploys: the DO only wires interception when
  * ENTERPRISE_MODE=active, so this class is never instantiated otherwise.
@@ -57,9 +63,12 @@ const STRIPPED_HEADERS: readonly string[] = [
   'content-length',
   // cf-aig-* control headers are interceptor-owned: strip any client-supplied
   // value so they are set only from the Worker env / DO props below, never the
-  // container. (cf-aig-gateway-id and cf-aig-metadata are re-set after stripping.)
+  // container. (cf-aig-gateway-id and cf-aig-metadata are re-set after stripping;
+  // cf-aig-authorization is re-set only on the compat leg, so stripping it here
+  // also stops a container-supplied value from riding the REST leg unset.)
   'cf-aig-metadata',
   'cf-aig-gateway-id',
+  'cf-aig-authorization',
 ];
 
 /**
@@ -82,7 +91,15 @@ const RESPONSE_STRIPPED_HEADERS: readonly string[] = [
 
 /** Per-session props attached when the DO instantiates this entrypoint. */
 interface InterceptorProps {
+  /** The user's email — stamped into cf-aig-metadata for per-user gateway analytics. */
   user: string;
+  /**
+   * The user's matched Cloudflare Access group, when the deployment configures
+   * group gating — stamped into cf-aig-metadata.group so the gateway can branch
+   * routing / cost / rate-limit policies on it (a user maps to at most one group).
+   * Omitted from the metadata when absent.
+   */
+  group?: string;
 }
 
 /**
@@ -98,6 +115,147 @@ function parseGateway(raw: string | undefined): { accountId: string; gatewayId: 
   const m = raw.match(/\/v1\/([^/?#]+)\/([^/?#]+)/);
   if (!m) return null;
   return { accountId: m[1], gatewayId: m[2] };
+}
+
+/**
+ * OpenAI-only request fields that non-OpenAI providers reject with a 400
+ * ("Invalid JSON payload received. Unknown name ..."). Cloudflare's compat layer
+ * forwards them verbatim, so the interceptor strips them — but ONLY on the compat
+ * fallback leg (see fetch()), which is the only path that reaches a non-OpenAI
+ * provider (e.g. google-ai-studio). The REST/OpenAI leg keeps them so OpenAI
+ * prompt caching (`prompt_cache_key`) and `store` are unaffected.
+ */
+const COMPAT_INCOMPATIBLE_FIELDS = ['store', 'prompt_cache_key'] as const;
+
+/** Return `raw` with COMPAT_INCOMPATIBLE_FIELDS removed; non-JSON/non-object bodies pass through unchanged. */
+function stripOpenAiOnlyFields(raw: string): string {
+  try {
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      for (const field of COMPAT_INCOMPATIBLE_FIELDS) delete payload[field];
+      return JSON.stringify(payload);
+    }
+  } catch {
+    /* not JSON: forward the original bytes unchanged */
+  }
+  return raw;
+}
+
+/**
+ * Normalize a streaming chat-completions SSE body so it always ends with a
+ * terminal `finish_reason` chunk before `data: [DONE]`.
+ *
+ * Cloudflare AI Gateway **dynamic routes** drop the terminal
+ * `{"choices":[{"delta":{},"finish_reason":"stop"}]}` chunk (and the usage
+ * chunk) when they re-emit a streamed response: the content arrives but the
+ * stream ends with `finish_reason: null` then `[DONE]`. Verified against the
+ * live gateway — the same model is conformant non-streaming and when called
+ * directly, but the dynamic-route streaming path strips the terminator. Strict
+ * OpenAI-wire clients (Pi, Copilot) treat that as an incomplete stream, error
+ * with "Stream ended without finish_reason", and retry — multiplying token cost.
+ *
+ * This transform passes every byte through verbatim and, when `[DONE]` arrives
+ * (or the stream ends) without a preceding non-null `finish_reason`, injects one
+ * synthetic terminator chunk first. It is idempotent — when the upstream already
+ * sends a non-null `finish_reason` (non-dynamic-route backends, non-streaming)
+ * nothing is injected. The synthesized reason is `tool_calls` when the stream
+ * carried tool-call deltas, otherwise `stop`, so a tool-calling turn is not
+ * falsely terminated as complete.
+ */
+function ensureStreamTerminator(): TransformStream<Uint8Array, Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = '';
+  let sawFinishReason = false;
+  let sawDone = false;
+  let sawToolCall = false;
+  const meta: { id?: string; model?: string; created?: number } = {};
+
+  const isDone = (line: string): boolean => {
+    const t = line.trim();
+    return t === 'data: [DONE]' || t === 'data:[DONE]';
+  };
+
+  const inspect = (line: string): void => {
+    const t = line.trimStart();
+    if (!t.startsWith('data:')) return;
+    const payload = t.slice(t.indexOf(':') + 1).trim();
+    if (payload === '[DONE]') return;
+    try {
+      const obj = JSON.parse(payload) as {
+        id?: string;
+        model?: string;
+        created?: number;
+        choices?: Array<{ finish_reason?: string | null; delta?: { tool_calls?: unknown } }>;
+      };
+      if (obj.id) meta.id = obj.id;
+      if (obj.model) meta.model = obj.model;
+      if (typeof obj.created === 'number') meta.created = obj.created;
+      // Scan every choice (not just [0]) so an n>1 stream that carries the
+      // finish_reason on a later choice is still recognized as terminated.
+      for (const choice of obj.choices ?? []) {
+        if (choice.finish_reason !== null && choice.finish_reason !== undefined) sawFinishReason = true;
+        if (choice.delta?.tool_calls) sawToolCall = true;
+      }
+    } catch {
+      /* non-JSON data line (comment / keepalive): ignore */
+    }
+  };
+
+  const terminator = (): string => {
+    const chunk = {
+      id: meta.id ?? 'codeflare-terminator',
+      object: 'chat.completion.chunk',
+      created: meta.created ?? Math.floor(Date.now() / 1000),
+      model: meta.model ?? 'unknown',
+      choices: [{ index: 0, delta: {}, finish_reason: sawToolCall ? 'tool_calls' : 'stop' }],
+    };
+    return `data: ${JSON.stringify(chunk)}\n\n`;
+  };
+
+  const handle = (line: string, controller: TransformStreamDefaultController<Uint8Array>): void => {
+    if (isDone(line)) {
+      if (!sawFinishReason) {
+        controller.enqueue(encoder.encode(terminator()));
+        sawFinishReason = true;
+      }
+      sawDone = true;
+      controller.enqueue(encoder.encode(line));
+      return;
+    }
+    inspect(line);
+    controller.enqueue(encoder.encode(line));
+  };
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx + 1);
+        buffer = buffer.slice(idx + 1);
+        handle(line, controller);
+      }
+    },
+    flush(controller) {
+      // If the final buffered line arrived without its trailing newline (a
+      // doubly-malformed upstream: no frame terminator AND no [DONE]), insert a
+      // frame boundary before any synthesized chunk so it is not concatenated
+      // onto the partial line.
+      let sep = '';
+      if (buffer.length > 0) {
+        if (!isDone(buffer) && !buffer.endsWith('\n')) sep = '\n\n';
+        handle(buffer, controller);
+        buffer = '';
+      }
+      // Stream ended with neither [DONE] nor any finish_reason: synthesize both
+      // so the client sees a complete turn rather than a dangling stream.
+      if (!sawDone && !sawFinishReason && (meta.id !== undefined || meta.model !== undefined)) {
+        controller.enqueue(encoder.encode(sep + terminator()));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      }
+    },
+  });
 }
 
 export class LlmInterceptor extends WorkerEntrypoint<Env> {
@@ -120,29 +278,28 @@ export class LlmInterceptor extends WorkerEntrypoint<Env> {
       });
     }
 
-    // Map the OpenAI-style request onto the AI Gateway REST API. The agent calls
-    // api.openai.com/v1/chat/completions (OpenAI SDK shape); the REST API serves
-    // the OpenAI-compatible endpoint at /ai/v1/chat/completions under the account.
-    //   api.openai.com/v1/chat/completions
-    //   -> api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/chat/completions
-    // The path is forwarded verbatim under /ai, so /v1/responses etc. map too.
-    const upstreamUrl = `https://api.cloudflare.com/client/v4/accounts/${gw.accountId}/ai${url.pathname}${url.search}`;
+    // Two AI Gateway transports, tried in order — see AD74 (dual transport):
+    //   1. REST API — api.cloudflare.com/client/v4/accounts/{acct}/ai/v1/<path>.
+    //      Auth: Authorization: Bearer (AIG_TOKEN's Workers AI scope); gateway by
+    //      cf-aig-gateway-id header. Carries OpenAI + Workers AI + dynamic routes
+    //      to those, but NOT every provider (google-ai-studio returns 404 here).
+    //   2. compat — gateway.ai.cloudflare.com/v1/{acct}/{gw}/compat/<path>.
+    //      Auth: cf-aig-authorization: Bearer (AIG_TOKEN's AI Gateway Run scope);
+    //      gateway in the URL, BYOK supplies the provider key. Deprecated by CF
+    //      but still functional, and carries ALL providers (incl. google-ai-studio)
+    //      plus dynamic routing.
+    // We try the REST API first and fall back to compat only on a 404 (below), so
+    // as CF migrates providers onto the REST API the fallback stops firing and
+    // traffic rides it with no code change. AIG_TOKEN therefore needs BOTH scopes.
+    const restUrl = `https://api.cloudflare.com/client/v4/accounts/${gw.accountId}/ai${url.pathname}${url.search}`;
+    const compatUrl = `https://gateway.ai.cloudflare.com/v1/${gw.accountId}/${gw.gatewayId}/compat${url.pathname.replace(/^\/v1/, '')}${url.search}`;
 
-    const headers = new Headers(request.headers);
-    for (const h of STRIPPED_HEADERS) headers.delete(h);
-    // Gateway authentication: the REST API uses the standard Authorization
-    // header carrying AIG_TOKEN — a Cloudflare API token with the Workers AI
-    // permission (the /ai/v1/* surface is the Workers AI namespace; a token
-    // scoped only to "AI Gateway: Run" is rejected). This replaces the legacy
-    // cf-aig-authorization header (AD74).
-    if (this.env.AIG_TOKEN) {
-      headers.set('authorization', `Bearer ${this.env.AIG_TOKEN}`);
-    }
-    // Route through the customer's named gateway: required for Workers AI models,
-    // honoured for all providers and dynamic routes.
-    headers.set('cf-aig-gateway-id', gw.gatewayId);
-    // Per-user attribution. The user is the opaque per-user bucket id passed as
-    // a DO prop at interception-setup time — never an email.
+    // Common headers: strip the container's placeholder credential + CF-managed
+    // headers and stamp per-user attribution (the user's email from the DO prop,
+    // for the gateway's per-user analytics). Transport-specific auth/routing is
+    // added per attempt below.
+    const baseHeaders = new Headers(request.headers);
+    for (const h of STRIPPED_HEADERS) baseHeaders.delete(h);
     const props = (this.ctx as unknown as { props?: InterceptorProps }).props;
     const user = props?.user;
     if (!user) {
@@ -150,7 +307,23 @@ export class LlmInterceptor extends WorkerEntrypoint<Env> {
       // per-user analytics is diagnosable rather than silently missing.
       console.warn('LlmInterceptor: per-session user prop absent; cf-aig-metadata user=unknown');
     }
-    headers.set('cf-aig-metadata', JSON.stringify({ user: user ?? 'unknown' }));
+    // Per-user (and, when configured, per-group) attribution. `group` is omitted
+    // when absent so a no-group deploy stamps exactly { user } as before, and a
+    // gateway rule on metadata.group simply does not match (keep a default branch).
+    const metadata: { user: string; group?: string } = { user: user ?? 'unknown' };
+    if (props?.group) metadata.group = props.group;
+    baseHeaders.set('cf-aig-metadata', JSON.stringify(metadata));
+
+    // REST transport: standard Authorization header (Workers AI scope) + the
+    // customer's named gateway in the cf-aig-gateway-id header.
+    const restHeaders = new Headers(baseHeaders);
+    if (this.env.AIG_TOKEN) restHeaders.set('authorization', `Bearer ${this.env.AIG_TOKEN}`);
+    restHeaders.set('cf-aig-gateway-id', gw.gatewayId);
+
+    // compat transport: cf-aig-authorization (AI Gateway Run scope); the gateway
+    // is in the URL and BYOK supplies the provider key, so no Authorization header.
+    const compatHeaders = new Headers(baseHeaders);
+    if (this.env.AIG_TOKEN) compatHeaders.set('cf-aig-authorization', `Bearer ${this.env.AIG_TOKEN}`);
 
     // Request body. The RESPONSE is always streamed back unbuffered (below) so
     // SSE token streams pass with constant memory. The REQUEST body is normally
@@ -169,11 +342,11 @@ export class LlmInterceptor extends WorkerEntrypoint<Env> {
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
     const isModelRoutable = url.pathname.endsWith('/chat/completions') || url.pathname.endsWith('/responses');
     let outboundBody: BodyInit | null | undefined = hasBody ? request.body : undefined;
-    if (hasBody && this.env.AIG_LANGUAGE_MODEL && isModelRoutable) {
-      // Consume the body ONCE as text. Reading the inbound stream can itself
-      // fail (a broken agent->Worker connection); surface that as a clean 400
-      // rather than letting the rejection escape as an opaque 500. A JSON parse
-      // failure, by contrast, is non-fatal: forward the original bytes unchanged.
+    if (hasBody && isModelRoutable) {
+      // Buffer the body ONCE as text so it can be REPLAYED across both transports
+      // on fallback (a stream could only be consumed once). Reading the inbound
+      // stream can itself fail (a broken agent->Worker connection); surface that
+      // as a clean 400 rather than letting the rejection escape as an opaque 500.
       let raw: string;
       try {
         raw = await request.text();
@@ -183,30 +356,61 @@ export class LlmInterceptor extends WorkerEntrypoint<Env> {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-      try {
-        const payload = JSON.parse(raw) as Record<string, unknown>;
-        if (payload && typeof payload === 'object' && !Array.isArray(payload) && 'model' in payload) {
-          payload.model = this.env.AIG_LANGUAGE_MODEL;
-          outboundBody = JSON.stringify(payload);
-        } else {
-          outboundBody = raw; // valid JSON without a model field: forward verbatim
+      outboundBody = raw;
+      // Route-pinning rewrite: when AIG_LANGUAGE_MODEL is set, replace the request
+      // `model` with that gateway route id. A JSON parse failure or a model-less
+      // body is non-fatal — forward the original bytes unchanged.
+      if (this.env.AIG_LANGUAGE_MODEL) {
+        try {
+          const payload = JSON.parse(raw) as Record<string, unknown>;
+          if (payload && typeof payload === 'object' && !Array.isArray(payload) && 'model' in payload) {
+            payload.model = this.env.AIG_LANGUAGE_MODEL;
+            outboundBody = JSON.stringify(payload);
+          }
+        } catch {
+          /* not JSON: forward the original bytes unchanged */
         }
-      } catch {
-        outboundBody = raw; // not JSON: forward the original bytes unchanged
       }
     }
-    const upstream = await fetch(
-      new Request(upstreamUrl, {
-        method: request.method,
-        headers,
-        body: outboundBody,
-        // Do not transparently follow gateway/provider redirects — a 3xx would
-        // otherwise be chased to an arbitrary Location host. Surface it to the
-        // agent's client instead.
-        redirect: 'manual',
-      }),
-    );
+    // Send REST-first; fall back to compat only on a 404 for a model-routable
+    // request with a replayable (buffered) body. The REST API returns 404 for a
+    // provider it does not carry (e.g. google-ai-studio; a dynamic route resolving
+    // to one surfaces the masked "Model execution failed", also 404). A 404 is a
+    // complete error body — not a stream — so the replay never double-bills or
+    // truncates a partial response. Genuine non-404 errors are returned as-is.
+    const sendTo = (target: string, h: Headers, body: BodyInit | null | undefined = outboundBody): Promise<Response> =>
+      fetch(
+        new Request(target, {
+          method: request.method,
+          headers: h,
+          body,
+          // Do not transparently follow gateway/provider redirects — a 3xx would
+          // otherwise be chased to an arbitrary Location host. Surface it to the
+          // agent's client instead.
+          redirect: 'manual',
+        }),
+      );
 
+    let upstream: Response;
+    try {
+      upstream = await sendTo(restUrl, restHeaders);
+      if (upstream.status === 404 && isModelRoutable && typeof outboundBody === 'string') {
+        // Compat reaches non-OpenAI providers (e.g. google-ai-studio) that reject
+        // OpenAI-only fields (store, prompt_cache_key) with a 400; strip them on
+        // THIS leg only, so the REST/OpenAI leg above keeps prompt caching intact.
+        upstream = await sendTo(compatUrl, compatHeaders, stripOpenAiOnlyFields(outboundBody));
+      }
+    } catch (err) {
+      // A thrown fetch (DNS, TLS, connection reset to the gateway) would otherwise
+      // escape as an opaque 500; surface it as a clean 502 and log the cause.
+      console.error('LlmInterceptor: upstream gateway fetch failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return new Response(JSON.stringify({ error: 'gateway fetch failed', code: 'GATEWAY_FETCH_FAILED' }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     // Strip hop-by-hop and cookie headers from the upstream response before it
     // reaches the container. Returning upstream.body (the ReadableStream) WITHOUT
     // reading it preserves text/event-stream + chunked transfer — tokens reach
@@ -214,7 +418,16 @@ export class LlmInterceptor extends WorkerEntrypoint<Env> {
     const responseHeaders = new Headers(upstream.headers);
     for (const h of RESPONSE_STRIPPED_HEADERS) responseHeaders.delete(h);
 
-    return new Response(upstream.body, {
+    // Repair the dynamic-route streaming terminator (see ensureStreamTerminator):
+    // only for streamed chat-completions responses; every other response (non-
+    // streaming, /responses, errors) passes through byte-for-byte.
+    const contentType = upstream.headers.get('content-type') ?? '';
+    const isStreamingChat =
+      contentType.includes('text/event-stream') && url.pathname.endsWith('/chat/completions');
+    const responseBody =
+      upstream.body && isStreamingChat ? upstream.body.pipeThrough(ensureStreamTerminator()) : upstream.body;
+
+    return new Response(responseBody, {
       status: upstream.status,
       headers: responseHeaders,
     });

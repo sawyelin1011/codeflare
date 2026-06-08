@@ -152,6 +152,12 @@ export class container extends Container<Env> implements ContainerEnvState {
   _vaultKey: string | null = null;
   _sessionId: string | null = null;
   _userEmail: string | null = null;
+  /**
+   * The user's matched Cloudflare Access group (REQ-ENTERPRISE-004), populated by
+   * the internal-config handler alongside _userEmail. Passed as the LlmInterceptor
+   * `group` prop so cf-aig-metadata.group carries it for per-group gateway policies.
+   */
+  _userGroup: string | null = null;
   /** REQ-MEM-001 AC4: user's IANA timezone (e.g. "Europe/Zurich"). */
   _userTimezone: string | null = null;
   /**
@@ -188,6 +194,7 @@ export class container extends Container<Env> implements ContainerEnvState {
       this._sessionId = await this.ctx.storage.get<string>(SESSION_ID_KEY) || null;
       this._usageSeconds = await this.ctx.storage.get<number>('usageSeconds') || 0;
       this._userEmail = await this.ctx.storage.get<string>('userEmail') || null;
+      this._userGroup = await this.ctx.storage.get<string>('userGroup') || null;
       // REQ-MEM-001 AC4: restore the user's IANA timezone so the capture
       // pipeline's TZ resolution produces wall-clock filenames after a
       // DO wake (matches the pattern for sessionId / userEmail above).
@@ -362,8 +369,31 @@ export class container extends Container<Env> implements ContainerEnvState {
    */
   /** Called when the container starts successfully. */
   override async onStart(): Promise<void> {
-    this.setupEnterpriseInterception();
     await lifecycleOnStart(this.lifecycleHost);
+  }
+
+  /**
+   * Wire enterprise LLM interception BEFORE the container boots.
+   *
+   * REQ-ENTERPRISE-004: `interceptOutboundHttps` must be registered before the
+   * SDK calls `container.start()`, so the platform mounts the ephemeral
+   * Cloudflare containers CA at `/etc/cloudflare/certs/` in time for
+   * entrypoint.sh to install it into the trust store. Wiring it in `onStart()`
+   * — which fires AFTER the container has booted and the entrypoint has already
+   * run its CA-trust block — was too late: the entrypoint found no cert, skipped
+   * trust, and every agent's intercepted-TLS handshake to api.openai.com then
+   * failed with "Connection error" (the interceptor was never even reached).
+   * The SDK applies its own pre-start interception at this same point; all start
+   * paths (explicit start + containerFetch auto-start) funnel through here.
+   *
+   * No-op unless enterprise mode + gateway configured, so a non-enterprise
+   * container's start path is byte-identical to today.
+   */
+  override async startAndWaitForPorts(
+    ...args: Parameters<Container<Env>['startAndWaitForPorts']>
+  ): Promise<void> {
+    this.setupEnterpriseInterception();
+    await super.startAndWaitForPorts(...args);
   }
 
   /**
@@ -372,8 +402,12 @@ export class container extends Container<Env> implements ContainerEnvState {
    * holds the AI Gateway secrets and stamps per-user attribution. No credential,
    * gateway URL, or token is ever placed inside the container; the interception
    * is platform-internal so it never traverses Cloudflare Access. The per-session
-   * `user` prop is the opaque bucket id (never an email). bucketName is set via
-   * setBucketName BEFORE the container is started, so it is populated by onStart.
+   * `user` prop is the user's email (stamped into cf-aig-metadata for the gateway's
+   * per-user analytics), falling back to the bucket id if no email is set; the
+   * optional `group` prop carries the user's matched Access group for per-group
+   * gateway policies. Both _userEmail and _bucketName are populated by the
+   * internal-config handler (which also calls setBucketName) BEFORE the container
+   * is started, so they are already set when startAndWaitForPorts wires interception.
    *
    * No-op unless ENTERPRISE_MODE=active and the gateway is configured, so a
    * non-enterprise container's egress is byte-identical to today. interceptOutbound*
@@ -395,13 +429,18 @@ export class container extends Container<Env> implements ContainerEnvState {
       // for unauthenticated access. This is almost always a deploy-secret omission.
       this.logger.warn('Enterprise mode active and gateway configured but AIG_TOKEN unset; gateway requests will be unauthenticated');
     }
-    const user = this._bucketName ?? 'unknown';
+    const user = this._userEmail ?? this._bucketName ?? 'unknown';
+    // Include the matched Access group only when set, so a no-group deploy passes
+    // exactly { user } (unchanged) and cf-aig-metadata omits an empty group key.
+    const props: { user: string; group?: string } = this._userGroup
+      ? { user, group: this._userGroup }
+      : { user };
     try {
       const ictx = this.ctx as unknown as {
-        exports: { LlmInterceptor(opts: { props: { user: string } }): Fetcher };
+        exports: { LlmInterceptor(opts: { props: { user: string; group?: string } }): Fetcher };
         container?: { interceptOutboundHttps(pattern: string, worker: Fetcher): void };
       };
-      const interceptor = ictx.exports.LlmInterceptor({ props: { user } });
+      const interceptor = ictx.exports.LlmInterceptor({ props });
       for (const host of INTERCEPTED_LLM_HOSTS) {
         ictx.container?.interceptOutboundHttps(host, interceptor);
       }

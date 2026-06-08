@@ -273,7 +273,9 @@ All preseed content is deployed via the manifest pipeline:
 
   The generator maps each manifest key by directory prefix:
   `extensions/` -> `.pi/agent/extensions/`, `skills/` -> `.pi/agent/skills/`,
-  `scripts/` -> `.pi/agent/scripts/`, and `prompts/` -> `.pi/agent/prompts/`.
+  `scripts/` -> `.pi/agent/scripts/`, `prompts/` -> `.pi/agent/prompts/`,
+  and `agents/` -> `.pi/agent/agents/`.
+  The `agents/` prefix maps both to `.pi/agent/agents/` (session-local overrides for `@gotgenes/pi-subagents`) and to `~/.pi/agent/agents/` (persistent user-level overrides). `preseed/agents/pi/agents/Explore.md` is the first native Pi agent override shipped via this path.
   Package files deploy under `.pi/agent/npm/`; `mcp.json` deploys directly
   under `.pi/agent/`.
 
@@ -409,9 +411,10 @@ extensions (e.g., `.agent.md` for Copilot agents). Pi additionally
 loads `preseed/agents/pi/manifest.json`, emits native runtime files
 to `.pi/agent/extensions/`, `.pi/agent/scripts/`, `.pi/agent/mcp.json`,
 `.pi/agent/npm/package.json`, `.pi/agent/npm/package-lock.json`,
-capture-contract prompts to `.pi/agent/prompts/`, and
-native Pi skill overrides under `~/.pi/agent/skills/`, and adapts Claude agent definitions into
-`.pi/agent/agents/*.md` for `@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops context-mode tools so those `@gotgenes/pi-subagents` subagents run against the native Pi tool surface. This applies to subagent frontmatter only; the durable PR-boundary review lanes are a separate `createAgentSession` path that loads context-mode additively when it is enabled (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so "review runs without ctx tools" is not categorical.
+capture-contract prompts to `.pi/agent/prompts/`, native Pi skill overrides under
+`~/.pi/agent/skills/`, and native Pi agent overrides under `~/.pi/agent/agents/`,
+and adapts Claude agent definitions into `.pi/agent/agents/*.md` for
+`@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops context-mode tools so those `@gotgenes/pi-subagents` subagents run against the native Pi tool surface. This applies to subagent frontmatter only; the durable PR-boundary review lanes are a separate `createAgentSession` path that loads context-mode additively when it is enabled (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so "review runs without ctx tools" is not categorical.
 
 **Per-mode seeding**: Default mode seeds the core rules plus the
 universal skills; advanced mode seeds the full set (memory, ECC
@@ -662,6 +665,8 @@ rm -rf .git/codeflare-review-jobs/$(git rev-parse HEAD)
 
 The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior install) is auto-deleted on the first v5 invocation, so no manual cleanup is needed for the v4 to v5 migration path.
 
+To inspect enforcement state without reading `.git/` by hand, Pi exposes a read-only `/review-status` command ([REQ-AGENT-057](../../sdd/spec/agents.md#req-agent-057-pi-review-status-command), `review-command.ts`). It renders the canonical review state for the current repo's enforced head — PR / local / last-acked HEADs, per-lane status, overall verdict, summary readiness, autofix and circuit-breaker state, and the merge-gate verdict — followed by a short tail of the `.git/codeflare-review-events.jsonl` decision audit (every enforcement decision — boundary detected, review started, merge blocked, breaker opened — is appended there). The command never spawns a review, advances the ack, or mutates any enforcement state; it is purely diagnostic.
+
 ---
 
 ## Specification Coverage
@@ -696,6 +701,7 @@ The legacy v4 timestamp file `.git/sdd-last-ack-push` (if present from a prior i
 - [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop) - Pi Durable Review Status, Result Formatting, and Fix Loop
 - [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement) - Pi PR-Boundary Review Window Advancement
 - [REQ-AGENT-056](../../sdd/spec/agents.md#req-agent-056-pi-local-statusline-footer) - Pi Local Statusline Footer
+- [REQ-AGENT-057](../../sdd/spec/agents.md#req-agent-057-pi-review-status-command) - Pi Review-Status Command
 - [REQ-MEM-013](../../sdd/spec/memory.md#req-mem-013-proactive-memory-injection-on-first-prompt) - Proactive memory injection on first prompt
 
 ---
