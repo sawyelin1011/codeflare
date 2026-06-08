@@ -8,6 +8,8 @@ export type DurableReviewLaneSnapshot = {
   resultPath?: string;
   transcriptPath?: string;
   error?: string;
+  pid?: number;
+  pidStart?: string;
 };
 
 export function recoverDurableReviewLaneState(input: {
@@ -15,11 +17,14 @@ export function recoverDurableReviewLaneState(input: {
   current?: DurableReviewLaneSnapshot;
   resultExists: boolean;
   resultPath?: string;
-  activeInMemory: boolean;
 }): DurableReviewLaneSnapshot {
+  // Result-file existence is the one durable proof of completion — it survives
+  // process death and reloads, so it always wins.
   if (input.resultExists) {
     return { ...input.current, lane: input.lane, status: "completed", resultPath: input.resultPath };
   }
+  // Recorded "completed" but the result file is gone (manual clean / corruption):
+  // re-open as pending so the lane can be re-run.
   if (input.current?.status === "completed") {
     return {
       lane: input.lane,
@@ -29,15 +34,115 @@ export function recoverDurableReviewLaneState(input: {
       transcriptPath: input.current.transcriptPath,
     };
   }
-  if (input.current?.status === "running" && !input.activeInMemory) {
-    return {
-      lane: input.lane,
-      status: "pending",
-      startedAt: input.current.startedAt,
-      transcriptPath: input.current.transcriptPath,
-    };
-  }
+  // "running" is preserved verbatim. Lanes now run as detached child `pi`
+  // processes, so a lane recorded "running" by another (possibly exited) session
+  // may still have a live child or a finished transcript on disk. The single
+  // authority for the running → completed/failed transition is reapLaneDecision,
+  // which checks child-process liveness and the transcript. Resetting running →
+  // pending here (the old in-process-model heuristic) caused re-spawn churn: the
+  // spawning session would exit, a later session would re-read the job, flip the
+  // lane back to pending, and reconcile would spawn a duplicate (review.md §7.1).
   return input.current ?? { lane: input.lane, status: "pending" };
+}
+
+// ── Durable lane reaping (detached child `pi` processes) ────────────────────
+// Lanes run as detached `pi --mode json -p` child processes that write a
+// newline-delimited JSON event stream to a transcript file. summarizeLaneTranscript
+// distils that stream into the facts the reaper needs; reapLaneDecision is the pure
+// running → completed/failed transition. Both are process-independent (driven from
+// disk facts) so ANY session can reap a lane another session spawned.
+
+export type LaneTranscriptSummary = {
+  // agent_end seen → the child finished its run (it may already have exited).
+  agentEnded: boolean;
+  // The last assistant message_end text — persisted verbatim as the lane result.
+  finalText: string;
+  // stopReason of the final assistant turn ("stop" = clean; "error"/"aborted" = failure).
+  stopReason?: string;
+  // The final assistant message carried an error payload.
+  errored: boolean;
+};
+
+export function summarizeLaneTranscript(lines: string[]): LaneTranscriptSummary {
+  let agentEnded = false;
+  let finalText = "";
+  let stopReason: string | undefined;
+  let errored = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let event: { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string } };
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      // Partial flush of the last line, or a non-JSON banner — never fatal.
+      continue;
+    }
+    if (event?.type === "agent_end") agentEnded = true;
+    if (event?.type === "message_end" && event.message?.role === "assistant") {
+      const content = event.message.content;
+      const text = Array.isArray(content)
+        ? content.map((part) => (part && typeof part === "object" && (part as { type?: unknown }).type === "text" ? String((part as { text?: unknown }).text ?? "") : "")).join("")
+        : typeof content === "string" ? content : "";
+      if (text.trim()) finalText = text;
+      if (typeof event.message.stopReason === "string") stopReason = event.message.stopReason;
+      if (event.message.errorMessage) errored = true;
+    }
+  }
+  return { agentEnded, finalText, stopReason, errored };
+}
+
+export type ReapLaneInput = {
+  // Current on-disk lane status.
+  status: "pending" | "running" | "completed" | "failed";
+  // A result .md already exists (settled by this or another session).
+  resultExists: boolean;
+  transcript: LaneTranscriptSummary;
+  // The lane recorded a child pid.
+  hasPid: boolean;
+  // The child is still alive AND is still our process (identity-checked against the
+  // recorded /proc start-time, so a reused pid reads as not-alive, not an impostor).
+  pidAlive: boolean;
+  startedAt?: number;
+  now: number;
+  timeoutMs: number;
+};
+
+export type ReapLaneDecision =
+  | { action: "none" }
+  | { action: "complete"; finalText: string }
+  | { action: "fail"; reason: string; kill: boolean };
+
+export function reapLaneDecision(input: ReapLaneInput): ReapLaneDecision {
+  // Only running lanes are reapable; everything else is already settled.
+  if (input.resultExists) return { action: "none" };
+  if (input.status !== "running") return { action: "none" };
+  const t = input.transcript;
+  const usable = t.finalText.trim().length > 0 && t.stopReason !== "error" && t.stopReason !== "aborted" && !t.errored;
+  // agent_end → the run finished; the child is already gone (or exiting), so the work is
+  // complete and there is nothing live to kill (kill: false avoids signalling a possibly
+  // reused pid). Checked FIRST so a child that finishes and exits in the same tick
+  // completes rather than being misread as "exited before result".
+  if (t.agentEnded) {
+    return usable
+      ? { action: "complete", finalText: t.finalText }
+      : { action: "fail", reason: `lane finished without a usable result (stopReason=${t.stopReason ?? "unknown"}${t.errored ? ", errored" : ""})`, kill: false };
+  }
+  // Child is gone but never emitted agent_end. If it nonetheless flushed a usable final
+  // assistant message before dying, KEEP it — don't discard a real review over a missing
+  // terminal line (transcript flush ordering / abrupt exit). Otherwise it crashed → fail.
+  // The child is gone either way, so no kill.
+  if (input.hasPid && !input.pidAlive) {
+    return usable
+      ? { action: "complete", finalText: t.finalText }
+      : { action: "fail", reason: "lane process exited before producing a result", kill: false };
+  }
+  // Verified-alive (pidAlive is identity-checked against the child's /proc start-time, so
+  // never a reused-pid impostor) but over its wall-clock budget → reclaim it (kill group).
+  if (input.startedAt !== undefined && input.now - input.startedAt > input.timeoutMs) {
+    return { action: "fail", reason: `lane exceeded ${input.timeoutMs}ms budget`, kill: true };
+  }
+  return { action: "none" };
 }
 
 export function durableReviewMessageKey(input: {
@@ -166,6 +271,7 @@ export function reviewAutofixRequest(repo: string, head: string): ReviewAutofixR
         "If any required review lane is still running, pending, missing, or unknown, do not edit, commit, or push; wait for the final merged review summary.",
         "If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.",
         "Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.",
+        "A finding's age is never a reason to skip it: fix every legitimate finding whether it is newly introduced or pre-existing, in this diff or adjacent. Do not exclude, defer, or ask about a legitimate finding because it pre-dates this change — legitimacy is the only criterion.",
         "Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.",
         "Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.",
       ].join("\n"),
@@ -239,6 +345,15 @@ export function stripExistingReviewSummary(text: string): string {
   return text.replace(/\n+## Review Summary[\s\S]*$/i, "").trim();
 }
 
+// A review lane can emit a severity COUNT block inside its findings body — e.g. the doc-updater
+// report header lists "CRITICAL: 0", "HIGH: 2", or "HIGH: 2 (A, B)". Those lines start with a
+// severity word but are tallies, not findings. Excluding them stops both the counter and the
+// finding parser from inflating (a phantom CRITICAL from "CRITICAL: 0 (none)" would otherwise
+// flip the merged verdict to block).
+function isSeverityCountLine(afterSeverity: string): boolean {
+  return /^\s*:?\s*\d+\s*(?:\([^)]*\))?\s*$/.test(afterSeverity);
+}
+
 export function countReviewSeverities(text: string): ReviewSeverityCounts {
   const counts: ReviewSeverityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
   let inFence = false;
@@ -248,8 +363,9 @@ export function countReviewSeverities(text: string): ReviewSeverityCounts {
       continue;
     }
     if (inFence) continue;
-    const match = line.match(/^\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:\*\*)?\[?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)\]?\b/i);
+    const match = line.match(/^\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:\*\*)?\[?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)\]?\b(.*)$/i);
     if (!match) continue;
+    if (isSeverityCountLine(match[2])) continue;
     const severity = match[1].toUpperCase();
     if (severity === "BLOCKING" || severity === "CRITICAL") counts.critical += 1;
     else if (severity === "HIGH") counts.high += 1;
@@ -342,7 +458,7 @@ function findingHeaderMatches(body: string): RegExpMatchArray[] {
     if (!inFence) {
       header.lastIndex = 0;
       const match = header.exec(line);
-      if (match) {
+      if (match && !isSeverityCountLine(match[2])) {
         match.index = offset + (match.index || 0);
         matches.push(match);
       }
@@ -601,7 +717,8 @@ export type ComputeReviewStateInput = {
   laneJobStatus: (lane: string) => ReviewLaneStatus | undefined;
   // existsSync(reviewResultPath(repo, head, lane)) — an authored result is authoritative.
   resultLaneExists: (lane: string) => boolean;
-  // runningLanes Set membership — only meaningful in the process that spawned the lane.
+  // Legacy hook; always false now that "running" is read from the on-disk lane record
+  // (the reaper keeps it accurate cross-process). Retained for call-site compatibility.
   runningInMemory: (lane: string) => boolean;
   ackHead: string;
   breakerHead: string;
@@ -651,8 +768,67 @@ export function computeReviewStateFrom(input: ComputeReviewStateInput): ReviewSt
   };
 }
 
-// Package source strings a durable review lane should load as additionalExtensionPaths.
-// graphify always (if configured) - reviewers benefit from graphify_query/path/explain.
+// ── Open-PR reconciliation (REQ-AGENT-058) ──────────────────────────────────
+// The onToolEnd boundary path can miss a PR-open command (compound `&&` + here-doc
+// parsing, a reload between command and event, a model that prints the URL without
+// the structured tool result). Reconciliation is the durable fallback: on lifecycle
+// ticks, if an OPEN, non-draft, ENFORCED main/master PR has a head that is not yet
+// acknowledged and has no review window and no open breaker, start one. This is the
+// narrow, bounded re-read REQ-036 AC7 permits - it never fires on mere branch/PR
+// existence, only on an open enforced PR whose head has no review at all. Returning a
+// reason (not a bare boolean) keeps the decision auditable: the caller logs every
+// non-reconcile outcome as a boundary_candidate_ignored event (never-silent, AC4).
+
+export type OpenPrReconcileInput = {
+  // PR facts (from `gh pr view`): the PR for this branch is OPEN and not a draft.
+  prOpen: boolean;
+  prDraft: boolean;
+  // Enforced = SDD project AND the PR base is main/master (the only gated boundary).
+  enforced: boolean;
+  // The resolved enforced head commit to review ("" when none could be resolved).
+  head: string;
+  // Review state for that head, from computeReviewState.
+  acked: boolean;
+  hasReviewJob: boolean;
+  reviewActive: boolean;
+  breakerOpen: boolean;
+};
+
+export type OpenPrReconcileDecision = { reconcile: boolean; reason: string };
+
+export type OpenPrReconcileLifecycleInput = {
+  activeRun: boolean;
+  hasRepo: boolean;
+  sddProject: boolean;
+  pendingSameRepo: boolean;
+  throttled: boolean;
+};
+
+export type OpenPrReconcileLifecycleDecision = { check: boolean; reason: string };
+
+export function shouldCheckOpenPrReconciliation(input: OpenPrReconcileLifecycleInput): OpenPrReconcileLifecycleDecision {
+  if (!input.activeRun) return { check: false, reason: "inactive review run" };
+  if (!input.hasRepo) return { check: false, reason: "no repo" };
+  if (!input.sddProject) return { check: false, reason: "not an SDD project" };
+  if (input.pendingSameRepo) return { check: false, reason: "pending window already managed" };
+  if (input.throttled) return { check: false, reason: "reconciliation throttled" };
+  return { check: true, reason: "lifecycle check may query open PR state" };
+}
+
+export function shouldReconcileOpenPr(input: OpenPrReconcileInput): OpenPrReconcileDecision {
+  if (!input.prOpen) return { reconcile: false, reason: "no open PR for branch" };
+  if (input.prDraft) return { reconcile: false, reason: "PR is a draft" };
+  if (!input.enforced) return { reconcile: false, reason: "PR not enforced (base not main/master, or not an SDD project)" };
+  if (!input.head) return { reconcile: false, reason: "no resolvable enforced head" };
+  if (input.acked) return { reconcile: false, reason: "head already acknowledged" };
+  if (input.breakerOpen) return { reconcile: false, reason: "review breaker open for head" };
+  if (input.hasReviewJob || input.reviewActive) return { reconcile: false, reason: "review window already exists for head" };
+  return { reconcile: true, reason: "open enforced PR head is unacknowledged with no review window" };
+}
+
+// Npm package source strings a durable review lane should load as additionalExtensionPaths.
+// Graphify is a first-party LOCAL extension (graphify-native.ts), loaded directly by the lane
+// runner alongside codeflare-pi - it is not an npm package and never appears here.
 // context-mode only when enabled (bare-string form, or an object entry without an
 // `extensions` filter - mirrors codeflare-pi's contextModeEnabled), so lanes inherit /ctx on.
 // Never @gotgenes/pi-subagents (the lane must not spawn subagents).
@@ -664,8 +840,7 @@ export function laneExtensionSources(
     const source = typeof entry === "string" ? entry : entry?.source ?? "";
     if (!source) continue;
     const enabled = typeof entry === "string" || entry.extensions === undefined;
-    if (source.includes("@gaodes/pi-graphify")) sources.push(source);
-    else if (source.includes("context-mode") && enabled) sources.push(source);
+    if (source.includes("context-mode") && enabled) sources.push(source);
   }
   return sources;
 }

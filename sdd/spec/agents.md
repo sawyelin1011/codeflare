@@ -1013,7 +1013,7 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh -->
 <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/git-push-review-reminder.sh -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4, gh pr create metadata-lag base inference -> AC6, seeded Pi review enforcement has no passive agent_end catch-up -> AC7) -->
+<!-- @test: host/__tests__/git-push-review-reminder.test.js (git-push-review-reminder.sh - PR-OPEN trigger (base-gated) describe + PR-SYNC trigger (base-gated) describe -> AC1 PR target main/master only + AC5 intermediate branches deferred + git-push-review-reminder.sh - MCP shell tool input shapes (issue #317) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + host/__tests__/enforce-review-spawn.test.js (enforce-review-spawn.sh - PR state gating describe -> AC1 + enforce-review-spawn.sh - vibe-coding gate describe -> AC7 non-SDD projects exit silently + enforce-review-spawn.sh - MCP shell tool input shapes (issue #319) describe -> AC2 PUSH_LINE detection across Bash/MCP surfaces) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi PR-boundary command detection -> AC2/AC3/AC4, gh pr create metadata-lag base inference -> AC6, seeded Pi review enforcement recovers a missed boundary only through the bounded open-PR reconciliation, never from passive branch existence -> AC7) -->
 
 **Intent:** Review agents must fire only on PR-boundary events that actually target shipping code. Trigger detection runs across every tool surface that can move HEAD, ignores intermediate-branch and no-PR pushes so vibe-coding mode and integration-branch development stay friction-free, and assumes upstream branch protection guards direct pushes to `main`. Lane classification + agent dispatch live in [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch); bypass surfaces live in [REQ-AGENT-041](#req-agent-041-pr-boundary-review-bypass-surfaces).
 
@@ -1027,7 +1027,7 @@ None.
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 6. During a `gh pr create` metadata-visibility race, Pi may infer a protected base (`main` or `master`, including quoted CLI values or the default when no base is supplied) and synthesize an open PR from local HEAD; non-protected bases remain ignored. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prCreateBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prForBoundaryCommand -->
-7. No review window is created from non-triggering states: on non-SDD projects (no `sdd/` folder) no review agents run at all and every hook exits silently (vibe-coding mode), and passive Pi lifecycle events such as session start, reload, branch checkout, or a normal assistant turn end do not create a review window solely because the current branch already has an open PR to `main` or `master`. Pi starts PR-boundary review only from the explicit head-moving commands in AC2/AC3 or from already-persisted pending review state. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+7. Non-triggering states never create a review window: vibe-coding projects run no agents, and passive lifecycle events never act on branch existence alone. Review starts only from an explicit command, persisted pending state, or bounded open-PR reconciliation. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview -->
 
 **Constraints:**
 
@@ -1061,13 +1061,12 @@ None.
 **Acceptance Criteria:**
 
 1. Layer 1 lane classification uses one internally shared classifier per runtime surface so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
-2. Lane mapping: docs-only (no sdd, no source) → `doc-updater`; `sdd/` touched without source (with or without docs) → `spec-reviewer` then `doc-updater`; any source touch → all three agents.
+2. Lane mapping: generated-only `graphify-out/` diffs → no lanes (auto-acked with a durable audit event); docs-only → `doc-updater`; `sdd/` without source → `spec-reviewer` then `doc-updater`; any source touch → all three agents. Generated files never suppress non-generated files; both runtime classifiers apply this identically. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewFiles --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isGeneratedArtifactPath --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh::compute_required_lanes --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (classifyReviewFiles generated-artifact handling -> AC2) --> <!-- @test: host/__tests__/lane-classifier.test.js (generated graphify-out artifacts -> AC2 Claude-side parity) -->
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
 4. The initial review wave starts `code-reviewer` and `spec-reviewer` together when both lanes are required. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewInitialLanes -->
 5. `doc-updater` starts only after `spec-reviewer` completes on SDD projects. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
-6. Review agents are dispatched with `run_in_background: true` so the main session stays interactive while reviewers run; the turn-end gate suppresses re-summoning per lane, so a single slow lane still in flight never masks the demand for other required lanes and never satisfies final acknowledgement without current-head completion. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::all_required_lanes_completed_for_current_head --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (suppresses an in-flight lane without masking missing peer lanes + does not ack while current-head lanes are still in flight) -->
+6. Review agents are dispatched with `run_in_background: true` so the main session stays interactive; the turn-end gate suppresses re-summoning per lane, so a slow in-flight lane never masks demand for other lanes nor satisfies acknowledgement without current-head completion. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::all_required_lanes_completed_for_current_head --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (suppresses an in-flight lane without masking missing peer lanes + does not ack while current-head lanes are still in flight) -->
 7. In-flight suppression is bounded by transcript recency: an uncompleted spawn that falls behind the transcript tail is treated as orphaned, demanded again, and cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (re-demands an orphaned in-flight lane after the transcript recency bound) -->
-
 **Constraints:**
 
 - The agent must not push to the PR branch or start a second review wave while any required review lane is in flight. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight -->
@@ -1082,16 +1081,14 @@ None.
 
 ---
 
-### REQ-AGENT-053: Pi Durable Review Status, Result Formatting, and Fix Loop
+### REQ-AGENT-053: Pi Durable Review Status and Result Formatting
 
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1/AC2/AC3/AC4/AC5/AC6 + lane extension sources -> AC7) -->
-<!-- coverage-gap: AC7's lane-source selection is unit-tested via laneExtensionSources; the in-lane loading of codeflare-pi and the per-session global-graph-merge skip are runtime behaviors verified by integration smoke test, with no dedicated automated test. -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1-AC5) -->
 
-**Intent:** Pi operators need consistent PR-boundary review output, a compact indication that internal durable lanes are active, and an automatic next-fix prompt when actionable findings remain unless the user explicitly opts out for that round.
+**Intent:** Pi operators need consistent PR-boundary review output and a compact indication that internal durable lanes are active.
 
 **Applies To:** User
 
@@ -1102,8 +1099,6 @@ None.
 3. Pi suppresses duplicate PR-boundary review result and summary announcements for the same repo, head, lane, and result path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
 4. After all required lanes complete, Pi publishes a merged chat summary instead of separate per-lane chat result blocks. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewSummaryMarkdown -->
 5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes and renders findings sorted by criticality, without requiring per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
-6. After the exact-head durable review job is complete and every required lane has a result file, when those completed review results contain legitimate `MEDIUM`, `HIGH`, or `CRITICAL` findings, Pi requests an automatic fix-and-push pass for those findings only; if any required lane is running, pending, missing, stale, or unknown, Pi must not request or start a fix pass from partial lane results. If the latest explicit user directive says not to automatically fix/implement or to wait for approval, Pi presents the findings and waits instead. The next PR-boundary review uses the pushed fix diff when a fix pass runs. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::requestReviewAutofixForRows --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
-7. Durable PR-boundary review lanes additively load the graphify package (always when configured), the context-mode package (only when enabled in Pi settings), and the `codeflare-pi` guard extension (local-build blocker, attribution, graphify gate), while excluding the `review-enforcement` extension and the `@gotgenes/pi-subagents` package from the lane; `codeflare-pi`'s per-session global-graph merge is skipped inside lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
 
 **Constraints:**
 
@@ -1122,7 +1117,8 @@ None.
 ### REQ-AGENT-054: Pi Durable Review Lane Failure Handling
 
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (durable lane recovery + result-file gating tests -> AC1/AC2/AC3/AC4) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (durable lane recovery + result-file gating + reapLaneDecision + summarizeLaneTranscript tests -> AC1-AC6) -->
+<!-- coverage-gap: the reap DECISION logic (reapLaneDecision) and transcript parsing (summarizeLaneTranscript) are unit-tested; the OS-level pieces they sit on — detached child-process spawn, pid-group liveness (process.kill(pid,0)), and group kill — are runtime behaviours verified by an integration smoke test (spawn a real detached lane → it runs to agent_end → reap writes a result file), with no dedicated test in the Workers vitest pool. -->
 
 **Intent:** Pi operators need durable PR-boundary review failures to fail closed without falsely acknowledging a PR head.
 
@@ -1130,11 +1126,12 @@ None.
 
 **Acceptance Criteria:**
 
-1. When a durable Pi review lane times out or records a failure, the lane is persisted as failed instead of completed. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runDurableLane -->
+1. When a durable Pi review lane exceeds its wall-clock budget, its child process dies before producing a result, or it finishes without usable output, the reaper persists the lane as failed instead of completed; an over-budget lane's process group is also killed. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reapLaneDecision --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes -->
 2. Failed or timed-out durable lanes do not satisfy the required result-file gate. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::completedDurableReviewLanes -->
 3. A PR head remains unacked until a later review run writes every required lane result file. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::markCompleted -->
-4. Persisted-only `running` lane state never suppresses a retry after Pi reloads; only the in-memory durable lane set counts as active retry suppression. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runningDurableReviewLanes -->
+4. Lane liveness is the live child pid, identity-checked against its recorded `/proc` start-time so a recycled pid is never trusted alive nor signalled. A `running` lane is re-spawn-suppressed only while alive; a dead child with no result file is reaped to failed and re-spawn-eligible. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runningDurableReviewLanes --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::isProcessAlive --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::startDurableReviewLanes -->
 5. If completion callbacks are missed or Pi reloads, persisted exact-head result files are enough to recover, finalize, acknowledge, and publish the review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::refreshReviewStatusFromDurable --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
+6. The reaper writes a lane result file and marks it completed when its transcript reaches `agent_end`, or when its child exits after flushing a usable final assistant message even without a terminal `agent_end` line. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reapLaneDecision -->
 
 **Constraints:**
 
@@ -1143,6 +1140,103 @@ None.
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-059: Pi Durable Review Fix Loop
+
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (autofix request gating + manual/auto directive tests -> AC1-AC4) -->
+
+**Intent:** Pi operators need actionable PR-boundary review findings to start a fix pass only when the exact-head review is complete.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. Pi requests a fix pass only after every required exact-head result file exists and at least one legitimate `MEDIUM`/`HIGH`/`CRITICAL` finding remains. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::requestReviewAutofixForRows -->
+2. Partial lane result sets never trigger a fix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewAckReady -->
+3. When a live session transcript is available, a wait/do-not-auto-fix directive makes Pi present findings without requesting a fix pass. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
+4. Idle finalization without live context keeps the default automatic fix behavior. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix -->
+
+**Constraints:**
+
+None.
+
+**Priority:** P2
+
+**Dependencies:** [REQ-AGENT-053](#req-agent-053-pi-durable-review-status-and-result-formatting)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-060: Pi Durable Review Lane Tool Surface
+
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-lane-guards.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (lane extension-source selection -> AC6; lane guard blocking -> AC7) -->
+<!-- coverage-gap: AC1-AC5's detached child-process lane execution is a runtime behaviour verified by an integration smoke test, with no dedicated automated test in the Workers vitest pool (which cannot spawn pi). -->
+
+**Intent:** Pi durable review lanes need enough bounded inspection capability to review diffs without loading recursive review enforcement or running local builds.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. Durable review lanes run isolated from the parent Pi session so a lane can finish after the spawning session exits. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+2. Durable review lanes start without stdin from the parent session. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+3. Durable review lanes start without context files and do not recursively load the full Codeflare extension stack. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+4. Durable review lanes expose bash for git/gh diff inspection. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+5. Durable review lanes expose graphify inspection tools. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+6. Settings-enabled context-mode may add `ctx_search` to durable review lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources -->
+7. Durable review lane guards block local build, test, lint, and dev-server commands. <!-- @impl: preseed/agents/pi/extensions/review-lane-guards.ts::reviewLaneBlockReason -->
+
+**Constraints:**
+
+None.
+
+**Priority:** P2
+
+**Dependencies:** [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-061: Pi Idle Durable Review Reaper
+
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-061 idle reaper helper test covers AC2/AC3 gating; AC1 runtime reaping has integration smoke coverage) -->
+<!-- coverage-gap: AC1's no-turn finished-lane reaping path is driven by a reload-safe `setInterval`; it is runtime-smoke-tested with detached lanes, with no dedicated automated test in the Workers vitest pool. -->
+
+**Intent:** Pi must advance and finalize durable review jobs even when the user does not submit another prompt.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. An idle Pi session with no user turn still reaps finished durable review lanes. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
+2. An idle Pi session starts the next eligible durable review lane after prerequisite lanes complete. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
+3. An idle Pi session finalizes a completed durable review by acknowledging the exact head, publishing the merged summary, and starting the autofix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
+
+**Constraints:**
+
+None.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling), [REQ-AGENT-059](#req-agent-059-pi-durable-review-fix-loop)
 
 **Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
 
@@ -1241,6 +1335,44 @@ None.
 **Dependencies:** [REQ-AGENT-055](#req-agent-055-pi-pr-boundary-review-window-advancement)
 
 **Verification:** [Canonical review-state unit tests](../../src/__tests__/lib/review-state.test.ts); the command's rendering layer (`formatReviewStatus`) is manually verified.
+
+**Status:** Partial
+
+---
+
+### REQ-AGENT-058: PR-Boundary Review Reconciliation and Missed-Event Recovery
+
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::ensureReviewWindow -->
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::resolveEnforcedHead -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent -->
+<!-- @test: src/__tests__/lib/review-state.test.ts (shouldReconcileOpenPr decision gating -> AC1/AC6) -->
+<!-- @test: src/__tests__/lib/review-trigger.test.ts (prUrlFromText PR-URL boundary detection -> AC5) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (seeded review-enforcement wires reconcileOpenPrReview + shouldReconcileOpenPr -> AC1/AC2/AC4) -->
+
+**Intent:** Review initiation must not depend solely on capturing a transient tool event. A missed or mis-parsed boundary command must not silently skip review: an open enforced PR whose head was never reviewed is recoverable on a later turn, the start path is shared with the boundary path so the two cannot drift, and every near-miss leaves a durable diagnostic so a skipped review is detectable instead of silent.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. On lifecycle events, Pi creates a review window for an SDD repo with an open, non-draft, enforced PR whose resolved head is unacknowledged, has no pending job, and has no open breaker. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+2. Boundary-command and reconciliation paths call one shared routine, so reconciled windows match captured-command windows in lanes, review base, durable job, and audit trail. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::ensureReviewWindow -->
+3. Head resolution reviews local HEAD during metadata lag only when it is on the PR branch, descends from GitHub's PR head, and the remote-tracking ref contains it. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::resolveEnforcedHead --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::enforcedHeadDecision --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (enforcedHeadDecision pushed-vs-unpushed table -> AC3) -->
+4. A boundary-shaped command that does not start a review appends a durable `boundary_candidate_ignored` audit event naming the gate reason, so a skipped review is always reconstructable from disk. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent --> <!-- @test: (none — boundary_candidate_ignored audit emission has no direct unit test, which is why this REQ is Partial) -->
+5. A successful `gh pr create` whose command text could not be parsed but whose tool output contains a GitHub PR URL is reconciled by reading the open PR, so unparseable command shapes still start review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prUrlFromText -->
+6. Reconciliation drives at most one transition per turn and is a no-op when the head is acked, a pending job exists, or the breaker is open, so it never duplicates work or re-spawns a completed review. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+
+**Constraints:**
+
+- Reconciliation is gated on a real open enforced PR, never on branch existence (consistent with [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions) AC7); integration-branch PRs stay deferred until their own PR-to-`main`.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-055](#req-agent-055-pi-pr-boundary-review-window-advancement)
+
+**Verification:** Unit tests: [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`shouldReconcileOpenPr` gating → AC1/AC6), [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`prUrlFromText` PR-URL detection → AC5); the on-turn ctx wiring and head/diagnostic paths (AC3/AC4) have no direct automated test (see Status: Partial).
 
 **Status:** Partial
 
@@ -1492,6 +1624,7 @@ None.
 <!-- @impl: preseed/agents/pi/scripts/build-graphify-ast.sh -->
 <!-- @impl: preseed/agents/pi/scripts/build-graphify-architecture.sh -->
 <!-- @impl: preseed/agents/pi/scripts/safe-graphify-update.sh -->
+<!-- @impl: preseed/agents/pi/extensions/graphify-native.ts -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @impl: Dockerfile -->
 <!-- @impl: entrypoint.sh -->
@@ -1502,7 +1635,7 @@ None.
 <!-- @test: host/__tests__/safe-graphify-update.test.js -->
 <!-- @test: host/__tests__/entrypoint-devshm-prereq.test.js (REQ-AGENT-023 prereq: /dev/shm tmpfs mount in entrypoint.sh describe -> /dev/shm mountpoint after entrypoint runs + Python multiprocessing.Lock allocates + idempotent on warm boot -> AC1 graphify Python multiprocessing prerequisite) -->
 <!-- @test: host/__tests__/context-mode-version-pin.test.js (context-mode plugin.json version pin describe -> at least v1.0.151 -> regression sentinel for issue #671 fix surface; REQ-AGENT-005 AC4/AC5 context-mode version floor) -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-023 Pi native runtime assets include graphify npm package, MCP config, and graphify skill override -> AC2 Pi-equivalent native graphify surface) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-023 Pi native runtime assets expose first-party graphify-native tools (no MCP, no third-party wrapper) -> AC2 Pi-equivalent native graphify surface) -->
 <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-023 AC4: codeflare-pi.ts tolerates missing graph and reports present graph -> AC4 Pi missing-graph tolerance and post-clone prompting) -->
 
 **Intent:** Every container ships the graphify code-knowledge-graph capability as ambient infrastructure, so any session (default or advanced session mode) can query an existing graph or build a new one without per-tier provisioning.
@@ -1511,23 +1644,22 @@ None.
 
 **Acceptance Criteria:**
 
-1. The `graphifyy` Python package is installed in every container image at build time with the MCP, SQL, and PDF extras, pinned to a single version Dependabot tracks; version bumps rebuild the image in lockstep. Provider/backend extras such as Gemini are not installed for Graphify; interactive semantic extraction and community labeling remain agent-driven.
-2. Claude Code receives the graphify MCP server as a session-level capability in every session (default and advanced modes). Pi receives the equivalent native graphify tool package in every session; the Pi graphify workflow skill, clone triage helper, and build/update scripts are advanced-mode preseed surfaces. MCP parity in Pi is optional and not required for the Pi graphify workflow.
-3. AC1 and AC2 hold across all paid tiers for ambient query/build capability; advanced-mode agent orchestration keeps `/graphify` extraction context bounded via subagent chunking.
-4. The Claude MCP server and Pi native graphify surface both tolerate a missing graph artefact at startup: Claude presents an empty graph initially and rebinds after a graph appears or changes, while advanced-mode Pi clone triage asks before any graph work and offers Full repo AST-only, Full repo semantic intent, or no graph action; query tools answer against the active repository's `graphify-out/graph.json` once it exists. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::graphifyCloneAction --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::fallbackGraphifyToolResult -->
-5. In advanced session mode only, the user's current active repository is tracked so graphify queries scope to that repo; resolution walks up to the nearest ancestor containing a Git repository or a graph artefact. Pi tracks the same active repo from command-local `cd ... &&` and `git -C ...` forms, and its session context identifies the active repo by basename, checked-out branch, and HEAD prefix.
-6. When the active-repo signal is absent or stale, graphify falls back to the most recently updated graph artefact in the user's workspace.
+1. `graphifyy` installs in every container image with MCP, SQL, and PDF extras, pinned to one Dependabot-tracked version. Provider extras stay absent; extraction and labeling remain agent-driven. <!-- @impl: Dockerfile::graphifyy -->
+2. Claude receives the Graphify MCP server in every session. Pi receives first-party native `graphify_query`/`graphify_path`/`graphify_explain` tools from `graphify-native.ts`, not an MCP server or npm wrapper. Both shell the upstream engine. <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-mcp-lazy.py::LazyGraph --> <!-- @impl: preseed/agents/pi/extensions/graphify-native.ts::graphify_query -->
+3. AC1 and AC2 hold across all paid tiers for ambient query/build capability; advanced-mode agent orchestration keeps `/graphify` extraction context bounded via subagent chunking. <!-- @impl: Dockerfile::graphifyy --> <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::subagent -->
+4. Startup with no graph is tolerated: Claude starts empty and rebinds later; advanced-mode Pi clone triage asks before graph work. Query tools use the active repo graph after it exists. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::graphifyCloneAction --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::fallbackGraphifyToolResult -->
+5. Advanced mode tracks the active repository; resolution walks up to the nearest Git repo or graph artefact and understands command-local `cd ... &&` plus `git -C ...` forms. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::effectivePathForCommand --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::updateActiveRepoFromPath -->
+6. When the active-repo signal is absent or stale, Pi graphify query tools fall back from the session cwd repo graph to the same-repo sentinel graph and then to the merged global graph. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::pickGraphSource -->
 
 **Constraints:**
 
-- The codeflare image uses the upstream graphify package without a fork.
-- When Pi's packaged native graphify tool resolves the session cwd (`/home/user/workspace`) and reports its `graphify-out/graph.json` missing, the Codeflare Pi adapter retries `graphify_query`, `graphify_path`, and `graphify_explain` against `<active-repo>/graphify-out/graph.json` via the graphify CLI and returns the retry as the tool result.
-- The ambient MCP/native graphify capability is available in every session mode; the graph-first agent discipline ([REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)), Pi graphify workflow skill/scripts, clone triage helper, and active-repo tracking (AC5) are mode-gated to advanced.
-- Per-branch graphs are not supported; users refresh the graph after a branch checkout.
-- Optional office/video/Neo4j/local-backend/provider extras are not installed by default; users who need them install upstream extras manually. Codeflare's interactive Graphify workflow does not use provider extras for community labeling.
-- Preseed surfaces that refresh an existing graph call the bounded update wrapper rather than bare `graphify update`, so a runaway rebuild cannot OOM-kill the container session. The Pi-owned update wrapper is a thin safety wrapper around upstream `graphify update`: it applies `RLIMIT_AS`, sets `GRAPHIFY_MAX_WORKERS`, preserves `GRAPHIFY_VIZ_NODE_LIMIT`, and does not rewrite graph output. Pi first-time full AST graph creation uses `build-graphify-ast.sh`, which calls Graphify's own detect/extract/build/cluster/report/export modules without Codeflare-specific file allowlists or import normalization. Pi architecture graph creation uses `build-graphify-architecture.sh`, which applies generic noise filters before Graphify extraction and projects the resulting symbol graph into a file/module dependency graph for navigation.
-- The Pi session-start graph summary is bounded against blocking: graphs larger than 30MB report availability without a synchronous parse, the git probes are wrapped with a short timeout, and the structural-search gate is fail-open (any unexpected error never locks the user out of search).
-- The container entrypoint ensures `/dev/shm` is present and tmpfs-mounted at boot. Graphify's AST extractor uses Python's `concurrent.futures.ProcessPoolExecutor`, which allocates a `multiprocessing.Lock` that requires POSIX shared memory at `/dev/shm`; on a cold Firecracker microVM boot the rootfs ships without the mountpoint directory and the executor fails at startup. The same prerequisite covers the memory-capture hook's chunker and the vault-extract subagent's writer.
+- The image uses upstream graphify without a fork; provider/office/video/Neo4j/local-backend extras are not installed.
+- Pi query tools resolve the session cwd repo graph, then the same-repo sentinel graph, then the merged global graph; no graph fails soft.
+- Ambient MCP/native query capability is all-mode; graph-first discipline, Pi workflow assets, clone triage, active-repo tracking, and graph summaries are advanced-only.
+- Per-branch graphs are unsupported; users refresh after checkout.
+- Existing graph refreshes use the bounded update wrapper, never bare `graphify update`.
+- Pi first-build scripts own AST and architecture graph creation.
+- Entrypoint mounts tmpfs `/dev/shm` for Graphify AST multiprocessing, memory capture, and vault extraction.
 
 **Priority:** P1
 

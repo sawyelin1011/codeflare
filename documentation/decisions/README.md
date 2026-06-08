@@ -1,7 +1,7 @@
 
 # Architecture Decisions
 
-Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD74](#ad74-enterprise-llm-transport-on-the-ai-gateway-rest-api) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
+Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
 
 **Audience:** Developers
 
@@ -74,7 +74,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD61](#ad61-pi-review-ships-as-a-dedicated-native-skill) | Pi `/review` ships as a dedicated native skill (Claude commands do not deploy to Pi) | Architecture |
 | [AD62](#ad62-pi-model-name-genericization-with-codeflare_memory_model-lever) | Pi model-name genericization with `CODEFLARE_MEMORY_MODEL` lever | Architecture |
 | [AD63](#ad63-pi-safe-graphify-updatesh-is-a-thin-bounded-upstream-update-wrapper) | Pi `safe-graphify-update.sh` is a thin bounded upstream-update wrapper | Architecture |
-| [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) | Durable review lanes load extensions additively behind the `noExtensions` shield | Agents |
+| [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) | _superseded by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) -- lanes now run as detached headless Pi processes_ | (superseded) |
 | [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy) | Gemini CLI replaced by Antigravity (agy) _(no-preseed-lane clause superseded by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored))_ | Architecture |
 | [AD66](#ad66-security-sensitive-rate-limiters-fail-closed-on-kv-outage) | Security-sensitive rate limiters fail closed on KV outage | Security |
 | [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored) | Antigravity reads the Gemini CLI config tree; preseed lane restored | Architecture |
@@ -85,6 +85,8 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD72](#ad72-outbound-https-interception-over-a-worker-side-llm-proxy-for-enterprise-gateway-routing) | Outbound-HTTPS interception over a Worker-side LLM proxy for enterprise gateway routing | Architecture, Security |
 | [AD73](#ad73-workersdev-enabled-on-every-deployment-for-setup-wizard-bootstrap) | workers.dev enabled on every deployment for setup-wizard bootstrap | Security |
 | [AD74](#ad74-enterprise-llm-transport-on-the-ai-gateway-rest-api) | Enterprise LLM transport on the AI Gateway REST API (amends [AD72](#ad72-outbound-https-interception-over-a-worker-side-llm-proxy-for-enterprise-gateway-routing)) | Architecture, Security |
+| [AD75](#ad75-pi-graphify-tools-replaced-by-a-first-party-native-extension) | Pi graphify tools replaced by a first-party native extension (`graphify-native.ts`); `@gaodes/pi-graphify` removed | Architecture |
+| [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) | Durable review lanes run as detached headless Pi processes | Agents |
 
 ---
 
@@ -1133,7 +1135,7 @@ Three smaller decisions bundled in:
 
 **Category:** Architecture
 
-**Status:** Accepted (2026-05-30)
+**Status:** Superseded by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) (2026-06-08)
 
 **Context:** PR-boundary review enforcement ([REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)/053/054) runs each lane as an in-process `createAgentSession` (`review-jobs.ts::runDurableLane`) with `DefaultResourceLoader({ noExtensions: true })`. That shield exists because extension factories run synchronously during load (pi's `loader.js` `await factory(api)`), and `review-enforcement.ts`'s factory writes a process-global run token (`__codeflareReviewEnforcementRun`) at load time; if a lane loaded that extension in the same process it would overwrite the token and silently disable the **main** session's enforcement (the merge gate). `@gotgenes/pi-subagents` similarly couples in-process state. But the blunt `noExtensions: true` also stripped every useful capability, leaving lanes with only the 7 built-in tools: reviewers had no `graphify_*`, no `ctx_*`, and none of `codeflare-pi`'s guards. A transient `gh pr view` failure once dropped the merge gate by mis-classifying a live head as stale (the "failure #13" referenced in `review-helpers.ts`); `classifyReviewHead` now separates `stale` from `unknown` to keep the gate fail-closed, and the durable `.git/`-persisted state makes that classification recoverable.
 
@@ -1149,7 +1151,7 @@ Three smaller decisions bundled in:
 
 **Alternative considered:** Self-guard `review-enforcement` to no-op when loaded in a lane. Rejected as the primary mechanism: it does not cover `@gotgenes/pi-subagents`' in-process coupling, and the additive allowlist is simpler and strictly scopes what a lane can load.
 
-**Related REQ:** [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop) (durable review status/result/fix loop, AC8), [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) (PR-boundary lane classification and dispatch), [REQ-AGENT-054](../../sdd/spec/agents.md#req-agent-054-pi-durable-review-lane-failure-handling) (durable lane failure handling).
+**Related REQ:** [REQ-AGENT-060](../../sdd/spec/agents.md#req-agent-060-pi-durable-review-lane-tool-surface) (durable review lane tool surface), [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) (PR-boundary lane classification and dispatch), [REQ-AGENT-054](../../sdd/spec/agents.md#req-agent-054-pi-durable-review-lane-failure-handling) (durable lane failure handling).
 
 ---
 
@@ -1379,6 +1381,56 @@ Two facts from the SB 2.8.1 source reshape the fix. First, SB's real service wor
 **Alternative considered — Cloudflare Access-based gateway auth (rejected):** Cloudflare's "identity-driven budgets" announcement (2026-06-05) proposes putting Cloudflare Access in front of the gateway so it derives caller identity from the Access JWT instead of caller-supplied metadata — pitched as removing the gateway token and "honor-system metadata headers." Evaluated as a replacement for `AIG_TOKEN` + Worker-stamped `cf-aig-metadata` and rejected on four grounds. (1) The REST API at `api.cloudflare.com/.../ai/v1/*` still *requires* a Cloudflare API token per request — it is Cloudflare's control-plane API, not a hostname an operator can front with their own Access application; the identity-aware integration attaches to the legacy `gateway.ai.cloudflare.com` endpoint this ADR deliberately migrated off. (2) codeflare's caller is a machine-to-machine `WorkerEntrypoint` with no interactive browser/JWT flow; the non-interactive Access credential is a service token (a client-id/secret pair) — another static secret, one identity per token, with no containment gain over the Worker-only secret model already established in [AD72](#ad72-outbound-https-interception-over-a-worker-side-llm-proxy-for-enterprise-gateway-routing). (3) codeflare runs many end-users behind one Worker credential, so a single Access identity cannot carry per-user attribution; per-user spend limits key on `cf-aig-metadata` (the gateway splits budgets on a metadata field — codeflare stamps `{ user: <email>, group: <access-group> }`), so the metadata path is retained regardless. (4) codeflare's metadata is not honor-system — the Worker stamps it from a server-side DO prop and strips any container-supplied value, so the container cannot forge it. Identity-driven budgets are additionally a closed beta. Net: keep `AIG_TOKEN` + Worker-stamped `cf-aig-metadata`; per-user budgets are achieved today via gateway spend-limit rules splitting on the `cf-aig-metadata` `user` field.
 
 **Related:** [AD72](#ad72-outbound-https-interception-over-a-worker-side-llm-proxy-for-enterprise-gateway-routing) (interception mechanism, unchanged), [REQ-ENTERPRISE-003](../../sdd/spec/enterprise-mode.md#req-enterprise-003-agent-allowlist-in-enterprise-mode), [REQ-ENTERPRISE-004](../../sdd/spec/enterprise-mode.md#req-enterprise-004-outbound-interception-llm-routing-to-customer-ai-gateway), [REQ-ENTERPRISE-006](../../sdd/spec/enterprise-mode.md#req-enterprise-006-deploy-time-aig-secrets-and-enterprise_mode-var), [REQ-ENTERPRISE-007](../../sdd/spec/enterprise-mode.md#req-enterprise-007-gateway-route-pinning).
+
+---
+
+### AD75: Pi graphify tools replaced by a first-party native extension
+
+**Category:** Architecture
+
+**Status:** Accepted (2026-06-08)
+
+**Context:** Pi has no MCP client, so the graphify query tools (`graphify_query`/`graphify_path`/`graphify_explain`) were exposed on Pi through the third-party `@gaodes/pi-graphify` npm wrapper plus a never-consumed `mcp.json`. The wrapper re-implemented graphify query logic independently of the Claude MCP-server path, so Pi and Claude could diverge in ranking/output from the same graph, and it added an npm dependency (plus the transitive `@gaodes/pi-utils-ui`) that `bump-shadow-pins.yml` had to track and that re-baked the image on every upstream bump. <!-- @impl: preseed/agents/pi/extensions/graphify-native.ts::resolveGraph -->
+
+**Decision:** Replace `@gaodes/pi-graphify` with a first-party native Pi extension, `preseed/agents/pi/extensions/graphify-native.ts`, registered via `pi.registerTool` (mirroring `browser-run.ts`). It shells the same `graphify` CLI that Claude's MCP server runs (`graphify.serve._query_graph_text`), so both agents query through one engine with identical ranking and output. Delete the dead `preseed/agents/pi/mcp.json` and its seed path-mapping and context-mode strip-branch.
+
+**Consequences:**
+
+- Pi and Claude graphify queries share one engine — no divergent third-party reimplementation.
+- The Pi npm closure shrinks by `@gaodes/pi-graphify` (and the transitive `@gaodes/pi-utils-ui`); `bump-shadow-pins.yml` and `dependabot.yml` no longer track it.
+- Graph resolution is codified in source: the session/job cwd repo's `graphify-out/graph.json` wins, then the same-repo active sentinel graph, then the merged global graph (`~/.graphify/global-graph.json`); a graphless session fails soft with a "build a graph first" message.
+- Durable review lanes load `graphify-native.ts` via explicit `-e`, plus `review-lane-guards.ts` and settings-enabled context-mode, so reviewers keep graphify tools without loading `codeflare-pi.ts` or recursive review enforcement.
+- The `save-result` feedback loop is restored in both agents' graphify skills, which move to the `references/` progressive-disclosure layout.
+- Clone-time triage (detect graph, prompt build/update/skip) is unchanged in both agents — only the query-tool provider changed.
+
+**Implements:** [REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify), [REQ-AGENT-024](../../sdd/spec/agents.md#req-agent-024-advanced-session-mode-graph-first-discipline).
+
+**Related:** [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) (durable review lanes run detached).
+
+---
+
+### AD76: Durable review lanes run as detached headless Pi processes
+
+**Category:** Agents
+
+**Status:** Accepted (2026-06-08)
+
+**Supersedes:** [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)
+
+**Context:** In-process `createAgentSession` lanes could die when the spawning Pi session exited, leaving `.git/codeflare-review-jobs/<head>/` stuck `running`. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::recoverDurableReviewLaneState -->
+
+**Decision:** Launch each durable lane as a detached `pi --mode json -p --no-session --no-extensions --no-context-files` child with stdin from `/dev/null`. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
+
+Load only explicit `-e` extensions: `graphify-native.ts`, `review-lane-guards.ts`, and settings-enabled context-mode. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources -->
+
+**Consequences:**
+
+- Lanes survive the spawning session and are reaped from disk. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes -->
+- The idle reaper advances and finalizes durable jobs without a user turn. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
+- Reviewers get a bounded inspection tool allowlist: bash for git/gh inspection, graphify tools, local-build blockers, and optional `ctx_search`.
+- Lanes do not load `codeflare-pi.ts`, `review-enforcement`, or `@gotgenes/pi-subagents`.
+
+**Related:** [REQ-AGENT-054](../../sdd/spec/agents.md#req-agent-054-pi-durable-review-lane-failure-handling), [REQ-AGENT-060](../../sdd/spec/agents.md#req-agent-060-pi-durable-review-lane-tool-surface), [REQ-AGENT-061](../../sdd/spec/agents.md#req-agent-061-pi-idle-durable-review-reaper).
 
 ---
 

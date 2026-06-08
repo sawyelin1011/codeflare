@@ -223,6 +223,16 @@ export function isFailedToolExecution(event: any): boolean {
   return event?.isError === true || event?.error === true || String(event?.status ?? "").toLowerCase() === "error";
 }
 
+// Extract a GitHub PR URL from arbitrary tool-output text. `gh pr create` prints
+// the new PR's URL on success; when the command text itself could not be parsed
+// out of the tool event, this lets the boundary path still recognise that a PR
+// was created and reconcile from it (REQ-AGENT-058 AC5).
+export function prUrlFromText(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const match = text.match(/https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
+  return match ? match[0] : undefined;
+}
+
 export type ReviewHeadStatus = "current" | "advanced" | "stale" | "unknown";
 
 export function bypassAckHeadForStatus(params: { status: ReviewHeadStatus; pendingHead: string; currentHead?: string }): string | undefined {
@@ -328,6 +338,22 @@ export function selectReviewBase(params: {
   return params.previous?.head || params.lastAck;
 }
 
+// Generated, machine-authored artifacts checked into the repo. The graphify
+// knowledge graph under `graphify-out/` is derived output, not authored source,
+// so a diff touching only these needs no prose review lane (REQ-AGENT-040 AC8).
+const GENERATED_ARTIFACT_PREFIXES = ["graphify-out/"];
+
+export function isGeneratedArtifactPath(file: string): boolean {
+  return GENERATED_ARTIFACT_PREFIXES.some((prefix) => file.startsWith(prefix));
+}
+
+// True when a non-empty diff touches ONLY generated artifacts. The caller uses
+// this to write an explicit, durable auto-ack audit reason rather than spawning
+// reviewers on derived output.
+export function isGeneratedOnlyDiff(files: string[] | undefined): boolean {
+  return Array.isArray(files) && files.length > 0 && files.every(isGeneratedArtifactPath);
+}
+
 export function classifyReviewFiles(files: string[] | undefined): string[] | undefined {
   if (files === undefined) return ALL_REVIEW_LANES;
   if (files.length === 0) return [];
@@ -335,6 +361,9 @@ export function classifyReviewFiles(files: string[] | undefined): string[] | und
   let touchesSdd = false;
   let touchesDocs = false;
   for (const file of files) {
+    // Generated artifacts contribute no review lane. A diff that mixes them with
+    // real source/sdd/docs is still classified by those non-generated files.
+    if (isGeneratedArtifactPath(file)) continue;
     if (file.startsWith("sdd/")) touchesSdd = true;
     else if (file.startsWith("documentation/") || ["README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md", "LICENSE"].includes(file)) touchesDocs = true;
     else hasBehavioral = true;
@@ -343,6 +372,24 @@ export function classifyReviewFiles(files: string[] | undefined): string[] | und
   if (touchesSdd) return ["spec-reviewer", "doc-updater"];
   if (touchesDocs) return ["doc-updater"];
   return [];
+}
+
+// Pure decision behind resolveEnforcedHead (REQ-AGENT-058 AC3). Given the resolved git facts,
+// choose whether the enforced PR-boundary head is the local HEAD or GitHub's reported PR head.
+// Prefer local ONLY when it is on the PR's own branch, descends from the reported head, AND was
+// actually pushed (the remote-tracking ref contains it) — so a push whose PR metadata still lags
+// is enforced, but an unpushed local WIP commit never arms a review for a commit the PR never had.
+export function enforcedHeadDecision(input: {
+  prHead: string;
+  local: string;
+  onPrBranch: boolean;
+  localDescendsFromPrHead: boolean;
+  localPushed: boolean;
+}): "local" | "prHead" {
+  if (!input.prHead) return "local";
+  if (!input.local || input.prHead === input.local) return "prHead";
+  if (input.onPrBranch && input.localDescendsFromPrHead && input.localPushed) return "local";
+  return "prHead";
 }
 
 export default function () {

@@ -47,7 +47,7 @@
       "advanced"
     ]
   },
-  "mcp.json": {
+  "extensions/graphify-native.ts": {
     "modes": [
       "default",
       "advanced"
@@ -61,6 +61,7 @@
   },
   "extensions/graphify-helpers.ts": {
     "modes": [
+      "default",
       "advanced"
     ]
   },
@@ -80,6 +81,21 @@
     ]
   },
   "skills/graphify/SKILL.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/graphify/references/build.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/graphify/references/labels.md": {
+    "modes": [
+      "advanced"
+    ]
+  },
+  "skills/graphify/references/query.md": {
     "modes": [
       "advanced"
     ]
@@ -150,8 +166,14 @@
       "advanced"
     ]
   },
+  "extensions/review-lane-guards.ts": {
+    "modes": [
+      "advanced"
+    ]
+  },
   "extensions/review-job-helpers.ts": {
     "modes": [
+      "default",
       "advanced"
     ]
   },

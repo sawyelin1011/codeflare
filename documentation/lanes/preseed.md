@@ -247,8 +247,9 @@ All preseed content is deployed via the manifest pipeline:
   + graphify-mcp-lazy.py; advanced-only for graphify-active-repo.sh,
   graphify-session-start.sh, graphify-clone-prompt.sh,
   graph-first-nudge.sh, safe-graphify-update.sh)
-- Pi-native runtime assets include package config, package lock, and MCP
-  config.
+- Pi-native runtime assets include package config and package lock. (Graphify
+  tools ship as the native extension `extensions/graphify-native.ts`, not a
+  seeded `mcp.json` — Pi has no MCP client.)
 
   Extension files deploy Pi-specific runtime behavior:
   `codeflare-commands.ts` provides `/debug`, `/deploy`, and `/brainstorm`;
@@ -276,8 +277,7 @@ All preseed content is deployed via the manifest pipeline:
   `scripts/` -> `.pi/agent/scripts/`, `prompts/` -> `.pi/agent/prompts/`,
   and `agents/` -> `.pi/agent/agents/`.
   The `agents/` prefix maps both to `.pi/agent/agents/` (session-local overrides for `@gotgenes/pi-subagents`) and to `~/.pi/agent/agents/` (persistent user-level overrides). `preseed/agents/pi/agents/Explore.md` is the first native Pi agent override shipped via this path.
-  Package files deploy under `.pi/agent/npm/`; `mcp.json` deploys directly
-  under `.pi/agent/`.
+  Package files deploy under `.pi/agent/npm/`.
 
   These assets adapt runtime behavior to Pi primitives while rules and
   skills still come from the Claude source tree. `/review` is deliberately
@@ -304,13 +304,14 @@ All preseed content is deployed via the manifest pipeline:
   `## Findings`, and `## Finding Details` sections. That chat summary aggregates
   severity counts across code/spec/docs, lists all findings sorted by
   criticality, and avoids per-lane result-file links; the per-lane `.md` files
-  remain the durable evidence store. Partial lane results, including any
-  missing, failed, timed-out, or still-running lane, cannot trigger autofix. If
-  legitimate MEDIUM/HIGH/CRITICAL findings remain after the complete exact-head
-  summary, Pi then requests a fix-and-push pass, unless the latest explicit user
-  directive opts out of auto-fixing for the round (in which case Pi presents the
-  findings and waits). Implements
-  [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop).
+  remain the durable evidence store. Implements
+  [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-and-result-formatting).
+
+  Partial lane results, including any missing, failed, timed-out, or still-running
+  lane, cannot trigger autofix. If legitimate MEDIUM/HIGH/CRITICAL findings remain
+  after the complete exact-head summary, Pi then requests a fix-and-push pass,
+  unless the latest explicit user directive opts out of auto-fixing for the round.
+  Implements [REQ-AGENT-059](../../sdd/spec/agents.md#req-agent-059-pi-durable-review-fix-loop).
 
   Timed-out or failed durable lanes are recorded as failed and do not produce
   the required result file. The PR head remains unacked until a later review run
@@ -391,14 +392,12 @@ active-repo/global-graph maintenance and clone triage, automatic memory capture,
 Vault graph extraction/global-graph merge, local-build blocking,
 and AI-attribution blocking. Pi receives a dedicated native graphify skill
 that uses local AST extraction plus Pi `Agent` subagents instead of the
-Claude/MCP-specific transformed skill. The Pi runtime adapter also makes
-native `graphify_query` / `graphify_path` / `graphify_explain` active-repo
-aware: if the packaged graphify tool resolves the session cwd
-(`~/workspace`) and reports `/home/user/workspace/graphify-out/graph.json`
-missing, Codeflare retries the same query through the graphify CLI with
-`--graph <active-repo>/graphify-out/graph.json`. The active repo identity
-injected into Pi context includes repository basename, checked-out branch,
-and HEAD prefix. Pi receives a separate
+Claude/MCP-specific transformed skill. The Pi runtime also registers first-party native
+`graphify_query` / `graphify_path` / `graphify_explain` tools through
+`graphify-native.ts`. Each query shells the upstream Graphify CLI and resolves
+the cwd repo graph first, then the active-repo sentinel graph, then the merged
+global graph. The active repo identity injected into Pi context includes
+repository basename, checked-out branch, and HEAD prefix. Pi receives a separate
 `review-command.ts` for the user-invoked `/review` UX and
 `review-enforcement.ts` for PR-boundary review enforcement.
 
@@ -409,12 +408,21 @@ remaps tool names in agent definition frontmatter, (3) removes
 references with agent-specific config paths, (5) uses correct file
 extensions (e.g., `.agent.md` for Copilot agents). Pi additionally
 loads `preseed/agents/pi/manifest.json`, emits native runtime files
-to `.pi/agent/extensions/`, `.pi/agent/scripts/`, `.pi/agent/mcp.json`,
+to `.pi/agent/extensions/`, `.pi/agent/scripts/`,
 `.pi/agent/npm/package.json`, `.pi/agent/npm/package-lock.json`,
 capture-contract prompts to `.pi/agent/prompts/`, native Pi skill overrides under
 `~/.pi/agent/skills/`, and native Pi agent overrides under `~/.pi/agent/agents/`,
 and adapts Claude agent definitions into `.pi/agent/agents/*.md` for
-`@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops context-mode tools so those `@gotgenes/pi-subagents` subagents run against the native Pi tool surface. This applies to subagent frontmatter only; the durable PR-boundary review lanes are a separate `createAgentSession` path that loads context-mode additively when it is enabled (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so "review runs without ctx tools" is not categorical.
+`@gotgenes/pi-subagents`. Pi's generated agent frontmatter deliberately drops
+context-mode tools so those `@gotgenes/pi-subagents` subagents run against the
+native Pi tool surface. This applies to subagent frontmatter only. Durable
+PR-boundary review lanes are not `@gotgenes/pi-subagents` and not in-process
+`createAgentSession` calls: `spawnDurableLane` launches detached headless `pi`
+child processes with a bounded inspection tool allowlist, `--no-extensions`,
+and explicit `-e` loading for `graphify-native.ts`, `review-lane-guards.ts`,
+plus settings-enabled context-mode. Bash remains available for git/gh diff
+inspection; `review-lane-guards.ts` blocks local build, test, lint, and dev-server
+commands in the headless lane.
 
 **Per-mode seeding**: Default mode seeds the core rules plus the
 universal skills; advanced mode seeds the full set (memory, ECC
@@ -499,7 +507,9 @@ without masking other required lanes, while a stale uncompleted lane past
 the transcript recency bound is demanded again.
 
 The PostToolUse nudge and Stop hook share `scripts/lib/lane-classifier.sh`.
-Doc-only pushes spawn only `doc-updater`; `sdd/`-only pushes spawn
+Generated-only `graphify-out/` diffs require no review lanes and are auto-acked
+with a durable audit event; generated artifacts never suppress review for mixed
+diffs. Doc-only pushes spawn only `doc-updater`; `sdd/`-only pushes spawn
 `spec-reviewer` then `doc-updater`; source pushes spawn all three; non-SDD
 projects fire no review agents.
 
@@ -509,13 +519,22 @@ predicates) and the pipe-alternated MCP matcher
 `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute`.
 This keeps attribution blocking and push detection effective whether
 context-mode is active or not. Implements
-[REQ-AGENT-021](../../sdd/spec/agents.md#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability) AC3, [REQ-AGENT-036](../../sdd/spec/agents.md#req-agent-036-pr-boundary-review-trigger-conditions) AC1+AC2, and [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) AC4-AC7. Hooks
-registered in settings.json, scripts delivered via plugin.
+[REQ-AGENT-021](../../sdd/spec/agents.md#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability) AC3,
+[REQ-AGENT-036](../../sdd/spec/agents.md#req-agent-036-pr-boundary-review-trigger-conditions) AC1+AC2,
+and [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) AC1+AC2+AC4-AC7.
+Hooks registered in settings.json, scripts delivered via plugin.
 
 ## Third-party plugin: context-mode
 
 [context-mode](https://github.com/mksglu/context-mode) is registered
-as an optional Claude Code MCP server (`ctx_*` helper tools) where that runtime enables it. Pi does not load context-mode by default; `/ctx on` enables the package for the current running Pi session and reloads resources, while `/ctx off` disables it again. Durable PR-boundary review lanes inherit this state: when context-mode is enabled in Pi settings, `runDurableLane` additively loads it into the lane via `additionalExtensionPaths` (see [AD64](../decisions/README.md#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield)), so reviewers gain `ctx_*` tools only when the main session has `/ctx on`; with it off, lanes run without them.
+as an optional Claude Code MCP server (`ctx_*` helper tools) where that runtime
+enables it. Pi does not load context-mode by default; `/ctx on` enables the
+package for the current running Pi session and reloads resources, while `/ctx off`
+disables it again. Durable PR-boundary review lanes inherit `/ctx on` only when
+`spawnDurableLane` adds the settings-enabled context-mode package as an explicit
+`-e` argument. With `/ctx on`, the lane can expose `ctx_search`; with it off,
+the lane runs without ctx tools. `graphify-native.ts` and `review-lane-guards.ts`
+are loaded separately.
 The npm package is fetched by the user's own container from the npm
 registry on first invocation; Codeflare does not redistribute the
 source. Commercial users receive only the MCP server registration:
@@ -551,20 +570,19 @@ All tiers append tool guidance (pointing at `mcp__graphify__query_graph`, `mcp__
 
 In advanced session mode, clone triage detects real `git clone` / `gh repo clone` operations and resolves the destination from the tool result (`Cloning into '...'`) before falling back to command parsing. If no repo graph exists, the agent asks the user which graph action to take before doing any graph work: Full repo AST-only, Full repo semantic, or no graph action. Claude's clone hook injects a directive that tells the agent to compare `graphify-out/graph.json` `built_at_commit` with `git rev-parse HEAD`; Pi performs that freshness comparison natively in its lifecycle extension. Fresh graphs produce an information message only. Stale or unknown graphs ask the user before any update, offering existing-graph-as-is, Full repo AST-only update, or Full repo semantic refresh. The AST-only update uses the bounded upstream-update wrapper only after the user chooses it. Full semantic build/refresh records clone-time intent only: after corpus detection, the graphify skill must show actual uncached file/subagent counts and get confirmation before dispatching semantic subagents. Pi mirrors the same behavior through native lifecycle events and suppresses clone triage inside durable PR-boundary review lanes.
 
-### Pi active-repo query fallback ([REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify) AC4-AC5)
+### Pi native graphify tools ([REQ-AGENT-023](../../sdd/spec/agents.md#req-agent-023-knowledge-graph-capability-graphify) AC4-AC5)
 
-Pi sessions run from `~/workspace`, while checked-out repositories live under
-child directories. The packaged Pi graphify tools execute from the Pi session
-cwd, so they can initially look for `/home/user/workspace/graphify-out/graph.json`.
-`codeflare-pi.ts` handles that mismatch in the `tool_result` hook: when
-`graphify_query`, `graphify_path`, or `graphify_explain` fails specifically with
-that missing workspace-root graph, the extension resolves the active repository
-from `~/.cache/codeflare-hooks/graphify-active-cwd`, verifies that
-`<repo>/graphify-out/graph.json` exists, and retries the equivalent CLI command
-with `--graph <repo>/graphify-out/graph.json`. The patched result is returned to
-Pi as a successful tool result, with details recording the repo path, graph path,
-branch, and HEAD prefix. If the retry fails too, the original tool error is left
-unchanged so the agent can fall back manually.
+Pi has no MCP client, so Codeflare exposes `graphify_query`, `graphify_path`,
+and `graphify_explain` through `graphify-native.ts`. The extension shells the
+same upstream `graphify` CLI used by Claude's MCP server and passes the resolved
+`--graph` path explicitly.
+
+Graph resolution is local-first: the cwd repo's `graphify-out/graph.json` wins,
+then the active-repo sentinel's graph, then `~/.graphify/global-graph.json`.
+Tool results include the graph path, scope, and repo cwd so the graphify skill
+can save the answer back to the same graph. If no graph exists, the tools fail
+soft with a build-graph hint. `codeflare-pi.ts` still owns active-repo context
+and clone triage; it no longer acts as the primary query retry shim.
 
 ### Build model choice ([REQ-AGENT-043](../../sdd/spec/agents.md#req-agent-043-graphify-build-mode-dispatch))
 
@@ -698,7 +716,10 @@ To inspect enforcement state without reading `.git/` by hand, Pi exposes a read-
 - [REQ-AGENT-047](../../sdd/spec/agents.md#req-agent-047-resume-mode-closure-and-review-pipeline-gate) - Resume Mode closure and review-pipeline gate
 - [REQ-AGENT-048](../../sdd/spec/agents.md#req-agent-048-audit-accumulator-surfaces) - Audit accumulator surfaces
 - [REQ-AGENT-050](../../sdd/spec/agents.md#req-agent-050-pi-native-review-workflow-skill) - Pi-Native `/review` Workflow Skill
-- [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-result-formatting-and-fix-loop) - Pi Durable Review Status, Result Formatting, and Fix Loop
+- [REQ-AGENT-053](../../sdd/spec/agents.md#req-agent-053-pi-durable-review-status-and-result-formatting) - Pi Durable Review Status and Result Formatting
+- [REQ-AGENT-059](../../sdd/spec/agents.md#req-agent-059-pi-durable-review-fix-loop) - Pi Durable Review Fix Loop
+- [REQ-AGENT-060](../../sdd/spec/agents.md#req-agent-060-pi-durable-review-lane-tool-surface) - Pi Durable Review Lane Tool Surface
+- [REQ-AGENT-061](../../sdd/spec/agents.md#req-agent-061-pi-idle-durable-review-reaper) - Pi Idle Durable Review Reaper
 - [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement) - Pi PR-Boundary Review Window Advancement
 - [REQ-AGENT-056](../../sdd/spec/agents.md#req-agent-056-pi-local-statusline-footer) - Pi Local Statusline Footer
 - [REQ-AGENT-057](../../sdd/spec/agents.md#req-agent-057-pi-review-status-command) - Pi Review-Status Command
