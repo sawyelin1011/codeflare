@@ -21,10 +21,11 @@ on:
           - production
           - integration
           - enterprise
+          - enterprise integration
         default: integration
 
 concurrency:
-  group: deploy-${{ ((github.event_name == 'workflow_run' || github.ref == 'refs/heads/main') && (inputs.environment || 'production')) || (inputs.environment == 'enterprise' && 'enterprise') || 'integration' }}
+  group: deploy-${{ ((github.event_name == 'workflow_run' || github.ref == 'refs/heads/main') && (inputs.environment || 'production')) || (inputs.environment == 'enterprise' && 'enterprise') || (inputs.environment == 'enterprise integration' && 'enterprise integration') || 'integration' }}
   cancel-in-progress: true
 
 permissions:
@@ -62,9 +63,10 @@ jobs:
     #   workflow_run.event == 'push'                   -- only post-merge runs trigger deploy
     #   head_repository.full_name == github.repository -- and only from this repo, never a fork
     # production is locked to main (the guard step below rejects it elsewhere);
-    # enterprise is a separate single-tenant env that may be deployed from any
-    # branch (e.g. develop) for iteration; everything else off non-main -> integration.
-    environment: ${{ (github.ref == 'refs/heads/main' && (inputs.environment || 'production')) || (inputs.environment == 'enterprise' && 'enterprise') || 'integration' }}
+    # enterprise and enterprise integration are separate single-tenant envs that may
+    # be deployed from any branch (e.g. develop) for iteration; everything else off
+    # non-main -> integration.
+    environment: ${{ (github.ref == 'refs/heads/main' && (inputs.environment || 'production')) || (inputs.environment == 'enterprise' && 'enterprise') || (inputs.environment == 'enterprise integration' && 'enterprise integration') || 'integration' }}
     timeout-minutes: 30
     env:
       WORKER_NAME: ${{ vars.CLOUDFLARE_WORKER_NAME || 'codeflare' }}
@@ -343,7 +345,6 @@ jobs:
           ${{ vars.SAAS_MODE && format('--var SAAS_MODE:{0}', vars.SAAS_MODE) || '' }}
           ${{ vars.SAAS_EXTRA_IDPS && format('--var SAAS_EXTRA_IDPS:{0}', vars.SAAS_EXTRA_IDPS) || '' }}
           ${{ vars.ENTERPRISE_MODE && format('--var ENTERPRISE_MODE:{0}', vars.ENTERPRISE_MODE) || '' }}
-          ${{ vars.ENTERPRISE_MODE == 'active' && vars.AIG_LANGUAGE_MODEL && format('--var AIG_LANGUAGE_MODEL:{0}', vars.AIG_LANGUAGE_MODEL) || '' }}
           ${{ vars.SAAS_MODE == 'active' && secrets.OAUTH_CLIENT_ID && format('--var OAUTH_CLIENT_ID:{0}', secrets.OAUTH_CLIENT_ID) || '' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

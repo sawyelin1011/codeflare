@@ -7,6 +7,7 @@ import { createRateLimiter } from '../../middleware/rate-limit';
 import { CF_API_BASE, logger, getWorkerNameFromHostname } from './shared';
 import { SETUP_KEYS } from '../../lib/kv-keys';
 import { getAccessGroupNames } from './access';
+import { parseAccessGroups } from '../../lib/access';
 import { isEnterpriseMode } from '../../lib/subscription';
 
 const statusRateLimiter = createRateLimiter({ windowMs: 60_000, maxRequests: 30, keyPrefix: 'setup-status' });
@@ -117,16 +118,31 @@ async function resolveAccountId(token: string, kv: KVNamespace): Promise<string 
  */
 handlers.get('/prefill', prefillRateLimiter, async (c) => {
   const token = c.env.CLOUDFLARE_API_TOKEN;
-  // Enterprise: surface the currently-stored Access group so the wizard field
-  // round-trips on re-run (empty string when unset / non-enterprise).
-  const enterpriseAccessGroup = (await c.env.KV.get(SETUP_KEYS.ENTERPRISE_ACCESS_GROUP)) ?? '';
+  // Enterprise: surface the currently-stored Access groups / route catalog /
+  // default route so the wizard round-trips on re-run. parseAccessGroups splits
+  // the CSV-joined groups value back into the chip array the UI expects. Gated on
+  // enterprise mode so a non-enterprise prefill response is byte-identical to
+  // before this feature (the fields are enterprise-only).
+  let enterpriseExtras: Record<string, unknown> = {};
+  if (isEnterpriseMode(c.env)) {
+    const enterpriseAccessGroup = parseAccessGroups(await c.env.KV.get(SETUP_KEYS.ENTERPRISE_ACCESS_GROUP));
+    // KV.get(...,'json') throws on malformed stored JSON; degrade to empty/null like
+    // the runtime route-config reader does (loadEnterpriseRouteConfig in lib/access).
+    let dynamicRoutes: string[] = [];
+    let defaultRoute: { route: string; reasoning: string } | null = null;
+    try {
+      dynamicRoutes = (await c.env.KV.get<string[]>(SETUP_KEYS.DYNAMIC_ROUTES, 'json')) ?? [];
+      defaultRoute = (await c.env.KV.get<{ route: string; reasoning: string }>(SETUP_KEYS.DEFAULT_ROUTE, 'json')) ?? null;
+    } catch { /* malformed stored JSON → wizard starts from empty */ }
+    enterpriseExtras = { enterpriseAccessGroup, dynamicRoutes, defaultRoute };
+  }
   if (!token) {
-    return c.json({ adminUsers: [], allowedUsers: [], enterpriseAccessGroup });
+    return c.json({ adminUsers: [], allowedUsers: [], ...enterpriseExtras });
   }
 
   // SaaS mode: admin enters everything manually, no prefill from CF Access groups
   if (c.env.SAAS_MODE === 'active') {
-    return c.json({ adminUsers: [], allowedUsers: [], enterpriseAccessGroup });
+    return c.json({ adminUsers: [], allowedUsers: [], ...enterpriseExtras });
   }
 
   try {
@@ -134,7 +150,7 @@ handlers.get('/prefill', prefillRateLimiter, async (c) => {
     const groupNames = getAccessGroupNames(workerName);
     const accountId = await resolveAccountId(token, c.env.KV);
     if (!accountId) {
-      return c.json({ adminUsers: [], allowedUsers: [] });
+      return c.json({ adminUsers: [], allowedUsers: [], ...enterpriseExtras });
     }
 
     const groupsRes = await cfApiCB.execute(() => fetch(`${CF_API_BASE}/accounts/${accountId}/access/groups`, {
@@ -152,11 +168,11 @@ handlers.get('/prefill', prefillRateLimiter, async (c) => {
     return c.json({
       adminUsers,
       allowedUsers,
-      enterpriseAccessGroup,
+      ...enterpriseExtras,
     });
   } catch (error) {
     logger.warn('Setup prefill failed', { error: toError(error).message });
-    return c.json({ adminUsers: [], allowedUsers: [], enterpriseAccessGroup });
+    return c.json({ adminUsers: [], allowedUsers: [], ...enterpriseExtras });
   }
 });
 

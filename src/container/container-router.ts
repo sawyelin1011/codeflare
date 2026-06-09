@@ -35,7 +35,10 @@ interface SetBucketNameBody {
   bucketName: string;
   sessionId?: string;
   userEmail?: string;
-  userGroup?: string;
+  userGroups?: string[];
+  routeCatalog?: string[];
+  defaultRoute?: string;
+  defaultReasoning?: string;
   r2AccessKeyId?: string;
   r2SecretAccessKey?: string;
   r2AccountId?: string;
@@ -142,7 +145,7 @@ export function dispatchInternalRoute(
 /** Handle POST /_internal/setBucketName. */
 async function handleSetBucketName(host: ContainerHost, request: Request): Promise<Response> {
   try {
-    const { bucketName, sessionId, userEmail, userGroup, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey, githubToken, cloudflareApiToken, cloudflareAccountId, encryptionKey, sessionMode, userTimezone, sleepAfter: sleepAfterPref } =
+    const { bucketName, sessionId, userEmail, userGroups, routeCatalog, defaultRoute, defaultReasoning, r2AccessKeyId, r2SecretAccessKey, r2AccountId, r2Endpoint, workspaceSyncEnabled, fastStartEnabled, tabConfig, openaiApiKey, geminiApiKey, githubToken, cloudflareApiToken, cloudflareAccountId, encryptionKey, sessionMode, userTimezone, sleepAfter: sleepAfterPref } =
       await request.json() as SetBucketNameBody;
 
     // FIX-28: Idempotency - once bucket name is set, reject subsequent calls.
@@ -152,7 +155,8 @@ async function handleSetBucketName(host: ContainerHost, request: Request): Promi
       // Update user preferences on restart even though bucket is already set.
       // Without this, preference changes made between sessions are lost.
       const prefsChanged = await applyPrefsOnRestart(host, host.ctx.storage, {
-        sessionId, userEmail, userGroup, workspaceSyncEnabled, fastStartEnabled, tabConfig,
+        sessionId, userEmail, userGroups, routeCatalog, defaultRoute, defaultReasoning,
+        workspaceSyncEnabled, fastStartEnabled, tabConfig,
         openaiApiKey, geminiApiKey, githubToken, cloudflareApiToken, cloudflareAccountId,
         encryptionKey, sessionMode, userTimezone,
       });
@@ -199,10 +203,37 @@ async function handleSetBucketName(host: ContainerHost, request: Request): Promi
       host._userEmail = userEmail;
     }
 
-    // Store the matched Access group for per-group gateway attribution (cf-aig-metadata.group).
-    if (userGroup) {
-      await host.ctx.storage.put('userGroup', userGroup);
-      host._userGroup = userGroup;
+    // Store the matched Access groups for per-group gateway attribution (one
+    // cf-aig-metadata tag per group). REQ-ENTERPRISE-004 (revised).
+    if (userGroups && userGroups.length > 0) {
+      await host.ctx.storage.put('userGroups', userGroups);
+      host._userGroups = userGroups;
+    }
+
+    // Store the dynamic-route catalog + resolved default route:reasoning so
+    // buildEnvVars emits them for entrypoint.sh on each container start.
+    // REQ-ENTERPRISE-005 (revised).
+    // The default route + reasoning travel as a unit with the catalog (they are only
+    // ever sent alongside a non-empty catalog — see buildSetBucketNameBody), so the
+    // writes are nested under catalog presence. This self-guards the non-enterprise
+    // path: with no catalog on the wire, a stray empty-string default cannot write
+    // enterprise route state into a non-enterprise container.
+    if (routeCatalog && routeCatalog.length > 0) {
+      await host.ctx.storage.put('routeCatalog', routeCatalog);
+      host._routeCatalog = routeCatalog;
+      // `!== undefined`, not truthiness: an empty-string default route/reasoning is the
+      // meaningful "admin cleared / default drifted out of catalog" reset (reasoning-off or
+      // first-route fallback) and must be stored as such — matching applyPrefsOnRestart's
+      // documented empty-reset contract. buildEnvVars omits the env var when state holds '',
+      // so an empty value surfaces downstream as "reasoning off" / first route.
+      if (defaultRoute !== undefined) {
+        await host.ctx.storage.put('defaultRoute', defaultRoute);
+        host._defaultRoute = defaultRoute;
+      }
+      if (defaultReasoning !== undefined) {
+        await host.ctx.storage.put('defaultReasoning', defaultReasoning);
+        host._defaultReasoning = defaultReasoning;
+      }
     }
 
     await applySetBucketName(host, bucketName, {

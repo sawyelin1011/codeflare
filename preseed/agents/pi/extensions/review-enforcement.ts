@@ -13,8 +13,8 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { basename, dirname, join } from "node:path";
 import { getMarkdownTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text } from "@earendil-works/pi-tui";
-import { ALL_REVIEW_LANES, bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, commandTextFromEvent, createReadyOnceTracker, cwdFromBoundaryCommand, enforcedHeadDecision, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryTrigger, prCreateBoundaryBase, prUrlFromText, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
-import { compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewMessageKey, durableReviewRecommendation, formatMergedReviewSummary, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, shouldCheckOpenPrReconciliation, shouldReconcileOpenPr, type DurableReviewSummaryRecord, type DurableReviewSummaryRow, type ReviewSeverityCounts } from "./review-job-helpers";
+import { ALL_REVIEW_LANES, bypassAckHeadForStatus, classifyReviewFiles, classifyReviewHead, commandTextFromEvent, createReadyOnceTracker, cwdFromBoundaryCommand, enforcedHeadDecision, extractBackgroundAgentId, isFailedToolExecution, isPrBoundaryTrigger, prBoundaryCommandBase, prUrlFromText, reusablePendingReview, selectReviewBase, type ReviewHeadStatus, type ReviewSpawnRequest } from "./review-helpers";
+import { compactDurableReviewStatus, countReviewSeverities, durableReviewAckReady, durableReviewEligibleLanes, durableReviewInitialLanes, durableReviewMessageKey, durableReviewRecommendation, formatMergedReviewSummary, requestReviewAutofixForRows, reviewAutofixModeFromUserMessages, shouldCheckOpenPrReconciliation, shouldReconcileOpenPr, reconcileBoundaryAction, reviewBaselineContinuation, resolveReviewRepo, type DurableReviewSummaryRecord, type DurableReviewSummaryRow, type ReviewSeverityCounts } from "./review-job-helpers";
 import { appendReviewEvent, completedDurableReviewLanes, failedDurableReviewLanes, readDurableReviewJob, reapDurableReviewLanes, reviewJobDir, reviewResultPath, reviewResultsDir, runningDurableReviewLanes, startDurableReviewLanes } from "./review-jobs";
 
 const REVIEW_BYPASS = "/tmp/review-bypass";
@@ -32,6 +32,12 @@ const REVIEW_REQUEST_RETRY_MS = 60 * 1000;
 // to at most once per window; forced ticks (session_start, agent_end, PR-URL fallback) bypass it.
 const RECONCILE_THROTTLE_MS = 20 * 1000;
 let lastReconcileCheckAt = 0;
+// Per-repo enforced head observed when THIS Pi session first reconciled (≈ session start).
+// In-memory only (never persisted): a head present at launch is not an in-session push, so it
+// must offer, not auto-start. Only a head that later advances beyond this baseline is treated
+// as in-session continuation (a dropped on-tool-end push) and auto-starts. Process-scoped so a
+// fresh `pi` launch always re-baselines and offers — restoring the offer-on-start behavior.
+const reviewSessionBaselineHead = new Map<string, string>();
 
 type PrState = {
   state?: string;
@@ -50,6 +56,8 @@ type PendingReview = {
   reviewBase?: string;
   lanes: string[];
   completed: Set<string>;
+  /** Vestigial: retained for pending.json backward-compat. doc-updater now dispatches in
+   *  the initial parallel wave, so spec-reviewer completion no longer gates it. */
   docPromptSent: boolean;
   spawned: boolean;
   spawnedIds: Record<string, string>;
@@ -77,14 +85,20 @@ function cwdFromCommand(command: string): string | undefined {
   return cwdFromBoundaryCommand(command);
 }
 
-function activeRepoFallback(): string | undefined {
-  try {
-    const p = "/home/user/.cache/codeflare-hooks/graphify-active-cwd";
-    if (existsSync(p)) return readFileSync(p, "utf8").trim() || undefined;
-  } catch {
-    return undefined;
-  }
-  return undefined;
+// The repo THIS Pi session is reviewing, remembered for the no-ctx autonomous reaper. Set by
+// reviewRepoForCtx whenever a ctx-bearing handler resolves the review repo from the session cwd.
+// Deliberately replaces the old graphify active-cwd sentinel read: that sentinel is shared across
+// agents (Claude's hook + Pi's codeflare-pi.ts both write it) and flaps to whichever agent acted
+// last, so it cannot identify the repo THIS Pi session is reviewing. See resolveReviewRepo().
+let sessionReviewRepo: string | undefined;
+
+// Resolve + remember the review repo for a ctx-bearing handler: an explicit command cwd (`cd`/`-C`
+// in the boundary command) first, then the Pi session's own cwd, then pi's process dir as a last
+// resort (its own dir, not the cross-agent sentinel). Never the graphify sentinel.
+function reviewRepoForCtx(ctx: any, commandCwd?: string): string | undefined {
+  const repo = resolveReviewRepo({ commandCwd, sessionCwd: ctx?.sessionManager?.getCwd?.(), processCwd: process.cwd() }, findGitRoot);
+  if (repo) sessionReviewRepo = repo;
+  return repo;
 }
 
 function commandText(event: any): string {
@@ -143,6 +157,22 @@ function acked(repo: string, head: string): boolean {
 
 function writeAck(repo: string, head: string): void {
   writeFileSync(ackPath(repo), `${head}\n`, "utf8");
+}
+
+// "Offered" marker (REQ-AGENT-058 revised). A missed boundary surfaced by reconciliation
+// (e.g. a fresh clone/checkout of a repo with an open PR) is OFFERED to the user once instead
+// of auto-spawning reviewers. Keyed by head so a new commit re-offers; distinct from the ack
+// file because being offered does NOT open the merge gate — only an explicit ack/skip does.
+function offeredPath(repo: string): string {
+  return join(repo, ".git", "sdd-review-offered-head");
+}
+
+function offered(repo: string, head: string): boolean {
+  try { return readFileSync(offeredPath(repo), "utf8").trim() === head; } catch { return false; }
+}
+
+function writeOffered(repo: string, head: string): void {
+  writeFileSync(offeredPath(repo), `${head}\n`, "utf8");
 }
 
 function clearPending(repo: string): void {
@@ -287,7 +317,7 @@ function isGitPushCommand(command: string): boolean {
 
 function prForBoundaryCommand(repo: string, command: string, pr: PrState | undefined): PrState | undefined {
   if (isEnforcedPr(pr)) return pr;
-  const base = prCreateBoundaryBase(command, pr?.baseRefName);
+  const base = prBoundaryCommandBase(command, pr?.baseRefName);
   if (!base) return pr;
   const head = localHead(repo) || pr?.headRefOid;
   if (!head) return pr;
@@ -572,16 +602,18 @@ let activeReviewFinalize: ((state: PendingReview) => void) | undefined;
 // by an idle session leaves finished lanes unharvested (agent_end on disk, no result file).
 // Pi exposes no periodic/idle hook, so this plain interval (registered once, below) drives
 // the reaper without a ctx while a review window is pending: it reaps finished lanes,
-// finalizes completed reviews (emit summary + autofix via the pi-bound closure), and spawns the next *fresh* eligible lane (e.g.
-// doc-updater once spec-reviewer has a result). Failed-lane RETRIES are intentionally left
+// finalizes completed reviews (emit summary + autofix via the pi-bound closure), and re-spawns any
+// *fresh* eligible lane that is not yet running (all lanes are eligible from the start now — no
+// ordering). Failed-lane RETRIES are intentionally left
 // to the on-turn driver so the breaker still bounds them. Best-effort and self-clearing:
 // it must never throw.
 function autonomousReviewReaperTick(): void {
   try {
     // The timer has no event ctx, so it cannot use ctx.sessionManager.getCwd() like the on-turn
-    // handlers. process.cwd() is pi's PROCESS dir, not the session/repo dir, so resolve the repo
-    // the way every other handler's fallback does: the active-repo sentinel first, process.cwd() last.
-    const repo = activeRepoFallback() || findGitRoot(process.cwd());
+    // handlers. Use the in-session review repo remembered by reviewRepoForCtx (set when this session
+    // armed/reconciled the review), falling back to pi's process dir. NOT the graphify active-cwd
+    // sentinel — under concurrent agents it flaps to whatever repo acted last, misrouting finalize.
+    const repo = resolveReviewRepo({ sessionReviewRepo, processCwd: process.cwd() }, findGitRoot);
     if (!repo) return;
     const pending = loadPending(repo);
     if (!pending || !pending.head || pending.lanes.length === 0) return;
@@ -779,7 +811,7 @@ export default function (pi: ExtensionAPI) {
 
   function hydratePending(ctx: any): PendingReview | undefined {
     if (pending) return pending;
-    const repo = activeRepoFallback() || findGitRoot(ctx.sessionManager.getCwd());
+    const repo = reviewRepoForCtx(ctx);
     pending = repo ? loadPending(repo) : undefined;
     return pending;
   }
@@ -879,7 +911,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function publishSummaryForCurrentPr(ctx: any): boolean {
-    const repo = activeRepoFallback() || findGitRoot(ctx.sessionManager.getCwd());
+    const repo = reviewRepoForCtx(ctx);
     if (!repo || !isSddProject(repo)) return false;
     const pr = prState(repo);
     if (!isEnforcedPr(pr)) return false;
@@ -928,7 +960,20 @@ export default function (pi: ExtensionAPI) {
     resetBlockCount(state.repo);
     clearBreaker(state.repo);
     clearPending(state.repo);
-    publishReviewSummary(state, ctx);
+    if (ctx) {
+      publishReviewSummary(state, ctx);
+    } else {
+      // Off-turn idle finalization: the autonomous reaper has no ctx, and pi.sendMessage does not
+      // surface a visible message outside a live turn. publishReviewSummary claims the exclusive
+      // summary-v3 announcement marker BEFORE emitting, so claiming it here would permanently
+      // suppress the on-turn re-emit (the marker is wx-create, never retried) and the summary would
+      // be lost — acked, pending cleared, but never shown. Persist the merged summary to disk only
+      // and leave the chat announcement UNCLAIMED; the next on-turn tick (refreshReviewStatusFromDurable
+      // → publishSummaryForCurrentPr → publishReviewSummary) claims and emits it with a live ctx. The
+      // autofix request below still fires and triggers a turn when there are actionable findings, which
+      // is what surfaces that deferred summary with zero extra user input.
+      writeReviewSummaryFromDisk(state);
+    }
     requestReviewAutofix(state, ctx);
     clearReviewStatus(ctx);
     pending = undefined;
@@ -992,13 +1037,9 @@ export default function (pi: ExtensionAPI) {
     state.completed.add(type);
     updateReviewStatus(state, ctx);
     resetBlockCount(state.repo); // a lane completing is progress: reset the breaker patience counter
-    if (type === "spec-reviewer" && state.lanes.includes("doc-updater") && !state.docPromptSent) {
-      state.docPromptSent = true;
-      savePending(state);
-      const currentPr = prState(state.repo) || { baseRefName: state.baseRefName, number: state.prNumber, headRefOid: state.head } as PrState;
-      await spawnReviewLanes(state, currentPr, ["doc-updater"], ctx, "spec-reviewer completion");
-      return;
-    }
+    // doc-updater is dispatched in the initial parallel wave (durableReviewInitialLanes),
+    // so spec-reviewer's completion no longer spawns it — every lane completes independently
+    // and the ack-ready check below fires once all report-only lanes have landed.
     savePending(state);
     if (durableReviewAckReady({ lanes: state.lanes, resultLanes: completedDurableReviewLanes(state.repo, state.head, state.lanes) })) {
       finalizeCompletedReview(state, ctx);
@@ -1055,7 +1096,7 @@ export default function (pi: ExtensionAPI) {
   // boundary_candidate_ignored so a stuck PR is never silent (AC4). `force` bypasses the network
   // throttle for once-per-turn ticks. Returns true when a window was created or acked.
   async function reconcileOpenPrReview(ctx: any, force: boolean): Promise<boolean> {
-    const repo = findGitRoot(ctx.sessionManager.getCwd()) || activeRepoFallback();
+    const repo = reviewRepoForCtx(ctx);
     const nowTs = Date.now();
     const lifecycle = shouldCheckOpenPrReconciliation({
       activeRun: isActiveRun(),
@@ -1089,21 +1130,41 @@ export default function (pi: ExtensionAPI) {
       }
       return false;
     }
-    appendReviewEvent(resolvedRepo, { event: "boundary_reconciled", head, reason: decision.reason });
-    ctx.ui.notify(`PR-boundary review reconciled for ${basename(resolvedRepo)} at ${head.slice(0, 12)} (missed boundary event recovered).`, "warning");
-    return ensureReviewWindow({ repo: resolvedRepo, pr: pr as PrState, head, ctx, trigger: "open-PR reconciliation" });
+    // REQ-AGENT-058 (revised): decide whether this missed boundary is in-session continuation
+    // work whose onToolEnd auto-start was dropped (compound `&&`, here-doc, `gh pr edit`, or a
+    // reload between the command and its event), or a head we simply inherited at launch (a fresh
+    // clone/checkout, or just relaunching `pi` on an existing repo with an open PR). The signal is
+    // an IN-MEMORY, per-session baseline: the head this session first observed here. A head present
+    // at launch (baseline unset on this first reconcile, or unchanged since) is NOT an in-session
+    // push, so it OFFERS; only a head that later ADVANCES beyond the baseline auto-starts. This
+    // restores the offer-on-launch behavior — keying off the on-disk ack instead made every launch
+    // whose head descended from a prior ack auto-start, which is the regression being fixed.
+    const baseline = reviewSessionBaselineHead.get(resolvedRepo);
+    if (baseline === undefined) reviewSessionBaselineHead.set(resolvedRepo, head);
+    const inSessionContinuation = reviewBaselineContinuation(baseline, head, (a, b) => isAncestor(resolvedRepo, a, b));
+    const action = reconcileBoundaryAction({
+      reconcile: decision.reconcile,
+      alreadyOffered: offered(resolvedRepo, head),
+      inSessionContinuation,
+    });
+    if (action === "noop") return false;
+    if (action === "autostart") {
+      return await ensureReviewWindow({ repo: resolvedRepo, pr: pr as PrState, head, ctx, trigger: "open-PR reconciliation (in-session continuation)" });
+    }
+    writeOffered(resolvedRepo, head);
+    appendReviewEvent(resolvedRepo, { event: "boundary_offered", head, reason: decision.reason });
+    ctx.ui.notify(`PR-boundary review available for ${basename(resolvedRepo)} at ${head.slice(0, 12)} (missed boundary). Run /review-run to start the required reviewers, or /review-skip to skip and ack this HEAD. Merge stays blocked until you choose.`, "warning");
+    return false;
   }
 
   const onAgentStart = (event: any, ctx: any) => {
     if (!isActiveRun()) return;
     remember(ctx);
-    const toolName = String(event?.toolName || "").toLowerCase();
-    const input = event?.input || event?.params || event?.args || event?.arguments || {};
     const command = commandText(event);
     // commandText() pulls the command from bash (input.command) or, when context-mode is on,
     // the ctx_* tools (code/commands). Gate on the command itself, never the tool name.
     if (isGhPrMerge(command)) {
-      const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
+      const repo = reviewRepoForCtx(ctx, cwdFromCommand(command));
       if (!repo || !isSddProject(repo)) return;
       const pr = prState(repo);
       if (!isEnforcedPr(pr)) return;
@@ -1118,19 +1179,8 @@ export default function (pi: ExtensionAPI) {
       }
       return;
     }
-
-    if (toolName !== "agent") return;
-    const type = String(input.subagent_type || input.subagentType || "");
-    if (type !== "doc-updater") return;
-    const state = hydratePending(ctx);
-    if (!state) return;
-    if (reviewHeadStatus(state) === "stale") {
-      discardStale(state, ctx);
-      return;
-    }
-    if (state.lanes.includes("spec-reviewer") && !state.completed.has("spec-reviewer")) {
-      return { block: true, reason: "PR-boundary review order violation: doc-updater must run only after spec-reviewer completes for this PR HEAD." };
-    }
+    // No doc-updater-after-spec-reviewer ordering gate: the lanes run in parallel
+    // (REQ-AGENT-040 AC4/AC5, AD78), so onAgentStart only enforces the merge gate.
   };
 
   pi.on("session_start", (_event: any, ctx: any) => {
@@ -1140,6 +1190,45 @@ export default function (pi: ExtensionAPI) {
     refreshReviewStatusFromDurable(ctx);
     // Catch a boundary missed before this session started (forced: once per session start).
     void reconcileOpenPrReview(ctx, true);
+  });
+
+  // User controls for a missed-boundary review that reconciliation OFFERED rather than
+  // auto-started (REQ-AGENT-058 revised). /review-run launches the required reviewers for the
+  // current enforced PR head; /review-skip acks that head so the merge gate opens with no review.
+  function resolveCommandRepo(ctx: any): string | undefined {
+    return reviewRepoForCtx(ctx);
+  }
+
+  pi.registerCommand("review-run", {
+    description: "Start the PR-boundary reviewers for the current enforced PR head",
+    handler: async (_args: string, ctx: any) => {
+      const repo = resolveCommandRepo(ctx);
+      if (!repo || !isSddProject(repo)) { ctx.ui.notify("/review-run: not inside an SDD repository.", "warning"); return; }
+      const pr = prState(repo);
+      if (!isEnforcedPr(pr)) { ctx.ui.notify("/review-run: no open PR to main/master for this repo — nothing to review.", "warning"); return; }
+      const head = resolveEnforcedHead(repo, pr);
+      if (!head) { ctx.ui.notify("/review-run: could not resolve the PR head.", "warning"); return; }
+      if (acked(repo, head)) { ctx.ui.notify(`/review-run: head ${head.slice(0, 12)} is already acked; nothing to do.`, "info"); return; }
+      remember(ctx);
+      const started = await ensureReviewWindow({ repo, pr, head, ctx, trigger: "user /review-run" });
+      if (!started) ctx.ui.notify(`/review-run: a review window for ${head.slice(0, 12)} already exists.`, "info");
+    },
+  });
+
+  pi.registerCommand("review-skip", {
+    description: "Skip the PR-boundary review and ack the current enforced PR head",
+    handler: (_args: string, ctx: any) => {
+      const repo = resolveCommandRepo(ctx);
+      if (!repo || !isSddProject(repo)) { ctx.ui.notify("/review-skip: not inside an SDD repository.", "warning"); return; }
+      const pr = prState(repo);
+      const head = isEnforcedPr(pr) ? resolveEnforcedHead(repo, pr) : (localHead(repo) || "");
+      if (!head) { ctx.ui.notify("/review-skip: could not resolve the current head.", "warning"); return; }
+      clearPending(repo);
+      clearBreaker(repo);
+      writeAck(repo, head);
+      appendReviewEvent(repo, { event: "review_skipped", head, reason: "user /review-skip" });
+      ctx.ui.notify(`PR-boundary review skipped for ${basename(repo)} at ${head.slice(0, 12)}; merge gate opened (head acked).`, "warning");
+    },
   });
 
   const onUiRefresh = (_event: any, ctx: any): void => {
@@ -1211,7 +1300,7 @@ export default function (pi: ExtensionAPI) {
       // a boundary, record the near-miss and let the bounded open-PR reconciliation start the
       // review. Gated on /pr create/ so read-only gh commands (pr view/list) never trigger it.
       if (/pr\s+create/i.test(command) && prUrlFromText(stringifyReviewResult(toolResultPayload(event)))) {
-        const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
+        const repo = reviewRepoForCtx(ctx, cwdFromCommand(command));
         if (repo && isSddProject(repo)) {
           appendReviewEvent(repo, { event: "boundary_candidate_ignored", reason: "pr_create_url_not_parsed" });
           await reconcileOpenPrReview(ctx, true);
@@ -1220,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const repo = findGitRoot(cwdFromCommand(command) || ctx.sessionManager.getCwd()) || activeRepoFallback();
+    const repo = reviewRepoForCtx(ctx, cwdFromCommand(command));
     if (!repo || !isSddProject(repo)) return;
 
     const pr = prForBoundaryCommand(repo, command, prState(repo));

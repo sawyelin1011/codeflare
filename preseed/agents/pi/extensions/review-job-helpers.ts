@@ -644,8 +644,12 @@ export function formatDurableReviewResult(job: { repo: string; head: string; prN
 }
 
 export function durableReviewInitialLanes(lanes: string[]): string[] {
-  const hasSpec = lanes.includes("spec-reviewer");
-  return lanes.filter((lane) => lane !== "doc-updater" || !hasSpec);
+  // All required lanes dispatch together. The reviewers are report-only and write to
+  // disjoint lane files (spec-reviewer → sdd/spec/.review-queue.md, doc-updater →
+  // documentation/.doc-coverage.md), so doc-updater no longer waits for spec-reviewer —
+  // there is no shared-write race, and the old sequential gate only existed for the
+  // superseded auto-fix model where spec-reviewer edited sdd/ in place.
+  return [...lanes];
 }
 
 export function durableReviewEligibleLanes(input: {
@@ -660,7 +664,8 @@ export function durableReviewEligibleLanes(input: {
   const running = new Set(input.running);
   return input.lanes.filter((lane) => {
     if (completed.has(lane) || running.has(lane)) return false;
-    if (lane === "doc-updater" && input.lanes.includes("spec-reviewer") && !completed.has("spec-reviewer")) return false;
+    // No lane ordering: all report-only reviewers are eligible immediately (doc-updater
+    // no longer gated on spec-reviewer completion — disjoint write targets, no race).
     const lastRequested = input.requestedAt[lane] || 0;
     return lastRequested === 0 || input.now - lastRequested >= input.retryMs;
   });
@@ -824,6 +829,71 @@ export function shouldReconcileOpenPr(input: OpenPrReconcileInput): OpenPrReconc
   if (input.breakerOpen) return { reconcile: false, reason: "review breaker open for head" };
   if (input.hasReviewJob || input.reviewActive) return { reconcile: false, reason: "review window already exists for head" };
   return { reconcile: true, reason: "open enforced PR head is unacknowledged with no review window" };
+}
+
+// Action gate for a reconciled (missed-boundary) PR head (REQ-AGENT-058 revised).
+// shouldReconcileOpenPr decides WHETHER a head is reconcilable; this decides what the
+// reconciler DOES with it. The locked design is: an in-session push still AUTO-STARTS the
+// review exactly like the onToolEnd boundary path, and only a fresh clone/checkout of a repo
+// with a pre-existing open PR is OFFERED (notify + persist the offered marker) so the user
+// runs /review-run or /review-skip. `inSessionContinuation` is the caller's verdict that this
+// head is continuous work on a branch we have ALREADY reviewed (the new head descends from a
+// previously-acked head), which means the onToolEnd auto-start was MISSED (compound `&&`,
+// here-doc, `gh pr edit`, or a reload between the command and its event) rather than this being
+// a fresh clone — so we auto-start to honour the design. A fresh clone has no prior ack on this
+// repo, so it falls through to OFFER, and `git clone` never auto-spawns an unstoppable review.
+// Offer is once-per-head (the marker is head-keyed, so a new commit re-offers). Pure: no fs, no
+// notify — the caller performs the side effects keyed off the returned action.
+export type ReconcileBoundaryInput = { reconcile: boolean; alreadyOffered: boolean; inSessionContinuation: boolean };
+export type ReconcileBoundaryAction = "autostart" | "offer" | "noop";
+
+export function reconcileBoundaryAction(input: ReconcileBoundaryInput): ReconcileBoundaryAction {
+  if (!input.reconcile) return "noop";
+  if (input.inSessionContinuation) return "autostart";
+  if (input.alreadyOffered) return "noop";
+  return "offer";
+}
+
+// In-session continuation = the enforced head ADVANCED during THIS Pi session, i.e. it
+// differs from and descends from the head observed when this session first reconciled
+// (the in-memory baseline, captured at session start). That is the only signal of an
+// in-session push whose on-tool-end auto-start was dropped (so reconciliation should
+// auto-start). A head present at session start (baseline undefined, or baseline === head)
+// was NOT pushed during this session — it is a fresh launch/clone/checkout and must OFFER,
+// never auto-start. Deriving continuation from the on-disk ack marker instead (the prior
+// implementation) wrongly treated ANY descendant-of-a-prior-ack head as continuation, so
+// every bare Pi start auto-spawned reviewers — the regression this restores to offering.
+export function reviewBaselineContinuation(
+  baseline: string | undefined,
+  head: string,
+  isAncestor: (ancestor: string, current: string) => boolean,
+): boolean {
+  if (!baseline || !head || baseline === head) return false;
+  return isAncestor(baseline, head);
+}
+
+// Resolve which repo a review handler should act on, WITHOUT consulting the shared graphify
+// active-cwd sentinel. That sentinel (/home/user/.cache/codeflare-hooks/graphify-active-cwd) is a
+// single-active-repo file written by BOTH Claude's graphify-active-repo.sh hook AND Pi's
+// codeflare-pi.ts (proactively, on every tool execution) from each agent's OWN cwd — so under
+// concurrent agents it flaps to whichever agent acted last, not the repo THIS Pi session is
+// reviewing. When Pi reviews a different (e.g. nested) repo than the one that last wrote the
+// sentinel, sentinel-based resolution silently misroutes finalize/footer to the wrong .git: the
+// summary never emits, autofix never starts, and the progress footer shows nothing. Precedence:
+//   commandCwd (explicit `cd`/`-C` in the boundary command) -> sessionCwd (Pi's session cwd)
+//   -> sessionReviewRepo (already-resolved root remembered in-session, for the no-ctx reaper)
+//   -> processCwd (Pi process dir, last resort).
+// commandCwd/sessionCwd/processCwd are directories resolved to a git root via gitRootOf;
+// sessionReviewRepo is already a git root and is returned verbatim.
+export function resolveReviewRepo(
+  input: { commandCwd?: string; sessionCwd?: string; sessionReviewRepo?: string; processCwd?: string },
+  gitRootOf: (dir: string) => string | undefined,
+): string | undefined {
+  const fromDir = (dir: string | undefined): string | undefined => (dir ? gitRootOf(dir) : undefined);
+  return fromDir(input.commandCwd)
+    ?? fromDir(input.sessionCwd)
+    ?? input.sessionReviewRepo
+    ?? fromDir(input.processCwd);
 }
 
 // Npm package source strings a durable review lane should load as additionalExtensionPaths.

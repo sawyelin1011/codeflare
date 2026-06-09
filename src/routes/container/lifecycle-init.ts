@@ -58,9 +58,21 @@ function buildSetBucketNameBody(params: ContainerConfigPayload): string {
     ...(params.encryptionKey && { encryptionKey: params.encryptionKey }),
     sessionMode: params.sessionMode,
     sleepAfter: params.sleepAfter,
-    // REQ-ENTERPRISE-004: forward the user's matched Access group so the
-    // LlmInterceptor stamps cf-aig-metadata.group for the gateway.
-    ...(params.userGroup && { userGroup: params.userGroup }),
+    // REQ-ENTERPRISE-004: forward the user's matched Access groups so the
+    // LlmInterceptor stamps one cf-aig-metadata tag per group for the gateway.
+    ...(params.userGroups && params.userGroups.length > 0 && { userGroups: params.userGroups }),
+    // REQ-ENTERPRISE-005 (revised): forward the dynamic-route catalog + resolved
+    // default route:reasoning so buildEnvVars emits them for entrypoint.sh (Pi
+    // models.json lists all routes; Copilot/Pi default model + Pi thinking level).
+    // The default route + reasoning travel as a unit with the catalog. defaultReasoning
+    // '' is a meaningful "reasoning off" value (admin cleared the default, or it drifted
+    // out of the catalog), so it is forwarded explicitly — a truthiness guard would drop
+    // the empty reset and leave applyPrefsOnRestart stranded on a stale grade.
+    ...(params.routeCatalog && params.routeCatalog.length > 0 && {
+      routeCatalog: params.routeCatalog,
+      defaultRoute: params.defaultRoute ?? '',
+      defaultReasoning: params.defaultReasoning ?? '',
+    }),
     // REQ-MEM-001 AC4: forward the user's IANA timezone so the capture
     // pipeline's TZ resolution produces wall-clock filenames matching
     // the user's location instead of UTC.

@@ -184,6 +184,41 @@ describe('git-push-review-reminder.sh — PR-OPEN trigger (base-gated)', () => {
   });
 });
 
+describe('git-push-review-reminder.sh — PR-RETARGET trigger (protected-base gh pr edit)', () => {
+  it('emits silent directive when gh pr edit retargets to main/master across flag forms', () => {
+    for (const command of [
+      'gh pr edit 286 --base main',
+      'gh pr edit --base=master',
+      'gh pr edit 286 -B main',
+    ]) {
+      const cwd = makeFixture();
+      withSdd(cwd);
+      const binDir = fakeGhFails(cwd);
+      const r = runHook(cwd, command, binDir);
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /additionalContext/, command);
+      assert.match(r.stdout, /PR retarget to main\/master/, command);
+      assert.doesNotMatch(r.stderr, /GH_SHOULD_NOT_HAVE_BEEN_CALLED/,
+        'retarget command base is authoritative; hook must not depend on stale gh view');
+    }
+  });
+
+  it('exits silently for non-protected retargets and metadata-only edits', () => {
+    for (const command of [
+      'gh pr edit 286 --base develop',
+      'gh pr edit 286 --title "metadata only"',
+    ]) {
+      const cwd = makeFixture();
+      withSdd(cwd);
+      const binDir = fakeGhFails(cwd);
+      const r = runHook(cwd, command, binDir);
+      assert.equal(r.status, 0);
+      assert.equal(r.stdout, '', command);
+      assert.doesNotMatch(r.stderr, /GH_SHOULD_NOT_HAVE_BEEN_CALLED/);
+    }
+  });
+});
+
 describe('git-push-review-reminder.sh — PR-SYNC trigger (base-gated)', () => {
   it('emits silent directive on git push when current branch has open PR to main', () => {
     const cwd = makeFixture();
@@ -671,7 +706,7 @@ describe('git-push-review-reminder.sh - lane-aware emission (compute_required_la
       'doc-only directive must NOT mention spec-reviewer');
   });
 
-  it('emits spec+doc sequential directive when ACK->HEAD diff is sdd/-only', () => {
+  it('emits spec+doc parallel directive when ACK->HEAD diff is sdd/-only', () => {
     const cwd = makeFixture();
     withSdd(cwd);
     const ackSha = commitAt(cwd, 'src/seed.ts', 'export {};\n', 'feat: seed');
@@ -680,8 +715,8 @@ describe('git-push-review-reminder.sh - lane-aware emission (compute_required_la
     const binDir = fakeGhWithHead(cwd, { headSha });
     const r = runHook(cwd, 'git push origin develop', binDir);
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /Sequential: spec-reviewer.*then doc-updater/,
-      'sdd-only diff must produce the sequential spec->doc directive');
+    assert.match(r.stdout, /Parallel: spec-reviewer.*doc-updater/,
+      'sdd-only diff must produce the parallel spec+doc directive');
     assert.doesNotMatch(r.stdout, /code-reviewer/,
       'sdd-only directive must NOT mention code-reviewer (no source touch)');
     assert.match(r.stdout, /Code lane silently excluded by Stop hook/,
@@ -698,7 +733,7 @@ describe('git-push-review-reminder.sh - lane-aware emission (compute_required_la
     const r = runHook(cwd, 'git push origin develop', binDir);
     assert.equal(r.status, 0);
     assert.match(r.stdout, /Parallel: code-reviewer/);
-    assert.match(r.stdout, /Sequential: spec-reviewer.*then doc-updater/);
+    assert.match(r.stdout, /Parallel: code-reviewer.*spec-reviewer.*doc-updater/);
   });
 
   it('emits no directive when LAST_ACK equals CURRENT_PR_HEAD (already acked)', () => {
@@ -725,6 +760,6 @@ describe('git-push-review-reminder.sh - lane-aware emission (compute_required_la
     const r = runHook(cwd, 'git push origin develop', binDir);
     assert.equal(r.status, 0);
     assert.match(r.stdout, /Parallel: code-reviewer/);
-    assert.match(r.stdout, /Sequential: spec-reviewer.*then doc-updater/);
+    assert.match(r.stdout, /Parallel: code-reviewer.*spec-reviewer.*doc-updater/);
   });
 });

@@ -153,11 +153,20 @@ export class container extends Container<Env> implements ContainerEnvState {
   _sessionId: string | null = null;
   _userEmail: string | null = null;
   /**
-   * The user's matched Cloudflare Access group (REQ-ENTERPRISE-004), populated by
-   * the internal-config handler alongside _userEmail. Passed as the LlmInterceptor
-   * `group` prop so cf-aig-metadata.group carries it for per-group gateway policies.
+   * The user's matched Cloudflare Access groups (REQ-ENTERPRISE-004 revised),
+   * populated by the internal-config handler alongside _userEmail. Passed as the
+   * LlmInterceptor `groups` prop so cf-aig-metadata carries one tag per group for
+   * per-group gateway policies.
    */
-  _userGroup: string | null = null;
+  _userGroups: string[] = [];
+  /**
+   * Enterprise dynamic-route config (REQ-ENTERPRISE-005 revised), populated by the
+   * internal-config handler. buildEnvVars fans these to entrypoint.sh as
+   * ENTERPRISE_ROUTE_CATALOG / ENTERPRISE_DEFAULT_ROUTE / ENTERPRISE_DEFAULT_REASONING.
+   */
+  _routeCatalog: string[] = [];
+  _defaultRoute: string | null = null;
+  _defaultReasoning: string | null = null;
   /** REQ-MEM-001 AC4: user's IANA timezone (e.g. "Europe/Zurich"). */
   _userTimezone: string | null = null;
   /**
@@ -194,7 +203,21 @@ export class container extends Container<Env> implements ContainerEnvState {
       this._sessionId = await this.ctx.storage.get<string>(SESSION_ID_KEY) || null;
       this._usageSeconds = await this.ctx.storage.get<number>('usageSeconds') || 0;
       this._userEmail = await this.ctx.storage.get<string>('userEmail') || null;
-      this._userGroup = await this.ctx.storage.get<string>('userGroup') || null;
+      // Back-compat: older sessions persisted a single string under 'userGroup'.
+      // Prefer the new 'userGroups' list; fall back to coercing the legacy scalar
+      // to a one-element array so an in-flight session keeps its attribution.
+      const storedGroups = await this.ctx.storage.get<string[]>('userGroups');
+      if (Array.isArray(storedGroups)) {
+        this._userGroups = storedGroups;
+      } else {
+        const legacy = await this.ctx.storage.get<string>('userGroup');
+        this._userGroups = legacy ? [legacy] : [];
+      }
+      // REQ-ENTERPRISE-005 (revised): restore the dynamic-route config so a DO wake
+      // re-emits the entrypoint env (matches the userGroups / userEmail pattern).
+      this._routeCatalog = await this.ctx.storage.get<string[]>('routeCatalog') || [];
+      this._defaultRoute = await this.ctx.storage.get<string>('defaultRoute') || null;
+      this._defaultReasoning = await this.ctx.storage.get<string>('defaultReasoning') || null;
       // REQ-MEM-001 AC4: restore the user's IANA timezone so the capture
       // pipeline's TZ resolution produces wall-clock filenames after a
       // DO wake (matches the pattern for sessionId / userEmail above).
@@ -404,8 +427,8 @@ export class container extends Container<Env> implements ContainerEnvState {
    * is platform-internal so it never traverses Cloudflare Access. The per-session
    * `user` prop is the user's email (stamped into cf-aig-metadata for the gateway's
    * per-user analytics), falling back to the bucket id if no email is set; the
-   * optional `group` prop carries the user's matched Access group for per-group
-   * gateway policies. Both _userEmail and _bucketName are populated by the
+   * optional `groups` prop carries the user's matched Access groups for per-group
+   * gateway policies (one cf-aig-metadata tag each). Both _userEmail and _bucketName are populated by the
    * internal-config handler (which also calls setBucketName) BEFORE the container
    * is started, so they are already set when startAndWaitForPorts wires interception.
    *
@@ -430,14 +453,14 @@ export class container extends Container<Env> implements ContainerEnvState {
       this.logger.warn('Enterprise mode active and gateway configured but AIG_TOKEN unset; gateway requests will be unauthenticated');
     }
     const user = this._userEmail ?? this._bucketName ?? 'unknown';
-    // Include the matched Access group only when set, so a no-group deploy passes
-    // exactly { user } (unchanged) and cf-aig-metadata omits an empty group key.
-    const props: { user: string; group?: string } = this._userGroup
-      ? { user, group: this._userGroup }
+    // Include the matched Access groups only when non-empty, so a no-group deploy
+    // passes exactly { user } (unchanged) and the interceptor stamps no group tags.
+    const props: { user: string; groups?: string[] } = this._userGroups.length > 0
+      ? { user, groups: this._userGroups }
       : { user };
     try {
       const ictx = this.ctx as unknown as {
-        exports: { LlmInterceptor(opts: { props: { user: string; group?: string } }): Fetcher };
+        exports: { LlmInterceptor(opts: { props: { user: string; groups?: string[] } }): Fetcher };
         container?: { interceptOutboundHttps(pattern: string, worker: Fetcher): void };
       };
       const interceptor = ictx.exports.LlmInterceptor({ props });

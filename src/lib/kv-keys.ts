@@ -262,11 +262,18 @@ export const SETUP_KEYS = {
   ACCESS_AUD: 'setup:access_aud',
   ACCESS_AUD_LIST: 'setup:access_aud_list',
   ACCESS_APP_ID: 'setup:access_app_id',
+  ACCESS_SW_BYPASS_APP_ID: 'setup:access_sw_bypass_app_id',
   ACCESS_GROUP_ADMIN_ID: 'setup:access_group_admin_id',
   ACCESS_GROUP_USER_ID: 'setup:access_group_user_id',
   ACCESS_GROUP_ADMIN_NAME: 'setup:access_group_admin_name',
   ACCESS_GROUP_USER_NAME: 'setup:access_group_user_name',
   ENTERPRISE_ACCESS_GROUP: 'setup:enterprise_access_group',
+  // Feature C: enterprise dynamic-route catalog. DYNAMIC_ROUTES is a JSON string[]
+  // of gateway route names (slash-free handles agents send, e.g. "development").
+  // DEFAULT_ROUTE is a JSON { route, reasoning } the container applies on start
+  // (entrypoint writes Pi defaultThinkingLevel); absent ⇒ no default pinned.
+  DYNAMIC_ROUTES: 'setup:dynamic_routes',
+  DEFAULT_ROUTE: 'setup:default_route',
   IDP_LIST: 'setup:idp_list',
   MAX_USERS: 'setup:max_users',
   TURNSTILE_SITE_KEY: 'setup:turnstile_site_key',

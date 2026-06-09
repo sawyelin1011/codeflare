@@ -157,20 +157,86 @@ describe('Setup Handlers / REQ-SETUP-005 (admin-only auth gate on POST setup end
       expect(body.enterpriseMode).toBe(false);
     });
 
-    it('GET /prefill round-trips the stored ENTERPRISE_ACCESS_GROUP', async () => {
-      mockKV._store.set('setup:enterprise_access_group', 'Codeflare-Users');
+    it('GET /prefill splits the stored CSV groups back into an array', async () => {
+      mockKV._store.set('setup:enterprise_access_group', 'team_a,team_b');
       const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
       const res = await app.request('/setup/prefill');
       expect(res.status).toBe(200);
-      const body = await res.json() as { enterpriseAccessGroup?: string };
-      expect(body.enterpriseAccessGroup).toBe('Codeflare-Users');
+      const body = await res.json() as { enterpriseAccessGroup?: string[] };
+      expect(body.enterpriseAccessGroup).toEqual(['team_a', 'team_b']);
     });
 
-    it('GET /prefill returns an empty group string when none is stored', async () => {
+    it('GET /prefill round-trips the stored dynamicRoutes', async () => {
+      mockKV._store.set('setup:dynamic_routes', JSON.stringify(['development']));
       const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
       const res = await app.request('/setup/prefill');
-      const body = await res.json() as { enterpriseAccessGroup?: string };
-      expect(body.enterpriseAccessGroup).toBe('');
+      const body = await res.json() as { dynamicRoutes?: string[] };
+      expect(body.dynamicRoutes).toEqual(['development']);
+    });
+
+    it('GET /prefill round-trips the stored defaultRoute', async () => {
+      mockKV._store.set('setup:default_route', JSON.stringify({ route: 'development', reasoning: 'high' }));
+      const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
+      const res = await app.request('/setup/prefill');
+      const body = await res.json() as { defaultRoute?: { route: string; reasoning: string } | null };
+      expect(body.defaultRoute).toEqual({ route: 'development', reasoning: 'high' });
+    });
+
+    it('GET /prefill returns empty defaults when nothing is stored', async () => {
+      const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
+      const res = await app.request('/setup/prefill');
+      const body = await res.json() as {
+        enterpriseAccessGroup?: string[];
+        dynamicRoutes?: string[];
+        defaultRoute?: unknown;
+      };
+      expect(body.enterpriseAccessGroup).toEqual([]);
+      expect(body.dynamicRoutes).toEqual([]);
+      expect(body.defaultRoute).toBeNull();
+    });
+
+    it('GET /prefill degrades to empty defaults when stored route JSON is malformed', async () => {
+      // Real Cloudflare KV.get(key, 'json') THROWS on malformed stored JSON. This
+      // read runs before the handler's CF-API try block, so without a guard a bad
+      // value would 500 the whole prefill. Simulate the boundary throwing.
+      mockKV.get.mockImplementation(async (_key: string, type?: string) => {
+        if (type === 'json') throw new SyntaxError('Unexpected token in JSON');
+        return null;
+      });
+      const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
+      const res = await app.request('/setup/prefill');
+      expect(res.status).toBe(200);
+      const body = await res.json() as { dynamicRoutes?: string[]; defaultRoute?: unknown };
+      expect(body.dynamicRoutes).toEqual([]);
+      expect(body.defaultRoute).toBeNull();
+    });
+
+    it('GET /prefill omits the enterprise extras when ENTERPRISE_MODE is unset (regression)', async () => {
+      // Even with values stored in KV, a non-enterprise prefill response must be
+      // byte-identical to the pre-feature shape (no enterprise keys leak).
+      mockKV._store.set('setup:enterprise_access_group', 'team_a');
+      mockKV._store.set('setup:dynamic_routes', JSON.stringify(['development']));
+      const app = createApp(); // ENTERPRISE_MODE unset
+      const res = await app.request('/setup/prefill');
+      expect(res.status).toBe(200);
+      const body = await res.json() as Record<string, unknown>;
+      expect(body).not.toHaveProperty('enterpriseAccessGroup');
+      expect(body).not.toHaveProperty('dynamicRoutes');
+      expect(body).not.toHaveProperty('defaultRoute');
+    });
+
+    it('GET /prefill returns the extras on the no-token path (regression)', async () => {
+      mockKV._store.set('setup:enterprise_access_group', 'team_a');
+      const app = createApp({ ENTERPRISE_MODE: 'active' } as Partial<Env>);
+      const res = await app.request('/setup/prefill');
+      const body = await res.json() as {
+        enterpriseAccessGroup?: string[];
+        dynamicRoutes?: string[];
+        defaultRoute?: unknown;
+      };
+      expect(body.enterpriseAccessGroup).toEqual(['team_a']);
+      expect(body.dynamicRoutes).toEqual([]);
+      expect(body.defaultRoute).toBeNull();
     });
   });
 

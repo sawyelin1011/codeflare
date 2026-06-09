@@ -542,19 +542,20 @@ describe('enforce-review-spawn.sh — agent-spawn enforcement', () => {
       'the checkpoint must not advance while required current-head lanes are still running');
   });
 
-  it('blocks demanding doc-updater after spec-reviewer completes', () => {
+  it('demands doc-updater in the initial parallel wave (no spec-reviewer dependency)', () => {
     const cwd = makeFixture();
     withSdd(cwd);
     const binDir = fakeGh(cwd, ghReturning('OPEN', 'newsha'));
+    // Nothing spawned yet: all three report-only lanes are demanded together — doc-updater
+    // no longer waits for spec-reviewer to complete (disjoint write targets, no race).
     const t = writeTranscript(cwd, [
       PUSH_LINE('2026-05-03T12:00:00.000Z'),
-      AGENT_LINE('code-reviewer', '2026-05-03T12:00:01.000Z', 'toolu_cr1'),
-      AGENT_LINE('spec-reviewer', '2026-05-03T12:00:02.000Z', 'toolu_sr1'),
-      SPEC_DONE_LINE('toolu_sr1'),
     ]);
     const r = runHook(cwd, { transcriptPath: t, binDir });
     assert.equal(r.status, 0);
     assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+    assert.match(r.stdout, /code-reviewer/);
+    assert.match(r.stdout, /spec-reviewer/);
     assert.match(r.stdout, /doc-updater/);
   });
 
@@ -625,14 +626,9 @@ describe('enforce-review-spawn.sh — fail-safe behavior', () => {
     // that appears BEFORE the push line is definitionally pre-push
     // and must not satisfy enforcement.
     //
-    // Check 1 only enforces code-reviewer + spec-reviewer (the two
-    // parallel agents in round 1 of the protocol). doc-updater is
-    // enforced by Check 2 once spec-reviewer's `completed</status>`
-    // tool-use marker appears AFTER the push. With no SPEC_DONE_LINE
-    // in this transcript, Check 2 doesn't fire, so doc-updater is
-    // NOT in the block reason. That separate enforcement path is
-    // covered by "blocks demanding doc-updater after spec-reviewer
-    // completes" above.
+    // All three report-only lanes are demanded together in the single parallel block.
+    // Every agent spawn here precedes the push, so none counts as current-head coverage
+    // and all three are re-demanded.
     const cwd = makeFixture();
     withSdd(cwd);
     const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
@@ -648,6 +644,7 @@ describe('enforce-review-spawn.sh — fail-safe behavior', () => {
       'agents earlier in the transcript than the push must not count');
     assert.match(r.stdout, /code-reviewer/);
     assert.match(r.stdout, /spec-reviewer/);
+    assert.match(r.stdout, /doc-updater/);
   });
 
   it('does not match "git push" inside echo strings (regression for substring false-positive)', () => {
@@ -895,6 +892,55 @@ describe('enforce-review-spawn.sh — MCP shell tool input shapes (issue #319)',
     const r = runHook(cwd, { transcriptPath: t, binDir });
     assert.equal(r.status, 0);
     assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+  });
+
+  it('blocks on Bash gh pr edit protected-base retargets across flag forms', () => {
+    for (const command of [
+      'gh pr edit 394 --base main',
+      'gh pr edit --base=master',
+      'gh pr edit 394 -B main',
+    ]) {
+      const cwd = makeFixture();
+      withSdd(cwd);
+      const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+      const t = writeTranscript(cwd, [bashGhMerge('2026-05-03T12:00:00.000Z', command)]);
+      const r = runHook(cwd, { transcriptPath: t, binDir });
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /"decision"\s*:\s*"block"/, command);
+    }
+  });
+
+  it('does NOT classify non-protected or metadata-only gh pr edit commands', () => {
+    for (const command of [
+      'gh pr edit 394 --base develop',
+      'gh pr edit 394 --title metadata-only',
+    ]) {
+      const cwd = makeFixture();
+      withSdd(cwd);
+      const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+      const t = writeTranscript(cwd, [bashGhMerge('2026-05-03T12:00:00.000Z', command)]);
+      const r = runHook(cwd, { transcriptPath: t, binDir });
+      assert.equal(r.status, 0);
+      assert.equal(r.stdout, '', command);
+    }
+  });
+
+  it('blocks on ctx_execute and ctx_batch_execute gh pr edit retargets', () => {
+    const cases = [
+      ctxExecPush('2026-05-03T12:00:00.000Z', 'gh pr edit 394 --base main'),
+      ctxBatchPush('2026-05-03T12:00:00.000Z', [
+        { label: 'retarget', command: 'gh pr edit 394 --base main' },
+      ]),
+    ];
+    for (const line of cases) {
+      const cwd = makeFixture();
+      withSdd(cwd);
+      const binDir = fakeGh(cwd, ghReturning('OPEN', 'unackedSHA', 'main'));
+      const t = writeTranscript(cwd, [line]);
+      const r = runHook(cwd, { transcriptPath: t, binDir });
+      assert.equal(r.status, 0);
+      assert.match(r.stdout, /"decision"\s*:\s*"block"/);
+    }
   });
 });
 
@@ -1282,6 +1328,8 @@ describe('enforce-review-spawn.sh — lane gating (task #58)', () => {
     const r = runHook(cwd, { transcriptPath: t, binDir });
     assert.equal(r.status, 0);
     assert.match(r.stdout, /spec-reviewer/);
+    assert.match(r.stdout, /doc-updater/,
+      'sdd-only push demands doc-updater in parallel with spec-reviewer (no spec->doc gate)');
     assert.doesNotMatch(r.stdout, /code-reviewer/,
       'sdd-only push must NOT demand code-reviewer');
   });

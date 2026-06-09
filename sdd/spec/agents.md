@@ -1023,7 +1023,7 @@ None.
 
 1. For readable PR metadata, PR-boundary review fires only for open PRs targeting `main` or `master`; the `gh pr create` metadata-lag exception is limited to AC6. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 2. Local push detection recognises `git push`, `git -C <repo> push`, and command-local `cd <repo>` prefixes separated by `&&`, semicolon, or newline across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::cwdFromBoundaryCommand -->
-3. GitHub CLI detection recognises PR-head-moving operations: `gh pr create`, `gh pr merge`, `gh pr update-branch`, and `gh repo sync`. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
+3. GitHub CLI detection recognises `gh pr create`, `gh pr merge`, `gh pr update-branch`, `gh repo sync`, and protected-base `gh pr edit --base main|master` as boundary-shaped commands. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prEditBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryTrigger --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (prEditBoundaryBase gh pr edit retarget across --base/--base=/-B and compound forms, undefined for non-main base / non-base edit / non-edit command; isPrBoundaryTrigger treats gh pr edit onto main/master as a boundary -> AC3) -->
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 6. During a `gh pr create` metadata-visibility race, Pi may infer a protected base (`main` or `master`, including quoted CLI values or the default when no base is supplied) and synthesize an open PR from local HEAD; non-protected bases remain ignored. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prCreateBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prForBoundaryCommand -->
@@ -1037,7 +1037,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability)
 
-**Verification:** [Automated test](../../host/__tests__/git-push-review-reminder.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Automated test](../../host/__tests__/git-push-review-reminder.test.js), [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts), [`gh pr edit` retarget trigger tests](../../src/__tests__/lib/review-trigger.test.ts)
 
 **Status:** Implemented
 
@@ -1052,7 +1052,7 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (agent-spawn enforcement describe -> AC4/AC5/AC6/AC7; lane gating describe -> AC1/AC2/AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial lane scheduling + AC5 doc-updater sequencing) -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (agent-spawn enforcement describe -> AC4/AC5/AC6/AC7; lane gating describe -> AC1/AC2/AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial all-lane scheduling + AC5 doc-updater parallel dispatch) -->
 
 **Intent:** Once a PR-boundary trigger fires ([REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
@@ -1061,10 +1061,10 @@ None.
 **Acceptance Criteria:**
 
 1. Layer 1 lane classification uses one internally shared classifier per runtime surface so the in-turn nudge and the turn-end gate agree on which review agents the diff requires.
-2. Lane mapping: generated-only `graphify-out/` diffs → no lanes (auto-acked with a durable audit event); docs-only → `doc-updater`; `sdd/` without source → `spec-reviewer` then `doc-updater`; any source touch → all three agents. Generated files never suppress non-generated files; both runtime classifiers apply this identically. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewFiles --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isGeneratedArtifactPath --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh::compute_required_lanes --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (classifyReviewFiles generated-artifact handling -> AC2) --> <!-- @test: host/__tests__/lane-classifier.test.js (generated graphify-out artifacts -> AC2 Claude-side parity) -->
+2. Lane mapping: generated-only `graphify-out/` diffs → no lanes (auto-acked with a durable audit event); docs-only → `doc-updater`; `sdd/` without source → `spec-reviewer` + `doc-updater`; any source touch → all three agents. Generated files never suppress non-generated files; both runtime classifiers apply this identically. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewFiles --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isGeneratedArtifactPath --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/lib/lane-classifier.sh::compute_required_lanes --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (classifyReviewFiles generated-artifact handling -> AC2) --> <!-- @test: host/__tests__/lane-classifier.test.js (generated graphify-out artifacts -> AC2 Claude-side parity) -->
 3. Conservative branches (empty diff, missing prior ack, divergent merge-base) and a missing or unsourceable helper both fall back to all-three-lanes (`code-reviewer spec-reviewer doc-updater`), so a partially-deployed install never disables enforcement.
-4. The initial review wave starts `code-reviewer` and `spec-reviewer` together when both lanes are required. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewInitialLanes -->
-5. `doc-updater` starts only after `spec-reviewer` completes on SDD projects. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
+4. The initial review wave starts every required lane together (`code-reviewer`, `spec-reviewer`, and `doc-updater`) — all three reviewers are report-only and write to disjoint lane files, so there is no inter-lane ordering. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewInitialLanes -->
+5. `doc-updater` dispatches in parallel with `spec-reviewer`, not after it: every required lane is eligible immediately, since the reviewers report findings to a triage file and the main session applies fixes — no shared-write race. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
 6. Review agents are dispatched with `run_in_background: true` so the main session stays interactive; the turn-end gate suppresses re-summoning per lane, so a slow in-flight lane never masks demand for other lanes nor satisfies acknowledgement without current-head completion. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::all_required_lanes_completed_for_current_head --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (suppresses an in-flight lane without masking missing peer lanes + does not ack while current-head lanes are still in flight) -->
 7. In-flight suppression is bounded by transcript recency: an uncompleted spawn that falls behind the transcript tail is treated as orphaned, demanded again, and cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (re-demands an orphaned in-flight lane after the transcript recency bound) -->
 **Constraints:**
@@ -1217,8 +1217,8 @@ None.
 ### REQ-AGENT-061: Pi Idle Durable Review Reaper
 
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-061 idle reaper helper test covers AC2/AC3 gating; AC1 runtime reaping has integration smoke coverage) -->
-<!-- coverage-gap: AC1's no-turn finished-lane reaping path is driven by a reload-safe `setInterval`; it is runtime-smoke-tested with detached lanes, with no dedicated automated test in the Workers vitest pool. -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-061 idle reaper helper test covers AC2 gating; AC1 runtime reaping + AC3/AC4 off-turn finalization have integration smoke coverage) -->
+<!-- coverage-gap: AC1's no-turn finished-lane reaping path is driven by a reload-safe `setInterval`; it is runtime-smoke-tested with detached lanes, with no dedicated automated test in the Workers vitest pool. AC4's off-turn summary deferral (no-ctx finalize persists summary.md but leaves the chat announcement unclaimed for the next on-turn emit) is the same off-turn `setInterval`/`pi.sendMessage` integration glue, verified by inspection and runtime smoke rather than a Workers-pool unit test. -->
 
 **Intent:** Pi must advance and finalize durable review jobs even when the user does not submit another prompt.
 
@@ -1228,7 +1228,9 @@ None.
 
 1. An idle Pi session with no user turn still reaps finished durable review lanes. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
 2. An idle Pi session starts the next eligible durable review lane after prerequisite lanes complete. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
-3. An idle Pi session finalizes a completed durable review by acknowledging the exact head, publishing the merged summary, and starting the autofix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
+3. An idle Pi session finalizes completed durable reviews by acknowledging the exact head, saving the merged summary, and starting the autofix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
+4. Off-turn finalization does NOT claim the chat-summary marker; the next on-turn tick emits the visible merged summary. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::publishSummaryForCurrentPr -->
+5. Review-repo resolution for the reaper, the on-turn finalizers, and the footer progress row derives the repo from the boundary-command cwd / Pi session cwd plus an in-session remembered review repo — never the shared graphify active-cwd sentinel, which multiple agents write and which points at whatever repo acted last. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::resolveReviewRepo --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewRepoForCtx --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::liveReviewRow --> <!-- @test: src/__tests__/lib/review-state.test.ts (resolveReviewRepo precedence + never probes the sentinel path -> AC5) -->
 
 **Constraints:**
 
@@ -1238,7 +1240,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling), [REQ-AGENT-059](#req-agent-059-pi-durable-review-fix-loop)
 
-**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1/AC2); [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (AC5 — resolveReviewRepo precedence + sentinel-independence)
 
 **Status:** Implemented
 
@@ -1346,10 +1348,11 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::ensureReviewWindow -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::resolveEnforcedHead -->
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reconcileBoundaryAction -->
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent -->
-<!-- @test: src/__tests__/lib/review-state.test.ts (shouldReconcileOpenPr decision gating -> AC1/AC6) -->
-<!-- @test: src/__tests__/lib/review-trigger.test.ts (prUrlFromText PR-URL boundary detection -> AC5) -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (seeded review-enforcement wires reconcileOpenPrReview + shouldReconcileOpenPr -> AC1/AC2/AC4) -->
+<!-- @test: src/__tests__/lib/review-state.test.ts (shouldReconcileOpenPr decision gating -> AC1/AC6; reconcileBoundaryAction action gate: autostarts in-session continuation, offers a fresh clone once, no-ops on re-offer of a clone head and on a non-reconcilable head -> AC1; every suppressed gate names a distinct non-empty reason -> AC4) -->
+<!-- @test: src/__tests__/lib/review-trigger.test.ts (enforcedHeadDecision pushed-vs-unpushed table -> AC3; prUrlFromText PR-URL boundary detection -> AC5) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (seeded review-enforcement wires reconcileOpenPrReview + shouldReconcileOpenPr -> AC1/AC4) -->
 
 **Intent:** Review initiation must not depend solely on capturing a transient tool event. A missed or mis-parsed boundary command must not silently skip review: an open enforced PR whose head was never reviewed is recoverable on a later turn, the start path is shared with the boundary path so the two cannot drift, and every near-miss leaves a durable diagnostic so a skipped review is detectable instead of silent.
 
@@ -1357,10 +1360,10 @@ None.
 
 **Acceptance Criteria:**
 
-1. On lifecycle events, Pi creates a review window for an SDD repo with an open, non-draft, enforced PR whose resolved head is unacknowledged, has no pending job, and has no open breaker. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+1. Lifecycle reconciliation recovers enforced open PRs with unacknowledged heads using an in-memory per-session baseline (the head first observed this session): a head that advances beyond the baseline auto-starts, while an inherited head (baseline unset or unchanged — fresh launch/clone/checkout) is offered once and remains merge-blocking until user choice. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reconcileBoundaryAction --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewBaselineContinuation --> <!-- @test: src/__tests__/lib/review-state.test.ts (reviewBaselineContinuation: bare launch offers, only an in-session advance autostarts -> AC1) -->
 2. Boundary-command and reconciliation paths call one shared routine, so reconciled windows match captured-command windows in lanes, review base, durable job, and audit trail. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::ensureReviewWindow -->
 3. Head resolution reviews local HEAD during metadata lag only when it is on the PR branch, descends from GitHub's PR head, and the remote-tracking ref contains it. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::resolveEnforcedHead --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::enforcedHeadDecision --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (enforcedHeadDecision pushed-vs-unpushed table -> AC3) -->
-4. A boundary-shaped command that does not start a review appends a durable `boundary_candidate_ignored` audit event naming the gate reason, so a skipped review is always reconstructable from disk. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent --> <!-- @test: (none — boundary_candidate_ignored audit emission has no direct unit test, which is why this REQ is Partial) -->
+4. A boundary-shaped command that does not start a review appends a durable `boundary_candidate_ignored` audit event naming the gate reason, so a skipped review is always reconstructable from disk. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent --> <!-- @test: src/__tests__/lib/review-state.test.ts (REQ-AGENT-058 AC4: every suppressed reconcile gate names a distinct non-empty reason to stamp into boundary_candidate_ignored -> AC4) -->
 5. A successful `gh pr create` whose command text could not be parsed but whose tool output contains a GitHub PR URL is reconciled by reading the open PR, so unparseable command shapes still start review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prUrlFromText -->
 6. Reconciliation drives at most one transition per turn and is a no-op when the head is acked, a pending job exists, or the breaker is open, so it never duplicates work or re-spawns a completed review. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
 
@@ -1372,9 +1375,9 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-055](#req-agent-055-pi-pr-boundary-review-window-advancement)
 
-**Verification:** Unit tests: [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`shouldReconcileOpenPr` gating → AC1/AC6), [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`prUrlFromText` PR-URL detection → AC5); the on-turn ctx wiring and head/diagnostic paths (AC3/AC4) have no direct automated test (see Status: Partial).
+**Verification:** Unit tests: [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`shouldReconcileOpenPr` gating + every suppressed gate names a distinct non-empty reason → AC1/AC4/AC6; `reconcileBoundaryAction` autostart-in-session-vs-offer-on-clone → AC1), [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`enforcedHeadDecision` pushed-vs-unpushed → AC3; `prUrlFromText` PR-URL detection → AC5), [agent-seed-manifest.test.ts](../../src/__tests__/lib/agent-seed-manifest.test.ts) (seed wires reconcileOpenPrReview + shouldReconcileOpenPr → AC1). The in-session-continuation verdict (`reconcileBoundaryAction` returns `autostart`) is unit-tested as a pure decision; the caller's `lastAck`/`isAncestor` wiring that feeds it, plus AC2's single-routine window invariant (exactly one `ensureReviewWindow`, the sole window-creator both the boundary path and `/review-run` call), are verified by inspection. The decision core for every other AC is unit-tested; the thin `appendReviewEvent` / `ctx.ui.notify` runtime wiring that acts on those decisions is integration glue, per the repo's runtime-coverage convention.
 
-**Status:** Partial
+**Status:** Implemented
 
 ---
 

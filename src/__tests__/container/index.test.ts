@@ -900,6 +900,49 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
       expect(stopSpy).toHaveBeenCalledWith('SIGTERM');
     });
 
+    // #516: a deliberate stop/delete that lands during a transient not-running
+    // reading (DO wake / deploy-roll) must STILL attempt the final drain - skipping
+    // it silently dropped the last edits. Pre-fix, the running gate skipped the whole
+    // block. Post-fix, the drain fetch fires regardless and the outcome is persisted.
+    it('REQ-SESSION-011/#516: attempts the final-sync drain on delete even when container.running reads transiently false, and persists a durable audit marker', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'test-bucket';
+        return null;
+      });
+      // The transient: container reports not-running at teardown start.
+      mockContainerRuntime.running = false;
+
+      let drainAttempted = false;
+      mockTcpPortFetch.mockImplementation(async (url: string) => {
+        if (typeof url === 'string' && url.includes('/internal/final-sync')) {
+          drainAttempted = true;
+          return new Response(JSON.stringify({ synced: true }), { status: 200 });
+        }
+        return new Response('', { status: 200 });
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+      await instance.destroy();
+
+      // Drain was attempted despite running===false (the #516 fix).
+      expect(drainAttempted).toBe(true);
+      // The outcome is durably recorded - never silently swallowed.
+      const auditPut = mockStorage.put.mock.calls.find((c) => c[0] === 'finalSyncAudit');
+      expect(auditPut).toBeDefined();
+      expect((auditPut![1] as { outcome: string }).outcome).toBe('completed');
+    });
+
+    it('#516: persists outcome "errored" and still completes destroy when the drain rejects under a transient not-running reading', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => (key === 'bucketName' ? 'test-bucket' : null));
+      mockContainerRuntime.running = false;
+      mockTcpPortFetch.mockRejectedValue(new Error('Connection refused'));
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+      await expect(instance.destroy()).resolves.toBeUndefined();
+      const auditPut = mockStorage.put.mock.calls.find((c) => c[0] === 'finalSyncAudit');
+      expect(auditPut).toBeDefined();
+      expect((auditPut![1] as { outcome: string }).outcome).toBe('errored');
+    });
+
     it('graceful shutdown: falls back to SIGKILL when the container is still running after the 135 s timeout', async () => {
       vi.useFakeTimers();
       try {
@@ -1090,7 +1133,7 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
       expect(LlmInterceptor).toHaveBeenCalledWith({ props: { user: 'nikola@novoselec.ch' } });
     });
 
-    it('passes the matched Access group as the interceptor group prop when set', async () => {
+    it('passes the matched Access groups as the interceptor groups prop when set', async () => {
       callOrder.length = 0;
       const fetcher = { id: 'llm-interceptor-fetcher' };
       const LlmInterceptor = vi.fn(() => fetcher);
@@ -1101,7 +1144,36 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
       };
       mockStorage.get.mockImplementation(async (key: string) => {
         if (key === 'userEmail') return 'nikola@novoselec.ch';
-        if (key === 'userGroup') return 'codeflare_admins';
+        if (key === 'userGroups') return ['codeflare_admins', 'codeflare_developers'];
+        if (key === 'bucketName') return 'codeflare-enterprise-nikola-novoselec-ch';
+        return null;
+      });
+      const instance = new ContainerClass(ctx as any, enterpriseEnv());
+      await vi.waitFor(() => {
+        expect(mockStorage.get).toHaveBeenCalledWith('userGroups');
+      });
+
+      await instance.startAndWaitForPorts(8080);
+
+      // The matched groups ride alongside the email; the interceptor stamps one
+      // cf-aig-metadata tag per group.
+      expect(LlmInterceptor).toHaveBeenCalledWith({ props: { user: 'nikola@novoselec.ch', groups: ['codeflare_admins', 'codeflare_developers'] } });
+    });
+
+    it('coerces a legacy single-string userGroup storage value to a one-element userGroups list on wake', async () => {
+      callOrder.length = 0;
+      const fetcher = { id: 'llm-interceptor-fetcher' };
+      const LlmInterceptor = vi.fn(() => fetcher);
+      const ctx = {
+        ...mockCtx,
+        container: { ...mockContainerRuntime, interceptOutboundHttps: vi.fn() },
+        exports: { LlmInterceptor },
+      };
+      // Older sessions persisted a scalar under 'userGroup' and have NO 'userGroups'.
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'userEmail') return 'nikola@novoselec.ch';
+        if (key === 'userGroups') return undefined; // new key absent on a legacy DO
+        if (key === 'userGroup') return 'codeflare_admins'; // legacy scalar
         if (key === 'bucketName') return 'codeflare-enterprise-nikola-novoselec-ch';
         return null;
       });
@@ -1112,8 +1184,9 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
 
       await instance.startAndWaitForPorts(8080);
 
-      // The matched group rides alongside the email as the second cf-aig-metadata key.
-      expect(LlmInterceptor).toHaveBeenCalledWith({ props: { user: 'nikola@novoselec.ch', group: 'codeflare_admins' } });
+      // The legacy scalar is coerced to a one-element list so the in-flight
+      // session keeps its per-group attribution.
+      expect(LlmInterceptor).toHaveBeenCalledWith({ props: { user: 'nikola@novoselec.ch', groups: ['codeflare_admins'] } });
     });
   });
 

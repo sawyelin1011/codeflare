@@ -133,6 +133,7 @@ function isBoundaryWords(words: ShellCommand): boolean {
   if (git?.[0] === "push") return true;
   if (words[0] !== "gh") return false;
   if (words[1] === "repo" && words[2] === "sync") return true;
+  if (words[1] === "pr" && words[2] === "edit") return Boolean(prEditBaseFromWords(words));
   return words[1] === "pr" && ["create", "merge", "update-branch"].includes(words[2]);
 }
 
@@ -152,6 +153,33 @@ export function cwdFromBoundaryCommand(command: string): string | undefined {
     if (isBoundaryWords(words)) return lastCd;
   }
   return undefined;
+}
+
+function prEditWords(command: string): ShellCommand | undefined {
+  return reviewBoundaryCommands(command).find((words) => words[0] === "gh" && words[1] === "pr" && words[2] === "edit");
+}
+
+function prEditBaseFromWords(words: ShellCommand): string | undefined {
+  let base: string | undefined;
+  for (let index = 3; index < words.length; index += 1) {
+    const word = words[index];
+    if ((word === "--base" || word === "-B") && words[index + 1]) { base = words[index + 1]; break; }
+    if (word.startsWith("--base=")) { base = word.slice("--base=".length); break; }
+    if (word.startsWith("-B=") && word.length > 3) { base = word.slice(3); break; }
+  }
+  if (!base || (base !== "main" && base !== "master")) return undefined;
+  return base;
+}
+
+// A `gh pr edit --base main|master` retargets an EXISTING PR onto a protected base — the same
+// enforced boundary `gh pr create --base main` establishes, but applied after creation. The
+// create path only fires at creation time, so without this a PR opened against another base (or
+// via the web UI) and later retargeted to main with `gh pr edit` would never arm a review. Only
+// an explicit `--base main|master` qualifies; a `gh pr edit` that changes title/body/labels is not
+// a boundary.
+export function prEditBoundaryBase(command: string): string | undefined {
+  const words = prEditWords(command);
+  return words ? prEditBaseFromWords(words) : undefined;
 }
 
 export function isGhPrCreateCommand(command: string): boolean {
@@ -175,6 +203,10 @@ export function prCreateBoundaryBase(command: string, knownBase?: string): strin
   const base = ghPrCreateBase(command) || knownBase || "";
   if (base && base !== "main" && base !== "master") return undefined;
   return base || "main";
+}
+
+export function prBoundaryCommandBase(command: string, knownBase?: string): string | undefined {
+  return prCreateBoundaryBase(command, knownBase) || prEditBoundaryBase(command);
 }
 
 export function isPrBoundaryCommand(command: string): boolean {
@@ -201,6 +233,7 @@ function isGhPrUpdateBranchWords(words: ShellCommand): boolean {
 // stays the low-level word matcher used to pluck a command out of a tool event.
 export function isPrBoundaryTrigger(command: string): boolean {
   if (prCreateBoundaryBase(command)) return true;
+  if (prEditBoundaryBase(command)) return true;
   return reviewBoundaryCommands(command).some(
     (words) => isGitPushWords(words) || isGhRepoSyncWords(words) || isGhPrUpdateBranchWords(words),
   );

@@ -502,9 +502,12 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(isPrBoundaryCommand('gh pr create --base main')).toBe(true);
     expect(isPrBoundaryCommand('gh pr merge 12')).toBe(true);
     expect(isPrBoundaryCommand('gh pr update-branch 12')).toBe(true);
+    expect(isPrBoundaryCommand('gh pr edit 12 --base main')).toBe(true);
     expect(isPrBoundaryCommand('cd /repo/codeflare && gh pr create --base main')).toBe(true);
+    expect(isPrBoundaryCommand('cd /repo/codeflare && gh pr edit 12 --base main')).toBe(true);
     expect(isPrBoundaryCommand('cd /repo/codeflare\ngit push origin develop')).toBe(true);
     expect(cwdFromBoundaryCommand('cd /repo/codeflare\ngit push origin develop')).toBe('/repo/codeflare');
+    expect(cwdFromBoundaryCommand('cd /repo/codeflare && gh pr edit 12 --base main')).toBe('/repo/codeflare');
     expect(cwdFromBoundaryCommand('cd "/repo/with space" && gh pr create --base main')).toBe('/repo/with space');
     expect(cwdFromBoundaryCommand('git -C /repo/codeflare push origin develop')).toBe('/repo/codeflare');
     const batchedDependabotCommand = 'cd /home/user/workspace/codeflare\nset -euo pipefail\ngit status --short --branch\ngit add package.json package-lock.json\ngit commit -m "chore: merge dependabot dependency bumps"\ngit push origin develop\nfor pr in 487 489 490 491; do\n  gh pr close "$pr" --delete-branch --comment "Merged into develop via batched dependency update commit to resolve overlapping package-lock conflicts." || true\ndone';
@@ -514,6 +517,7 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(commandTextFromEvent({ input: { command: 'git status' }, toolCall: { arguments: { command: batchedDependabotCommand } } })).toBe(batchedDependabotCommand);
     expect(isPrBoundaryCommand('rg -n "gh pr create --base main" preseed/agents/pi/extensions/review-enforcement.ts')).toBe(false);
     expect(isPrBoundaryCommand("printf '%s' 'git push origin develop'")).toBe(false);
+    expect(isPrBoundaryCommand('gh pr edit 12 --base develop')).toBe(false);
     expect(isPrBoundaryCommand('gh pr edit 12 --title metadata-only')).toBe(false);
     expect(isPrBoundaryCommand('gh pr view --json number')).toBe(false);
   });
@@ -565,9 +569,11 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
     expect(shouldProcess('tool-1', true)).toBe(true);
   });
 
-  it('REQ-AGENT-040: durable Pi review jobs sequence spec before docs and ack only after every lane completes', () => {
+  it('REQ-AGENT-040: durable Pi review jobs dispatch all report-only lanes in parallel and ack only after every lane completes', () => {
     const lanes = ['code-reviewer', 'spec-reviewer', 'doc-updater'];
-    expect(durableReviewInitialLanes(lanes)).toEqual(['code-reviewer', 'spec-reviewer']);
+    // All required lanes dispatch in the initial wave — doc-updater no longer waits for spec-reviewer.
+    expect(durableReviewInitialLanes(lanes)).toEqual(['code-reviewer', 'spec-reviewer', 'doc-updater']);
+    // With only code-reviewer done, BOTH spec-reviewer and doc-updater are eligible (no ordering gate).
     expect(durableReviewEligibleLanes({
       lanes,
       completed: ['code-reviewer'],
@@ -575,11 +581,13 @@ describe('multi-agent documents / REQ-MEM-008 (memory plugin: advanced-only, fou
       requestedAt: {},
       now: 1000,
       retryMs: 60_000,
-    })).toEqual(['spec-reviewer']);
+    })).toEqual(['spec-reviewer', 'doc-updater']);
+    // doc-updater is eligible WHILE spec-reviewer is still running (proves no spec→doc gate);
+    // a running lane is not re-dispatched.
     expect(durableReviewEligibleLanes({
       lanes,
-      completed: ['code-reviewer', 'spec-reviewer'],
-      running: [],
+      completed: ['code-reviewer'],
+      running: ['spec-reviewer'],
       requestedAt: {},
       now: 1000,
       retryMs: 60_000,
