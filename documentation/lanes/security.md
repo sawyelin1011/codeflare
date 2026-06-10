@@ -326,7 +326,15 @@ Browse endpoint validates prefix parameter against directory traversal (`..` rej
 
 ### Container Image Scanning ([REQ-SEC-011](../../sdd/spec/security.md#req-sec-011-container-image-scanned-for-cves-before-deploy))
 
-Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (in `deploy.yml`).
+Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (in `deploy.yml`). The scan fails the deploy on any unsuppressed HIGH/CRITICAL finding.
+
+**Suppression policy (`.trivyignore`):** A CVE may be added to the allowlist only when all of:
+
+1. **No untrusted-input path** — the vulnerable code is never reached with attacker-controlled input in the container (typically outbound-only CLI tools, or base-image / git-tooling dependencies never invoked on hostile archives, JSON, XML, or MIME).
+2. **Impact is limited** — DoS only (CPU/memory exhaustion or panic), with no confidentiality or integrity impact in this container's context.
+3. **No remediation is currently applicable** — either no fixed version exists in the installed channel (e.g. Debian bookworm), or a fix exists upstream but the vendored tool or base image has not yet rebuilt against it.
+
+Every entry carries an inline comment recording the affected package, the impact, and which conditions apply. The allowlist is reviewed monthly and entries are removed once a fix reaches the image.
 
 ### Protected R2 Paths
 
@@ -346,6 +354,7 @@ Trivy scans Docker images for HIGH/CRITICAL vulnerabilities before deployment (i
 - [REQ-SEC-006](../../sdd/spec/security.md#req-sec-006-transparent-kv-encryption-migration) - Transparent KV encryption migration
 - [REQ-SEC-009](../../sdd/spec/security.md#req-sec-009-input-validation-at-system-boundaries) - Input validation at system boundaries
 - [REQ-SEC-010](../../sdd/spec/security.md#req-sec-010-path-traversal-prevention-on-storage-endpoints) - Path traversal prevention on storage endpoints
+- [REQ-SEC-011](../../sdd/spec/security.md#req-sec-011-container-image-scanned-for-cves-before-deploy) - Container image scanned for CVEs before deploy
 - [REQ-SEC-012](../../sdd/spec/security.md#req-sec-012-container-auth-token-per-do-lifecycle) - Container auth token per DO lifecycle
 - [REQ-SEC-014](../../sdd/spec/security.md#req-sec-014-saas-service-token-header-not-trusted-in-saas-mode) - SaaS service-token header not trusted in SaaS mode
 - [REQ-SEC-016](../../sdd/spec/security.md#req-sec-016-concurrent-cache-deduplication-for-auth-config) - Concurrent cache deduplication for auth config
