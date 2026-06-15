@@ -78,6 +78,17 @@ jobs:
           echo "::error::Production deploys are only allowed from main. Got branch: ${{ github.ref }}"
           exit 1
 
+      # Scorecard DangerousWorkflowID (code-scanning alert #63) flags this
+      # workflow_run + head_sha checkout as a pwn-request vector. It is
+      # MITIGATED, not exploitable, and is deliberately left OPEN (not
+      # dismissed) so any future weakening of the guards re-surfaces the alert:
+      # the job `if:` above requires workflow_run.event == 'push' AND
+      # head_repository.full_name == github.repository, so only a post-merge
+      # push originating from THIS repo ever reaches here — head_sha is then
+      # always already-merged, maintainer-trusted code. Fork PRs fire the
+      # pull_request event (not push) and are filtered out before checkout.
+      # Scorecard scores the pattern 0 unconditionally because it cannot read
+      # the job `if:` guards. See the rationale at lines 54-64 (prior alert #34).
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           # On workflow_run: pin to the SHA whose PR Checks just ended
@@ -108,6 +119,14 @@ jobs:
           key: webui-${{ hashFiles('web-ui/package-lock.json') }}
           restore-keys: webui-
 
+      - name: Cache landing node_modules
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: cache-landing
+        with:
+          path: landing/node_modules
+          key: landing-${{ hashFiles('landing/package-lock.json') }}
+          restore-keys: landing-
+
       - name: Install root dependencies
         if: steps.cache-root.outputs.cache-hit != 'true'
         run: npm ci
@@ -117,9 +136,20 @@ jobs:
         run: npm ci
         working-directory: web-ui
 
+      - name: Install landing dependencies
+        if: steps.cache-landing.outputs.cache-hit != 'true'
+        run: npm ci
+        working-directory: landing
+
       - name: Build frontend
         run: npm run build
         working-directory: web-ui
+
+      # Landing builds AFTER web-ui: its output lands inside web-ui/dist/landing,
+      # which the web-ui build would otherwise wipe (REQ-LANDING-001).
+      - name: Build landing page
+        run: npm run build
+        working-directory: landing
 
       - name: Run backend tests
         # Same known @cloudflare/vitest-pool-workers teardown-crash guard as the
@@ -147,6 +177,11 @@ jobs:
       - name: Run frontend tests
         run: npm test
         working-directory: web-ui
+
+      - name: Run landing tests
+        # Keep in sync with test.yml: Container-API render + unit tests
+        run: npm test
+        working-directory: landing
 
       - name: Generate Workers runtime types
         run: npx wrangler types
@@ -291,7 +326,23 @@ jobs:
           echo "local_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Free disk space for Trivy scan
-        run: docker builder prune -af && rm -rf /tmp/trivy-* || true
+        # Trivy exports the full uncompressed image to a temp dir before
+        # analyzing layers; on this self-hosted runner the root fs fills with
+        # container images accumulated across deploys (the post-deploy prune
+        # only runs on success, so a failed run leaves its image behind, and a
+        # prior environment's image is still resident), so the export dies with
+        # "no space left on device". Reclaim space first: build cache, dangling
+        # images, and every *-container image except the one we just built,
+        # plus any stale Trivy/export temp dirs.
+        run: |
+          KEEP="${{ steps.docker-build.outputs.local_ref }}"
+          docker builder prune -af || true
+          docker image prune -f || true
+          docker images --format '{{.Repository}}:{{.Tag}}' \
+            | grep -- '-container:' | grep -vxF "$KEEP" \
+            | xargs -r docker rmi -f || true
+          rm -rf /tmp/trivy-* /tmp/docker-export-* || true
+          df -h / /tmp 2>/dev/null || true
 
       - name: Scan container image for vulnerabilities
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -351,7 +402,7 @@ jobs:
           ${{ vars.SAAS_MODE && format('--var SAAS_MODE:{0}', vars.SAAS_MODE) || '' }}
           ${{ vars.SAAS_EXTRA_IDPS && format('--var SAAS_EXTRA_IDPS:{0}', vars.SAAS_EXTRA_IDPS) || '' }}
           ${{ vars.ENTERPRISE_MODE && format('--var ENTERPRISE_MODE:{0}', vars.ENTERPRISE_MODE) || '' }}
-          ${{ vars.SAAS_MODE == 'active' && secrets.OAUTH_CLIENT_ID && format('--var OAUTH_CLIENT_ID:{0}', secrets.OAUTH_CLIENT_ID) || '' }}
+          ${{ (vars.SAAS_MODE == 'active' || vars.ONBOARDING_LANDING_PAGE == 'active') && secrets.OAUTH_CLIENT_ID && format('--var OAUTH_CLIENT_ID:{0}', secrets.OAUTH_CLIENT_ID) || '' }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -418,8 +469,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Set GitHub OIDC secrets (SaaS mode, optional)
-        if: ${{ vars.SAAS_MODE == 'active' }}
+      - name: Set GitHub OIDC secrets (SaaS or onboarding mode, optional)
+        # GitHub sign-in is the entry path for BOTH SaaS mode and the onboarding
+        # /login (REQ-AUTH-020), so the OAuth secrets must be provisioned whenever
+        # either mode is active — not SaaS-only, or onboarding login has no OAuth.
+        if: ${{ vars.SAAS_MODE == 'active' || vars.ONBOARDING_LANDING_PAGE == 'active' }}
         run: |
           if [ -n "${OAUTH_CLIENT_SECRET}" ]; then
             printf '%s' "${OAUTH_CLIENT_SECRET}" | npx wrangler secret put OAUTH_CLIENT_SECRET --name "${WORKER_NAME}" 2>/dev/null

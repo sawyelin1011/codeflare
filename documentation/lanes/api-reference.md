@@ -16,6 +16,7 @@ Complete API endpoint reference for the Codeflare Worker.
 - [Billing](#billing)
 - [Deploy Keys](#deploy-keys)
 - [Public (Unauthenticated)](#public-unauthenticated)
+- [Discoverability Documents](#discoverability-documents)
 - [Setup](#setup)
 - [Storage (R2 File Browser)](#storage-r2-file-browser)
 - [Presets](#presets)
@@ -138,6 +139,18 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 | GET | `/public/onboarding-config` | none | [REQ-SETUP-012](../../sdd/spec/setup.md#req-setup-012-setup-wizard-step-sequence), [REQ-AUTH-006](../../sdd/spec/authentication.md#req-auth-006-user-email-normalized) | Turnstile site key + onboarding status |
 | GET | `/public/tiers` | none | [REQ-SETUP-012](../../sdd/spec/setup.md#req-setup-012-setup-wizard-step-sequence), [REQ-SUB-009](../../sdd/spec/subscription.md#req-sub-009-admin-configurable-tiers-via-management-panel) | Public tier config (no session mode info) |
 | POST | `/public/waitlist` | none | [REQ-SETUP-012](../../sdd/spec/setup.md#req-setup-012-setup-wizard-step-sequence), [REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure) | Waitlist signup with Turnstile (rate-limited 1/day by IP) |
+| GET | `/public/contact-config` | none | [REQ-LANDING-002](../../sdd/spec/landing.md#req-landing-002-demo-request-contact-pipeline) | Turnstile site key for the landing contact form (SaaS or onboarding mode) |
+| POST | `/public/contact` | none | [REQ-LANDING-002](../../sdd/spec/landing.md#req-landing-002-demo-request-contact-pipeline), [REQ-SEC-007](../../sdd/spec/security.md#req-sec-007-rate-limiting-infrastructure) | Demo-request submission: Turnstile-verified, relayed to admins as email, never persisted (rate-limited 5/min) |
+
+### Discoverability Documents
+
+Served at the deployment root by the Worker (in `src/index.ts`, before the setup-completion gate so crawlers reach them on a fresh instance). The response depends on deployment mode; content is built by pure functions in `src/lib/seo.ts`, with the canonical origin hardcoded to `https://codeflare.ch` so integration/staging hosts never advertise themselves as canonical.
+
+| Method | Endpoint | Public mode (SaaS / onboarding) | Private mode (default / enterprise) | Implements |
+|--------|----------|----------|----------|------------|
+| GET | `/robots.txt` | `200` — allows the marketing surface, excludes `/app /api /auth /login /setup`, points at `/sitemap.xml` | `200` — disallow-all | [REQ-LANDING-003](../../sdd/spec/landing.md#req-landing-003-landing-social-share-and-search-metadata) |
+| GET | `/sitemap.xml` | `200` — canonical marketing routes (login excluded, it is noindex) | `404` | [REQ-LANDING-003](../../sdd/spec/landing.md#req-landing-003-landing-social-share-and-search-metadata) |
+| GET | `/llms.txt` | `200` — llmstxt.org-convention product summary | `404` | [REQ-LANDING-003](../../sdd/spec/landing.md#req-landing-003-landing-social-share-and-search-metadata) |
 
 ### Setup
 
@@ -472,7 +485,45 @@ Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived fr
 
 ### Public (Onboarding)
 
-GET `/public/onboarding-config`, POST `/public/waitlist` (rate limited)
+GET `/public/onboarding-config`, POST `/public/waitlist` (rate limited; onboarding mode only)
+
+### Public (Landing)
+
+The landing contact surface ([REQ-LANDING-002](../../sdd/spec/landing.md#req-landing-002-demo-request-contact-pipeline)). Both endpoints are gated on SaaS **or** onboarding mode and return `404` in default/enterprise mode.
+
+#### GET `/public/contact-config`
+
+Exposes only the public Turnstile site key for the landing form widget.
+
+```json
+{ "turnstileSiteKey": "0x4AAA..." }
+```
+
+`turnstileSiteKey` is `null` when no site key is configured.
+
+#### POST `/public/contact`
+
+Demo-request submission: Turnstile-verified, relayed to all admin users as email (reply-to set to the submitter), and **never persisted** — the only KV writes on this path are rate-limiter bookkeeping. Rate-limited to **5 requests/minute per client IP** (`contact-submit` bucket).
+
+Request body (JSON):
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `name` | string | required, 1–100 chars |
+| `email` | string | required, valid email, ≤254 chars |
+| `company` | string | optional, ≤200 chars (omitted from payload when blank) |
+| `topic` | string | required, one of the shared `CONTACT_TOPICS` enum (`src/lib/contact-topics.ts`) |
+| `message` | string | required, 10–4000 chars |
+| `turnstileToken` | string | required (Turnstile widget token) |
+
+Responses:
+
+- `200` — `{ "success": true }` on accepted submission.
+- `400` — `VALIDATION_ERROR`: malformed body, a field failing the constraints above, **or** a failed Turnstile verification (`CAPTCHA verification failed`).
+- `429` — rate limit exceeded (5/min).
+- `502` — `CONTACT_EMAIL_FAILED`: the Resend outbound relay returned a non-2xx response (retryable).
+- `503` — `CONTACT_NOT_CONFIGURED` / `CONTACT_NO_ADMIN_RECIPIENT`: Turnstile/Resend secrets absent or no admin recipient configured (same degradation contract as the waitlist).
+- `404` — neither SaaS nor onboarding mode is active.
 
 ### Health
 

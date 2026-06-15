@@ -2,7 +2,15 @@
   "name": "codeflare-pi-preseed",
   "private": true,
   "dependencies": {
-    "@gotgenes/pi-subagents": "14.0.1",
-    "context-mode": "1.0.162"
+    "@gotgenes/pi-subagents": "16.2.1",
+    "@juicesharp/rpiv-advisor": "1.19.1",
+    "@juicesharp/rpiv-ask-user-question": "1.19.1",
+    "@juicesharp/rpiv-todo": "1.19.1",
+    "context-mode": "1.0.162",
+    "pi-mcp-adapter": "2.9.0",
+    "pi-web-access": "0.10.7"
+  },
+  "overrides": {
+    "@mozilla/readability": "0.6.0"
   }
 }

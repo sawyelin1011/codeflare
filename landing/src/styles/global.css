@@ -1,0 +1,2160 @@
+/* ==========================================================================
+   Codeflare Landing — global styles
+
+   Calm, confident enterprise dark-tech. Sans carries all prose; mono is used
+   only for the one terminal demo and code snippets. One accent, locked.
+   Mobile-first: base rules target small screens, media queries enhance up.
+   ========================================================================== */
+
+@import './tokens.css';
+
+/* --------------------------------------------------------------------------
+   Reset & base
+   -------------------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+  scroll-padding-top: calc(var(--nav-height) + 1rem);
+  /* Lets block-size animate to/from `auto`, which powers the disclosure
+     open/close animations (FAQ, login SSO) via ::details-content. */
+  interpolate-size: allow-keywords;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: 1.62;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  /* clip (not hidden) prevents any accidental horizontal scroll without turning
+     body into a scroll container. The real fix is min-width:0 on grid children
+     (below); this is belt-and-suspenders. */
+  overflow-x: clip;
+}
+
+::selection {
+  background: var(--selection-bg);
+  color: var(--text-primary);
+}
+
+h1,
+h2,
+h3,
+h4 {
+  color: var(--text-primary);
+  font-weight: 680;
+  line-height: 1.1;
+  letter-spacing: -0.022em;
+  text-wrap: balance;
+}
+
+p {
+  text-wrap: pretty;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.18s var(--ease-out);
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+strong {
+  color: var(--text-primary);
+  font-weight: 650;
+}
+
+em {
+  font-style: italic;
+  color: var(--text-primary);
+}
+
+img,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 3px;
+}
+
+/* --------------------------------------------------------------------------
+   Layout primitives
+   -------------------------------------------------------------------------- */
+.container {
+  width: 100%;
+  max-width: var(--max-width);
+  margin-inline: auto;
+  padding-inline: clamp(1.25rem, 5vw, 2.25rem);
+}
+
+.section {
+  padding-block: var(--section-y);
+}
+
+/* Alternating sections are separated by their background tint and the section
+   vertical rhythm alone, never a drawn rule. The subtle surface tint is enough
+   to read one section ending and the next beginning. */
+.section--alt {
+  background: var(--bg-surface);
+}
+
+.section-head {
+  max-width: 44rem;
+  margin-bottom: clamp(1.75rem, 3vw, 2.5rem);
+}
+
+/* Section / sub-section marker, in the page's own terminal language: a path tag
+   ("~/security", nested "~/security/operations") instead of the generic uppercase
+   tracked eyebrow that reads as AI scaffolding. Mono + lowercase + the coral "~/"
+   prefix tie it to the terminals, and the nesting in the path string carries the
+   section -> sub-section hierarchy, so the reader sees depth rather than guessing
+   from size. Content keeps its capitalised word ("Security") so the nav-pillar
+   echo and tests hold; text-transform renders it lowercase. */
+.kicker {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: lowercase;
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+
+.kicker::before {
+  content: '~/';
+  color: var(--accent);
+}
+
+/* The hero's single product tagline keeps the classic eyebrow treatment (uppercase
+   coral): one deliberate kicker is brand voice, unlike the per-section eyebrow that
+   was the AI tell. It is NOT a terminal-path tag, so it does not use .kicker. */
+.hero-kicker {
+  display: inline-block;
+  font-size: var(--fs-kicker);
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.section h2 {
+  font-size: var(--fs-h2);
+}
+
+.lead {
+  font-size: var(--fs-lead);
+  color: var(--text-secondary);
+  max-width: var(--measure);
+  margin-top: 1.1rem;
+}
+
+/* --------------------------------------------------------------------------
+   Buttons
+   -------------------------------------------------------------------------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.78rem 1.4rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    transform 0.12s var(--ease-out),
+    background 0.18s var(--ease-out),
+    border-color 0.18s var(--ease-out),
+    color 0.18s var(--ease-out);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #160a06;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  color: #160a06;
+}
+
+.btn-ghost {
+  background: transparent;
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.btn-ghost:hover {
+  border-color: var(--text-muted);
+  color: var(--text-primary);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn-sm {
+  padding: 0.55rem 1rem;
+  font-size: var(--fs-small);
+}
+
+/* --------------------------------------------------------------------------
+   Navigation
+   -------------------------------------------------------------------------- */
+.site-nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  height: var(--nav-height);
+  background: rgb(var(--bg-base-rgb) / 0.72);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.site-nav .container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 100%;
+  gap: 1rem;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 700;
+  font-size: 1.02rem;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.brand:hover {
+  color: var(--text-primary);
+}
+
+.brand-mark {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 3px;
+  background: var(--flare-gradient);
+  box-shadow: 0 0 14px rgb(var(--accent-rgb) / 0.55);
+}
+
+.nav-links {
+  display: none;
+  align-items: center;
+  gap: 1.75rem;
+  list-style: none;
+  padding: 0;
+}
+
+.nav-links a {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.nav-links a:hover {
+  color: var(--text-primary);
+}
+
+.nav-right {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+}
+
+/* "Sign in" goes to the SPA /login provider chooser (GitHub / Google / OIDC /
+   one-time-pin), which starts the OAuth flow. NOT /app/ (that bounces an
+   unauthenticated visitor back to the landing). Kept lighter than the primary
+   CTA so "Book a demo" stays the lead action. Visible at every width. */
+
+@media (min-width: 900px) {
+  .nav-links {
+    display: flex;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Hero
+   -------------------------------------------------------------------------- */
+.hero {
+  position: relative;
+  padding-top: clamp(3.5rem, 4rem + 4vw, 6rem);
+  padding-bottom: var(--section-y);
+  overflow: hidden;
+}
+
+.hero-glow {
+  position: absolute;
+  inset: -20% -10% auto -10%;
+  height: 60vh;
+  background: radial-gradient(60% 60% at 30% 0%, rgb(var(--accent-rgb) / 0.16), transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.hero .container {
+  position: relative;
+  z-index: 1;
+}
+
+/* Tablet/foldable and up: headline copy and the terminal sit side by side, so
+   the terminal is a natural ~half-width window (the short transcript fills it)
+   instead of a wide box with dead space on the right. The 820px breakpoint (down
+   from 980) catches the ~873px unfolded-foldable and landscape-tablet width,
+   where a single column left the copy stranded at ~half width with empty space
+   beside it. Below 820, copy stacks above the terminal. */
+@media (min-width: 820px) {
+  .hero .container {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.02fr);
+    align-items: center;
+    gap: clamp(2.5rem, 5vw, 4.5rem);
+  }
+  .hero-terminal {
+    margin-top: 0;
+  }
+}
+
+.hero-headline {
+  font-size: var(--fs-display);
+  max-width: 18ch;
+  letter-spacing: -0.03em;
+}
+
+.hero-headline .flare {
+  background: var(--flare-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Scramble word spans (JS-created): fixed-width boxes so the churning glyphs
+   never reflow the headline. Each carries its own gradient clip because the
+   parent's clip does not paint through child boxes. */
+.scramble-word {
+  display: inline-block;
+  white-space: nowrap;
+  text-align: left;
+  vertical-align: baseline;
+  background: var(--flare-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* The plain "what it is" answer directly under the headline: the terminal command
+   white (matching .t-cmd / --text-primary) so it reads as the bright payoff to the
+   "not a coding assistant" hook. --fs-lead keeps it on the token scale (no bespoke
+   size); the supporting sub sits quietly beneath it in secondary grey. */
+.hero-def {
+  font-size: var(--fs-lead);
+  color: var(--text-primary);
+  max-width: 48ch;
+  margin-top: 1.4rem;
+  line-height: 1.5;
+}
+
+.hero-cta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  margin-top: 2rem;
+}
+
+.hero-terminal {
+  margin-top: clamp(2rem, 5vw, 3rem);
+}
+
+/* Spine strip under the terminal: the run named once, as a quiet TOC. The IDs
+   are coral; the four verbs between them are dim mono steps. */
+.hero-spine {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem 0.9rem;
+  margin-top: 1.1rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  letter-spacing: 0.04em;
+}
+
+.hero-spine > * {
+  position: relative;
+}
+
+.hero-spine > * + *::before {
+  content: '·';
+  position: absolute;
+  left: -0.55rem;
+  color: var(--text-dimmed);
+}
+
+.hero-spine-id {
+  color: var(--accent);
+}
+
+.hero-spine-step {
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Terminal demo (the one mono moment)
+   -------------------------------------------------------------------------- */
+.terminal {
+  background: var(--bg-terminal);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius);
+  overflow: hidden;
+  box-shadow: 0 30px 60px -30px rgb(0 0 0 / 0.7);
+}
+
+/* The wide lower artifacts share the terminal chrome but take a lighter shadow
+   so they do not stack hero-grade depth down the page. The legacy + context
+   narrative terminals are now full-width lower artifacts too (no longer in a
+   half-width pair), so they join this group instead of the heavy base shadow. */
+.gate,
+.review-board,
+.ledger,
+.proof-terminal {
+  box-shadow: 0 18px 40px -28px rgb(0 0 0 / 0.6);
+}
+
+/* One header treatment for every terminal, modelled on the hero terminal's bar:
+   dots + a calm muted mono-ui title, optionally a right-pushed (margin-left:auto)
+   meta in the same muted tone. The artifact terminals (gate / board / ledger /
+   orch / mcp) used to colour their ids coral or white and size their metas down
+   to micro-uppercase, which read as a different header per section; they now all
+   inherit this one muted mono-ui combination so the headers align across the page
+   (the load-bearing ids like REQ-PAY-014 / PR #207 stay, just in the calm tone). */
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  padding: 0.7rem 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgb(var(--white-rgb) / 0.015);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  color: var(--text-muted);
+}
+
+.terminal-dots {
+  display: inline-flex;
+  gap: 0.4rem;
+}
+
+.terminal-dots span {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: var(--border-strong);
+}
+
+.terminal-title {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  color: var(--text-muted);
+  margin-left: 0.4rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminal-body {
+  padding: 1.15rem 1.25rem 1.4rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  line-height: 1.85;
+  overflow-x: auto;
+}
+
+.t-line {
+  display: block;
+  white-space: pre;
+}
+
+/* Phone: the transcript wraps instead of scrolling sideways (the old overflow).
+   A hanging indent keeps a wrapped continuation aligned under the line's text,
+   past the leading glyph, and a slightly smaller mono fits more per line.
+   Desktop keeps single-line `pre`; the terminal is wide enough there. */
+@media (max-width: 680px) {
+  .terminal-body {
+    overflow-x: hidden;
+    font-size: 0.74rem;
+    padding: 1rem 1.05rem 1.2rem;
+  }
+
+  .t-line {
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    padding-left: 2ch;
+    text-indent: -2ch;
+  }
+}
+
+/* Hero terminal never scrolls sideways: a long transcript line reflows the way a
+   real terminal wraps it, with a hanging indent so the continuation aligns past
+   the leading glyph. (The orchestration tree keeps its own `pre`/scroll, since
+   its columns must line up.) The capability reel is a typed command, so it takes
+   the brighter command white (--text-primary), matching the prompt it types at. */
+.hero-terminal .terminal-body {
+  overflow-x: hidden;
+}
+
+.hero-terminal .t-line {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  padding-left: 2ch;
+  text-indent: -2ch;
+}
+
+.hero-terminal .ft-typed {
+  color: var(--text-primary);
+}
+
+.t-cmd {
+  color: var(--text-primary);
+}
+
+.t-cmd::before {
+  content: '❯ ';
+  color: var(--accent);
+}
+
+.t-agent {
+  color: var(--term-cyan);
+}
+
+.t-ok {
+  color: var(--term-green);
+}
+
+.t-dim {
+  color: var(--term-dim);
+}
+
+.t-warn {
+  color: var(--term-warn);
+}
+
+.t-deny {
+  color: var(--accent);
+}
+
+.t-caret {
+  display: inline-block;
+  width: 0.5rem;
+  height: 1.05em;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: caret 1.1s steps(1) infinite;
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Coding-agent statusline footer under a terminal: context / model / reasoning,
+   the segments a real session shows. The hero foot is gently animated by
+   agentfoot.ts (context ticks, an occasional compaction beat); static and fully
+   legible without JS and under reduced motion. */
+.terminal-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 0.85rem;
+  padding: 0.62rem 1.25rem 0.72rem;
+  border-top: 1px solid var(--border-subtle);
+  background: rgb(var(--white-rgb) / 0.012);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-micro);
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+}
+
+.tf-seg {
+  position: relative;
+  white-space: nowrap;
+}
+
+/* Single prose-caption feet (.tf-static, used by every terminal's in-chrome
+   caption) wrap instead of clipping mid-word on narrow viewports. The animated
+   multi-segment statusline (.terminal-foot without .tf-static, e.g. the hero)
+   keeps per-segment nowrap; its segments are short and wrap between each other. */
+.tf-static .tf-seg {
+  white-space: normal;
+}
+
+/* A faint dot between segments, like a real statusline (skipped before the first). */
+.tf-seg + .tf-seg::before {
+  content: '·';
+  position: absolute;
+  left: -0.48rem;
+  color: var(--text-dimmed);
+}
+
+.tf-ctx {
+  color: var(--text-secondary);
+}
+
+.tf-dot {
+  display: inline-block;
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: var(--term-green);
+  margin-right: 0.42rem;
+  vertical-align: middle;
+}
+
+.tf-note {
+  color: var(--text-muted);
+}
+
+/* The occasional compaction beat: the reasoning segment swaps to a coral
+   "compacting" tint for a couple of seconds (agentfoot.ts toggles the class). */
+.terminal-foot.is-compacting [data-tf-reason] {
+  color: var(--accent);
+}
+
+/* One-shot line typing: when proof.ts arms a terminal on scroll-in, its lines
+   reveal in sequence (caret-led). The default (no .is-live) is the resolved
+   static transcript, so it stays fully legible with no JS and under reduced
+   motion (proof.ts never arms there). */
+.terminal.is-live .t-line {
+  animation: term-type 0.28s var(--ease-out) backwards;
+  animation-delay: calc(var(--i) * 0.09s);
+}
+
+@keyframes term-type {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Feature terminals (the shift, shown as terminals)
+   -------------------------------------------------------------------------- */
+.feature-terminals {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--gap);
+}
+
+/* Compact relatives of the hero terminal: lighter shadow (four of them), tighter
+   body, smaller foot. They inherit the .terminal chrome and the .t-* tones. */
+.feature-terminal {
+  box-shadow: 0 18px 40px -28px rgb(0 0 0 / 0.6);
+}
+
+.feature-terminal .terminal-body {
+  padding: 0.95rem 1.1rem 1.1rem;
+  line-height: 1.7;
+}
+
+.feature-terminal .terminal-foot {
+  font-size: var(--fs-mono-micro);
+}
+
+@media (min-width: 760px) {
+  .feature-terminals {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Feature grid (borderless, hairline-separated)
+   -------------------------------------------------------------------------- */
+.feature-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: clamp(1.4rem, 4vw, 2rem);
+}
+
+/* Stacked (mobile) cards are separated by grid gap, never a horizontal rule.
+   Desktop (>=760px) sets vertical rules between columns (below), which are
+   column separators, not the horizontal dividers we avoid. */
+.feature-col {
+  padding-block: 0;
+}
+
+/* Card term: the "term" in a term/definition pair, for the under-terminal prose
+   blocks (operations, cost, runs-everywhere). It sits at body size but reads as a
+   distinct level through WEIGHT + COLOUR, not size: semibold + primary (white) over
+   the regular + secondary (grey) explanation below it, exactly like a dictionary
+   word above its definition. The three levels never collide in size, so none reads
+   as an accidental near-miss: the sub-section head is --fs-subhead (decisively
+   larger), this term is 1rem white-semibold, the explanation is 1rem grey-regular.
+   Sentence case in the one page-wide heading case; no caps, no eyebrow, no stripe. */
+.feature-col h3 {
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  margin-bottom: 0.5rem;
+}
+
+.feature-col p {
+  font-size: var(--fs-body);
+  color: var(--text-secondary);
+}
+
+@media (min-width: 760px) {
+  .feature-grid--3 {
+    grid-template-columns: repeat(3, 1fr);
+    gap: clamp(1.5rem, 4vw, 3rem);
+  }
+  .feature-grid--2 {
+    grid-template-columns: repeat(2, 1fr);
+    gap: clamp(1.5rem, 4vw, 3.5rem);
+  }
+  .feature-grid--3 .feature-col,
+  .feature-grid--2 .feature-col {
+    border-top: none;
+    border-bottom: none;
+    border-left: 1px solid var(--border-subtle);
+    padding-block: 0;
+    padding-left: clamp(1.25rem, 3vw, 2rem);
+  }
+  .feature-grid--3 .feature-col:first-child,
+  .feature-grid--2 .feature-col:first-child {
+    border-left: none;
+    padding-left: 0;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Agent chips
+   -------------------------------------------------------------------------- */
+.agent-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 1.75rem;
+}
+
+.agent-chips span {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+}
+
+/* --------------------------------------------------------------------------
+   FAQ accordion
+   -------------------------------------------------------------------------- */
+.faq {
+  max-width: 48rem;
+}
+
+/* Desktop: CSS multi-column flow (not a grid). Items flow down each column, so
+   when one expands it simply pushes the items below it within its own column.
+   A grid paired each row's heights and left a gap beside an opened item; column
+   flow has no rows, so there is never an empty gap. break-inside keeps each
+   question+answer whole. */
+@media (min-width: 760px) {
+  .faq {
+    max-width: none;
+    columns: 2;
+    column-gap: clamp(2.5rem, 6vw, 4.5rem);
+  }
+}
+
+/* No hairline between questions (the gray rule the page avoids); the summary's
+   own vertical padding separates them. break-inside keeps an item from being
+   split across columns. */
+.faq-item {
+  break-inside: avoid;
+}
+
+/* Animate the FAQ (and login SSO, same rule below) open/close. ::details-content
+   is the wrapper the browser generates around a <details>'s collapsible content;
+   interpolate-size (set on html) lets block-size transition to/from auto.
+   Browsers without ::details-content support (e.g. Firefox) snap open, which is
+   an acceptable fallback. Reduced-motion users get the snap too. */
+@media (prefers-reduced-motion: no-preference) {
+  .faq-item::details-content,
+  .sso-item::details-content {
+    block-size: 0;
+    overflow: hidden;
+    transition:
+      block-size 0.3s var(--ease-out),
+      content-visibility 0.3s allow-discrete;
+  }
+  .faq-item[open]::details-content,
+  .sso-item[open]::details-content {
+    block-size: auto;
+  }
+}
+
+.faq-item summary {
+  list-style: none;
+  cursor: pointer;
+  padding-block: 1.3rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: 1.02rem;
+}
+
+.faq-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.faq-item summary::after {
+  content: '+';
+  color: var(--accent);
+  font-size: 1.3rem;
+  font-weight: 400;
+  line-height: 1;
+  transition: transform 0.2s var(--ease-out);
+}
+
+.faq-item[open] summary::after {
+  transform: rotate(45deg);
+}
+
+.faq-answer {
+  color: var(--text-secondary);
+  font-size: var(--fs-body);
+  max-width: var(--measure);
+  padding-bottom: 1.4rem;
+}
+
+/* --------------------------------------------------------------------------
+   Contact
+   -------------------------------------------------------------------------- */
+.contact-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: clamp(2rem, 5vw, 3.5rem);
+  align-items: start;
+}
+
+/* Wide screens: the intro copy sits left, the form right, so neither is
+   stranded. Below 820 (phones, portrait tablets) they stack, copy then form.
+   Matches the hero/split breakpoint so the whole page changes shape at once. */
+@media (min-width: 820px) {
+  .contact-grid {
+    grid-template-columns: 0.82fr 1.18fr;
+    gap: clamp(2.5rem, 5vw, 4rem);
+  }
+}
+
+/* The contact section has no section-head lead; its intro paragraph IS the lead,
+   so it takes the same --fs-lead as every other section's lead. The note below it
+   shares that exact size and colour (it is the same aside voice, not separate
+   fine print in a one-off size that appears nowhere else on the page), with only
+   a top margin separating the two (#34). */
+.contact-aside p {
+  font-size: var(--fs-lead);
+  color: var(--text-secondary);
+  max-width: 42ch;
+}
+
+.contact-aside .aside-note {
+  margin-top: 1.1rem;
+}
+
+.contact-form {
+  display: grid;
+  gap: 1.1rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: clamp(1.5rem, 4vw, 2rem);
+  background: var(--bg-surface);
+}
+
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.1rem;
+}
+
+.field {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.field label {
+  font-size: var(--fs-small);
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 0.7rem 0.85rem;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--fs-ui);
+  transition: border-color 0.18s var(--ease-out), box-shadow 0.18s var(--ease-out);
+}
+
+.field textarea {
+  min-height: 7.5rem;
+  resize: vertical;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgb(var(--accent-rgb) / 0.16);
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--text-muted);
+}
+
+.form-status {
+  font-size: var(--fs-small);
+  min-height: 1.2em;
+  color: var(--text-muted);
+}
+
+.form-status[data-state='success'] {
+  color: var(--term-green);
+}
+
+.form-status[data-state='error'] {
+  color: var(--accent);
+}
+
+#cf-turnstile {
+  min-height: 0;
+}
+
+@media (min-width: 640px) {
+  .form-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (min-width: 900px) {
+  .contact-grid {
+    grid-template-columns: 0.85fr 1.15fr;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Micro CTA link
+   -------------------------------------------------------------------------- */
+.micro-cta {
+  margin-top: 2rem;
+  font-size: var(--fs-ui);
+}
+
+.micro-cta a {
+  font-weight: 550;
+}
+
+.micro-cta a::after {
+  content: ' →';
+}
+
+/* --------------------------------------------------------------------------
+   Footer
+   -------------------------------------------------------------------------- */
+/* Separated from the last section by a subtle tint step, not a rule. */
+.site-footer {
+  background: var(--bg-surface);
+  padding-block: clamp(2.5rem, 5vw, 3.5rem);
+}
+
+.site-footer .container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* One uniform footer line: a single font, size, weight, tracking and colour
+   (the ai-news-digest footer treatment) so "Built with Codeflare" and the
+   copyright read as one quiet line, not four mismatched fragments. No "·"
+   separator (the two lines space apart). The product name still perpetually
+   scrambles but in the same treatment as the rest, not its own font/colour. */
+.footer-copy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.4rem 1.4rem;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.footer-line {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+/* The copyright mark is its own flex item so the column-gap is symmetric on both
+   sides of it; letter-spacing zeroed so left and right of the mark match exactly. */
+.footer-mark {
+  letter-spacing: 0;
+}
+
+.footer-gm-link {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.18s var(--ease-out);
+}
+
+.footer-gm-link:hover {
+  border-color: currentColor;
+}
+
+/* The scrambling product name inherits the footer line treatment (same font,
+   size, colour); only the hero coral gradient is neutralised. */
+.footer-codeflare.scramble-word,
+.footer-codeflare .scramble-word {
+  background: none;
+  -webkit-text-fill-color: currentColor;
+  color: inherit;
+}
+
+/* --------------------------------------------------------------------------
+   Legal / prose (privacy page)
+   -------------------------------------------------------------------------- */
+.prose {
+  max-width: 44rem;
+  margin-inline: auto;
+  padding-inline: clamp(1.25rem, 5vw, 2.25rem);
+  padding-block: clamp(4rem, 8vw, 6rem);
+}
+
+.prose h1 {
+  font-size: var(--fs-h2);
+  margin-bottom: 1.5rem;
+}
+
+.prose h2 {
+  font-size: var(--fs-h3);
+  margin-top: 2.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.prose p {
+  color: var(--text-secondary);
+  margin-bottom: 1rem;
+}
+
+.prose a {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* --------------------------------------------------------------------------
+   Micro-interactions (subtle, purposeful; hover gated to fine pointers so a
+   touch tap never triggers a stuck hover state)
+   -------------------------------------------------------------------------- */
+@media (hover: hover) and (pointer: fine) {
+  /* Primary CTA: a small lift + soft flare shadow on hover. */
+  .btn-primary {
+    transition:
+      transform 0.16s var(--ease-out),
+      background 0.18s var(--ease-out),
+      box-shadow 0.18s var(--ease-out);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 24px -10px rgb(var(--accent-rgb) / 0.5);
+  }
+
+  /* Nav links: an underline that grows from the left on hover. */
+  .nav-links a {
+    position: relative;
+  }
+  .nav-links a::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -4px;
+    height: 1.5px;
+    background: var(--accent);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform 0.2s var(--ease-out);
+  }
+  .nav-links a:hover::after {
+    transform: scaleX(1);
+  }
+
+  /* The "see the deep-dive" arrow nudges forward on hover. */
+  .micro-cta a::after {
+    display: inline-block;
+    transition: transform 0.18s var(--ease-out);
+  }
+  .micro-cta a:hover::after {
+    transform: translateX(3px);
+  }
+}
+
+/* The sticky nav gains a depth seam once you scroll past the hero. A colour /
+   shadow change only (no movement), so it is safe under reduced motion. */
+.site-nav {
+  transition:
+    box-shadow 0.25s var(--ease-out),
+    border-color 0.25s var(--ease-out);
+}
+.site-nav.is-scrolled {
+  border-bottom-color: var(--border-default);
+  box-shadow: 0 12px 30px -22px rgb(0 0 0 / 0.85);
+}
+
+/* --------------------------------------------------------------------------
+   Reveal-on-scroll (JS adds the animation; content visible by default)
+   -------------------------------------------------------------------------- */
+.reveal {
+  will-change: opacity, transform;
+}
+
+/* Smooth cross-document navigation (landing <-> /login): a default cross-fade
+   between same-origin pages, so clicking "Sign in" transitions instead of a hard
+   cut. Progressive enhancement (Chromium); unsupported browsers navigate
+   normally. Gated on motion preference so reduced-motion gets the plain cut. */
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition {
+    navigation: auto;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Proof artifacts — turn the load-bearing claims into evidence in the
+   terminal/mono aesthetic of the hero. Each [data-proof] renders its resolved
+   final state by default (legible with no JS); proof.ts adds .is-live once on
+   scroll-in to arm a one-shot reveal sequence. Motion is opacity/transform only
+   and never runs under reduced motion (proof.ts leaves the static state).
+
+   Shared one-shot entrance keyframe (per-row staggered via inline --i).
+   -------------------------------------------------------------------------- */
+@keyframes proof-row {
+  from {
+    opacity: 0;
+    transform: translateY(7px);
+  }
+}
+
+@keyframes proof-pulse {
+  40% {
+    background: rgb(var(--accent-rgb) / 0.1);
+  }
+}
+
+/* Line-roll loop (proof.ts): the top row of a [data-roll] list slides out and
+   re-enters at the bottom. The rolled child transitions; the list height is
+   frozen by JS during a cycle so nothing jumps. */
+[data-roll] > .roll-anim {
+  overflow: hidden;
+  transition:
+    height 0.42s var(--ease-out),
+    opacity 0.42s var(--ease-out),
+    transform 0.42s var(--ease-out);
+}
+[data-roll] > .roll-up {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+[data-roll] > .roll-down {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+/* Scroll-anchoring opt-out. The roll loop moves the top row of the list to the
+   bottom every few seconds. On a phone, when the terminal fills the viewport and
+   the reader is scrolled into it, the browser would otherwise pick a rolling row
+   as its scroll anchor and chase it as it moves, walking the whole page downward
+   on every cycle. Excluding the list's subtree from anchoring keeps the viewport
+   still; the list height is already frozen by JS during a cycle, so nothing below
+   the terminal shifts. */
+[data-roll] {
+  overflow-anchor: none;
+}
+
+/* Once an artifact is rolling, its one-shot entrance keyframes must not replay
+   on DOM re-insertion (they are backwards-filled and would flash rows invisible). */
+.is-rolling .gate-step,
+.is-rolling .board-lane,
+.is-rolling .ledger-row,
+.terminal.is-rolling .t-line {
+  animation: none;
+}
+
+/* ---- Method: self-healing enforcement gate (shares .terminal chrome) ---- */
+.gate {
+  margin-top: clamp(1.25rem, 3vw, 2rem);
+}
+
+/* Header ids/metas share the bar's muted mono-ui tone (normalized chrome, #17);
+   the bar sets the colour/size, so these only carry their layout role. */
+.gate-req {
+  letter-spacing: 0.02em;
+}
+
+.gate-pr {
+  margin-left: auto;
+}
+
+.gate-step {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    'actor state'
+    'text text';
+  gap: 0.2rem 0.8rem;
+  padding: 0.7rem 1.1rem;
+  border-top: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+}
+
+.gate-step:first-child {
+  border-top: none;
+}
+
+.gate-actor {
+  grid-area: actor;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.gate-state {
+  grid-area: state;
+  justify-self: end;
+  align-self: center;
+  font-size: var(--fs-mono-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.gate-text {
+  grid-area: text;
+  color: var(--text-secondary);
+}
+
+.gate-step.is-fail .gate-actor,
+.gate-step.is-fail .gate-state {
+  color: var(--accent);
+}
+.gate-step.is-fail .gate-state {
+  border-color: var(--accent-line);
+}
+
+.gate-step.is-work .gate-state {
+  color: var(--term-cyan);
+  border-color: rgb(103 232 249 / 0.34);
+}
+
+.gate-step.is-pass .gate-actor {
+  color: var(--term-green);
+}
+.gate-step.is-pass .gate-state {
+  color: var(--term-green);
+  border-color: rgb(74 222 128 / 0.34);
+}
+
+/* Security boundary: the paths the architecture makes impossible, coral like a
+   caught drift, so the negative space reads as deliberate, not an error. */
+.gate-step.is-deny .gate-actor,
+.gate-step.is-deny .gate-state {
+  color: var(--accent);
+}
+.gate-step.is-deny .gate-state {
+  border-color: var(--accent-line);
+}
+
+@media (min-width: 620px) {
+  .gate-step {
+    grid-template-columns: 8.5rem 6.5rem 1fr;
+    grid-template-areas: 'actor state text';
+    align-items: baseline;
+  }
+  .gate-state {
+    justify-self: start;
+  }
+}
+
+/* The gates fill the wider container on large screens (like the board/ledger);
+   the actor/state columns breathe so the 1fr text column gets more room. */
+@media (min-width: 980px) {
+  .gate-step {
+    grid-template-columns: 11rem 7.5rem 1fr;
+  }
+}
+
+.gate.is-live .gate-step {
+  animation: proof-row 0.5s var(--ease-out) backwards;
+  animation-delay: calc(var(--i) * 0.18s);
+}
+.gate.is-live .gate-step.is-fail {
+  animation:
+    proof-row 0.5s var(--ease-out) backwards,
+    proof-pulse 0.7s var(--ease-out) calc(var(--i) * 0.18s + 0.3s);
+}
+
+/* The one outbound call, rendered as a left-aligned command echo (not a centered
+   footer) above a thin divider, introducing the egress rows that inspect it
+   inside the same merged boundary terminal (#7): boundary rows above, one real
+   call obeying the boundary below, in one receipt. */
+.gate-echo {
+  padding: 0.7rem 1.1rem;
+  border-top: 1px solid var(--border-subtle);
+  background: rgb(255 255 255 / 0.015);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono);
+  letter-spacing: 0.02em;
+  color: var(--text-primary);
+}
+
+.gate-echo-prompt {
+  color: var(--accent);
+  margin-right: 0.35ch;
+}
+
+/* ---- Security: egress rows inside the boundary terminal (structural twin of
+   the gate). One amber beat: the DLP redaction. Everything else passes green. */
+@keyframes proof-pulse-warn {
+  40% {
+    background: rgb(251 191 36 / 0.1);
+  }
+}
+
+.gate-step.is-redact .gate-actor,
+.gate-step.is-redact .gate-state {
+  color: var(--term-warn);
+}
+.gate-step.is-redact .gate-state {
+  border-color: rgb(251 191 36 / 0.34);
+}
+
+.gate.is-live .gate-step.is-redact {
+  animation:
+    proof-row 0.5s var(--ease-out) backwards,
+    proof-pulse-warn 0.7s var(--ease-out) calc(var(--i) * 0.18s + 0.3s);
+}
+
+/* ---- Method: the two pillars as plain label-and-prose clauses. The page-wide
+   station spine now carries the numbering, so the method body has no coral
+   counter of its own (#8). ---- */
+.method-clauses {
+  list-style: none;
+  padding: 0;
+  margin-top: clamp(1.5rem, 3vw, 2.25rem);
+  display: grid;
+  gap: clamp(1.5rem, 4vw, 2.25rem);
+  max-width: var(--measure);
+}
+
+.method-clauses li h3 {
+  font-size: var(--fs-h3);
+  margin-bottom: 0.4rem;
+}
+
+.method-clauses li p {
+  font-size: var(--fs-body);
+  color: var(--text-secondary);
+}
+
+/* --------------------------------------------------------------------------
+   Proof terminals: the narrative legacy + context terminals. They sit full
+   width beneath a standard section head (not in a half-width pair) like every
+   other major artifact, so every section opens the same way (kicker + h2 +
+   lead, then the artifact). The wrapping keeps long transcript lines from
+   scrolling sideways at any width.
+   -------------------------------------------------------------------------- */
+.proof-terminal .terminal-body {
+  overflow-x: hidden;
+}
+
+.proof-terminal .t-line {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  padding-left: 2ch;
+  text-indent: -2ch;
+}
+
+/* A standalone narrative terminal under a section head gets the same top gap as
+   any first artifact, and successive ones (context: web fetch, then e2e) keep a
+   clear rhythm without a divider. */
+.proof-terminal {
+  margin-top: clamp(1.25rem, 3vw, 1.75rem);
+}
+
+/* ---- Pipeline: parallel review board (shares .terminal chrome) ---- */
+.review-board {
+  margin-top: clamp(1.25rem, 3vw, 1.75rem);
+  margin-bottom: 0;
+}
+
+/* Inherit the bar's muted mono-ui tone (#17); only the trigger's right-push remains. */
+.board-pr-trigger {
+  margin-left: auto;
+}
+
+/* Overhead conductor label: the fan-out under one human gate, made explicit. */
+.board-dispatch {
+  padding: 0.5rem 1.1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.board-lane {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-areas:
+    'agent'
+    'track'
+    'note';
+  gap: 0.4rem 1.2rem;
+  padding: 0.8rem 1.1rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.board-lane:first-child {
+  border-top: none;
+}
+
+.lane-agent {
+  grid-area: agent;
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.lane-track {
+  grid-area: track;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.lane-step {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.lane-step.is-finding {
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+.lane-step.is-fixed {
+  color: var(--term-cyan);
+  border-color: rgb(103 232 249 / 0.3);
+}
+.lane-step.is-verified {
+  color: var(--term-green);
+  border-color: rgb(74 222 128 / 0.34);
+}
+
+.lane-note {
+  grid-area: note;
+  min-width: 0;
+  font-size: var(--fs-mono-ui);
+  color: var(--text-secondary);
+}
+
+@media (min-width: 760px) {
+  .board-lane {
+    grid-template-columns: 11rem 1fr auto;
+    grid-template-areas: 'agent note track';
+    align-items: center;
+  }
+  .lane-track {
+    justify-content: flex-end;
+  }
+}
+
+.board-verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem 1.1rem;
+  border-top: 1px solid var(--accent-line);
+  background: rgb(var(--accent-rgb) / 0.04);
+}
+
+.verdict-title {
+  font-family: var(--font-mono);
+  font-size: var(--fs-mono-ui);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.verdict-title::before {
+  content: '✓ ';
+  color: var(--term-green);
+}
+
+.verdict-note {
+  font-size: var(--fs-mono-ui);
+  color: var(--text-secondary);
+}
+
+.review-board.is-live .board-lane {
+  animation: proof-row 0.5s var(--ease-out) backwards;
+  animation-delay: calc(var(--i) * 0.1s + 0.15s);
+}
+.review-board.is-live .board-verdict {
+  animation: proof-row 0.6s var(--ease-out) backwards;
+  animation-delay: 0.92s;
+}
+
+/* ---- Cost: attribution ledger (shares .terminal chrome) ---- */
+.ledger {
+  margin-bottom: clamp(1.75rem, 4vw, 2.5rem);
+  font-family: var(--font-mono);
+}
+
+/* Run identity + sample note bind the ledger to the spine PR; both inherit the
+   bar's muted mono-ui tone (#17), the sample note pushed to the right edge. */
+.ledger-meta-sample {
+  margin-left: auto;
+}
+
+.ledger-head,
+.ledger-row {
+  display: grid;
+  grid-template-columns: 5rem 1fr auto;
+  gap: 0.4rem 0.9rem;
+  align-items: baseline;
+  padding: 0.55rem 1.1rem;
+}
+
+.ledger-head {
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--fs-mono-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+}
+
+.ledger-row {
+  border-top: 1px solid var(--border-subtle);
+  font-size: var(--fs-mono-ui);
+  color: var(--text-secondary);
+}
+.ledger-rows .ledger-row:first-child {
+  border-top: none;
+}
+
+.ledger-row .lc-agent {
+  color: var(--text-primary);
+}
+
+.lc-cost {
+  text-align: right;
+  color: var(--text-primary);
+}
+
+.lc-user,
+.lc-team,
+.lc-route {
+  display: none;
+}
+
+@media (min-width: 760px) {
+  .ledger-head,
+  .ledger-row {
+    grid-template-columns: 5.5rem 5rem 6rem 8.5rem 1fr auto;
+  }
+  .lc-user,
+  .lc-team,
+  .lc-route {
+    display: block;
+  }
+}
+
+.ledger-totals {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem 1.5rem;
+  padding: 0.9rem 1.1rem;
+  border-top: 1px solid var(--border-default);
+  background: rgb(var(--white-rgb) / 0.015);
+}
+
+.ledger-total {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.total-label {
+  font-size: var(--fs-mono-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+}
+
+.total-value {
+  font-size: var(--fs-mono-ui);
+  color: var(--text-secondary);
+}
+
+.ledger-total.is-accent {
+  margin-left: auto;
+}
+.ledger-total.is-accent .total-label,
+.ledger-total.is-accent .total-value {
+  color: var(--accent);
+}
+
+.ledger.is-live .ledger-row {
+  animation: proof-row 0.45s var(--ease-out) backwards;
+  animation-delay: calc(var(--i) * 0.12s + 0.1s);
+}
+.ledger.is-live .ledger-totals {
+  animation: proof-row 0.5s var(--ease-out) backwards;
+  animation-delay: 0.72s;
+}
+
+/* --------------------------------------------------------------------------
+   Page-wide flare-fluid field + glass surfaces
+
+   A fixed full-viewport WebGL canvas (injected by splash.ts into .flare-field)
+   sits behind every section as a cursor- and scroll-reactive background (cursor
+   on desktop, page scroll on touch), with a readability veil above it. All of
+   this activates only once the fluid is actually live: splash.ts sets
+   html.flare-on, so no-WebGL / reduced-motion visitors keep the solid default
+   surfaces and never see a darkened, empty field.
+   -------------------------------------------------------------------------- */
+.flare-field {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.flare-fluid-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Readability veil over the fluid: one calm, constant wash page-wide, so the
+   hero renders on the same background treatment as every text-dense section. */
+.flare-on .flare-field::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgb(var(--bg-base-rgb) / 0.72);
+}
+
+/* Lift the content above the fixed field (the sticky nav already sits higher). */
+.flare-on main,
+.flare-on .site-footer {
+  position: relative;
+  z-index: 1;
+}
+
+/* Sections turn transparent so the single fluid field shows continuously; the
+   alt band keeps only its hairlines for rhythm (no opaque fill to block it). */
+.flare-on .section--alt {
+  background: transparent;
+}
+
+/* Content panels become translucent "glass" floating on the fluid. Dense-text
+   panels stay near-opaque for prose AA; the showcase artifacts lean glassier and
+   carry the backdrop blur. Stat tiles and form inputs keep solid
+   fills — their muted small labels / input text need full opaque contrast. */
+.flare-on .agent-chips span,
+.flare-on .contact-form {
+  background: var(--glass-panel);
+}
+
+.flare-on .hero .terminal,
+.flare-on .feature-terminal,
+.flare-on .gate,
+.flare-on .review-board,
+.flare-on .ledger,
+.flare-on .proof-terminal {
+  background: var(--glass-artifact);
+}
+
+.flare-on .hero .terminal,
+.flare-on .feature-terminal,
+.flare-on .contact-form,
+.flare-on .gate,
+.flare-on .review-board,
+.flare-on .ledger,
+.flare-on .proof-terminal {
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}
+
+/* --------------------------------------------------------------------------
+   Reduced motion
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  .t-caret {
+    animation: none;
+    opacity: 0.6;
+  }
+  /* The flare fluid is motion: never render it under reduced-motion (the script
+     also skips creating the canvas and never sets html.flare-on; this is
+     belt-and-suspenders). */
+  .flare-field {
+    display: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Polish additions: dogfood proof terminal, live prompt
+   -------------------------------------------------------------------------- */
+/* The dogfood terminal spans the full container width like every other body
+   terminal (the prior 56rem cap made it the odd narrow one out). */
+
+.dogfood-cta {
+  margin-top: 1.35rem;
+}
+
+/* Feature-terminal live prompt: the typed command inherits the command colour;
+   the caret sits right after it. The type/delete loop is feature-terminals.ts. */
+.ft-typed {
+  color: var(--text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   Sub-section heads + folded substations (SectionHead substation). Moved here
+   from the page-scoped <style> when the page was componentized: these selectors
+   cross component boundaries (a SectionHead substation following a Terminal /
+   FeatureGrid / agent-chips), so they must be global, not scoped to a component.
+   -------------------------------------------------------------------------- */
+/* Sub-content folded into the section above it (operations under security,
+   tenancy under cost, runs-everywhere under platform, trusted under proof):
+   separated by space alone, never a rule, so it reads as the same section
+   continuing rather than a block walled off by a gray line. The shared section
+   tint already groups it with the content above. */
+.substation {
+  margin-top: clamp(3rem, 6vw, 5rem);
+}
+
+/* When a substation sub-head directly follows a terminal / grid / chips, the
+   full substation gap read as a section break and severed the section. Those
+   blocks are already self-contained boxes, so a tighter gap keeps the sub-head
+   reading as a continuation of the same section rather than a new one. */
+.terminal + .substation,
+.feature-grid + .substation,
+.agent-chips + .substation {
+  margin-top: clamp(1.75rem, 4vw, 2.75rem);
+}
+
+/* Sub-section head: the larger --fs-subhead (a decisive step above the 1rem card
+   terms), bold, so it reads as the block's headline rather than a near-miss of
+   the term size. Anchored by a nested terminal-path kicker ("~/security/
+   operations"), one level deeper than the section's own, so the hierarchy reads
+   from path depth plus the size jump, never from size alone. */
+.substation h3 {
+  font-size: var(--fs-subhead);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.6rem;
+}
+
+/* --------------------------------------------------------------------------
+   Trusted-by social-proof strip (TrustStrip): a quiet, centered band folded
+   into the dogfood proof as its substation tail.
+   -------------------------------------------------------------------------- */
+.trusted-section {
+  text-align: center;
+}
+
+/* Its separation from the dogfood proof above comes from .substation's
+   margin-top alone (no rule). */
+.trusted-section.substation {
+  text-align: center;
+}
+
+.trusted-label {
+  margin: 0 0 1.5rem;
+  font-size: var(--fs-kicker);
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+}
+
+.trusted-logos {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(2rem, 5vw, 3.5rem);
+  flex-wrap: wrap;
+}
+
+/* Four mixed-width logos wrap unevenly (3 + 1) on a phone; a 2-column grid keeps
+   them balanced 2x2 and centered. 680px matches the page's phone breakpoint. */
+@media (max-width: 680px) {
+  .trusted-logos {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    justify-items: center;
+    align-items: center;
+    gap: 1.75rem 1.25rem;
+  }
+}
+
+/* The marks have very different aspects: one wide wordmark (Cloudflare 2.19:1)
+   and three squares. A shared bounding box whose aspect (3:2) sits between square
+   (1.0) and the widest mark auto-balances them. Grayscale + lifted brightness +
+   reduced opacity unify their clashing brand colours; colour returns on hover. */
+.trusted-logo {
+  width: clamp(58px, 13vw, 66px);
+  height: auto;
+  aspect-ratio: 3 / 2;
+  object-fit: contain;
+  filter: grayscale(1) brightness(1.35);
+  opacity: 0.6;
+  transition:
+    opacity 0.3s ease,
+    filter 0.3s ease;
+}
+
+/* The logo links to the customer site; restoring colour + full opacity on
+   hover/focus signals it is clickable. */
+.trusted-logo-link {
+  display: inline-flex;
+}
+
+.trusted-logo-link:hover .trusted-logo,
+.trusted-logo-link:focus-visible .trusted-logo {
+  filter: grayscale(0) brightness(1);
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trusted-logo {
+    transition: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Orchestration tree (OrchTree): the "Running N agents" operator tree. Reuses
+   the terminal chrome; these tones colour the live agent rows over the mono
+   body, and the box-drawing connectors keep their alignment.
+   -------------------------------------------------------------------------- */
+.orch-head {
+  color: var(--text-secondary);
+}
+
+.orch-dot {
+  color: var(--term-green);
+}
+
+.orch-agent {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.orch-meta,
+.orch-sub,
+.orch-hint,
+.orch-branch {
+  color: var(--term-dim);
+}
+
+/* The agent tree relies on box-drawing connectors lining up across lines. `pre`
+   preserves the leading-space indentation each row needs, and horizontal scroll
+   keeps the tree intact on a phone instead of wrapping (which misaligned the
+   connectors). Scoped to the orch terminal so other terminals keep their phone
+   wrapping. */
+.orch .terminal-body {
+  overflow-x: auto;
+}
+
+.orch .t-line {
+  white-space: pre;
+  line-height: 1.85;
+}
+
+/* --------------------------------------------------------------------------
+   Onboarding /login page (LoginCard, SsoAccordion, RequestedPanel, Header
+   variant="login"). Moved here from the page-scoped <style> when login was
+   componentized, so the selectors reach the elements now living in components.
+   -------------------------------------------------------------------------- */
+.login-main {
+  max-width: 26rem;
+  margin: 0 auto;
+  padding: clamp(2.5rem, 1.5rem + 5vw, 5rem) 1.25rem var(--section-y);
+  min-height: calc(100vh - var(--nav-height));
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+/* The back arrow is an inline SVG, not the &larr; font glyph: a glyph's ink
+   position is font-metric-dependent and drifts at fractional DPR. The SVG
+   geometry is vertically symmetric, so the flex button's align-items:center
+   lands it on the label's optical centre at every viewport and DPR. */
+.login-back-arrow {
+  width: 0.95em;
+  height: 0.95em;
+  flex-shrink: 0;
+}
+
+.login-card {
+  text-align: center;
+}
+
+.login-title {
+  font-size: var(--fs-h2);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.login-sub {
+  color: var(--text-secondary);
+  font-size: var(--fs-body);
+  margin: 0.6rem auto 2rem;
+  max-width: 22rem;
+}
+
+.login-error {
+  margin: 0 0 1.25rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-size: var(--fs-small);
+  text-align: left;
+}
+
+/* GitHub is the one primary action: full width, the locked coral. */
+.login-github {
+  width: 100%;
+  padding-block: 0.95rem;
+  font-size: 1rem;
+}
+
+.sso-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  margin: 1.85rem 0 1.1rem;
+  color: var(--text-muted);
+  font-size: var(--fs-kicker);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+
+.sso-divider::before,
+.sso-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+.sso-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.sso-item {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+/* The provider button looks like a real SSO option; the chevron rotates open. */
+.sso-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.8rem 0.95rem;
+  min-height: 44px;
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-sans);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--text-primary);
+  transition: background 0.18s var(--ease-out);
+}
+
+.sso-btn::-webkit-details-marker {
+  display: none;
+}
+
+.sso-btn:hover {
+  background: var(--bg-elevated);
+}
+
+.sso-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.7rem;
+  height: 1.7rem;
+  flex-shrink: 0;
+  border-radius: 7px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.sso-name {
+  flex: 1;
+  text-align: left;
+}
+
+.sso-chev {
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: transform 0.2s var(--ease-out);
+}
+
+.sso-item[open] .sso-chev {
+  transform: rotate(90deg);
+}
+
+.sso-panel {
+  padding: 0 0.95rem 0.95rem;
+  text-align: left;
+}
+
+.sso-panel p {
+  color: var(--text-secondary);
+  font-size: var(--fs-small);
+  line-height: 1.6;
+  margin: 0 0 0.85rem;
+}
+
+.login-helper {
+  margin: 1.75rem auto 0;
+  max-width: 22rem;
+  color: var(--text-muted);
+  font-size: var(--fs-small);
+  line-height: 1.6;
+}
+
+/* Confirmation state. */
+.login-requested {
+  text-align: center;
+}
+
+/* The reused landing hero line (HeroHeadline): same size, gradient flare, and
+   scramble as the marketing hero, centered to sit where the checkmark did. */
+.login-requested .hero-headline {
+  max-width: none;
+  margin: 0 auto 1.4rem;
+  text-align: center;
+}
+
+.login-requested-title {
+  font-size: var(--fs-h3);
+  margin: 0 0 0.6rem;
+}
+
+.login-requested-body {
+  color: var(--text-secondary);
+  font-size: var(--fs-body);
+  line-height: 1.65;
+  margin: 0 auto 1.6rem;
+  max-width: 22rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sso-chev {
+    transition: none;
+  }
+}

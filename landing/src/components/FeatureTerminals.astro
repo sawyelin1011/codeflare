@@ -1,0 +1,29 @@
+---
+/**
+ * Feature terminals: a small grid of compact terminals, each one codeflare
+ * capability shown as a command and its output, with a one-line caption foot.
+ * Each uses the shared <Terminal> chrome + <Transcript animate="typed">: the
+ * transcript then a live command line that feature-terminals.ts types / deletes
+ * in a loop (data-ft-loop). The static markup is the resolved state, fully
+ * legible with no JS and under reduced motion. Content from FEATURE_TERMINALS.
+ */
+import { FEATURE_TERMINALS } from '../content/site';
+import Terminal from './Terminal.astro';
+import Transcript from './Transcript.astro';
+---
+
+<div class="feature-terminals">
+  {
+    FEATURE_TERMINALS.map((ft) => (
+      <Terminal
+        variant="feature-terminal"
+        reveal={false}
+        title={ft.title}
+        foot={ft.foot}
+        ftLoop={ft.loop ? JSON.stringify(ft.loop) : undefined}
+      >
+        <Transcript lines={ft.lines} animate="typed" typed={ft.loop?.[0] ?? ''} />
+      </Terminal>
+    ))
+  }
+</div>

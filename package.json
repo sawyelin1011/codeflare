@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "build": "cd web-ui && npm ci && npm run build",
+    "build": "cd web-ui && npm ci && npm run build && cd ../landing && npm ci && npm run build",
     "deploy": "npm run build && wrangler deploy",
     "generate:tutorial-seed": "node scripts/generate-tutorial-seed.mjs",
     "generate:agent-seed": "node scripts/generate-agent-seed.mjs && node scripts/check-pi-extensions.mjs",
@@ -26,17 +26,18 @@
     "knip": "knip"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.3.6",
+    "@cloudflare/containers": "^0.3.7",
     "aws4fetch": "^1.0.20",
-    "hono": "^4.12.23",
+    "hono": "^4.12.25",
     "zod": "^4.4.3"
   },
   "overrides": {
     "minimatch": ">=10.2.1",
-    "glob": ">=11.0.0"
+    "glob": ">=11.0.0",
+    "esbuild": ">=0.28.1"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "0.16.13",
+    "@cloudflare/vitest-pool-workers": "0.16.14",
     "@types/node": "^25.9.2",
     "@vitest/coverage-v8": "^4.1.7",
     "fast-check": "^4.8.0",
@@ -45,6 +46,6 @@
     "puppeteer": "^25.1.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8",
-    "wrangler": "4.98.0"
+    "wrangler": "4.99.0"
   }
 }

@@ -34,7 +34,6 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: Dockerfile -->
 <!-- @impl: entrypoint.sh -->
-<!-- @impl: src/types.ts::AgentTypeSchema -->
 <!-- @test: src/__tests__/lib/agent-config.test.ts (AGENT_COMMANDS exhaustiveness describe → AC1/AC2) -->
 <!-- @test: host/__tests__/dockerfile-graphify.test.js (npm install + V8 warm-up + Pi npm warm-cache behavior → AC3/AC4/AC5) -->
 
@@ -44,8 +43,8 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `antigravity`, `opencode`, `pi`, `bash`.
-2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`).
+1. Seven agent types are defined: `claude-code`, `codex`, `copilot`, `antigravity`, `opencode`, `pi`, `bash`. <!-- @impl: src/types.ts::AgentTypeSchema -->
+2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`). <!-- @impl: src/types.ts::AgentTypeSchema -->
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
 4. Node.js-based agent CLIs (Codex, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code is installed as a global npm package and is warmed by the version smoke-test run at install time, so it is excluded from the dedicated warm-up block; Go-based agents (OpenCode, Antigravity) are natively compiled.
 5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install.
@@ -69,7 +68,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-002: Agent Selection at Session Creation
 
 <!-- @impl: src/routes/session/crud.ts -->
-<!-- @impl: src/types.ts::AgentTypeSchema -->
 <!-- @test: src/__tests__/lib/agent-config.test.ts (getDefaultTabConfig describe → AC1/AC2/AC5) -->
 
 **Intent:** Users must be able to choose which AI agent to use when creating a session.
@@ -79,7 +77,7 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. `POST /api/sessions` accepts an optional `agentType` field in the request body.
-2. Invalid agent types are rejected at session creation.
+2. Invalid agent types are rejected at session creation. <!-- @impl: src/types.ts::AgentTypeSchema -->
 3. The selected agent type is persisted in the session record.
 4. The UI defaults to the agent type used in the user's most recent session.
 5. When `agentType` is not specified, it defaults to `claude-code`.
@@ -105,18 +103,17 @@ Multi-agent support, preseed system, and session modes.
 
 <!-- @impl: entrypoint.sh::configure_tab_autostart -->
 <!-- @impl: host/src/prewarm-config.ts -->
-
 **Intent:** When a session starts, the selected agent's CLI must be running and ready in the first terminal tab without manual user intervention.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. The container entrypoint configures the selected agent's launch command to run automatically when tab 1's shell starts.
-2. Claude Code starts in permissions-bypass mode appropriate for an isolated sandbox container.
-3. User-opened tabs beyond tab 1 do not auto-start an agent.
-4. The agent CLI is findable on the system PATH in all terminal sessions.
-5. Pre-warm readiness is detected by first PTY output (any terminal output means the agent is ready).
+1. The container entrypoint configures the selected agent's launch command to run automatically when tab 1's shell starts. <!-- @impl: entrypoint.sh::configure_tab_autostart -->
+2. Claude Code starts in permissions-bypass mode appropriate for an isolated sandbox container. <!-- @impl: entrypoint.sh::configure_tab_autostart -->
+3. User-opened tabs beyond tab 1 do not auto-start an agent. <!-- @impl: entrypoint.sh::configure_tab_autostart -->
+4. The agent CLI is findable on the system PATH in all terminal sessions. <!-- @impl: entrypoint.sh::configure_tab_autostart -->
+5. Pre-warm readiness is detected by first PTY output (any terminal output means the agent is ready). <!-- @impl: host/src/prewarm-config.ts::getPrewarmConfig -->
 6. A 20-second hard timeout exists as a safety net if the PTY produces no output.
 
 **Constraints:**
@@ -149,11 +146,11 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. Session mode (Standard or Pro) is stored durably in the user's preferences record; the value is absent for users who have never expressed a preference.
-2. A single resolver provides the default-to-Standard fallback when no preference is recorded; all callers read through the resolver rather than checking the raw field directly.
+2. A single resolver provides the default-to-Standard fallback when no preference is recorded; all callers read through the resolver rather than checking the raw field directly. <!-- @impl: src/lib/session-mode.ts::resolveSessionMode -->
 3. Mode selection is available in Settings under the session-defaults area.
-4. Mode takes effect on any of: explicit "Recreate AI agent skills & rules" action, new bucket creation, payment-provider mode change (upgrade or downgrade via webhook), subscription termination, or Settings toggle of the session-mode preference.
-5. On webhook-driven or Settings-driven reconciliation, preseed files are overwritten to match the new mode; user-created files are never deleted (see [REQ-AGENT-005](#req-agent-005-pro-mode-includes-additional-skills-rules-agents-and-mcp-servers) Constraints).
-6. Reconciliation triggered by webhooks or Settings is non-fatal: failure does not block the webhook response or the preference write.
+4. Mode takes effect on any of: explicit "Recreate AI agent skills & rules" action, new bucket creation, payment-provider mode change (upgrade or downgrade via webhook), subscription termination, or Settings toggle of the session-mode preference. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
+5. On webhook-driven or Settings-driven reconciliation, preseed files are overwritten to match the new mode; user-created files are never deleted (see [REQ-AGENT-005](#req-agent-005-pro-mode-includes-additional-skills-rules-agents-and-mcp-servers) Constraints). <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
+6. Reconciliation triggered by webhooks or Settings is non-fatal: failure does not block the webhook response or the preference write. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
 
 **Constraints:**
 
@@ -162,7 +159,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-SUB-014](subscription.md#req-sub-014-session-mode-gating-by-tier)
+**Dependencies:** None.
 
 **Verification:** [Automated test](../../src/__tests__/lib/session-mode.test.ts)
 
@@ -177,8 +174,9 @@ Multi-agent support, preseed system, and session modes.
 <!-- @impl: src/lib/agent-seed.generated.ts -->
 <!-- @impl: entrypoint.sh -->
 <!-- @test: host/__tests__/entrypoint-context-mode.test.js (entrypoint-context-mode describe → mode-gated context-mode preseed + hooks → AC4/AC5/AC6) -->
+<!-- @test: host/__tests__/pi-settings-packages.test.js (Pi settings.json packages assembly describe → context-mode enabled by default + 5 tool extensions in required + coexistence/idempotence/dedup → AC5/AC8) -->
 
-**Intent:** Pro mode must provide a significantly enhanced agent experience over Standard - more rules, skills, agent definitions, commands, hooks, and persistent memory. Pi sessions must remain fully functional without context-mode; context-mode behavior, where still available in Claude Code, is optional and tier-gated.
+**Intent:** Pro mode must provide a significantly enhanced agent experience over Standard - more rules, skills, agent definitions, commands, hooks, and persistent memory. Pi sessions remain fully functional whether or not context-mode is active; context-mode is enabled by default for Pi, and its Custom-tier context-window-reduction behavior in Claude Code remains tier-gated.
 
 **Applies To:** User
 
@@ -187,10 +185,11 @@ Multi-agent support, preseed system, and session modes.
 1. Pro mode delivers a strict superset of the content Standard mode delivers, covering memory persistence, language rules, agent definitions, slash commands, cherry-picked skills, the discipline triad (spec, docs, tests), and the commit-attribution and PR-boundary review hooks. The canonical per-content-category matrix lives in [documentation/preseed.md](../../documentation/lanes/preseed.md#session-modes); the spec lane documents the user-observable contract only.
 2. Pro mode enables persistent memory by including the user's Vault directory tree in the R2 sync filters so it syncs to their bucket; Standard mode explicitly excludes the Vault tree from those filters so memory does not persist across container restarts. The legacy `.memory/` directory is no longer written.
 3. Pro-mode hooks fire uniformly regardless of which tool surface invoked the underlying command, so coverage is identical whether the user is on Custom tier (commands route through context-mode) or any other tier (commands run directly): commit attribution is blocked before the commit lands, the SDD review pipeline is triggered at every PR-to-`main` boundary event, the turn cannot end while a PR HEAD remains unreviewed, and memory capture runs on the user-prompt cadence.
-4. Pi agents remain fully functional without context-mode: native Bash/Read/Grep/Find/Edit/Write plus graphify tools are sufficient on their own, and no context-mode MCP registration is required. The shared agent definitions' context-mode helper tools are remapped to their Pi-native names (`ctx_execute`, `ctx_batch_execute`, `ctx_execute_file`, `ctx_search`, `ctx_fetch_and_index`) and kept in the Pi agent frontmatter rather than stripped: they are absent at runtime when context-mode is disabled (Pi drops the unavailable tools) and usable when `/ctx on` enables it, with no Pi-specific agent variants.
-5. Pi always starts with context-mode disabled. The Codeflare Pi extension provides `/ctx status`, `/ctx on`, and `/ctx off`; `/ctx on` enables the context-mode package for the current running session and reloads resources, while the next Codeflare container start resets Pi back to disabled.
+4. Pi agents remain fully functional whether or not context-mode is active: native Bash/Read/Grep/Find/Edit/Write plus graphify tools are sufficient on their own. The shared agent definitions' context-mode helper tools are remapped to their Pi-native names (`ctx_execute`, `ctx_batch_execute`, `ctx_execute_file`, `ctx_search`, `ctx_fetch_and_index`) and kept in the Pi agent frontmatter rather than stripped: with context-mode enabled by default they are present at runtime, and a session that disables it via `/ctx off` simply drops them — with no Pi-specific agent variants.
+5. Pi starts with context-mode ENABLED by default — its `ctx_*` tools and the bash-curl-redirect hook are active without an explicit `/ctx on`. The Codeflare Pi extension provides `/ctx status`, `/ctx on`, and `/ctx off`; `/ctx off` disables the context-mode package for the current running session and reloads resources, while the next Codeflare container start resets Pi back to enabled. <!-- @impl: entrypoint.sh --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 6. Custom-tier Claude Code users may receive context-mode's automatic context-window-reduction behavior: large tool output stays out of the conversation window unless the agent explicitly retrieves it, and commands that would flood the window are redirected to the equivalent helper tool.
 7. Downgrading away from Custom tier, switching away from Pro mode, or using Pi removes the Custom-tier-only behavior on the next reconcile so automatic context-mode redirection no longer fires.
+8. The Pi preseed installs five tool extensions in the settings `required` set — `@juicesharp/rpiv-advisor` (the `advisor` escalate-to-a-stronger-model tool), `@juicesharp/rpiv-ask-user-question` (the `ask_user_question` tool), `@juicesharp/rpiv-todo` (the `todo` tool), `pi-web-access` (`web_search`/`fetch_content`), and `pi-mcp-adapter` (the `mcp` proxy) — so they load in every Pi session independently of the context-mode toggle, each shipped with a skill documenting when to use which tool. The `advisor` and `web_search`/`fetch_content` tools authenticate through Pi's own model registry / zero-config Exa MCP, so they require no per-user API keys. The settings `packages` assembly is idempotent and identity-keyed, so it never duplicates a package and preserves any user-added packages/settings. <!-- @impl: entrypoint.sh --> <!-- @impl: preseed/agents/pi/package.json --> <!-- @impl: preseed/agents/pi/manifest.json -->
 
 **Constraints:**
 
@@ -201,7 +200,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Dependencies:** [REQ-AGENT-004](#req-agent-004-two-session-modes-standard-and-pro), [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth)
 
-**Verification:** [Automated test](../../host/__tests__/entrypoint-context-mode.test.js)
+**Verification:** [Automated test](../../host/__tests__/entrypoint-context-mode.test.js); [Pi settings packages test](../../host/__tests__/pi-settings-packages.test.js) (AC5/AC8)
 
 **Status:** Implemented
 
@@ -282,7 +281,6 @@ Multi-agent support, preseed system, and session modes.
 <!-- @test: host/__tests__/entrypoint-hooks-merge.test.js (plugin enablement describe -> advanced mode includes PreToolUse/PostToolUse/UserPromptSubmit hook registrations + default mode omits them -> AC4 advanced-mode hook registrations) -->
 ### REQ-AGENT-008: Preseed Deployed to Container on Start
 
-<!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
 <!-- @impl: entrypoint.sh -->
 <!-- @test: src/__tests__/lib/r2-seed.test.ts (seedAgentConfigs describe -> AC1/AC2/AC5/AC6 preseed write + sync + plugin enable + malformed-file handling) -->
 
@@ -292,7 +290,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. On first bucket creation, mode-appropriate preseed files are written to the user's R2 bucket without overwriting any existing objects and without removing anything.
+1. On first bucket creation, mode-appropriate preseed files are written to the user's R2 bucket without overwriting any existing objects and without removing anything. <!-- @impl: src/lib/r2-seed.ts::seedAgentConfigs -->
 2. During container startup, the initial R2-to-local sync restores preseed files into each supported agent's per-user config directory before the agent launches.
 3. The container entrypoint merges agent settings using a hooks-aware merge: non-hook fields use recursive merge; hook arrays are rebuilt per event type by preserving user-added hooks and replacing managed (codeflare-owned) hooks with the current platform version. The managed-hook detector identifies a stable, enumerable set of codeflare-owned hook surfaces; per-path inventory lives in [documentation/lanes/preseed.md](../../documentation/lanes/preseed.md).
 4. In Pro mode, the settings merge includes the codeflare-owned hook registrations across the PreToolUse, PostToolUse, and UserPromptSubmit event families; Standard mode omits them.
@@ -319,7 +317,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-009: LLM API Key Storage (Encrypted in KV)
 
 <!-- @impl: src/routes/llm-keys.ts -->
-<!-- @impl: src/lib/kv-crypto.ts -->
 <!-- @test: src/__tests__/routes/llm-keys.test.ts (LLM Keys routes describe → AC1-AC5) -->
 
 **Intent:** Users must be able to store LLM provider API keys so that cross-model consultation features work without re-entering keys each session.
@@ -331,7 +328,7 @@ Multi-agent support, preseed system, and session modes.
 1. Users can store one or both supported LLM provider keys (OpenAI and Gemini) through a single management endpoint.
 2. The update interface supports three semantics per key: a new value replaces, an explicit null deletes, an absent field leaves the existing value unchanged.
 3. Keys are persisted in durable storage scoped to the user's bucket so two users cannot read each other's keys.
-4. When platform-level credential encryption is configured, values are encrypted before persistence.
+4. When platform-level credential encryption is configured, values are encrypted before persistence. <!-- @impl: src/lib/kv-crypto.ts::encryptAndStore -->
 5. Read responses return masked values (only the trailing characters are visible); the full key is never returned to the client.
 
 **Constraints:**
@@ -339,7 +336,8 @@ Multi-agent support, preseed system, and session modes.
 - Encryption follows the cryptographic contract in [REQ-SEC-004](security.md#req-sec-004-credential-encryption-at-rest-cryptographic-contract).
 - The ciphertext carries a version prefix so future schemes can be added without breaking reads.
 - Plaintext values are transparently upgraded to encrypted on read when encryption is configured.
-- Propagation to the container env + MCP wiring live in [REQ-AGENT-031](#req-agent-031-llm-api-key-propagation-to-container).
+- Propagation to the container env + MCP wiring live in [REQ-AGENT-031](#req-agent-031-consult-llm-key-isolation-subscription-backend-and-multi-agent-parity).
+- Unavailable in enterprise mode: every method on `/api/llm-keys` returns 403 because models route through the managed AI Gateway BYOK, not per-user keys (see [REQ-AGENT-031](#req-agent-031-consult-llm-key-isolation-subscription-backend-and-multi-agent-parity) AC6).
 
 **Priority:** P1
 
@@ -354,7 +352,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-010: Deploy Credential Storage (GitHub PAT, CF API Token)
 
 <!-- @impl: src/routes/deploy-keys.ts -->
-<!-- @impl: src/lib/kv-crypto.ts -->
 <!-- @test: src/__tests__/routes/deploy-keys.test.ts (deploy-keys routes describe → AC1-AC4) -->
 <!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (token-scopes describe → scope tier definitions → AC1 contract) -->
 
@@ -367,7 +364,7 @@ Multi-agent support, preseed system, and session modes.
 1. Tokens are validated against the provider's own API before being stored, so an invalid or expired token is rejected up front rather than discovered at use time.
 2. Read responses return masked tokens; the full value is never returned to the client.
 3. Users can clear all stored deploy credentials in a single action.
-4. Deploy credentials are persisted in durable storage scoped to the user's bucket and are encrypted at rest when platform-level credential encryption is configured.
+4. Deploy credentials are persisted in durable storage scoped to the user's bucket and are encrypted at rest when platform-level credential encryption is configured. <!-- @impl: src/lib/kv-crypto.ts::encryptAndStore -->
 
 **Constraints:**
 
@@ -386,7 +383,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-011: Agent Skills & Rules Manually Recreatable from Settings
 
 <!-- @impl: src/routes/storage/seed.ts -->
-<!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
 <!-- @test: src/__tests__/routes/storage-seed.test.ts (Agent Config Seed Routes describe → AC1/AC3/AC6/AC7 recreate endpoint + rate limit + storage-stats KV cache invalidation) + src/__tests__/lib/r2-seed-mode-req-coverage.test.ts (REQ-AGENT-011 reconcileAgentConfigs describe → AC2/AC4/AC5 overwrite-and-cleanup with user-file preservation) -->
 
 **Intent:** Users must be able to reset their agent skills and rules to the platform defaults at any time, recovering from accidental deletion or corruption.
@@ -396,10 +392,10 @@ Multi-agent support, preseed system, and session modes.
 **Acceptance Criteria:**
 
 1. A "Recreate AI agent skills & rules" action in the settings UI triggers a reseed of preseed-managed agent configuration.
-2. The reseed performs a full overwrite-and-cleanup of all preseed-managed files for the user's current session mode.
-3. Overwrite replaces every preseed-managed file with the current default content.
-4. Cleanup removes preseed-managed files that are not part of the user's current session mode.
-5. User-created files (files not generated by the preseed pipeline) are never overwritten or deleted.
+2. The reseed performs a full overwrite-and-cleanup of all preseed-managed files for the user's current session mode. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
+3. Overwrite replaces every preseed-managed file with the current default content. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
+4. Cleanup removes preseed-managed files that are not part of the user's current session mode. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
+5. User-created files (files not generated by the preseed pipeline) are never overwritten or deleted. <!-- @impl: src/lib/r2-seed.ts::reconcileAgentConfigs -->
 6. The endpoint is rate-limited (3/min).
 7. After seeding, the storage stats KV cache is invalidated.
 
@@ -423,7 +419,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-012: Fast CLI Start (Configurable)
 
 <!-- @impl: entrypoint.sh -->
-<!-- @impl: src/container/container-env.ts -->
 <!-- @test: src/__tests__/routes/preferences.test.ts (fastStartEnabled preference describe -> AC1/AC5 settings toggle + KV persistence) + src/__tests__/container/container-env.test.ts (buildEnvVars describe -> AC1 fast-start propagation to container runtime env) + src/__tests__/routes/container-restart-prefs.test.ts (REQ-SESSION-008 AC5 describe -> AC4 fast-start applied on restart) + host/__tests__/dockerfile-graphify.test.js (REQ-AGENT-012 Fast Start controls Pi update checks + Fast Start OFF removes settings-file update suppressors -> AC2/AC3/AC4) -->
 
 **Intent:** Agent CLIs must start quickly by default, with an option for users who want automatic updates.
@@ -432,7 +427,7 @@ Multi-agent support, preseed system, and session modes.
 
 **Acceptance Criteria:**
 
-1. A fast-start preference (default: enabled) controls whether agent CLIs skip auto-update checks at launch, and the user's choice is propagated into the container's runtime environment.
+1. A fast-start preference (default: enabled) controls whether agent CLIs skip auto-update checks at launch, and the user's choice is propagated into the container's runtime environment. <!-- @impl: src/container/container-env.ts::buildEnvVars -->
 2. When enabled, auto-update checks are disabled for all supported agent CLIs, eliminating 5-30s startup delay.
 3. Every supported agent CLI has a corresponding disable mechanism: each tool's native auto-update path is suppressed by the channel that tool exposes (environment variable for tools that expose one, on-disk settings file for tools that don't). For settings-file tools, user customizations are preserved across container restarts.
 4. When the fast-start preference is disabled, the suppression channels are not applied, Codeflare-managed settings-file suppressors are removed, and each CLI runs its normal update or package-reconciliation path before the session starts.
@@ -456,8 +451,6 @@ Multi-agent support, preseed system, and session modes.
 ### REQ-AGENT-013: Browser Shim for OAuth Flows
 
 <!-- @impl: Dockerfile -->
-<!-- @impl: web-ui/src/lib/terminal-link-provider.ts -->
-<!-- @impl: web-ui/src/stores/terminal-url-detection.ts -->
 <!-- @test: web-ui/src/__tests__/stores/terminal-url-detection.test.ts -->
 
 **Intent:** Agent CLIs that attempt to open a browser for OAuth must degrade gracefully to printing clickable URLs in the terminal.
@@ -469,7 +462,7 @@ Multi-agent support, preseed system, and session modes.
 1. A browser-shim is installed in the container that intercepts browser-launch attempts and exits with a non-zero code, causing the calling CLI to fall back to plain-text URL output.
 2. The XDG browser-launch entry-point is similarly shimmed so any tool that bypasses the BROWSER convention also degrades to text output.
 3. CLIs fall back to printing auth URLs as plain text in the PTY when the browser fails to open.
-4. The xterm.js link provider detects URLs in terminal output and makes them clickable, joining continuation rows for URLs that span multiple terminal rows (soft-wrap or application-inserted newlines) so long OAuth URLs on narrow or mobile-keyboard-shrunk viewports are assembled and offered in full, never truncated mid-URL.
+4. The xterm.js link provider detects URLs in terminal output and makes them clickable, joining continuation rows for URLs that span multiple terminal rows (soft-wrap or application-inserted newlines) so long OAuth URLs on narrow or mobile-keyboard-shrunk viewports are assembled and offered in full, never truncated mid-URL. <!-- @impl: web-ui/src/lib/terminal-link-provider.ts::registerMultiLineLinkProvider --> <!-- @impl: web-ui/src/stores/terminal-url-detection.ts::getLastUrlFromBuffer -->
 
 **Constraints:**
 
@@ -670,6 +663,7 @@ None.
 **Constraints:**
 
 - Must comply with [CON-SEC-003](constraints.md#con-sec-003-credentials-encrypted-at-rest-when-encryption_key-configured)
+- Hidden in enterprise mode: the Settings "LLM API Keys" section is not rendered, matching the 403 backend gate (see [REQ-AGENT-031](#req-agent-031-consult-llm-key-isolation-subscription-backend-and-multi-agent-parity) AC6).
 
 **Priority:** P1
 
@@ -742,7 +736,7 @@ None.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability), [REQ-AGENT-034](#req-agent-034-sdd-init-enrichment-pass-with-graphify), [REQ-AGENT-035](#req-agent-035-sdd-init-phase-7a-source-anchor-verifier-gate), [REQ-AGENT-039](#req-agent-039-sdd-init-phase-7b-enumeration-coverage-verifier-gate)
+**Dependencies:** [REQ-AGENT-021](#req-agent-021-pro-mode-sdd-workflow-preseed-and-tool-surface-portability)
 
 **Verification:** [Automated test](../../host/__tests__/skill-sdd-init-contract.test.js)
 
@@ -779,7 +773,7 @@ None.
 
 ### REQ-AGENT-049: Auto-upgrade preseed on release
 
-<!-- @impl: scripts/generate-agent-seed.mjs, src/routes/session/lifecycle.ts, src/routes/storage/seed.ts, web-ui/src/stores/session.ts -->
+<!-- @impl: scripts/generate-agent-seed.mjs, src/routes/session/lifecycle.ts, src/routes/storage/seed.ts -->
 <!-- @test: src/__tests__/routes/session-batch-status.test.ts (REQ-AGENT-049 describe -> AC3 preseedNeedsUpgrade) + src/__tests__/routes/storage-seed.test.ts (REQ-AGENT-049 -> AC2 lastPreseedHash persistence + AC7 mode/tier propagation) + web-ui/src/__tests__/stores/session.test.ts (REQ-AGENT-049 -> AC4 upgrade trigger + AC5 preseedUpgrading flag lifecycle + AC6 failure path) + web-ui/src/__tests__/components/Dashboard.test.tsx (REQ-AGENT-049 -> AC5 Dashboard button disabled/Upgrading text) + web-ui/src/__tests__/components/SessionDropdown.test.tsx (REQ-AGENT-049 AC5 -> SessionDropdown disabled during upgrade) + web-ui/src/__tests__/components/SessionStatCard.test.tsx (REQ-AGENT-049 AC5 -> stopped card dimmed/click-disabled) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-049 AC1 -> PRESEED_CONTENT_HASH determinism) -->
 
 **Intent:** When a new codeflare release ships changed preseed content (agent skills, rules, plugins), the user's R2 bucket should be reconciled automatically on first dashboard load - no manual "Recreate Agent Skills & Rules" click required. Session creation and stopped-session access are prevented in the UI during the brief upgrade.
@@ -788,12 +782,12 @@ None.
 
 **Acceptance Criteria:**
 
-1. The preseed generation script computes a deterministic SHA-256 content hash over all preseed documents (sorted by key) and emits it as a build-time constant accessible to the runtime.
+1. The preseed generation script computes a deterministic SHA-256 content hash over all preseed documents (sorted by key) and emits it as a build-time constant accessible to the runtime. <!-- @impl: src/lib/agent-seed.generated.ts::PRESEED_CONTENT_HASH -->
 2. After a successful reconcile (manual or auto), the applied hash is persisted in the user's preferences store.
 3. On initial dashboard load, the backend compares the stored hash against the build-time constant and returns whether an upgrade is needed. This check is omitted from periodic polling to avoid overhead.
-4. On initial dashboard load, if an upgrade is needed, the frontend triggers the reconcile in the background.
+4. On initial dashboard load, if an upgrade is needed, the frontend triggers the reconcile in the background. <!-- @impl: web-ui/src/stores/session.ts::applyMetricsUpdate -->
 5. While the upgrade is in progress, the "+ New Session" button is disabled and displays "Upgrading..." (both Dashboard and SessionDropdown), and stopped session cards are visually dimmed (reduced opacity) and click-disabled.
-6. If the auto-upgrade fails, the error is logged but the dashboard remains fully usable. A page refresh retries the check.
+6. If the auto-upgrade fails, the error is logged but the dashboard remains fully usable. A page refresh retries the check. <!-- @impl: web-ui/src/stores/session.ts::applyMetricsUpdate -->
 7. The reconcile respects the user's current session mode and tier (standard/pro/unlimited) - identical behavior to the manual "Recreate" button.
 
 **Constraints:** None.
@@ -1021,13 +1015,15 @@ None.
 
 **Acceptance Criteria:**
 
-1. For readable PR metadata, PR-boundary review fires only for open PRs targeting `main` or `master`; the `gh pr create` metadata-lag exception is limited to AC6. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
-2. Local push detection recognises `git push`, `git -C <repo> push`, and command-local `cd <repo>` prefixes separated by `&&`, semicolon, or newline across Pi's normal Bash and context-mode shell surfaces. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::cwdFromBoundaryCommand -->
-3. GitHub CLI detection recognises `gh pr create`, `gh pr merge`, `gh pr update-branch`, `gh repo sync`, and protected-base `gh pr edit --base main|master` as boundary-shaped commands. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prEditBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryTrigger --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (prEditBoundaryBase gh pr edit retarget across --base/--base=/-B and compound forms, undefined for non-main base / non-base edit / non-edit command; isPrBoundaryTrigger treats gh pr edit onto main/master as a boundary -> AC3) -->
+1. PR-boundary review fires only for an open PR targeting `main` or `master`; the `gh pr create` metadata-lag exception is limited to AC6. A push to a DRAFT PR does not arm review on the boundary path (symmetric with reconciliation, which excludes drafts); reconciliation catches it when the PR is marked ready-for-review while its head is still unacked, and a draft cannot merge on GitHub meanwhile. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPrForPush --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prEnforcedForPush --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (prEnforcedForPush: main/master OPEN enforced, develop/CLOSED/headless not enforced -> AC1) --> <!-- @test: src/__tests__/lib/review-state.test.ts (shouldReconcileOpenPr does NOT reconcile a draft PR -> AC1 draft exclusion) -->
+1a. On the actual-command `onToolEnd` boundary path (a real `git push` / `gh pr create` just ran), an OPEN PR whose `baseRefName` is empty (transient `gh`/`jq` parse edge) is treated as enforced — fail-open to over-review rather than silently miss a PR-to-`main`; the autonomous reconcile tick and the merge gate keep the strict `main`/`master` check. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prEnforcedForPush --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (prEnforcedForPush: fails OPEN when baseRefName is empty or absent -> AC1a) -->
+2. Local push detection recognises `git push`, `git -C <repo> push`, pushes to ssh/https remote URLs, and env-var-prefixed forms (e.g. `GIT_SSH_COMMAND='…' git push`), plus command-local `cd <repo>` prefixes separated by `&&`, semicolon, or newline. Command text is extracted shell-only: Bash `.command`, `ctx_execute` `.code` only when `language === "shell"`, and `ctx_batch_execute` `.commands[].command` — non-shell `ctx_execute` bodies and the legacy `.script` shape yield no command, so a JS/TS/Python source literal containing `git push` can never false-fire the boundary. Detection itself is a stateless start/separator-anchored regex over the raw command (not a shell tokenizer), so a heredoc body carrying markdown pipes or apostrophes can never desync it. A `git push` that cannot advance a head — a dry run (`--dry-run`/`-n`) or a branch teardown (`--delete`/`-d`) — is excluded from push detection, so a credential probe or a branch delete does not arm review on an inherited unacked head; `--tags` stays a boundary because `git push origin main --tags` advances a head. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isAdvancingGitPush --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (isPrBoundaryTrigger/isGitPushOnlyCommand: dry-run / -n / --delete / -d is not a boundary, --tags stays a boundary -> AC2) --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::cwdFromBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::commandTextFromEvent --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (isPrBoundaryTrigger robustness describe — heredoc body, ssh/https remote, env-var prefix with quoted value, batched compound, false-positive guards -> AC2/AC3) --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (commandTextFromEvent shell-only gate: non-shell ctx_execute body and .script excluded, language:"shell" code and ctx_batch .commands[].command included -> AC2) -->
+3. GitHub CLI detection recognises `gh pr create`, `gh pr merge`, `gh pr update-branch`, `gh repo sync`, and protected-base `gh pr edit --base main|master` as boundary-shaped commands — including a `gh pr create` whose `--body` carries a `$(cat <<EOF …)` heredoc, which the same stateless regex matches without tokenizing the body. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prEditBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryTrigger --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (prEditBoundaryBase gh pr edit retarget across --base/--base=/-B and compound forms, undefined for non-main base / non-base edit / non-edit command; isPrBoundaryTrigger treats gh pr edit onto main/master as a boundary -> AC3) -->
 4. Metadata-only PR commands do not trigger review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::isPrBoundaryCommand -->
 5. PRs into intermediate integration branches (`develop`, `staging`, etc.) do NOT trigger reviews; the case is deferred until the integration branch's own PR-to-`main` opens or syncs, where the cumulative review covers everything that landed. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isEnforcedPr -->
 6. During a `gh pr create` metadata-visibility race, Pi may infer a protected base (`main` or `master`, including quoted CLI values or the default when no base is supplied) and synthesize an open PR from local HEAD; non-protected bases remain ignored. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prCreateBoundaryBase --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prForBoundaryCommand -->
 7. Non-triggering states never create a review window: vibe-coding projects run no agents, and passive lifecycle events never act on branch existence alone. Review starts only from an explicit command, persisted pending state, or bounded open-PR reconciliation. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::isSddProject --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview -->
+8. A PR-boundary command still creates the review window when its `tool_execution_start` event is lost across a reload or turn boundary: its start-args are also captured on `tool_call`, so the command is recovered at `tool_result` instead of arriving empty and being silently skipped. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::rememberToolStartArgs --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prStateFreshResult --> <!-- coverage-gap: the tool-event wiring (start-args captured on tool_call, withStartArgs recovery at tool_result, the cache-fresh boundary PR read via prStateFreshResult, and the deduped `missing_command_text_after_success` audit when a successful bash result still has no recoverable command) is in-process Pi lifecycle glue not loadable in the Workers vitest pool; verified by inspection + the bundled-jiti load-check + the manual missed-boundary smoke test, consistent with this REQ's other runtime paths. -->
 
 **Constraints:**
 
@@ -1052,7 +1048,7 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
-<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (agent-spawn enforcement describe -> AC4/AC5/AC6/AC7; lane gating describe -> AC1/AC2/AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial all-lane scheduling + AC5 doc-updater parallel dispatch) -->
+<!-- @test: host/__tests__/lane-classifier.test.js (compute_required_lanes describes -> AC1/AC2/AC3 shared helper + lane mapping + conservative fallback to all-three-lanes) + host/__tests__/enforce-review-spawn.test.js (agent-spawn enforcement describe -> AC4/AC5/AC6/AC7; lane gating describe -> AC1/AC2/AC3) + src/__tests__/lib/agent-seed-manifest.test.ts (Pi review helper behavior tests -> AC4 initial all-lane scheduling + AC5 doc-updater parallel dispatch; seeded reviewer defs scope-agnostic -> AC8) -->
 
 **Intent:** Once a PR-boundary trigger fires ([REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions)), a shared lane classifier picks the minimal correct set of review agents from the diff so the in-turn nudge and turn-end gate agree, and a fix-push cascade can advance the ack pointer without losing review coverage.
 
@@ -1067,6 +1063,8 @@ None.
 5. `doc-updater` dispatches in parallel with `spec-reviewer`, not after it: every required lane is eligible immediately, since the reviewers report findings to a triage file and the main session applies fixes — no shared-write race. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewEligibleLanes -->
 6. Review agents are dispatched with `run_in_background: true` so the main session stays interactive; the turn-end gate suppresses re-summoning per lane, so a slow in-flight lane never masks demand for other lanes nor satisfies acknowledgement without current-head completion. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::all_required_lanes_completed_for_current_head --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (suppresses an in-flight lane without masking missing peer lanes + does not ack while current-head lanes are still in flight) -->
 7. In-flight suppression is bounded by transcript recency: an uncompleted spawn that falls behind the transcript tail is treated as orphaned, demanded again, and cannot suppress its lane indefinitely. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight --> <!-- @test: host/__tests__/enforce-review-spawn.test.js (re-demands an orphaned in-flight lane after the transcript recency bound) -->
+8. After the first acknowledged review, a follow-up review is dispatched scoped to the incremental window (last-acked clean head -> current head), so a re-review inspects only the new commits instead of re-reviewing the entire PR each round. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewPrompt --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::docUpdaterPrompt --> <!-- @impl: preseed/agents/claude/agents/code-reviewer.md --> <!-- @impl: preseed/agents/claude/agents/spec-reviewer.md --> <!-- @impl: preseed/agents/claude/agents/doc-updater.md --> <!-- @impl: preseed/agents/claude/skills/spec-enforce/SKILL.md --> <!-- @impl: preseed/agents/claude/skills/doc-enforce/SKILL.md --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (seeded reviewer defs are scope-agnostic: honor an explicit window, keep the full-diff default -> AC8) -->
+
 **Constraints:**
 
 - The agent must not push to the PR branch or start a second review wave while any required review lane is in flight. <!-- @impl: preseed/agents/claude/plugins/codeflare-hooks/scripts/enforce-review-spawn.sh::lane_in_flight -->
@@ -1086,7 +1084,8 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1-AC5) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (result model + compact status + announcement-key + summary/actionability tests -> AC1/AC3/AC4/AC5) -->
+<!-- @test: src/__tests__/lib/review-state.test.ts (AC2 footer badge: see inline annotation below) -->
 
 **Intent:** Pi operators need consistent PR-boundary review output and a compact indication that internal durable lanes are active.
 
@@ -1095,10 +1094,11 @@ None.
 **Acceptance Criteria:**
 
 1. Durable PR-boundary result files use a shared `## Findings` plus severity-count Review Summary table format. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatDurableReviewResult -->
-2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job from the persisted pending review state. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::updateReviewStatus -->
+2. Pi exposes compact durable-lane progress in the footer while PR-boundary review runs, rendering only lanes required for the current review job from the persisted pending review state, prefixed with an elapsed-time badge (`M:SS`, measured from the earliest lane start) and annotating each completed lane with its best-effort token count parsed from the lane transcript (the badge and token figures are omitted when their inputs are unavailable). <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::compactDurableReviewStatus --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatReviewElapsed --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatReviewTokens --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::laneTokensFromTranscript --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::updateReviewStatus --> <!-- @test: src/__tests__/lib/review-state.test.ts ("compactDurableReviewStatus timer + token badge (footer enhancement)" + "formatReviewElapsed / formatReviewTokens" describes -> badge rendering + graceful omission -> AC2) -->
 3. Pi suppresses duplicate PR-boundary review result and summary announcements for the same repo, head, lane, and result path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
 4. After all required lanes complete, Pi publishes a merged chat summary instead of separate per-lane chat result blocks. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewSummaryMarkdown -->
 5. The merged chat summary reports aggregate severity counts across code, spec, and documentation lanes and renders findings sorted by criticality, without requiring per-lane result-file links in chat. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergedReviewSummaryModel --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::formatMergedReviewSummary -->
+6. The finding extractor (`extractReviewFindings`) and the severity counter (`countReviewSeverities`) apply one byte-identical decoration rule — a severity word is a finding only when decorated as `[SEVERITY]`, `**SEVERITY**`, or `SEVERITY:` at the leading position of a header line — so the rendered finding list and the Review Summary counts never diverge. A bare severity word in prose ("High-level summary…") or one decorated elsewhere on the line is a finding in neither; a tally line (`HIGH: 2 (…)`) is excluded from both; and a decorated label with no inline title (`**CRITICAL**` alone) is counted once and surfaced as a finding with a placeholder `(untitled)` title rather than dropped from the list while still being counted. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::findingHeaderMatches --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::extractReviewFindings --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::countReviewSeverities --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (decoration lockstep: leading bare severity word with a decorated label elsewhere is not a finding and counts 0; bare decorated label with no title is counted once and extracted as untitled -> AC6) -->
 
 **Constraints:**
 
@@ -1108,7 +1108,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch)
 
-**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1/AC3-AC6); [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (AC2 — elapsed/token badge formatting + compact status rendering/omission)
 
 **Status:** Implemented
 
@@ -1131,7 +1131,8 @@ None.
 3. A PR head remains unacked until a later review run writes every required lane result file. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::markCompleted -->
 4. Lane liveness is the live child pid, identity-checked against its recorded `/proc` start-time so a recycled pid is never trusted alive nor signalled. A `running` lane is re-spawn-suppressed only while alive; a dead child with no result file is reaped to failed and re-spawn-eligible. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::runningDurableReviewLanes --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::isProcessAlive --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::startDurableReviewLanes -->
 5. If completion callbacks are missed or Pi reloads, persisted exact-head result files are enough to recover, finalize, acknowledge, and publish the review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::refreshReviewStatusFromDurable --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
-6. The reaper writes a lane result file and marks it completed when its transcript reaches `agent_end`, or when its child exits after flushing a usable final assistant message even without a terminal `agent_end` line. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reapLaneDecision -->
+6. The reaper writes a lane result file and marks it completed when its transcript reaches a terminal `agent_end` (one with no pending retry), or when its child exits after flushing a usable final assistant message even without a terminal `agent_end` line. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reapLaneDecision --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::summarizeLaneTranscript -->
+7. Lane-transcript distillation is retry-aware: an `agent_end` carrying `willRetry: true` (an attempt pi will auto-retry in the same child, e.g. after a transient WebSocket drop) does not settle the lane, and that failed attempt's `errored`/`stopReason`/final-text verdict is discarded so an early transient error cannot poison the retry that later succeeds. The terminal end is any `agent_end` without `willRetry: true` (a clean finish omits the field). A lane a prior reaper tick already marked `failed` is self-healed to `completed` when its transcript later shows a terminal `agent_end` AND a usable result — non-empty final text, `stopReason` neither `error` nor `aborted`, and no error payload — and no result file exists yet; a killed, timed-out, or terminally-errored lane whose result fails that usability check stays failed. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::summarizeLaneTranscript --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reapLaneDecision --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-054: durable lane orchestration is retry-aware (transient error + retry completes; a willRetry attempt-end never settles a lane; a failed lane self-heals) -> AC7) -->
 
 **Constraints:**
 
@@ -1159,10 +1160,10 @@ None.
 
 **Acceptance Criteria:**
 
-1. Pi requests a fix pass only after every required exact-head result file exists and at least one legitimate `MEDIUM`/`HIGH`/`CRITICAL` finding remains. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::requestReviewAutofixForRows -->
-2. Partial lane result sets never trigger a fix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewAckReady -->
+1. Pi requests a fix pass only after every required exact-head result file exists and at least one legitimate `MEDIUM`/`HIGH`/`CRITICAL` finding remains. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::sendAnnouncement --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::requestReviewAutofixForRows -->
+2. Partial lane result sets never trigger a fix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::sendAnnouncement --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::durableReviewAckReady -->
 3. When a live session transcript is available, a wait/do-not-auto-fix directive makes Pi present findings without requesting a fix pass. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAutofixModeFromUserMessages -->
-4. Idle finalization without live context keeps the default automatic fix behavior. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::requestReviewAutofix -->
+4. Idle finalization without live context keeps the default automatic fix behavior. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::sendAnnouncement -->
 
 **Constraints:**
 
@@ -1183,7 +1184,7 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
 <!-- @impl: preseed/agents/pi/extensions/review-lane-guards.ts -->
-<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (lane extension-source selection -> AC6; lane guard blocking -> AC7) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (lane extension-source selection -> AC6; lane guard blocking -> AC7; incremental-scope guard (reviewScopeBlockReason) -> AC8) -->
 <!-- coverage-gap: AC1-AC5's detached child-process lane execution is a runtime behaviour verified by an integration smoke test, with no dedicated automated test in the Workers vitest pool (which cannot spawn pi). -->
 
 **Intent:** Pi durable review lanes need enough bounded inspection capability to review diffs without loading recursive review enforcement or running local builds.
@@ -1199,6 +1200,7 @@ None.
 5. Durable review lanes expose graphify inspection tools. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane -->
 6. Settings-enabled context-mode may add `ctx_search` to durable review lanes. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::laneExtensionSources -->
 7. Durable review lane guards block local build, test, lint, and dev-server commands. <!-- @impl: preseed/agents/pi/extensions/review-lane-guards.ts::reviewLaneBlockReason -->
+8. When a prior clean head was acknowledged, durable review lanes are confined to the incremental window: `spawnDurableLane` exports `CODEFLARE_REVIEW_BASE` / `CODEFLARE_REVIEW_HEAD` / `CODEFLARE_REVIEW_BASE_REF`, and the lane guard blocks `gh pr diff` and any `git diff` ranging (two- or three-dot) against the base branch. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::spawnDurableLane --> <!-- @impl: preseed/agents/pi/extensions/review-lane-guards.ts::reviewScopeBlockReason --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (reviewScopeBlockReason: no base allows all; acked base blocks gh pr diff + two-/three-dot ranges against the base branch; window forms incl. bare SHA range allowed -> AC8) -->
 
 **Constraints:**
 
@@ -1218,7 +1220,7 @@ None.
 
 <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
 <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-061 idle reaper helper test covers AC2 gating; AC1 runtime reaping + AC3/AC4 off-turn finalization have integration smoke coverage) -->
-<!-- coverage-gap: AC1's no-turn finished-lane reaping path is driven by a reload-safe `setInterval`; it is runtime-smoke-tested with detached lanes, with no dedicated automated test in the Workers vitest pool. AC4's off-turn summary deferral (no-ctx finalize persists summary.md but leaves the chat announcement unclaimed for the next on-turn emit) is the same off-turn `setInterval`/`pi.sendMessage` integration glue, verified by inspection and runtime smoke rather than a Workers-pool unit test. -->
+<!-- coverage-gap: AC1's no-turn finished-lane reaping path is driven by a reload-safe `setInterval`; it is runtime-smoke-tested with detached lanes, with no dedicated automated test in the Workers vitest pool. AC4's off-turn summary deferral (no-ctx finalize arms a durable nonce-verified delivery announcement, which the next on-turn tick delivers and verifies — full contract in REQ-AGENT-062) is the same off-turn `setInterval`/`pi.sendMessage` integration glue, verified by inspection and runtime smoke rather than a Workers-pool unit test. -->
 
 **Intent:** Pi must advance and finalize durable review jobs even when the user does not submit another prompt.
 
@@ -1229,8 +1231,8 @@ None.
 1. An idle Pi session with no user turn still reaps finished durable review lanes. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
 2. An idle Pi session starts the next eligible durable review lane after prerequisite lanes complete. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
 3. An idle Pi session finalizes completed durable reviews by acknowledging the exact head, saving the merged summary, and starting the autofix request. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
-4. Off-turn finalization does NOT claim the chat-summary marker; the next on-turn tick emits the visible merged summary. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::publishSummaryForCurrentPr -->
-5. Review-repo resolution for the reaper, the on-turn finalizers, and the footer progress row derives the repo from the boundary-command cwd / Pi session cwd plus an in-session remembered review repo — never the shared graphify active-cwd sentinel, which multiple agents write and which points at whatever repo acted last. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::resolveReviewRepo --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewRepoForCtx --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::liveReviewRow --> <!-- @test: src/__tests__/lib/review-state.test.ts (resolveReviewRepo precedence + never probes the sentinel path -> AC5) -->
+4. Off-turn finalization arms a durable, nonce-verified delivery announcement instead of emitting a fire-and-forget message; the next on-turn tick delivers and verifies the merged summary (full delivery contract in [REQ-AGENT-062](#req-agent-062-pi-pr-boundary-review-result-delivery)). <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::drainReviewAnnouncements -->
+5. Review-repo resolution for the reaper, the on-turn finalizers, the footer progress row, and the read-only `/review-status` command derives the repo from the boundary-command cwd / Pi session cwd, then an in-session remembered review repo, then the in-memory active repo codeflare-pi tracks on every tool execution (the same signal the statusline uses) — never, for routing, the shared graphify active-cwd sentinel, which multiple agents write and which points at whatever repo acted last. Both the active-repo and review-repo slots live on `globalThis` under `Symbol.for` keys (`codeflare.activeRepo`, `codeflare.reviewRepo`) because Pi 0.79.1's loader (`createJiti(moduleCache:false)`) gives each extension its own module instance, making `globalThis` the only cross-extension channel; a module-local variable written by `codeflare-pi.ts` is invisible to `review-enforcement.ts` and `local-statusline.ts`. The in-memory active-repo fallback is what lets `/review-run`, the no-ctx reaper, and `/review-status` resolve a nested clone when the session cwd is a non-repo parent workspace and no review has run yet; `/review-status` previously resolved from the session cwd alone and so warned "not inside a git repository" in such a session. Because `/review-status` is strictly read-only it additionally falls back — for display only, never for routing — to the guarded on-disk sentinel, the same last resort the statusline footer uses (`activeRepoSentinelForDisplay`, guarded to a git repo inside a session root). <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::resolveReviewRepo --> <!-- @impl: preseed/agents/pi/extensions/review-command.ts::reviewStatusRepo --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::recallActiveRepo --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::rememberActiveRepo --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::rememberReviewRepo --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewRepoForCtx --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::liveReviewRow --> <!-- @test: src/__tests__/lib/review-state.test.ts (resolveReviewRepo precedence incl. the active-repo fallback + never probes the sentinel path -> AC5) -->
 
 **Constraints:**
 
@@ -1241,6 +1243,41 @@ None.
 **Dependencies:** [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling), [REQ-AGENT-059](#req-agent-059-pi-durable-review-fix-loop)
 
 **Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1/AC2); [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (AC5 — resolveReviewRepo precedence + sentinel-independence)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-062: Pi PR-Boundary Review Result Delivery
+
+<!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-jobs.ts -->
+<!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-062 delivery announcement nonce/retry/reconcile decision helpers -> AC2/AC3) -->
+<!-- coverage-gap: the impure layer — the durable announcement-record I/O lifecycle (arming, no-re-arm-when-visible, re-arm-when-failed, superseded-head retirement: AC1/AC5) and the live wiring (sessionContainsNonce's transcript scan, the emit/reconcile drain on each lifecycle tick, the /review-results command, the persistent results-ready status: AC4; the idle-gated plain-append summary delivery in sendAnnouncement: AC6) — lives in review-jobs.ts/review-enforcement.ts, which top-level-import node:child_process and the Pi SDK and so cannot load in the Workers vitest pool. It is verified by inspection + a bundled-jiti load-check + a post-deploy live smoke test, the repo's runtime-coverage convention. The pure decision helpers (AC2/AC3) are unit-tested. -->
+
+**Intent:** A completed PR-boundary review must reliably DELIVER its merged summary back into the main Pi session, not just ack the head and write `summary.md` to disk. `pi.sendMessage` persists a custom message into the session transcript only when the live agent session emits a `message_end` event, so an off-turn finalize (the idle reaper has no live session loop) or a stale post-reload sender silently no-ops. Delivery is therefore a SECOND, separately-tracked durable phase: a send is never assumed delivered — it is proven against the transcript, retried, observable, and has a manual fallback, so a review's findings are never acked-and-lost. Review execution and lane finalization live in [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling)/[REQ-AGENT-061](#req-agent-061-pi-idle-durable-review-reaper); summary formatting in [REQ-AGENT-053](#req-agent-053-pi-durable-review-status-and-result-formatting).
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. Review delivery is two-phase: finalizing a completed review (acking the head, saving `summary.md`) arms a durable per-`(head, kind)` delivery announcement in `pending` instead of emitting a fire-and-forget message. The summary announcement is always armed; the autofix announcement only when actionable findings remain. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::armReviewAnnouncements --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::ensureReviewAnnouncementPending -->
+2. A delivery announcement is marked `visible` (delivered) ONLY when its unique nonce is found in the session transcript — never on a bare `sendMessage` return. Each summary/autofix message embeds its nonce, which persists into the transcript line iff the message actually reached the live session. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::sessionContainsNonce --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::announcementReconcileDecision --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewAnnouncementNonce --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (nonce determinism/uniqueness; reconcile nonce->visible; autofix request carries the nonce -> AC2) -->
+3. Pending or unverified announcements are (re)attempted on every live lifecycle tick (`session_start` / `turn_start` / `turn_end` / `resources_discover` / `agent_end`), bounded by a retry delay and an attempt cap. Once the cap is exhausted without the nonce ever appearing, the announcement is marked `failed` and the user is notified to run `/review-results`. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::drainReviewAnnouncements --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldAttemptAnnouncement --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::announcementReconcileDecision --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (shouldAttemptAnnouncement retry/cap; reconcile under-cap keep vs cap+window failed -> AC3) -->
+4. While a completed review's summary announcement is not yet `visible`, a persistent `results ready (not shown) — /review-results` footer status is shown and cleared only on delivery; the `/review-results` command displays the persisted `summary.md` on demand (the guaranteed fallback when automatic delivery never lands) and marks the announcement delivered. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::refreshDeliveryStatus --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::review-results -->
+5. A delivered (`visible`) announcement is never re-emitted (no duplicate summary), and a superseded head's undelivered announcements are retired so the new head never re-emits stale results. The `sendMessage` dedupe patch binds the CURRENT live sender (never a reload-surviving stale sender that returns cleanly but writes nothing), so delivery always targets the active session. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::ensureReviewAnnouncementPending --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::abandonReviewAnnouncements --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::installReviewMessageDedupe -->
+6. The display-only summary is delivered with a plain `pi.sendMessage` (no `triggerTurn`/`deliverAs` options), taking Pi's synchronous append path — the same one `/review-results` uses — that persists the nonce-bearing content and displays it in one step; it is gated on `pi.isIdle()`, staying pending for the next idle tick (`agent_end`/`turn_end`/`session_start`) while the agent is mid-turn so it is never steered into a streaming turn, and escalating to the `/review-results` fallback if it stays undelivered past a maximum age. The nonce-verify/retry phase (AC2/AC3) is the backstop, not the primary delivery path. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::sendAnnouncement --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::announcementReconcileDecision --> <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (announcementReconcileDecision age backstop escalates an idle-deferred summary -> AC6) -->
+
+**Constraints:**
+
+None.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-061](#req-agent-061-pi-idle-durable-review-reaper), [REQ-AGENT-059](#req-agent-059-pi-durable-review-fix-loop), [REQ-AGENT-053](#req-agent-053-pi-durable-review-status-and-result-formatting)
+
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC2/AC3 — nonce determinism, retry/reconcile decisions). The impure durable announcement-record I/O lifecycle (AC1/AC5), the live transcript-scan delivery, per-tick emit/reconcile drain, `/review-results` command, and results-ready status (AC4) are verified by inspection plus a bundled-jiti load-check and a post-deploy live smoke test — the repo's runtime-coverage convention, since review-jobs.ts/review-enforcement.ts top-level-import node:child_process and the Pi SDK and cannot load in the Workers vitest pool.
 
 **Status:** Implemented
 
@@ -1261,9 +1298,10 @@ None.
 
 1. A pending review window is discarded when the readable PR has definitively closed, retargeted, or moved to an unrelated head. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
 2. If the PR state cannot be read, the pending review window is left intact for retry. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead -->
-3. If the readable PR head advances to a descendant while review is still in flight, Pi rolls the review window forward instead of discarding it. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::rollForwardAdvancedReview -->
+3. If the readable PR head advances to a descendant while review is still in flight, Pi rolls the review window forward instead of discarding it, and kills the superseded head's still-running lane children so a fix-push cascade cannot pile up orphaned reviewer processes on the container (completed lanes' results are reused). <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::classifyReviewHead --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::rollForwardAdvancedReview --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::abandonDurableReviewLanes -->
 4. A fix-push cascade preserves the first unreviewed review base for cumulative review. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
 5. Pi does not use a remote-tracking previous head as a review base unless an explicit ack or completed previous review proves the earlier PR contents were already covered. <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::selectReviewBase -->
+6. The `gh pr merge` gate blocks the merge until the reviewed head is acked; it gates on whether the required reviewers RAN, not on findings severity (lanes are report-only, [AD80](../../documentation/decisions/README.md#ad80-pi-pr-boundary-merge-gate-is-report-only-and-defended-in-depth)). The decision evaluates the PR the merge command actually TARGETS (a number / `/pull/` URL / branch / `--repo` slug), not just the cwd branch; fails CLOSED when that PR is readable-but-malformed (OPEN with empty `baseRefName`/`headRefOid`) or `gh` is transiently unreadable while any unacked merge-blocking head exists (pending, latched-breaker, or outstanding-offer); blocks `--auto` on an enforced unacked PR (it would merge server-side after checks without re-consulting the gate); and, as a retroactive backstop for wrapper forms the pre-block cannot intercept (`bash -c`, `xargs`, server-side `--auto`), emits a durable `merge_completed_unreviewed` audit + toast when a PR is observed MERGED while its head was never acked. The pure decision is unit-tested; the handler is thin wiring. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergeGateDecision --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::mergeCommandTarget --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onAgentStart --> <!-- @test: src/__tests__/lib/review-state.test.ts (mergeGateDecision: head_not_acked block, acked allow, non-enforced/no-PR allow, transient/malformed fail-closed with pending, breaker/offer candidate, bypass -> AC6) --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (mergeCommandTarget: number/URL/branch/--repo/--auto/value-flag/wrapper -> AC6) -->
 
 **Constraints:**
 
@@ -1273,7 +1311,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-054](#req-agent-054-pi-durable-review-lane-failure-handling)
 
-**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Pi review helper behavior tests](../../src/__tests__/lib/agent-seed-manifest.test.ts); the merge-gate decision and merge-command-target parsing are unit-tested in [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`mergeGateDecision`) and [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`mergeCommandTarget`). The roll-forward lane abandonment (AC3), the retroactive `merge_completed_unreviewed` audit, and the `onAgentStart` gate wiring that consumes the pure decision are verified by inspection plus a bundled-jiti load-check (the repo's runtime-coverage convention for the seeded extensions).
 
 **Status:** Implemented
 
@@ -1284,6 +1322,7 @@ None.
 <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts -->
 <!-- @impl: preseed/agents/pi/manifest.json -->
 <!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-056 local statusline fake-footer render -> AC1/AC2/AC3/AC4/AC5) -->
+<!-- @test: src/__tests__/lib/review-state.test.ts (active-repo remember/recall + separate slot from review-repo memory + sentinel guard accept/reject including path-boundary workspace-other case -> AC2) -->
 
 **Intent:** Pi users need a compact footer in every session mode that shows session context without hiding extension-owned status rows such as PR-boundary review progress.
 
@@ -1292,7 +1331,7 @@ None.
 **Acceptance Criteria:**
 
 1. The Pi local statusline extension is preseeded in both Standard and Pro modes. <!-- @impl: preseed/agents/pi/manifest.json::local-statusline.ts -->
-2. The footer's first line renders current context usage, active model ID with thinking effort as `model:effort`, and the active repository label when one can be resolved. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::renderLine --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::contextPercent --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::repositoryLabel -->
+2. The footer's first line renders current context usage, active model ID with thinking effort as `model:effort`, and the active repository label when one can be resolved. When neither the session cwd nor the ctx cwd is inside a git repo (e.g. the session cwd is a non-repo parent workspace and work happens in a nested repo via `git -C`), the label falls back — display-only, never for review routing — through: the in-session active repo remembered by codeflare-pi whenever a command resolves a git root, the in-session remembered review repo (nested review clones), and finally the on-disk graphify active-cwd sentinel guarded to a git repo inside a session root so a concurrent agent's unrelated repo cannot hijack the footer. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::renderLine --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::contextPercent --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::repositoryLabel --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::sentinelRepoForDisplay --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::rememberActiveRepo --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::activeRepoSentinelForDisplay --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::rememberReviewRepo --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::updateActiveRepoFromPath -->
 3. Extension-owned statuses are preserved on an additional footer line only while statuses exist; idle sessions do not render an empty second line. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::installFooter -->
 4. Footer lines are truncated by visible width, preserving ANSI color sequences and appending a reset before the ellipsis so colored review statuses do not consume visible width or bleed styling past truncation. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::truncateToWidth -->
 5. The statusline refreshes on session start, resource discovery, turn boundaries, model changes, thinking-effort changes, and cache-TTL repaint intervals. <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::refreshFooter --> <!-- @impl: preseed/agents/pi/extensions/local-statusline.ts::CACHE_TTL_MS -->
@@ -1305,7 +1344,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-004](#req-agent-004-two-session-modes-standard-and-pro), [REQ-AGENT-006](#req-agent-006-preseed-configs-generated-from-single-source-of-truth)
 
-**Verification:** [Pi local statusline render test](../../src/__tests__/lib/agent-seed-manifest.test.ts)
+**Verification:** [Pi local statusline render test](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC1-AC5); [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (AC2 — repo-label resolution via rememberReviewRepo/recallReviewRepo, rememberActiveRepo/recallActiveRepo, and the guarded activeRepoSentinelForDisplay fallback)
 
 **Status:** Implemented
 
@@ -1360,12 +1399,13 @@ None.
 
 **Acceptance Criteria:**
 
-1. Lifecycle reconciliation recovers enforced open PRs with unacknowledged heads using an in-memory per-session baseline (the head first observed this session): a head that advances beyond the baseline auto-starts, while an inherited head (baseline unset or unchanged — fresh launch/clone/checkout) is offered once and remains merge-blocking until user choice. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reconcileBoundaryAction --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewBaselineContinuation --> <!-- @test: src/__tests__/lib/review-state.test.ts (reviewBaselineContinuation: bare launch offers, only an in-session advance autostarts -> AC1) -->
+1. Lifecycle reconciliation recovers enforced open PRs with unacknowledged heads. Whether a missed boundary AUTO-STARTS reviewers or merely OFFERS them is decided by two `globalThis`-backed per-session signals (module-local state would reset on Pi's `moduleCache:false` mid-session module reload and lose the in-session fact). The PRIMARY signal is `boundaryActedThisSession` (key `codeflare.reviewBoundaryActedThisSession`, `Symbol.for`): the set of repo+branch keys for which a real boundary command (push / `gh pr create`) executed this session, marked in `onToolEnd` BEFORE any window-creation guard so a dropped window still records that this session pushed. The BACKSTOP is a per-session, per-branch baseline (key `codeflare.reviewSessionBaselineHead`, `Symbol.for`) seeded to the head this session first observes on a branch, so a later in-session push to a descendant of that baseline still reads as an in-session advance even when a reload ate the boundary tool-event. A head matching EITHER signal auto-starts; a head matching NEITHER — inherited at launch (fresh clone, relaunch) or reached by a bare `git checkout` of another branch — is offered once and remains merge-blocking until user choice. The baseline is keyed by repo+current-branch, not repo alone, so a descendant-branch checkout cannot inherit a baseline advanced by a prior branch and mis-fire an autostart; `writeAck` deliberately no longer advances the baseline (redundant under seed-on-observe, and the former advance was itself a cross-branch autostart-bug source). `gh pr view` results are cached per repo+branch on `globalThis` (key `codeflare.prCache`, `Symbol.for`) with an asymmetric TTL — 60 s for OPEN results, 10 s for negative/absent — and transient `gh` failures are never cached, so the boundary handler, the no-ctx reaper, and the statusline (separate jiti instances under `moduleCache:false`) share one PR-state view without redundant shell-outs. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::prCache --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reconcileBoundaryAction --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::reviewInSessionContinuation --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reviewBaselineMemory --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::baselineKey --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::boundaryActedThisSession --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::writeAck --> <!-- @test: src/__tests__/lib/review-state.test.ts (reviewInSessionContinuation: bare launch offers, an in-session boundary command OR a baseline advance autostarts -> AC1) -->
 2. Boundary-command and reconciliation paths call one shared routine, so reconciled windows match captured-command windows in lanes, review base, durable job, and audit trail. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::ensureReviewWindow -->
 3. Head resolution reviews local HEAD during metadata lag only when it is on the PR branch, descends from GitHub's PR head, and the remote-tracking ref contains it. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::resolveEnforcedHead --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::enforcedHeadDecision --> <!-- @test: src/__tests__/lib/review-trigger.test.ts (enforcedHeadDecision pushed-vs-unpushed table -> AC3) -->
-4. A boundary-shaped command that does not start a review appends a durable `boundary_candidate_ignored` audit event naming the gate reason, so a skipped review is always reconstructable from disk. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent --> <!-- @test: src/__tests__/lib/review-state.test.ts (REQ-AGENT-058 AC4: every suppressed reconcile gate names a distinct non-empty reason to stamp into boundary_candidate_ignored -> AC4) -->
+4. A boundary-shaped command that does not start a review appends a durable `boundary_candidate_ignored` audit event naming the gate reason, so a skipped review is always reconstructable from disk. The actual-command `onToolEnd` path additionally stamps a `boundary_tool_end_ignored` event (reason `no_resolvable_head` or `dedupe_skipped`) when a *confirmed enforced* PR's boundary tool-event is dropped after the enforcement check, so a direct-path near-miss is diagnosable too — reconciliation still backstops the start, but the drop is no longer invisible. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr --> <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::appendReviewEvent --> <!-- @test: src/__tests__/lib/review-state.test.ts (REQ-AGENT-058 AC4: every suppressed reconcile gate names a distinct non-empty reason to stamp into boundary_candidate_ignored -> AC4) -->
 5. A successful `gh pr create` whose command text could not be parsed but whose tool output contains a GitHub PR URL is reconciled by reading the open PR, so unparseable command shapes still start review. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onToolEnd --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::prUrlFromText -->
 6. Reconciliation drives at most one transition per turn and is a no-op when the head is acked, a pending job exists, or the breaker is open, so it never duplicates work or re-spawns a completed review. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::shouldReconcileOpenPr -->
+7. A missed-boundary offer surfaces ONLY as a passive `ctx.ui.notify` toast plus the `boundary_offered` audit event — never as a chat/transcript message. A chat-visible custom message is agent-readable, so the agent reads the offer's "Run `/review-run` …" text as an instruction and spirals into trying to act on it after a clone-only request; the merge gate is the durable enforcement, not a transcript copy. The offer is deduped PER SESSION (process-scoped `globalThis` set `codeflare.reviewOfferSurfacedThisSession`, `Symbol.for`), not per-head-ever: a new `pi` launch on a still-unchosen offer re-surfaces the toast exactly once. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileOpenPrReview --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::markOfferSurfaced --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::offerSurfacedThisSession -->
 
 **Constraints:**
 
@@ -1375,7 +1415,7 @@ None.
 
 **Dependencies:** [REQ-AGENT-036](#req-agent-036-pr-boundary-review-trigger-conditions), [REQ-AGENT-040](#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch), [REQ-AGENT-055](#req-agent-055-pi-pr-boundary-review-window-advancement)
 
-**Verification:** Unit tests: [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`shouldReconcileOpenPr` gating + every suppressed gate names a distinct non-empty reason → AC1/AC4/AC6; `reconcileBoundaryAction` autostart-in-session-vs-offer-on-clone → AC1), [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`enforcedHeadDecision` pushed-vs-unpushed → AC3; `prUrlFromText` PR-URL detection → AC5), [agent-seed-manifest.test.ts](../../src/__tests__/lib/agent-seed-manifest.test.ts) (seed wires reconcileOpenPrReview + shouldReconcileOpenPr → AC1). The in-session-continuation verdict (`reconcileBoundaryAction` returns `autostart`) is unit-tested as a pure decision; the caller's `lastAck`/`isAncestor` wiring that feeds it, plus AC2's single-routine window invariant (exactly one `ensureReviewWindow`, the sole window-creator both the boundary path and `/review-run` call), are verified by inspection. The decision core for every other AC is unit-tested; the thin `appendReviewEvent` / `ctx.ui.notify` runtime wiring that acts on those decisions is integration glue, per the repo's runtime-coverage convention.
+**Verification:** Unit tests: [review-state.test.ts](../../src/__tests__/lib/review-state.test.ts) (`shouldReconcileOpenPr` gating + every suppressed gate names a distinct non-empty reason → AC1/AC4/AC6; `reconcileBoundaryAction` autostart-in-session-vs-offer-on-clone → AC1), [review-trigger.test.ts](../../src/__tests__/lib/review-trigger.test.ts) (`enforcedHeadDecision` pushed-vs-unpushed → AC3; `prUrlFromText` PR-URL detection → AC5), [agent-seed-manifest.test.ts](../../src/__tests__/lib/agent-seed-manifest.test.ts) (seed wires reconcileOpenPrReview + shouldReconcileOpenPr → AC1). The in-session-continuation verdict (`reconcileBoundaryAction` returns `autostart`) is unit-tested as a pure decision; the caller's `lastAck`/`isAncestor` wiring that feeds it, plus AC2's single-routine window invariant (exactly one `ensureReviewWindow`, the sole window-creator both the boundary path and `/review-run` call), are verified by inspection. The `globalThis` per-session signals (`reviewBaselineMemory` branch-keyed via `baselineKey`, and `boundaryActedThisSession`), the passive offer toast (`ctx.ui.notify` only — no chat/transcript message, deduped per session via `offerSurfacedThisSession`/`markOfferSurfaced`, AC7), and the `onToolEnd` `boundary_tool_end_ignored` near-miss audit (AC4) are runtime wiring verified by inspection — module loads are checked via the bundled-jiti harness. The decision core for every other AC is unit-tested; the thin `appendReviewEvent` / `ctx.ui.notify` runtime wiring that acts on those decisions is integration glue, per the repo's runtime-coverage convention.
 
 **Status:** Implemented
 
@@ -1624,9 +1664,11 @@ None.
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-mcp-lazy.py -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-active-repo.sh -->
 <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/safe-graphify-update.sh -->
+<!-- @impl: preseed/agents/claude/plugins/graphify/scripts/local-graphify-labels.sh -->
 <!-- @impl: preseed/agents/pi/scripts/build-graphify-ast.sh -->
 <!-- @impl: preseed/agents/pi/scripts/build-graphify-architecture.sh -->
 <!-- @impl: preseed/agents/pi/scripts/safe-graphify-update.sh -->
+<!-- @impl: preseed/agents/pi/scripts/local-graphify-labels.sh -->
 <!-- @impl: preseed/agents/pi/extensions/graphify-native.ts -->
 <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts -->
 <!-- @impl: Dockerfile -->
@@ -1767,11 +1809,11 @@ None.
 
 **Acceptance Criteria:**
 
-1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects real `git clone` and `gh repo clone` invocations using anchored token parsing that rejects quoted or echoed false positives. <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-clone-prompt.sh::COMMAND --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::isGitClone -->
+1. In advanced session mode only, a PostToolUse hook on `Bash` and `mcp__context-mode__ctx_execute|mcp__context-mode__ctx_batch_execute` matchers detects real `git clone` and `gh repo clone` invocations using anchored token parsing that rejects quoted or echoed false positives. For Pi, clone detection extracts command text shell-only (`shellCommandText`: Bash `.command`, `ctx_execute` `.code` only when `language === "shell"`, `ctx_batch_execute` `.commands[].command`), excluding non-shell `ctx_execute` bodies so a source literal cannot false-fire the prompt; the clone regex consumes a shared env-var prefix (`ENV_PREFIX`: zero or more `VAR=value` assignments and an optional `env` wrapper before the verb) so `BROWSER="" gh repo clone`, `GIT_TERMINAL_PROMPT=0 git clone`, and `env BROWSER="" gh repo clone` all trigger. <!-- @impl: preseed/agents/claude/plugins/graphify/scripts/graphify-clone-prompt.sh::COMMAND --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::isGitClone --> <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::shellCommandText --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::ENV_PREFIX --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::cloneTargetPath -->
 2. Pi implements clone triage with native tool lifecycle events and Pi follow-up messages. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::graphifyClonePromptDecision -->
 3. Clone destination resolution prefers the tool result's `Cloning into '...'` line before falling back to command parsing, so shell variables such as `$repo` never surface as literal user-facing paths. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::cloneTargetPath -->
 4. When `<cloned-dir>/graphify-out/graph.json` is absent, the directive asks which graph action the user wants before any graph work, offering Full repo AST-only, Full repo semantic intent, or no graph action. <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::renderGraphifyCloneDirective -->
-5. When `<cloned-dir>/graphify-out/graph.json` exists, fresh graphs are used as-is; stale or unknown graphs ask before update, offering existing-graph-as-is, Full repo AST-only update, or Full repo semantic refresh intent. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::existingGraphCloneNotice --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::renderGraphifyCloneDirective -->
+5. When `<cloned-dir>/graphify-out/graph.json` exists, fresh graphs are used as-is (information message only); a stale graph (built at a commit other than HEAD) opens the directive with an explicit STALE warning before the choices, while an unknown-freshness graph asks without the stale flag — all offering existing-graph-as-is, Full repo AST-only update, or Full repo semantic refresh intent. Freshness and on-disk existence are resolved at clone-event time via `exists`/`freshness` callbacks. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::existingGraphCloneNotice --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::renderGraphifyCloneDirective --> <!-- @impl: preseed/agents/pi/extensions/graphify-helpers.ts::graphifyClonePromptDecision -->
 6. The bounded upstream-update wrapper runs only after the user chooses AST-only, and Full semantic build/refresh must pass through graphify skill detection plus post-detection count confirmation before semantic subagents dispatch. <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::Clone-time triage --> <!-- @impl: preseed/agents/pi/skills/graphify/SKILL.md::Mandatory graph refresh choice -->
 7. The hook is idempotent per cloned directory per session via a marker key that includes both the session identifier and cloned repository path; Pi clone triage suppresses follow-up prompts for failed clone commands, skipped/already-cloned targets, and durable PR-boundary review lanes. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::shouldHandleClonePrompt -->
 
@@ -1881,35 +1923,38 @@ None.
 
 ---
 
-### REQ-AGENT-031: LLM API Key Propagation to Container
+### REQ-AGENT-031: consult-llm Key Isolation, Subscription Backend, and Multi-Agent Parity
 
-<!-- @impl: src/container/container-env.ts -->
-<!-- @impl: entrypoint.sh -->
-<!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
-<!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe → OPENAI_API_KEY + GEMINI_API_KEY injection → AC1) + src/__tests__/lib/agent-seed-manifest.test.ts (REQ-AGENT-031 consult-llm invocation behaviour describe → AC4 provider dialog + AC5 latest-flagship model) -->
+<!-- @impl: scripts/generate-agent-seed.mjs -->
+<!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe → AC1 CODEFLARE_-namespaced injection + bare-name regression + AC6 enterprise no-inject) -->
+<!-- @test: host/__tests__/entrypoint-consult-llm.test.js (entrypoint consult-llm configuration describe → AC2 scoped env mapping + AC3 codex-cli/API backend selection + AC4 Pi directTools + AC6 enterprise gate) -->
+<!-- @test: src/__tests__/lib/agent-seed-manifest.test.ts (consult-llm available to Claude and Pi only → AC4; REQ-AGENT-031 consult-llm invocation behaviour describe → AC5 five-choice model dialog + selectors) -->
+<!-- @test: src/__tests__/routes/llm-keys.test.ts (enterprise mode describe → AC6 403 on GET/PUT/DELETE) -->
 
-**Intent:** Stored LLM API keys must reach the container as environment variables and trigger the consult-llm MCP server wiring, so the in-container agent can call OpenAI or Gemini without re-authentication.
+**Intent:** Stored LLM API keys must reach the `consult-llm-mcp` MCP server WITHOUT leaking into the coding agents' general environment (where the latest Pi/opencode/antigravity auto-detect them as their own provider credentials and silently drain the user's API account), must prefer the user's subscription over per-call API billing, and must be available identically to Claude Code and Pi — while being entirely absent in enterprise mode, where models route through the managed AI Gateway BYOK.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. Stored LLM API keys are propagated into the container environment at container start so in-container CLIs can call OpenAI or Gemini without re-authentication.
-2. When keys are present, the container entrypoint configures the `consult-llm-mcp` MCP server in `~/.claude.json`.
-3. Keys are NOT persisted in DO storage; they are read fresh from KV on each container start.
-4. When the user invokes the consult-llm skill without naming a provider, the agent shows an interactive provider-selection dialog (multi-select over the two configured providers, OpenAI and Google Gemini) before calling `consult_llm`; it never silently defaults to a provider. When the user names a provider explicitly, no dialog is shown. <!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
-5. The agent always passes an explicit `model` to `consult_llm`, resolved live from the provider's model listing at call time (OpenAI `/v1/models`, Gemini `/v1beta/models`) to the provider's current latest flagship; it never relies on the MCP server's configured default model. An explicitly named model from the user overrides the flagship auto-pick. <!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md -->
+1. LLM provider keys are injected into the container ONLY under a `CODEFLARE_`-namespaced name (`CODEFLARE_OPENAI_API_KEY` / `CODEFLARE_GEMINI_API_KEY`); the bare `OPENAI_API_KEY` / `GEMINI_API_KEY` names NEVER appear in the container's global environment. Keys are read fresh from KV on each container start and are not persisted in DO storage. <!-- @impl: src/container/container-env.ts::buildEnvVars -->
+2. The entrypoint maps the namespaced keys back to the standard `OPENAI_API_KEY` / `GEMINI_API_KEY` names ONLY inside the `consult-llm-mcp` MCP server's scoped `env` block (in `~/.claude.json` and `~/.pi/agent/mcp.json`), never as a global export. <!-- @impl: entrypoint.sh -->
+3. Per provider the entrypoint prefers the subscription over the API key: OpenAI uses the Codex CLI backend (`CONSULT_LLM_OPENAI_BACKEND=codex-cli`, `CONSULT_LLM_CODEX_REASONING_EFFORT=high`) when the user is logged into Codex (`~/.codex/auth.json` present), passing the API key only as a fallback; otherwise it uses the API key. Gemini always uses the API key. When no provider is usable, no MCP server is written. <!-- @impl: entrypoint.sh -->
+4. The `consult-llm` tooling is available to Claude Code AND Pi only: Claude reads it from `~/.claude.json`; Pi reads `~/.pi/agent/mcp.json` with `directTools:["consult_llm"]` promoting it to a first-class tool, and is seeded a native Pi `consult-llm` skill. The Pi server sets `lifecycle:"keep-alive"` so pi-mcp-adapter connects it on startup and auto-reconnects rather than lapsing to a `0/1 servers … cached` footer after the default idle timeout; the Claude server carries no `lifecycle` field (a pi-mcp-adapter-only concept). No other agent (codex/opencode/antigravity) receives the skill or the server. <!-- @impl: entrypoint.sh --> <!-- @impl: preseed/agents/pi/manifest.json -->
+5. When the user invokes the consult-llm skill without naming a model, the agent shows a single-select dialog (`AskUserQuestion` on Claude, `ask_user_question` on Pi) of four explicit choices plus the tool's automatic "Other" write-in (five total): latest Google/Gemini, latest OpenAI/GPT, both, and "list all available models". For "list all available models" the skill surfaces **concrete** model IDs, never the bare provider selectors: consult-llm-mcp (v2.13.x) exposes no model-list tool and no schema enum (the concrete IDs were deliberately replaced by selectors), so the skill reads the latest `AVAILABLE MODELS:` block from the server startup log (`~/.local/state/consult-llm-mcp/mcp.log`), keeps only Gemini (`gemini-*`) and OpenAI (`gpt-*`) IDs, and falls back to clearly-labelled selectors only when the log is unreadable. "Latest" is resolved by the server-side `"openai"` / `"gemini"` model selectors — the skill never hardcodes a flagship ID and never performs a live provider model-list fetch with the raw key. When the user names a specific model, no dialog is shown and that exact ID is passed. <!-- @impl: preseed/agents/claude/skills/consult-llm/SKILL.md --> <!-- @impl: preseed/agents/pi/skills/consult-llm/SKILL.md -->
+6. In enterprise mode the entire LLM-keys-and-consult-llm surface is unavailable: the keys are not injected (AC1 suppressed), the `/api/llm-keys` routes return 403 on every method, the Settings "LLM API Keys" section is hidden, and the entrypoint writes no consult-llm MCP config and removes any seeded `consult-llm` skill dirs for both Claude and Pi. <!-- @impl: src/container/container-env.ts::buildEnvVars --> <!-- @impl: src/routes/llm-keys.ts --> <!-- @impl: web-ui/src/components/SettingsPanel.tsx --> <!-- @impl: entrypoint.sh -->
 
 **Constraints:**
 
 - The container reads keys at start and on restart; mid-session key changes take effect only after the next session start.
-- AC4 and AC5 are skill-directed agent behaviour; the consult-llm SKILL.md is the implementation surface and is verified by asserting its bundled-seed content (the provider-dialog mandate and the latest-flagship/never-server-default model directive).
+- AC5 is skill-directed agent behaviour; the consult-llm SKILL.md files (Claude + Pi) are the implementation surface and are verified by asserting their bundled-seed content (the five-choice dialog mandate, the `"openai"`/`"gemini"` selectors, the absence of any provider model-list curl, and the "list all" path reading concrete IDs from the server startup log rather than presenting provider selectors as the model list).
+- The consult-llm MCP config is wrapped in a shell function invoked with `|| echo WARNING` so a jq/IO failure can never abort the entrypoint before the init-complete flag (a crash-loop class bug).
 
 **Priority:** P1
 
 **Dependencies:** [REQ-AGENT-009](#req-agent-009-llm-api-key-storage-encrypted-in-kv)
 
-**Verification:** [Container-env test](../../src/__tests__/container/container-env.test.ts) (AC1) and [agent-seed manifest test](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC4/AC5 consult-llm skill content).
+**Verification:** [Container-env test](../../src/__tests__/container/container-env.test.ts) (AC1/AC6), [entrypoint consult-llm host test](../../host/__tests__/entrypoint-consult-llm.test.js) (AC2/AC3/AC4/AC6), [agent-seed manifest test](../../src/__tests__/lib/agent-seed-manifest.test.ts) (AC4/AC5), and [LLM keys route test](../../src/__tests__/routes/llm-keys.test.ts) (AC6 enterprise 403).
 
 **Status:** Implemented
 
@@ -1948,7 +1993,6 @@ None.
 
 ### REQ-AGENT-029: Deploy Credential Propagation to Container
 
-<!-- @impl: src/container/container-env.ts -->
 <!-- @impl: entrypoint.sh -->
 <!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe → GH_TOKEN + CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID injection → AC1-AC4) -->
 
@@ -1958,8 +2002,8 @@ None.
 
 **Acceptance Criteria:**
 
-1. Stored GitHub and Cloudflare deploy credentials are injected into the container as environment variables on session start.
-2. Credentials are sent as explicit `null` when absent (not omitted) so revocation propagates on session restart.
+1. Stored GitHub and Cloudflare deploy credentials are injected into the container as environment variables on session start. <!-- @impl: src/container/container-env.ts::buildEnvVars -->
+2. Credentials are sent as explicit `null` when absent (not omitted) so revocation propagates on session restart. <!-- @impl: src/container/container-env.ts::applyPrefsOnRestart -->
 3. When a GitHub credential is present, the container configures git for authenticated HTTPS access.
 4. The Cloudflare account ID is resolved automatically from the API token when one is stored, so users need not supply it separately.
 
@@ -1979,7 +2023,6 @@ None.
 
 ### REQ-AGENT-028: Deploy Credential Token-Creation UX
 
-<!-- @impl: web-ui/src/lib/token-scopes.ts -->
 <!-- @impl: web-ui/src/components/settings/ProviderRow.tsx -->
 <!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (GITHUB_TIERS + getGithubTokenUrl describes -> AC1 three-tier GitHub scope selector; CLOUDFLARE_TIERS + getCloudflareTokenUrl describes -> AC2 three-tier Cloudflare scope selector with 7/10/22 scope counts) -->
 
@@ -1989,9 +2032,9 @@ None.
 
 **Acceptance Criteria:**
 
-1. GitHub token creation offers three scope tiers (Minimal, Recommended, Advanced) via a selector in the connect flow, with Recommended pre-selected and the URL pre-filling the correct scopes per tier.
-2. Cloudflare token creation offers three scope tiers (Minimal, Recommended, Advanced) via the same selector pattern, with Recommended pre-selected and the URL pre-filling the correct permission group keys per tier.
-3. A documentation page lists all scopes per tier with explanations of why each is needed, linked from the UI via "See all scopes".
+1. GitHub token creation offers three scope tiers (Minimal, Recommended, Advanced) via a selector in the connect flow, with Recommended pre-selected and the URL pre-filling the correct scopes per tier. <!-- @impl: web-ui/src/lib/token-scopes.ts::GITHUB_TIERS --> <!-- @impl: web-ui/src/lib/token-scopes.ts::getGithubTokenUrl -->
+2. Cloudflare token creation offers three scope tiers (Minimal, Recommended, Advanced) via the same selector pattern, with Recommended pre-selected and the URL pre-filling the correct permission group keys per tier. <!-- @impl: web-ui/src/lib/token-scopes.ts::CLOUDFLARE_TIERS --> <!-- @impl: web-ui/src/lib/token-scopes.ts::getCloudflareTokenUrl -->
+3. A documentation page lists all scopes per tier with explanations of why each is needed, linked from the UI via "See all scopes". <!-- @impl: web-ui/src/lib/token-scopes.ts::SCOPES_DOCS_URL -->
 
 **Constraints:**
 

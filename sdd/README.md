@@ -1,12 +1,12 @@
 # Codeflare Specification
 
-Codeflare is an ephemeral cloud IDE that runs AI coding agents in isolated containers on Cloudflare's edge. Each session spins up a dedicated container pre-loaded with the user's choice of agent (Claude Code, Codex, Antigravity, GitHub Copilot, OpenCode, Pi, or Bash), provides a browser-native terminal accessible from any device, and tears itself down when idle. Files persist in per-user R2 storage via bidirectional sync; containers do not. The product targets developers who want zero-setup, zero-risk AI coding from any screen -- phone, tablet, or laptop -- without touching their local machine.
+Codeflare is the enterprise agentic coding engine: it runs autonomous AI coding agents in isolated containers on Cloudflare's edge. Each session spins up a dedicated container pre-loaded with the user's choice of agent (Claude Code, Codex, Antigravity, GitHub Copilot, OpenCode, Pi, or Bash), provides a browser-native terminal accessible from any device, and tears itself down when idle. Files persist in per-user R2 storage via bidirectional sync; containers do not. The product targets teams who want zero-setup AI coding from any screen -- phone, tablet, or laptop -- without touching their local machine.
 
 ## Principles
 
 1. **Isolation per session** -- Every session runs in its own container. No shared shells, no cross-session access. An agent can `rm -rf /` and the only victim is itself.
 
-2. **Files persist, bad decisions don't** -- R2 storage survives container teardown. Containers are ephemeral and disposable. Bisync runs every 15 minutes with a manual Sync-now trigger and a final sync on stop, so work is never lost even if a session dies before `git push`.
+2. **Files persist, containers don't** -- R2 storage survives container teardown. Containers are ephemeral and disposable. Bisync runs every 15 minutes with a manual Sync-now trigger and a final sync on stop, so work is never lost even if a session dies before `git push`.
 
 3. **Zero setup** -- Four steps from fork to live deployment (fork, set two secrets, deploy, run wizard). No Kubernetes, no Terraform, no local installs. Users connect GitHub and Cloudflare once; every subsequent session is pre-authenticated.
 
@@ -39,10 +39,25 @@ Codeflare is an ephemeral cloud IDE that runs AI coding agents in isolated conta
 | [Enterprise Mode](spec/enterprise-mode.md) | Deploy-time enterprise instance, subscription bypass, Worker-side LLM proxy | P1 | Active |
 | [Browser Run](spec/browser-run.md) | Real-browser WebFetch fallback via Cloudflare Browser Run | P2 | Active |
 | [Setup](spec/setup.md) | Onboarding wizard, deployment modes, DNS | P1 | Active |
+| [Landing](spec/landing.md) | Public enterprise landing page, mode-aware serving, contact pipeline | P1 | Active |
 | [Security](spec/security.md) | Auth enforcement, encryption, rate limiting, headers | P0 | Active |
 | [Operations](spec/operations.md) | CI/CD, testing, deployment, cost | P1 | Active |
 | [Memory](spec/memory.md) | Vault-based cross-session memory, automatic capture, hook delivery | P2 | Active |
 | [Vault](spec/vault.md) | Persistent obsidian-style notes, unified graphify graph, SilverBullet editor | P2 | Active |
+
+## Support files
+
+The `sdd/spec/` directory also holds these non-domain files (no `REQ-*` of their own):
+
+| File | Purpose |
+|------|---------|
+| [constraints.md](spec/constraints.md) | Global `CON-*` constraints referenced by REQ Dependencies |
+| [glossary.md](spec/glossary.md) | Canonical terminology |
+| [changes.md](spec/changes.md) | Product changelog (user-facing spec changes) |
+| [pending.md](spec/pending.md) | TODOs / known gaps not yet ready to be REQs |
+| [config.yml](spec/config.yml) | SDD autonomy mode and enforcement config |
+| `.review-queue.md` | Live PR-boundary review queue (open findings only) |
+| `.review-decisions.md` | Log of resolved review decisions |
 
 ## Out of Scope
 

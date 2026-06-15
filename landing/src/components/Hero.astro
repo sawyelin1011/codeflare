@@ -1,0 +1,55 @@
+---
+/**
+ * Hero: positioning line, the headline, a plain definition line, two CTAs, and
+ * one legible terminal showing a real Codeflare session (the spine run, opened).
+ * The terminal uses the shared <Terminal> chrome + <Transcript animate="typed">:
+ * the transcript then a typed command line that feature-terminals.ts cycles as a
+ * capability reel (data-ft-loop + data-ft-shuffle, looping, never stopping). The
+ * statusline foot is the hero's own (agentfoot.ts ticks it). The spine strip
+ * below names the run once as the page's quiet table of contents.
+ */
+import { HERO, TERMINAL, SPINE } from '../content/site';
+import HeroHeadline from './HeroHeadline.astro';
+import Terminal from './Terminal.astro';
+import Transcript from './Transcript.astro';
+---
+
+<header class="hero">
+  <div class="hero-glow" aria-hidden="true"></div>
+  <div class="container">
+    <div class="hero-copy">
+      <p class="hero-kicker">{HERO.kicker}</p>
+      <HeroHeadline />
+      <p class="hero-def">{HERO.definition}</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href={HERO.primaryCta.href}>{HERO.primaryCta.label}</a>
+        <a class="btn btn-ghost" href={HERO.secondaryCta.href}>{HERO.secondaryCta.label}</a>
+      </div>
+    </div>
+
+    <div class="hero-terminal reveal">
+      <Terminal reveal={false} title={TERMINAL.title} ftLoop={JSON.stringify(TERMINAL.run)} ftShuffle>
+        <Transcript lines={TERMINAL.lines} animate="typed" typed={TERMINAL.run[0]} />
+        <!-- Coding-agent statusline: context / model / reasoning, gently animated
+             (context ticks, an occasional compaction beat) by agentfoot.ts; static
+             and fully legible without JS and under reduced motion. -->
+        <div class="terminal-foot" data-agentfoot slot="foot">
+          <span class="tf-seg tf-ctx"><span class="tf-dot" aria-hidden="true"></span><span data-tf-ctx>{TERMINAL.foot.ctx}</span></span>
+          <span class="tf-seg">{TERMINAL.foot.model}</span>
+          <span class="tf-seg" data-tf-reason>{TERMINAL.foot.reason}</span>
+          <span class="tf-seg tf-note">{TERMINAL.foot.note}</span>
+        </div>
+      </Terminal>
+      <!-- The spine as the page's quiet table of contents: one run, named once,
+           that every proof artifact below is a camera angle on. -->
+      <div class="hero-spine" aria-hidden="true">
+        <span class="hero-spine-id">{SPINE.req}</span>
+        <span class="hero-spine-step">spec</span>
+        <span class="hero-spine-step">build</span>
+        <span class="hero-spine-step">prove</span>
+        <span class="hero-spine-step">ship</span>
+        <span class="hero-spine-id">{SPINE.pr}</span>
+      </div>
+    </div>
+  </div>
+</header>

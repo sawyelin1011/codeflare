@@ -8,10 +8,10 @@
  */
 
 import { spawn } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { computeReviewStateFrom, formatDurableReviewResult, laneExtensionSources, reapLaneDecision, recoverDurableReviewLaneState, summarizeLaneTranscript, type ReviewState } from "./review-job-helpers";
+import { computeReviewStateFrom, formatDurableReviewResult, laneExtensionSources, reapLaneDecision, recoverDurableReviewLaneState, summarizeLaneTranscript, type ReviewAnnouncement, type ReviewAnnouncementKind, type ReviewState } from "./review-job-helpers";
 import type { ReviewSpawnRequest } from "./review-helpers";
 
 export type DurableReviewLaneStatus = "pending" | "running" | "completed" | "failed";
@@ -96,6 +96,16 @@ function safeWriteJson(path: string, value: unknown): void {
   renameSync(tmp, path);
 }
 
+// Atomic text write (tmp + rename), for files whose bare EXISTENCE is a cross-process signal. The
+// distinct tmp name (pid+timestamp) is never mistaken for the real file, and the rename makes the file
+// appear complete-or-not — never half-written — to another process reading it concurrently.
+export function safeWriteText(path: string, content: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, content, "utf8");
+  renameSync(tmp, path);
+}
+
 export function reviewJobDir(repo: string, head: string): string {
   return join(repo, ".git", "codeflare-review-jobs", head);
 }
@@ -126,6 +136,48 @@ export function reviewResultsDir(repo: string, head: string): string {
 
 export function reviewResultPath(repo: string, head: string, lane: string): string {
   return join(reviewResultsDir(repo, head), `${lane}.md`);
+}
+
+// --- Review-result delivery announcement records (durable side of the two-phase delivery state
+// machine; pure decision logic is in review-job-helpers.ts). Persisted per (head, kind) so a
+// superseded head's records never bleed into the new head, and so delivery survives Pi reloads. ---
+export function reviewAnnouncementKinds(): ReviewAnnouncementKind[] {
+  return ["summary", "autofix"];
+}
+
+export function reviewAnnouncementPath(repo: string, head: string, kind: ReviewAnnouncementKind): string {
+  return join(reviewJobDir(repo, head), "announcements", `${kind}.json`);
+}
+
+export function readReviewAnnouncement(repo: string, head: string, kind: ReviewAnnouncementKind): ReviewAnnouncement | undefined {
+  return readJson<ReviewAnnouncement>(reviewAnnouncementPath(repo, head, kind));
+}
+
+export function writeReviewAnnouncement(record: ReviewAnnouncement): void {
+  safeWriteJson(reviewAnnouncementPath(record.repo, record.head, record.kind), record);
+}
+
+// Arm a `pending` announcement for (repo, head, kind). An already-`visible` record is delivered and
+// returned unchanged (never re-armed → no duplicate). A `pending`/`attempted` record is in flight and
+// returned unchanged (the emit/reconcile loop owns it). Only an absent or previously-`failed` record
+// gets a fresh pending arm with a new nonce, giving delivery another full shot.
+export function ensureReviewAnnouncementPending(repo: string, head: string, kind: ReviewAnnouncementKind, nonce: string, now: number): ReviewAnnouncement {
+  const existing = readReviewAnnouncement(repo, head, kind);
+  if (existing && existing.status !== "failed") return existing;
+  const record: ReviewAnnouncement = { kind, repo, head, status: "pending", attempts: 0, nonce, createdAt: now };
+  writeReviewAnnouncement(record);
+  return record;
+}
+
+// A superseded head's not-yet-delivered announcements are retired so a later tick (which resolves the
+// CURRENT head) never re-emits stale results. Keyed by head, so this only touches the old head.
+export function abandonReviewAnnouncements(repo: string, head: string): void {
+  for (const kind of reviewAnnouncementKinds()) {
+    const existing = readReviewAnnouncement(repo, head, kind);
+    if (existing && existing.status !== "visible" && existing.status !== "failed") {
+      writeReviewAnnouncement({ ...existing, status: "failed", lastError: "superseded by a newer head" });
+    }
+  }
 }
 
 function readJson<T>(path: string): T | undefined {
@@ -366,7 +418,22 @@ function spawnDurableLane(jobInput: DurableReviewJobInput, request: ReviewSpawnR
       cwd: repo,
       detached: true,
       stdio: ["ignore", out, err],
-      env: { ...process.env, BROWSER: "" },
+      // When a prior clean head was acked, jobInput.reviewBase names it: this lane
+      // must review ONLY reviewBase..head, never the full PR diff. The lane prompt
+      // already says so; these vars let review-lane-guards.ts make it binding (block
+      // full-PR diff commands). On a first review (no acked base) they are absent, so
+      // the lane defaults to the full PR diff.
+      env: {
+        ...process.env,
+        BROWSER: "",
+        ...(jobInput.reviewBase
+          ? {
+              CODEFLARE_REVIEW_BASE: jobInput.reviewBase,
+              CODEFLARE_REVIEW_HEAD: head,
+              CODEFLARE_REVIEW_BASE_REF: jobInput.baseRefName,
+            }
+          : {}),
+      },
     });
     // An async spawn failure (e.g. ENOENT) would otherwise be an unhandled error
     // event; record it so the reaper/state machine sees a failed lane, not a hang.
@@ -398,7 +465,10 @@ export function reapDurableReviewLanes(repo: string, head: string): void {
   if (!job) return;
   for (const lane of job.lanes) {
     const rec = job.laneState[lane];
-    if (!rec || rec.status !== "running") continue;
+    // `failed` lanes are re-evaluated too, so the reaper can self-heal one its earlier tick
+    // (or a pre-retry-aware reaper) failed while a retry was still in flight.
+    if (!rec || (rec.status !== "running" && rec.status !== "failed")) continue;
+    const wasFailed = rec.status === "failed";
     const hasPid = typeof rec.pid === "number";
     const decision = reapLaneDecision({
       status: rec.status,
@@ -412,10 +482,12 @@ export function reapDurableReviewLanes(repo: string, head: string): void {
     });
     if (decision.action === "complete") {
       const resultPath = reviewResultPath(repo, head, lane);
-      mkdirSync(dirname(resultPath), { recursive: true });
-      writeFileSync(resultPath, formatDurableReviewResult(job, lane, decision.finalText), "utf8");
+      // P10: write atomically. The bare existence of this .md is the cross-process lane-completion signal
+      // (completedDurableReviewLanes → existsSync), so a second Pi session reaping the same repo must
+      // never observe a half-written result and finalize/summarize on partial text.
+      safeWriteText(resultPath, formatDurableReviewResult(job, lane, decision.finalText));
       recordDurableReviewLane(job, { lane, status: "completed", startedAt: rec.startedAt, completedAt: now(), transcriptPath: rec.transcriptPath, resultPath });
-      appendReviewEvent(repo, { event: "lane_completed", head, lane, resultPath });
+      appendReviewEvent(repo, { event: wasFailed ? "lane_recovered" : "lane_completed", head, lane, resultPath });
       // Defensive: a completed lane's child is normally already gone; only signal if it
       // is still alive AND identity-matches, so we never SIGKILL a recycled pid's group.
       if (hasPid && isProcessAlive(rec.pid as number, rec.pidStart)) killLaneProcessGroup(rec.pid as number);
@@ -427,24 +499,87 @@ export function reapDurableReviewLanes(repo: string, head: string): void {
   }
 }
 
+// Force-stop every still-running detached lane child for a head whose review window is being
+// SUPERSEDED — a different, non-descendant head was pushed (history rewrite) or the branch/PR was
+// switched in the same repo. Without this, those orphaned `pi --mode json` children keep reviewing an
+// abandoned head and pile up on the 1-vCPU container. A child is signalled only when its pid is still
+// alive AND identity-matches its recorded start time, so a recycled pid's unrelated process group is
+// never killed. Each lane is recorded failed("superseded") so the reaper stops tracking it.
+export function abandonDurableReviewLanes(repo: string, head: string): void {
+  // Retire any undelivered announcements for this (now-superseded) head before touching lanes, so a
+  // later live tick that resolves the new head never re-emits the old head's stranded summary.
+  abandonReviewAnnouncements(repo, head);
+  const job = readDurableReviewJob(repo, head);
+  if (!job) return;
+  for (const lane of job.lanes) {
+    const rec = job.laneState[lane];
+    if (!rec || rec.status !== "running") continue;
+    if (typeof rec.pid === "number" && isProcessAlive(rec.pid, rec.pidStart)) killLaneProcessGroup(rec.pid);
+    recordDurableReviewLane(job, { lane, status: "failed", startedAt: rec.startedAt, completedAt: now(), transcriptPath: rec.transcriptPath, error: "superseded by a newer head" });
+    appendReviewEvent(repo, { event: "lane_abandoned", head, lane });
+  }
+}
+
+const SPAWN_LOCK_STALE_MS = 30_000;
+// Best-effort cross-process lock around the read-then-spawn critical section (P11). Two Pi sessions
+// reviewing the SAME repo+head can each pass the per-lane liveness check below before either records its
+// child's pid, and thus double-spawn (6 reviewer children instead of 3 on a 1-vCPU box). O_EXCL
+// (`wx`) serialises them. A holder that crashed mid-spawn is reclaimed after a stale TTL so the lock can
+// never wedge reviews permanently; a genuinely-live holder makes the other session skip spawning THIS
+// tick — the 20s reaper retries, so no lane is lost. The lock file lives inside the (kept) current-head
+// job dir and is removed on release.
+function claimSpawnLock(lock: string): number | undefined {
+  // Stamp our pid INTO the lock at claim time so releaseSpawnLock can prove ownership before unlinking.
+  try { const fd = openSync(lock, "wx"); try { writeFileSync(fd, String(process.pid)); } catch { /* stamp best-effort */ } return fd; } catch { return undefined; }
+}
+function acquireSpawnLock(repo: string, head: string): number | undefined {
+  const lock = join(reviewJobDir(repo, head), ".spawn.lock");
+  mkdirSync(dirname(lock), { recursive: true });
+  const first = claimSpawnLock(lock);
+  if (first !== undefined) return first;
+  let stale = true;
+  try { stale = now() - statSync(lock).mtimeMs > SPAWN_LOCK_STALE_MS; } catch { /* vanished: treat as free */ }
+  if (!stale) return undefined; // a concurrent spawn is genuinely in flight; skip this tick
+  try { unlinkSync(lock); } catch { /* raced with the holder releasing it */ }
+  return claimSpawnLock(lock);
+}
+function releaseSpawnLock(repo: string, head: string, fd: number | undefined): void {
+  if (fd === undefined) return;
+  try { closeSync(fd); } catch { /* already closed */ }
+  // Only remove the lock if WE still own it. If a peer reclaimed it after our stale TTL expired, the file
+  // now holds the peer's pid and a blind unlink would delete that LIVE lock — letting a third spawner in
+  // and cascading the double-spawn the lock exists to prevent (third-review finding). Pid-match → ours.
+  const lock = join(reviewJobDir(repo, head), ".spawn.lock");
+  try { if (readFileSync(lock, "utf8").trim() === String(process.pid)) unlinkSync(lock); } catch { /* gone or unreadable: nothing to release */ }
+}
+
 export function startDurableReviewLanes(_runner: ReviewRunnerContext, jobInput: DurableReviewJobInput, requests: ReviewSpawnRequest[]): { job: DurableReviewJob; launched: string[] } {
   const job = ensureDurableReviewJob(jobInput);
+  const lockFd = acquireSpawnLock(jobInput.repo, jobInput.head);
+  if (lockFd === undefined) return { job, launched: [] }; // a peer process is spawning now; retry next tick
   const launched: string[] = [];
-  for (const request of requests) {
-    const current = job.laneState[request.lane] ?? readLane(job.repo, job.head, request.lane);
-    if (current?.status === "completed") continue;
-    // A lane with a still-alive child is already running — don't double-spawn. A
-    // "running" record whose child is dead (no result) is a stale orphan; respawn it.
-    if (current?.status === "running" && typeof current.pid === "number" && isProcessAlive(current.pid, current.pidStart)) continue;
-    launched.push(request.lane);
-    appendReviewEvent(jobInput.repo, { event: "lane_spawned", head: jobInput.head, lane: request.lane });
-    try {
-      spawnDurableLane(jobInput, request);
-    } catch (error) {
-      const message = `spawn failed: ${error instanceof Error ? error.message : String(error)}`;
-      recordDurableReviewLane(jobInput, { lane: request.lane, status: "failed", completedAt: now(), error: message });
-      appendReviewEvent(jobInput.repo, { event: "lane_failed", head: jobInput.head, lane: request.lane, error: message });
+  try {
+    for (const request of requests) {
+      // Read the lane FRESH from disk under the lock — `job` was snapshotted before acquireSpawnLock, so
+      // its laneState can be stale (a peer that held the lock first may have just recorded "running").
+      // Trusting the pre-lock snapshot is the TOCTOU the lock was meant to close (P11 / third-review finding).
+      const current = readLane(job.repo, job.head, request.lane) ?? job.laneState[request.lane];
+      if (current?.status === "completed") continue;
+      // A lane with a still-alive child is already running — don't double-spawn. A
+      // "running" record whose child is dead (no result) is a stale orphan; respawn it.
+      if (current?.status === "running" && typeof current.pid === "number" && isProcessAlive(current.pid, current.pidStart)) continue;
+      launched.push(request.lane);
+      appendReviewEvent(jobInput.repo, { event: "lane_spawned", head: jobInput.head, lane: request.lane });
+      try {
+        spawnDurableLane(jobInput, request);
+      } catch (error) {
+        const message = `spawn failed: ${error instanceof Error ? error.message : String(error)}`;
+        recordDurableReviewLane(jobInput, { lane: request.lane, status: "failed", completedAt: now(), error: message });
+        appendReviewEvent(jobInput.repo, { event: "lane_failed", head: jobInput.head, lane: request.lane, error: message });
+      }
     }
+  } finally {
+    releaseSpawnLock(jobInput.repo, jobInput.head, lockFd);
   }
   return { job: readDurableReviewJob(jobInput.repo, jobInput.head) ?? job, launched };
 }

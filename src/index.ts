@@ -32,7 +32,8 @@ import { authenticateRequest } from './lib/access';
 import { SETUP_KEYS } from './lib/kv-keys';
 import { verifySessionJWT, shouldRefreshJWT, signSessionJWT, SESSION_JWT_AUD, cookieDomainAttr } from './lib/session-jwt';
 import { warnIfNoEncryptionKey } from './lib/kv-crypto';
-import { isOnboardingLandingPageActive, isSaasModeActive } from './lib/onboarding';
+import { isOnboardingLandingPageActive, isSaasModeActive, isSessionOidcMode } from './lib/onboarding';
+import { buildRobotsTxt, buildSitemapXml, buildLlmsTxt } from './lib/seo';
 import { isActiveUser } from './lib/access-tier';
 import { getEffectiveTier } from './lib/subscription';
 import authApiRoutes from './routes/auth';
@@ -136,8 +137,8 @@ app.use('*', async (c, next) => {
 // SaaS mode: cookie refresh middleware - extends session when < 15 min remaining
 app.use('*', async (c, next) => {
   await next();
-  // Only refresh for SaaS OIDC mode
-  if (!isSaasModeActive(c.env.SAAS_MODE) || !c.env.OAUTH_CLIENT_ID || !c.env.OAUTH_JWT_SECRET) return;
+  // Only refresh app-owned OIDC sessions (SaaS or onboarding; REQ-AUTH-020)
+  if (!isSessionOidcMode(c.env) || !c.env.OAUTH_CLIENT_ID || !c.env.OAUTH_JWT_SECRET) return;
   const cookieHeader = c.req.header('Cookie');
   if (!cookieHeader) return;
   const match = cookieHeader.match(/codeflare_session=([^;]+)/);
@@ -346,8 +347,35 @@ export default {
       return app.fetch(request, env, ctx);
     }
 
-    // Setup redirect: if setup is not complete, redirect non-setup pages to /setup
     const path = url.pathname;
+
+    // Discoverability documents (REQ-LANDING-003) served at the deployment root,
+    // before the setup gate so crawlers reach them on a fresh instance. They are
+    // mode-aware: the public marketing landing (SaaS or onboarding) advertises an
+    // indexable robots.txt + sitemap.xml + llms.txt; default and enterprise
+    // deployments are private apps and return a disallow-all robots with no
+    // sitemap or llms manifest.
+    if (path === '/robots.txt' || path === '/sitemap.xml' || path === '/llms.txt') {
+      const publicMode = isSaasModeActive(env.SAAS_MODE) || onboardingLandingActive;
+      if (path === '/robots.txt') {
+        return withSecurityHeaders(new Response(buildRobotsTxt(publicMode), {
+          headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+        }));
+      }
+      if (!publicMode) {
+        return withSecurityHeaders(new Response('Not found', { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }));
+      }
+      if (path === '/sitemap.xml') {
+        return withSecurityHeaders(new Response(buildSitemapXml(), {
+          headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+        }));
+      }
+      return withSecurityHeaders(new Response(buildLlmsTxt(), {
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' },
+      }));
+    }
+
+    // Setup redirect: if setup is not complete, redirect non-setup pages to /setup
     if (path !== '/setup' && !path.startsWith('/setup/')) {
       // Check setup status (with in-memory cache)
       if (getSetupCompleteCache() === null) {
@@ -359,10 +387,15 @@ export default {
       }
     }
 
-    // Root behavior is mode-dependent:
-    // - SaaS mode: redirect active users to /app/, serve SPA (LoginPage) otherwise
+    // Root behavior is mode-dependent (REQ-LANDING-001):
+    // - SaaS mode: redirect active users to /app/; unauthenticated visitors
+    //   get the prerendered marketing landing (assets under /landing/)
     // - default mode: redirect / to /app/
-    // - onboarding mode: serve SPA (OnboardingLanding component handles the UI)
+    // - onboarding mode: unauthenticated visitors get the same landing
+    // If the landing build is absent, ASSETS not_found_handling falls back to
+    // the SPA index.html (LoginPage / OnboardingLanding) — graceful degrade.
+    let assetRequest = request;
+    const landingRequest = () => new Request(new URL('/landing/', url).toString(), request);
     if (path === '/') {
       const saasActive = isSaasModeActive(env.SAAS_MODE);
       if (saasActive) {
@@ -378,7 +411,8 @@ export default {
           // Authenticated but pending/blocked - redirect to subscribe page
           return redirectWithHeaders('/app/subscribe');
         } catch {
-          // Not authenticated - serve SPA (LoginPage)
+          // Not authenticated - serve the static landing
+          assetRequest = landingRequest();
         }
       } else if (!onboardingLandingActive) {
         return redirectWithHeaders('/app/');
@@ -387,14 +421,23 @@ export default {
           await authenticateRequest(request, env);
           return redirectWithHeaders('/app/');
         } catch {
-          // Unauthenticated - serve landing page
+          // Unauthenticated - serve the static landing
+          assetRequest = landingRequest();
         }
       }
     }
 
+    // Onboarding mode: serve the prerendered Astro login page at /login
+    // (assets under /landing/login/). In SaaS mode /login falls through to the
+    // SPA unchanged. If the landing build is absent, ASSETS not_found_handling
+    // falls back to the SPA index.html — graceful degrade.
+    if ((path === '/login' || path === '/login/') && onboardingLandingActive && !isSaasModeActive(env.SAAS_MODE)) {
+      assetRequest = new Request(new URL('/landing/login/', url).toString(), request);
+    }
+
     // For all other routes, serve from static assets
     // With not_found_handling = "single-page-application", missing routes get index.html
-    const assetResponse = await env.ASSETS.fetch(request);
+    const assetResponse = await env.ASSETS.fetch(assetRequest);
     const secureResponse = new Response(assetResponse.body, assetResponse);
     for (const [key, value] of Object.entries(SECURITY_HEADERS)) {
       secureResponse.headers.set(key, value);

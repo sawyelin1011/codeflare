@@ -31,10 +31,10 @@ Dependabot runs weekly against the `develop` branch for three npm package direct
 | `scorecard.yml` | Push to `main`, weekly (Monday 06:00 UTC) + `workflow_dispatch` | OSSF Scorecard security posture assessment, publishes results and uploads SARIF |
 | `pentest.yml` | Weekly (Monday 05:00 UTC) + `workflow_dispatch` | External black-box penetration testing: security headers, TLS, auth gate, info disclosure, injection attacks, HTTP methods |
 | `stress-test.yml` | `workflow_dispatch` | k6 stress tests (API throughput, session lifecycle, storage operations, rate-limit validation) against integration worker. Configurable concurrency via `STRESS_TEST_CONCURRENCY` variable. |
-| `deploy-dockerhub.yml` | `workflow_dispatch` (production/integration/enterprise/enterprise integration) | Fallback deploy pipeline identical to `deploy.yml` but pushes the container image to Docker Hub instead of `registry.cloudflare.com`. Used when the Cloudflare managed registry drops connections mid-upload. Requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets. |
-| `bump-shadow-pins.yml` | Weekly (Monday 06:00 UTC) + `workflow_dispatch` | Tracks non-Dependabot pins: context-mode, graphifyy plugin version, Dockerfile binaries, and Pi preseed npm pins. Opens one PR per bump and regenerates matching lockfiles/agent seed when duplicated literals change. SHA256 checksums are invalidated on Dockerfile-binary bumps. |
+| `deploy-dockerhub.yml` | `workflow_dispatch` (production/integration/enterprise/enterprise integration) | Fallback deploy pipeline near-identical to `deploy.yml` but pushes the container image to Docker Hub instead of `registry.cloudflare.com`. Used when the Cloudflare managed registry drops connections mid-upload. Before the Trivy scan it frees disk on the runner — prunes the local build cache, removes stale `*-container` images (keeping the image being scanned), and prunes dangling layers — so the scan's image export does not exhaust the Docker data root when using a persistent self-hosted runner (the `RUNNER` Actions variable; defaults to `ubuntu-latest`). The build itself caches via `type=gha`, so this does not cause cold builds. Requires `DOCKERHUB_USERNAME` + `DOCKERHUB_TOKEN` secrets. |
+| `bump-shadow-pins.yml` | Weekly (Monday 06:00 UTC) + `workflow_dispatch` | Tracks non-Dependabot pins: context-mode, graphify plugin version, Dockerfile binaries, the `consult-llm-mcp` Dockerfile global-install pin, and every Pi preseed npm pin. Opens one PR per bump and regenerates matching lockfiles/agent seed when duplicated literals change. SHA256 checksums are invalidated on Dockerfile-binary bumps. |
 
-For the Pi preseed job, both `@gotgenes/pi-subagents` and context-mode live in `preseed/agents/pi/package.json` and the generated seed. Only `@gotgenes/pi-subagents` is in the Pi settings `required` install array; context-mode is carried as a disabled package spec. Dependabot intentionally skips that directory, so this workflow keeps the duplicates aligned.
+The Pi preseed job is data-driven: it diffs **every** dependency in `preseed/agents/pi/package.json` against npm latest — `@gotgenes/pi-subagents`, context-mode, and the five tool extensions (`@juicesharp/rpiv-advisor`, `@juicesharp/rpiv-ask-user-question`, `@juicesharp/rpiv-todo`, `pi-web-access`, `pi-mcp-adapter`). Each version is duplicated as a literal in entrypoint.sh (the Pi settings `required` install array — so context-mode is enabled by default and the extensions stay available regardless of the `/ctx` toggle), `codeflare-pi.ts`, the pinned-version test assertions, and the generated seed. Dependabot intentionally skips that directory, so this workflow keeps every copy aligned.
 
 ### GitHub Environments
 
@@ -54,6 +54,9 @@ For the Pi preseed job, both `@gotgenes/pi-subagents` and context-mode live in `
 | `CLOUDFLARE_API_TOKEN` | Yes | `deploy.yml`, `e2e.yml` | Wrangler CLI auth, KV operations, container push, worker deploy, secret management |
 | `CLOUDFLARE_ACCOUNT_ID` | Yes | `deploy.yml`, `e2e.yml` | Identifies the Cloudflare account for all API operations |
 | `RESEND_API_KEY` | If onboarding or SaaS mode active | `deploy.yml` | Notification emails via Resend (waitlist submissions + access requests) |
+| `OAUTH_CLIENT_ID` | If onboarding or SaaS mode active | `deploy.yml` | GitHub OAuth app client id; injected as a worker `--var` for the sign-in flow |
+| `OAUTH_CLIENT_SECRET` | If onboarding or SaaS mode active | `deploy.yml` | GitHub OAuth app client secret; set as a worker secret via `wrangler secret put` |
+| `OAUTH_JWT_SECRET` | If onboarding or SaaS mode active | `deploy.yml` | Signs the post-OAuth session JWT; set as a worker secret via `wrangler secret put` |
 | `CF_ACCESS_CLIENT_ID` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token ID for E2E auth |
 | `CF_ACCESS_CLIENT_SECRET` | For E2E | `deploy.yml`, `e2e.yml` | CF Access service token secret; also used as `SERVICE_AUTH_SECRET` worker secret and KV seeding |
 | `DOCKERHUB_USERNAME` | For Docker Hub fallback | `deploy-dockerhub.yml` | Docker Hub account that owns the image repo |
@@ -66,7 +69,7 @@ For the Pi preseed job, both `@gotgenes/pi-subagents` and context-mode live in `
 | `CLOUDFLARE_WORKER_NAME` | `codeflare` | `deploy.yml`, `e2e.yml` | Worker name for deploy and E2E target resolution | Hardcoded fallback in workflow |
 | `RUNNER` | `ubuntu-latest` | All workflows | GitHub Actions runner label (self-hosted support) | Hardcoded fallback in workflow |
 | `E2E_BASE_URL` | - | `e2e.yml` | Base URL of deployed worker for E2E tests | Set per environment |
-| `ONBOARDING_LANDING_PAGE` | `inactive` | `deploy.yml` | Enables public waitlist landing page via `--var` | Hardcoded fallback in workflow |
+| `ONBOARDING_LANDING_PAGE` | `inactive` | `deploy.yml` | Enables the public landing + onboarding `/login` via `--var`; when `active`, also triggers GitHub OAuth provisioning, so the three `OAUTH_*` secrets above are required | Hardcoded fallback in workflow |
 | `RESSOURCE_TIER` | unset (1 vCPU, 3 GiB, 6 GB) | `deploy.yml` | Container instance size (low/default/high/saas). All tiers default to 10 max instances | Defaults to `default` in deploy step |
 | `MAX_INSTANCES` | unset (10) | `deploy.yml` | Override container max_instances. Must be a positive integer | Passed via env to avoid shell injection |
 | `CLAUDE_CODE_CACHE_BUSTER` | `inactive` | `deploy.yml` | When `active`, writes `.cache-bust` to invalidate AI agent Docker layer | Not set by default |
@@ -78,7 +81,7 @@ For the Pi preseed job, both `@gotgenes/pi-subagents` and context-mode live in `
 ### Deploy Workflow Detail
 
 1. Install dependencies (cached via `actions/cache`)
-2. Build frontend, run backend + frontend tests, generate Workers runtime types (`wrangler types`), typecheck both
+2. Build frontend, then build landing page (`landing/` → `web-ui/dist/landing/`; order matters — the web-ui build wipes `dist/`), run backend + frontend + landing tests, generate Workers runtime types (`wrangler types`), typecheck both
 3. Resolve/create KV namespace, patch `wrangler.toml` with KV ID
 4. Apply worker name and container tier from `RESSOURCE_TIER` (low=basic 0.25vCPU/1GiB/4GB, default/saas=1vCPU/3GiB/6GB, high=2vCPU/6GiB/8GB). All tiers default to 10 max instances; `MAX_INSTANCES` variable overrides if set
 5. Optionally generate `.cache-bust` for AI agent layer
@@ -93,7 +96,7 @@ For the Pi preseed job, both `@gotgenes/pi-subagents` and context-mode live in `
 ### Test Workflow Detail
 
 Two parallel jobs:
-- **test**: Lint (oxlint), build frontend, run backend tests, host hook tests (`node --test`), frontend tests, generate Workers runtime types (`wrangler types`), typecheck both, dead code check (knip), `npm audit --audit-level=high --omit=dev` for backend and frontend
+- **test**: Lint (oxlint), build frontend, run backend tests, host hook tests (`node --test`), frontend tests, landing tests (`npm test` in `working-directory: landing` — Container-API render + unit tests), generate Workers runtime types (`wrangler types`), typecheck both, dead code check (knip), `npm audit --audit-level=high --omit=dev` for backend and frontend
 - **dependency-review**: Runs `actions/dependency-review-action` on PRs - blocks merging if new dependencies introduce known vulnerabilities
 
 ### E2E Workflow Detail

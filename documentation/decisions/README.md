@@ -1,7 +1,7 @@
 
 # Architecture Decisions
 
-Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD78](#ad78-pr-boundary-review-lanes-run-in-parallel-report-only-reviewers) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
+Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD79](#ad79-image-baked-pi-extension-transpile-cache) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
 
 **Audience:** Developers
 
@@ -89,6 +89,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes) | Durable review lanes run as detached headless Pi processes | Agents |
 | [AD77](#ad77-enterprise-vault-service-worker-reached-via-a-higher-precedence-access-bypass-app) | Enterprise vault service-worker reached via a higher-precedence Access bypass app | Architecture, Security |
 | [AD78](#ad78-pr-boundary-review-lanes-run-in-parallel-report-only-reviewers) | PR-boundary review lanes run in parallel (report-only reviewers) | Agents |
+| [AD79](#ad79-image-baked-pi-extension-transpile-cache) | Image-baked Pi extension transpile cache | Performance |
 
 ---
 
@@ -957,6 +958,10 @@ The DO's `_shutdownStartedAt` telemetry already logs `shutdownElapsedMs` on `onS
 
 The fix is the synchronous-drain RPC the "Alternative considered" below originally rejected: before signalling stop, the DO drains a fresh bisync while the container is still running and the DO holds teardown open. `drainFinalSync` (container-metrics.ts) calls a new awaitable host endpoint `POST /internal/final-sync` (host/src/server.ts) that triggers the daemon via SIGUSR1 and blocks until that run reaches a terminal status; completion is detected by a monotonic epoch-ms `ts` stamp on `sync-status.json` plus a `syncing` emission before each daemon run, so the endpoint waits for OUR triggered run (`syncing` stamped strictly after the trigger, then `success`/`failed`) and ignores an already-in-flight bisync. `destroy()` awaits the drain (120s budget, best-effort) before `stop('SIGTERM')`; idle-stop and quota-stop in `collectMetrics` drain identically; STOP and DELETE both route through `destroy()` so they behave identically by construction. The 135s teardown hard-cap and the 110s warn threshold are unchanged and now bound the drain-then-stop sequence (120s sync + 15s stop). The SIGTERM trap is retained as a best-effort backstop, not the primary mechanism. The cost is that a deliberate stop/delete now blocks up to ~120s in the worst case (large unsynced accumulation) to guarantee no loss -- the same user-accepted floor the original budget already implied, now actually enforced. See [REQ-SESSION-011](../../sdd/spec/session-lifecycle.md#req-session-011-graceful-shutdown-with-final-sync).
 
+**Revision (2026-06-10) -- the host endpoint's internal timeout was inverted *below* the DO budget:** The 2026-06-04 live-drain fix was still losing the last edits on delete in production. Root cause, confirmed in code: the in-container final-sync endpoint capped its own poll loop at `INTERNAL_TIMEOUT_MS = 115_000` -- *below* the DO's 120s drain budget (the comment literally read "just under the DO's 120s budget"). For any final bisync landing in the 115-120s band -- exactly the long-idle sessions AD56's 15-minute cadence produces -- the host returned 504 first, `drainFinalSyncAudited` mapped it to `incomplete`, and the session deleted with unsynced edits. Every prior "raise the budget" attempt raised numbers on the wrong side of the inverted ceiling, and a regression test (`host/__tests__/final-sync-endpoint.test.js`) even asserted the inversion (`INTERNAL_TIMEOUT_MS < 120_000`) as an invariant, so any correct fix would have failed CI -- a large part of why this survived ~10 attempts. **Fix:** the host endpoint timeout is raised strictly ABOVE the DO budget (`125_000`), so the DO's `AbortSignal(120s)` is the sole authoritative ceiling; the guard test now asserts host `> 120_000`; and `finalSyncAudit` additionally records the final-sync HTTP status + reason + session id so a residual non-completed sync is queryable post-mortem. Per the product decision, a genuinely >135s sync still deletes (data loss accepted past the hard cap) -- but it is now audited, not silent. A suspected rclone state-wedge (held lock / stale `.lst` poisoning the next session) was ruled out: those live in `~/.cache/rclone/bisync`, which is both ephemeral per container and excluded from R2 sync (`--filter "- .cache/**"`), so a fresh session cannot inherit a wedged baseline -- no entrypoint change was warranted.
+
+**Revision (2026-06-10, later the same day) -- the drain never reached the timeout machinery at all: it 401'd at the in-container auth gate on every single stop/delete.** Live-incident forensics (integration, full Workers Observability history) showed every teardown drain failing in ~51-300ms with HTTP 401 -- and **zero successful teardown final syncs ever recorded in ≥30 days of logs**, before AND after the budget-inversion fix shipped. Root cause: both drains (`drainFinalSyncAudited` on delete, `drainFinalSync` on idle/quota-stop) called the host with a bare `port.fetch('http://localhost/internal/final-sync')`. The raw TCP-port fetch bypasses the DO's public `fetch()` override -- the only place the `Authorization: Bearer` header is injected (the reason `/health` and `/activity` are explicitly auth-exempt in `host/src/auth-check.ts`; `/internal/final-sync` is not) -- so the host's auth gate rejected the drain before the final-sync handler ever ran. Compounding it on the delete path, `destroy()` wipes `containerAuthToken` from storage and memory *before* the drain fires (REQ-SESSION-009 resurrection-guard ordering), so even an auth-aware drain would have had no token to send. The manual storage-panel "Sync R2" button always worked because it routes through the worker's authenticated container fetch -- the working reference path that exposed the contrast. **Fix:** `destroy()` captures the token before the storage clear (alongside the audit session id) and passes it to the drain; both drains now set `Authorization: Bearer <token>` (the idle/quota-stop path reads the still-intact token from DO storage). The budget-inversion fix above remains correct and necessary -- but it was unreachable behind this 401; the auth header is the prerequisite for any of the timeout machinery to matter. REQ-SESSION-011 AC8 pins the behavior; tests assert the header on both paths and that the delete-path token is the pre-clear capture.
+
 **Consequences:**
 - Final bisync has headroom for the worst-case 15-minute accumulation.
 - Session-delete UX shows a "Saving final changes to storage..." spinner up to ~130 seconds before reporting success. The session-delete handler in `src/routes/session/crud.ts` already awaits `container.destroy()` end-to-end, so no fire-and-forget fix is required.
@@ -1491,6 +1496,63 @@ Load only explicit `-e` extensions: `graphify-native.ts`, `review-lane-guards.ts
 - `/sdd clean` behavior is unchanged.
 
 **Related:** [REQ-AGENT-040](../../sdd/spec/agents.md#req-agent-040-pr-boundary-lane-classification-and-agent-dispatch) AC4/AC5, [AD44](#ad44-sdd-three-mode-autonomy-with-conservative-judgment-resolution) (the `/sdd clean` sequential order this decision deliberately preserves), [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes).
+
+---
+
+### AD79: Image-baked Pi extension transpile cache
+
+**Category:** Performance
+
+**Status:** Accepted (2026-06-10)
+
+**Context:** The 2026-06-10 preseed bundle grew Pi's loaded extension set from 1 npm package to 6 (context-mode enabled by default + four tool extensions). Pi loads every extension through jiti (`moduleCache: false`); jiti caches transpiles on disk under `$TMPDIR/jiti` because no `node_modules` directory sits next to `~/.pi/agent/extensions/` (and this pi build ignores a path-valued `JITI_FS_CACHE` env — verified empirically). `/tmp` starts empty in every fresh container, so **every session cold-transpiled the full extension graph before Pi's first PTY output** — measured live at ~9s cold vs ~4s warm. The host pre-warm (REQ-SESSION-015) treats first PTY output as its readiness signal with a 20s hard cap; the cold transpile pushed it past the cap, doubling perceived session startup (15s → 30-35s, user-reported).
+
+**Decision:** Bake a warmed jiti cache into the image. A Dockerfile layer runs a throwaway `pi -p` at build with `TMPDIR` redirected, against an agent dir that mirrors the runtime layout (npm symlinked to the image preseed cache; package list **derived** from the preseed `package.json`, never duplicated), then moves the result to `/opt/codeflare/jiti-cache` and **fails the build if the cache is empty**. The entrypoint symlinks `/tmp/jiti` → the baked cache at boot (the same pattern as the npm preseed `node_modules` symlink). <!-- @impl: Dockerfile --> <!-- @impl: entrypoint.sh --> All coding agents — pi included — stay `@latest` (user policy: agents auto-update at every deploy); the bake remains self-consistent under `@latest` because the warm run executes with the exact pi installed in the same build, so the cache is always generated by the same pi/jiti that consumes it at runtime. (One residual cold path: a Fast-Start-disabled session runs `pi update` at start, and a pi that updates past the image version may miss the baked cache — it then transpiles cold once, which is the pre-existing Fast-Start-disabled cost profile.)
+
+**Rationale:** jiti's cache is content-addressed (source hash), so entries baked at build hit at runtime even though the R2-seeded extensions land at a different path with fresh mtimes (seeding is verbatim — verified). Validated end-to-end in the live container: 153/153 cache hits, 3.8s extension load through the symlinked baked cache, zero rewrites. The empty-cache build guard turns "a pi CLI change broke the warm-up" into a visible build failure instead of a silent production startup regression.
+
+**Alternatives considered:**
+
+- **`JITI_FS_CACHE=<path>` env (rejected):** ignored by this jiti build — entries land in `$TMPDIR/jiti` regardless (tested).
+- **Lazy/deferred extension loading upstream (rejected for now):** requires pi-core changes; the cache bake achieves the same perceived latency without forking load semantics.
+- **Raising the pre-warm 20s cap (rejected):** treats the symptom; sessions would still pay the cold transpile, just behind a quieter gate.
+- **Pinning the pi version for bisectability (rejected by user policy):** coding agents auto-update at deploy is the product stance; the accepted tradeoff is that a pi-core change and a code change can land in the same deploy. The empty-cache build guard and the AC5 structural tests bound the startup-regression risk specifically.
+
+**Consequences:**
+
+- First Pi launch in a fresh container loads warm (~4s); pre-warm settles on real output, under its cap.
+- A preseed package bump automatically re-warms the right set (derived list); each deploy re-warms against whatever pi `@latest` resolves to.
+- The V8 compile cache (`NODE_COMPILE_CACHE`, already baked for `--version` paths) additionally gains the extension-graph entries from the same warm run.
+
+**Related:** [REQ-SESSION-015](../../sdd/spec/session-lifecycle.md#req-session-015-container-port-readiness-gating-with-pre-warm-pre-condition) AC5, [AD57](#ad57-135-second-shutdown-budget-for-final-bisync) (the same incident's data-loss half).
+
+---
+
+### AD80: Pi PR-boundary merge gate is report-only and defended in depth
+
+**Category:** Architecture
+
+**Status:** Accepted (2026-06-11)
+
+**Context:** A Fable-5 deep review of the Pi PR-boundary review subsystem found the merge gate (the `onAgentStart`/`tool_call` interceptor that blocks `gh pr merge` until the reviewed head is acked) was the weakest-covered layer, and raised two questions that are genuinely product decisions rather than defects. (1) **What does "reviewed" mean for the gate?** `durableReviewAckReady` opens the gate once all required lanes have *produced a result*, regardless of severity — three lane reports that each contain CRITICAL findings still ack the head and let the merge proceed. (2) **How strong should the interception be?** The Pi gate is a hard pre-block (it returns `{block: true}` and the merge tool never runs), unlike Claude, whose enforcement is retroactive (a PostToolUse directive + a Stop-hook turn-block with a 5-strike fail-open) — the merge command actually executes and Claude reacts after, leaning entirely on a `gh pr view`-at-turn-end truth layer.
+
+**Decision:** (1) **Report-only semantics.** The gate blocks until the required reviewers have *run* (their head is acked), NOT until their findings are *addressed*. The lanes are advisory (AD78): they surface findings; acting on them is the user's call. "Merge blocked until review" means "until review *ran*", and `/review-skip` is the explicit user override. (2) **Defense in depth.** Pi keeps its hard pre-block — strengthened so it evaluates the PR the merge command actually targets (`mergeCommandTarget` → a specific number/URL/branch/`--repo`, not just the cwd branch), fails *closed* on a readable-but-malformed PR or a transient `gh` failure while any unacked review (pending, latched-breaker, or outstanding-offer head) exists, and recognises `--auto` and wrapper-prefixed (`timeout`/`env`/`command`/`nice`) forms. On TOP of the pre-block, Pi now also runs Claude's retroactive model as a backstop: after any `gh pr merge`-shaped command runs, if the PR is observed MERGED while its head was never acked, it emits a loud, durable `merge_completed_unreviewed` audit + toast. The pre-block stops the common cases; the retroactive layer catches what no anchor can (`bash -c '…'`, `xargs`, server-side `--auto`). The whole gate decision is the pure, unit-tested `mergeGateDecision`. <!-- @impl: preseed/agents/pi/extensions/review-job-helpers.ts::mergeGateDecision --> <!-- @impl: preseed/agents/pi/extensions/review-helpers.ts::mergeCommandTarget --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::onAgentStart -->
+
+**Rationale:** Verdict-gating (blocking the merge until CRITICAL/HIGH findings clear) would make the gate authoritative over a process that is deliberately advisory, would need an override path and a severity contract, and would diverge from Claude's engine — keeping both engines "reviewers ran, not findings fixed" keeps them coherent. Defense in depth is the right answer to "the regex is the gate" for merges: detection has the reconcile backstop, but a single missed merge is unreviewed, so the gate needs both a stronger pre-block AND a retroactive truth layer rather than an ever-more-baroque pre-block regex.
+
+**Alternatives considered:**
+
+- **Block the merge on unaddressed CRITICAL/HIGH (rejected):** stronger, but makes the gate authoritative over advisory lanes, needs a spec + tests + an override path, and diverges from Claude. Revisit if findings are routinely ignored.
+- **Pre-block only, no retroactive layer (rejected):** leaves `bash -c`/`xargs`/`--auto` as silent unreviewed-merge holes.
+- **Match `gh pr merge` anywhere in the command for the gate (rejected):** over-blocks on mentions (`grep 'gh pr merge'`); the wrapper-word anchor plus the retroactive audit covers the realistic forms without the false-block tax.
+
+**Consequences:**
+
+- The merge gate's correctness is pinned by `mergeGateDecision` unit tests; the inline handler is thin wiring.
+- An unreviewed merge that bypasses the pre-block is no longer silent — it leaves a durable audit and a visible toast.
+- A reviewed head with unaddressed CRITICAL findings can still be merged; the findings are surfaced, not enforced. If that proves too weak, AD80 is the place to revisit.
+
+**Related:** [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement), [REQ-AGENT-058](../../sdd/spec/agents.md#req-agent-058-pr-boundary-review-reconciliation-and-missed-event-recovery), [AD78](#ad78-pr-boundary-review-lanes-run-in-parallel-report-only-reviewers).
 
 ---
 

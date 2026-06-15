@@ -1,81 +1,61 @@
 ---
 name: consult-llm
 description: This skill should be used when the user wants to consult external LLMs for a second opinion or discussion. Use when the user says "discuss with llms", "consult llms", "consult LLMs", "ask LLMs", "get LLM opinions", "what do other LLMs think", "ask ChatGPT", "consult Gemini", "ask GPT", "get a second opinion", "ask another AI".
-version: 2.1.0
+version: 3.0.0
 ---
 
 # Consult LLM: Query External AI Models
 
-This skill queries external LLM providers via the `consult_llm` MCP tool and presents their responses for comparison.
+Query external LLM providers via the `consult_llm` MCP tool and present their responses for comparison. Two providers are available: **OpenAI** (GPT) and **Google Gemini**.
 
-There are exactly two configured providers: **OpenAI** (GPT) and **Google Gemini**. API keys are managed in **Settings > LLM API Keys** and injected at session start.
+The server picks the backend automatically — for OpenAI it uses your **Codex subscription** when you are logged into Codex (no API spend), otherwise your OpenAI API key; for Gemini it uses your Gemini API key. Keys/login are managed in **Settings → LLM API Keys** (and `codex login`) and take effect on the next session start.
 
-## Prerequisites
+## Step 1 — Choose the model
 
-API keys must be configured in **Settings > LLM API Keys** before using this skill. Keys take effect on the next session start.
+**If the user named a specific model** ("ask gpt-5.5…", "use gemini-3.1-pro…") → use that exact model ID, no dialog.
 
-- **OpenAI**: Get your API key from https://platform.openai.com/api-keys
-- **Gemini**: Get your API key from https://aistudio.google.com/apikey
+**Otherwise you MUST show an `AskUserQuestion` dialog** (single-select) so the user picks. Provide these four options — the tool automatically adds an "Other" free-text choice, giving **five** total:
 
-## Step 1 - Decide which provider(s) to consult
+1. **Latest Google (Gemini)** — call with the selector `model: "gemini"`.
+2. **Latest OpenAI (GPT)** — call with the selector `model: "openai"`.
+3. **Both** — call once per provider (`"gemini"` and `"openai"`) and synthesize across them.
+4. **List all available models** — show the **concrete** model IDs this server actually supports (see **Listing concrete models** below), then let the user pick an exact one. Do **not** present the provider selectors as the model list.
+5. *(Other — added automatically)* the user types the **exact model** they want → pass it verbatim.
 
-- **User named a provider explicitly** ("ask GPT", "ask OpenAI", "ask ChatGPT", "ask Gemini", "ask Google") -> use exactly that provider. No dialog.
-- **User did NOT name a provider** ("consult an LLM", "get a second opinion", "what do other LLMs think") -> you MUST show an `AskUserQuestion` dialog (multi-select) letting the user choose which of the two configured providers to consult:
-  - Option 1: **OpenAI (GPT)**
-  - Option 2: **Google Gemini**
-  - multiSelect: true, so the user can pick one or both.
-  - Do NOT silently default to "both" or to one provider. Always ask when ambiguous.
-- If the user selects both, consult each provider and synthesize across the responses.
+**Never hardcode a model ID for "latest."** The selectors `"openai"` / `"gemini"` are resolved to the current best flagship by the server at call time — that is the correct way to get "the latest" and avoids drifting to a stale pin.
 
-## Step 2 - Resolve the LATEST flagship model (never an old default)
+### Listing concrete models
 
-NEVER rely on the `consult_llm` server's configured default model - it is a static pin that drifts to OLD versions (this is the bug that makes consults land on stale models like an old gpt-5.x). You must pass an explicit `model`, and unless the user named a specific model, it must be the provider's **current latest flagship**.
+The `consult_llm` `model` parameter documents only provider **selectors** (`gemini`, `openai`, …) — never present that selector list as "all available models." This server (v2.13.x) has **no** model-list tool and **no** concrete `enum` in its schema (the concrete IDs were deliberately replaced by selectors); it writes the real, per-session list to its **startup log** instead. To list models:
 
-Do NOT hardcode a model ID from memory - resolve it live at call time from the provider's own model list:
+1. Read the **latest** `AVAILABLE MODELS:` block (equivalently the `CONFIGURATION` → `allowedModels` line) from `~/.local/state/consult-llm-mcp/mcp.log`. (If a future server version exposes a concrete `enum` on `model` or a list-models tool, prefer that.)
+2. Keep only **Gemini** (`gemini-*`) and **OpenAI** (`gpt-*`) IDs — this deployment configures only those two providers; ignore any `anthropic`/`deepseek`/`minimax` entries and never surface them.
+3. Print the IDs grouped under **Gemini** and **OpenAI** in chat, then ask one compact follow-up — **Latest Gemini** (`model: "gemini"`), **Latest OpenAI** (`model: "openai"`), **Both**, or the automatic **Other** free-text to type an exact ID — and call `consult_llm` with the chosen exact ID (a selector only for "latest").
 
-- **OpenAI** - pick the newest flagship GPT (highest version number; prefer the general flagship, not `mini`/`nano`/`codex`/`-chat`/specialised variants, unless the user asks):
-  ```
-  curl -s https://api.openai.com/v1/models \
-    -H "Authorization: Bearer $OPENAI_API_KEY" \
-    | jq -r '.data[].id' | sort
-  ```
-- **Google Gemini** - prefer the `gemini-pro-latest` alias (Google maintains it as the current flagship Pro). If you need to verify or the alias is unavailable, pick the newest flagship `gemini-*-pro` (highest version; prefer `pro` over `flash`/`flash-lite`, exclude `image`/`tts`/`embedding`/`robotics`/`preview-customtools` variants) unless the user asks otherwise:
-  ```
-  curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY" \
-    | jq -r '.models[].name' | sort
-  ```
+If the log can't be read, say exact model discovery is unavailable this session and offer only the **Gemini** and **OpenAI** selectors, clearly labelled as selectors (not models).
 
-If the user names a specific model ("use gpt-5.x", "use gemini flash"), honour that exact choice instead of auto-picking the flagship.
+## Step 2 — Build the prompt and call
 
-## Step 3 - Build the prompt and call
+1. Identify what to discuss — a code/architecture question, a file or function to review, or a design decision.
+2. Build a context-rich, one-shot prompt; attach relevant file paths via the `files` parameter when code is involved (include everything needed — the consult is one-shot).
+3. Call `consult_llm` with the chosen `model` (a selector for "latest", or the exact ID the user named/picked). Set `task_mode`: `"review"` for code review, `"plan"` for architecture, `"debug"` for troubleshooting, `"general"` otherwise.
 
-1. **Identify what to discuss.** Extract the topic from the user's message - a code/architecture question, a file or function to review, a design decision, or a general question.
-2. **Construct a context-rich prompt.** Include the question, relevant file paths via the `files` parameter (if code is involved), and enough background for a useful answer. The consult is one-shot - include everything needed.
-3. **Call `consult_llm`** once per chosen provider, each with an explicit `model` (the latest flagship from Step 2 - never the server default). Set `task_mode` appropriately: `"review"` for code review, `"plan"` for architecture, `"debug"` for troubleshooting, `"general"` otherwise.
+## Step 3 — Present and synthesize
 
-## Step 4 - Present and synthesize
+- Label each response with the model that produced it.
+- When more than one provider was consulted, highlight agreements and disagreements.
+- Add your own synthesis — don't just relay the raw responses.
 
-- Label each response with the model name (the exact model ID you used).
-- Highlight agreements and disagreements when more than one provider was consulted.
-- Add your own synthesis - don't just relay the raw responses.
+## Examples
 
-## Example Usage
-
-**User:** "consult llms whether we should use KV or D1 for session storage"
-- No provider named -> show AskUserQuestion (OpenAI / Gemini, multi-select).
-- For each chosen provider, resolve its latest flagship model, then call with task_mode `plan`.
-
-**User:** "ask Gemini what it thinks about this approach"
-- Provider named (Gemini) -> no dialog.
-- Resolve latest flagship Gemini Pro, call with task_mode `general`.
-
-**User:** "ask GPT-5.x to review the auth middleware"
-- Provider + specific model named -> use that exact model, task_mode `review`, include the middleware file path.
+- "consult llms whether we should use KV or D1 for session storage" → no model named → show the dialog → on **Latest OpenAI**, call `consult_llm(model: "openai", task_mode: "plan", …)`.
+- "ask Gemini to review the auth middleware" → provider named, no specific model → call `consult_llm(model: "gemini", task_mode: "review", files: ["…"])`.
+- "ask gpt-5.5 about this approach" → exact model named → call `consult_llm(model: "gpt-5.5", task_mode: "general", …)`.
 
 ## Troubleshooting
 
 If the `consult_llm` tool is not available:
 
-1. Check that your API keys are saved in **Settings > LLM API Keys**
-2. Restart your session (keys are injected at session start)
-3. Verify your API keys are valid and have sufficient quota
+1. Confirm your OpenAI/Gemini keys are saved in **Settings → LLM API Keys** (or that you are logged into Codex for OpenAI).
+2. Restart your session — keys and CLI logins apply at session start.
+3. Note: enterprise deployments do not expose LLM API Keys or consult-llm; models route through the managed AI Gateway instead.

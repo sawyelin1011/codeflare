@@ -71,14 +71,28 @@ export function summarizeLaneTranscript(lines: string[]): LaneTranscriptSummary 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    let event: { type?: string; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string } };
+    let event: { type?: string; willRetry?: boolean; message?: { role?: string; content?: unknown; stopReason?: string; errorMessage?: string } };
     try {
       event = JSON.parse(trimmed);
     } catch {
       // Partial flush of the last line, or a non-JSON banner — never fatal.
       continue;
     }
-    if (event?.type === "agent_end") agentEnded = true;
+    if (event?.type === "agent_end") {
+      // A retryable attempt end (`willRetry: true`) is NOT terminal: pi retries IN the same
+      // child process (e.g. after a transient WebSocket drop), so it must not settle the lane,
+      // and the failed attempt's verdict is discarded — errored/stopReason/finalText are judged
+      // per-attempt, never sticky across a retry, so an early error can't poison the retry that
+      // later succeeds. Only an `agent_end` WITHOUT a pending retry is the terminal lane end.
+      if (event.willRetry === true) {
+        errored = false;
+        stopReason = undefined;
+        finalText = "";
+      } else {
+        agentEnded = true;
+      }
+      continue;
+    }
     if (event?.type === "message_end" && event.message?.role === "assistant") {
       const content = event.message.content;
       const text = Array.isArray(content)
@@ -114,11 +128,20 @@ export type ReapLaneDecision =
   | { action: "fail"; reason: string; kill: boolean };
 
 export function reapLaneDecision(input: ReapLaneInput): ReapLaneDecision {
-  // Only running lanes are reapable; everything else is already settled.
   if (input.resultExists) return { action: "none" };
-  if (input.status !== "running") return { action: "none" };
   const t = input.transcript;
   const usable = t.finalText.trim().length > 0 && t.stopReason !== "error" && t.stopReason !== "aborted" && !t.errored;
+  // Self-heal: a lane an earlier reaper tick (or a pre-retry-aware reaper) marked `failed`
+  // whose retry later flushed a terminal, clean, usable result is recovered rather than left
+  // discarded — a good review must never stay lost. Gated on a TERMINAL agent_end with a
+  // usable result; a killed/timed-out/genuinely-errored lane has no such result and stays
+  // failed. (resultExists is checked above, so a failed lane that already has a file is left
+  // alone.)
+  if (input.status === "failed") {
+    return t.agentEnded && usable ? { action: "complete", finalText: t.finalText } : { action: "none" };
+  }
+  // Only running lanes are otherwise reapable; everything else is already settled.
+  if (input.status !== "running") return { action: "none" };
   // agent_end → the run finished; the child is already gone (or exiting), so the work is
   // complete and there is nothing live to kill (kill: false avoids signalling a possibly
   // reused pid). Checked FIRST so a child that finishes and exits in the same tick
@@ -153,6 +176,100 @@ export function durableReviewMessageKey(input: {
   path?: string;
 }): string {
   return [input.customType, input.repo || "", input.head || "", input.lane || "summary", input.path || ""].join("\u0000");
+}
+
+// --- Review-result delivery announcements (two-phase: execution done != delivery done) ---
+// The durable review engine acks a head and writes summary.md, but pushing the summary BACK into
+// the live session is unreliable: pi.sendMessage only persists a custom message to the session
+// transcript when the agent session emits a `message_end` (role:"custom") event, which never fires
+// from the off-turn setInterval reaper (no live session loop) nor from a stale-bound sender after a
+// reload. The old code created a one-shot `<lane>.sent` marker BEFORE sending and trusted the send,
+// so a silent no-op permanently suppressed every retry. These helpers drive a small durable state
+// machine instead — pending -> attempted -> visible|failed — whose ONLY proof of delivery is the
+// announcement's nonce appearing in the session transcript (scannable plain text, written iff the
+// message actually persisted). Pure decision logic lives here; the disk records live in
+// review-jobs.ts and the wiring/transcript-scan in review-enforcement.ts.
+export type ReviewAnnouncementKind = "summary" | "autofix";
+export type ReviewAnnouncementStatus = "pending" | "attempted" | "visible" | "failed";
+
+export type ReviewAnnouncement = {
+  kind: ReviewAnnouncementKind;
+  repo: string;
+  head: string;
+  status: ReviewAnnouncementStatus;
+  attempts: number;
+  nonce: string;
+  createdAt: number;
+  lastAttemptAt?: number;
+  deliveredAt?: number;
+  lastError?: string;
+};
+
+// Deterministic, transcript-scannable delivery token. Caller passes the time stamp (Date.now in the
+// extension) so this stays pure/testable. No spaces; embeds kind+head so distinct announcements can
+// never collide, and the stamp distinguishes a re-created announcement from its predecessor.
+export function reviewAnnouncementNonce(kind: ReviewAnnouncementKind, head: string, stamp: number): string {
+  return `cf-review-${kind}:${head.slice(0, 12)}:${stamp}`;
+}
+
+export type AnnouncementAttemptInput = {
+  status: ReviewAnnouncementStatus;
+  attempts: number;
+  lastAttemptAt?: number;
+  now: number;
+  maxAttempts: number;
+  retryDelayMs: number;
+};
+
+// Should emitPendingAnnouncements (re)send this announcement on this tick? `pending` sends once;
+// `attempted` re-sends only after the retry delay AND while under the attempt cap; terminal states
+// (`visible`/`failed`) never send. This is the SOLE owner of retry/backoff timing.
+export function shouldAttemptAnnouncement(input: AnnouncementAttemptInput): boolean {
+  if (input.status === "visible" || input.status === "failed") return false;
+  if (input.status === "pending") return true;
+  if (input.attempts >= input.maxAttempts) return false;
+  return input.now - (input.lastAttemptAt ?? 0) >= input.retryDelayMs;
+}
+
+export type AnnouncementReconcileInput = {
+  kind: ReviewAnnouncementKind;
+  status: ReviewAnnouncementStatus;
+  attempts: number;
+  lastAttemptAt?: number;
+  nonceFound: boolean;
+  now: number;
+  maxAttempts: number;
+  retryDelayMs: number;
+  createdAt?: number;
+  maxAgeMs?: number;
+};
+
+export type AnnouncementReconcileDecision = "visible" | "failed" | "keep";
+
+// Post-send verdict from observing whether the nonce is now in the session transcript. Proof of
+// delivery wins outright. An `attempted` announcement that has burned its attempt cap AND given the
+// final attempt its full retry window without ever appearing is `failed` (the user is told to run
+// /review-results); anything still in flight is `keep` (emit retries it per shouldAttemptAnnouncement).
+// Age backstop — SUMMARY ONLY: the idle-gated summary defers (no attempt burned) while the agent
+// streams, so a record that never observes an idle tick would otherwise retry forever without ever
+// escalating; once older than maxAgeMs it becomes `failed` so the documented /review-results fallback
+// stays reachable and nothing is acked-and-lost. The AUTOFIX announcement is deliberately EXEMPT: it
+// defers off-turn (no live session) without burning an attempt, so aging it would mark it `failed` at
+// attempts:0 — expiring the fix turn before it ever fired. An undelivered autofix instead reaches a
+// terminal state via head-supersede (a newer push retires the stale head via abandonReviewAnnouncements),
+// or via the attempt cap above while still claimable and a send keeps erroring — never on age alone.
+// (Once the one-shot autofix.requested marker is claimed, claim() returns false so the record can no
+// longer re-fire to accrue attempts; head-supersede is then its only terminal path.) Keyed on
+// createdAt, so the summary backstop is independent of the attempt counter and never penalises a
+// normal in-flight retry.
+export function announcementReconcileDecision(input: AnnouncementReconcileInput): AnnouncementReconcileDecision {
+  if (input.nonceFound) return "visible";
+  if (input.status === "failed") return "failed";
+  if (input.status === "attempted" && input.attempts >= input.maxAttempts) {
+    return input.now - (input.lastAttemptAt ?? 0) >= input.retryDelayMs ? "failed" : "keep";
+  }
+  if (input.kind === "summary" && input.maxAgeMs !== undefined && input.createdAt !== undefined && input.now - input.createdAt >= input.maxAgeMs) return "failed";
+  return "keep";
 }
 
 export type ReviewSeverityCounts = {
@@ -212,7 +329,7 @@ export type ReviewAutofixMessage = {
   customType: "codeflare-review-autofix-request";
   content: string;
   display: false;
-  details: { repo: string; head: string };
+  details: { repo: string; head: string; nonce?: string };
 };
 
 export type ReviewAutofixOptions = {
@@ -260,30 +377,34 @@ export function reviewAutofixModeFromUserMessages(messages: string[]): ReviewAut
   return mode;
 }
 
-export function reviewAutofixRequest(repo: string, head: string): ReviewAutofixRequest {
+export function reviewAutofixRequest(repo: string, head: string, nonce?: string): ReviewAutofixRequest {
+  const lines = [
+    `Fix legitimate PR-boundary review findings for ${basename(repo)} at ${head}.`,
+    "Use the merged review summary immediately above as the actionable finding list; do not fix from partial lane results.",
+    "Before editing, committing, or pushing, verify the review job for this exact head is complete and every required lane has a result file.",
+    "If any required review lane is still running, pending, missing, or unknown, do not edit, commit, or push; wait for the final merged review summary.",
+    "If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.",
+    "Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.",
+    "A finding's age is never a reason to skip it: fix every legitimate finding whether it is newly introduced or pre-existing, in this diff or adjacent. Do not exclude, defer, or ask about a legitimate finding because it pre-dates this change — legitimacy is the only criterion.",
+    "Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.",
+    "Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.",
+  ];
+  // A delivery nonce (when supplied) rides in a trailing HTML comment so it lands verbatim in the
+  // persisted transcript line — the announcement state machine proves delivery by finding it there.
+  if (nonce) lines.push(`<!-- cf-review-delivery ${nonce} -->`);
   return {
     message: {
       customType: "codeflare-review-autofix-request",
-      content: [
-        `Fix legitimate PR-boundary review findings for ${basename(repo)} at ${head}.`,
-        "Use the merged review summary immediately above as the actionable finding list; do not fix from partial lane results.",
-        "Before editing, committing, or pushing, verify the review job for this exact head is complete and every required lane has a result file.",
-        "If any required review lane is still running, pending, missing, or unknown, do not edit, commit, or push; wait for the final merged review summary.",
-        "If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.",
-        "Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.",
-        "A finding's age is never a reason to skip it: fix every legitimate finding whether it is newly introduced or pre-existing, in this diff or adjacent. Do not exclude, defer, or ask about a legitimate finding because it pre-dates this change — legitimacy is the only criterion.",
-        "Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.",
-        "Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.",
-      ].join("\n"),
+      content: lines.join("\n"),
       display: false,
-      details: { repo, head },
+      details: nonce ? { repo, head, nonce } : { repo, head },
     },
     options: { triggerTurn: true, deliverAs: "followUp" },
   };
 }
 
-export function sendReviewAutofixRequest(sender: ReviewAutofixSender, repo: string, head: string): void {
-  const request = reviewAutofixRequest(repo, head);
+export function sendReviewAutofixRequest(sender: ReviewAutofixSender, repo: string, head: string, nonce?: string): void {
+  const request = reviewAutofixRequest(repo, head, nonce);
   sender.sendMessage(request.message, request.options);
 }
 
@@ -294,13 +415,14 @@ export function requestReviewAutofixForRows(input: {
   rows: ReviewAutofixRow[];
   reviewComplete: boolean;
   suppress?: boolean;
+  nonce?: string;
   claim: () => boolean;
 }): boolean {
   if (!input.reviewComplete) return false;
   if (input.suppress) return false;
   if (!input.rows.some((row) => actionableReviewCount(row.counts) > 0)) return false;
   if (!input.claim()) return false;
-  sendReviewAutofixRequest(input.sender, input.repo, input.head);
+  sendReviewAutofixRequest(input.sender, input.repo, input.head, input.nonce);
   return true;
 }
 
@@ -325,20 +447,45 @@ export function durableReviewStatusSegments(input: {
     }));
 }
 
+// Elapsed wall-clock as M:SS (e.g. 78_000 -> "1:18"), for the leading review badge.
+export function formatReviewElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+// Compact token count for the footer (e.g. 950 -> "950", 2_120 -> "2.1k", 124_000 -> "124k").
+export function formatReviewTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return k >= 100 ? `${Math.round(k)}k` : `${k.toFixed(1).replace(/\.0$/, "")}k`;
+}
+
 export function compactDurableReviewStatus(input: {
   head: string;
   lanes: string[];
   completed: string[];
   running: string[];
   style?: DurableReviewStatusStyle;
+  // Optional leading timer badge: "Review 1:18 · code | spec | docs".
+  elapsedMs?: number;
+  // Optional best-effort per-lane token totals, appended to each lane label.
+  laneTokens?: Record<string, number>;
 }): string {
   const styledLabel = (segment: DurableReviewStatusSegment): string => {
     if (segment.state === "completed") return input.style?.done?.(segment.label) ?? segment.label;
     if (segment.state === "running") return input.style?.running?.(segment.label) ?? segment.label;
     return input.style?.pending?.(segment.label) ?? segment.label;
   };
-  const parts = durableReviewStatusSegments(input).map(styledLabel);
-  return `Review ${parts.join(" | ")}`;
+  const parts = durableReviewStatusSegments(input).map((segment) => {
+    let label = styledLabel(segment);
+    const tokens = input.laneTokens?.[segment.lane];
+    if (typeof tokens === "number" && tokens > 0) label = `${label} ${formatReviewTokens(tokens)}`;
+    return label;
+  });
+  const badge = input.elapsedMs !== undefined ? `${formatReviewElapsed(input.elapsedMs)} · ` : "";
+  return `Review ${badge}${parts.join(" | ")}`;
 }
 
 export function stripExistingReviewSummary(text: string): string {
@@ -363,10 +510,18 @@ export function countReviewSeverities(text: string): ReviewSeverityCounts {
       continue;
     }
     if (inFence) continue;
-    const match = line.match(/^\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:\*\*)?\[?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)\]?\b(.*)$/i);
+    // A severity word counts only when DECORATED as a finding label — bracketed [HIGH], bolded
+    // **HIGH**, or colon-trailed HIGH: — never as a bare prose adjective. Without this, a lane writing
+    // "High-level summary:" or "Critical to the design is…" mints a phantom HIGH/CRITICAL that flips the
+    // merged verdict to block and fires a needless autofix turn (P5). Tally lines (HIGH: 2 (…)) match via
+    // the colon but are filtered out by isSeverityCountLine below, so the honest count is preserved.
+    const match = line.match(/^\s*(?:[-*]\s*|\d+\.\s*)?(\[|\*\*)?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)(\]|\*\*|:)(.*)$/i);
     if (!match) continue;
-    if (isSeverityCountLine(match[2])) continue;
-    const severity = match[1].toUpperCase();
+    const open = match[1]; const close = match[3];
+    const decorated = (open === "[" && close === "]") || (open === "**" && close === "**") || close === ":";
+    if (!decorated) continue;
+    if (isSeverityCountLine(match[4])) continue;
+    const severity = match[2].toUpperCase();
     if (severity === "BLOCKING" || severity === "CRITICAL") counts.critical += 1;
     else if (severity === "HIGH") counts.high += 1;
     else if (severity === "MEDIUM") counts.medium += 1;
@@ -446,7 +601,16 @@ function reviewField(block: string, field: string): string | undefined {
 
 function findingHeaderMatches(body: string): RegExpMatchArray[] {
   const matches: RegExpMatchArray[] = [];
-  const header = /^\s*(?:[-*]\s*)?(?:\d+\.\s*)?(?:\*\*)?\[?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)\]?\s*(?:\*\*)?\s*(.+?)\s*$/gim;
+  // Use the SAME anchored decoration rule as countReviewSeverities: the decoration must wrap the LEADING
+  // severity word ([HIGH] / **HIGH** / HIGH:), not merely appear somewhere on the line. A line-wide test
+  // diverges from the counter on a line like "HIGH risk because [LOW] elsewhere" (counter 0, extractor 1),
+  // re-opening the phantom-finding-vs-zero-count gap this is meant to close. This regex is BYTE-IDENTICAL
+  // to the counter's (group 4 = (.*) so it also matches an empty title), so the match/no-match decision can
+  // never drift. Groups: 1=open, 2=severity, 3=close, 4=title. A bare-prose leading severity word
+  // ("Critical to the design…") has a space — not ]/**/: — after it, so it simply fails to match and is
+  // never a finding. A bare decorated label with no inline title ([HIGH] alone) is counted by the counter,
+  // so it is surfaced here too — extractReviewFindings gives it a placeholder title rather than drop it.
+  const header = /^\s*(?:[-*]\s*|\d+\.\s*)?(\[|\*\*)?(BLOCKING|CRITICAL|HIGH|MEDIUM|LOW)(\]|\*\*|:)(.*)$/i;
   let inFence = false;
   let offset = 0;
   for (const line of body.split("\n")) {
@@ -456,11 +620,14 @@ function findingHeaderMatches(body: string): RegExpMatchArray[] {
       continue;
     }
     if (!inFence) {
-      header.lastIndex = 0;
-      const match = header.exec(line);
-      if (match && !isSeverityCountLine(match[2])) {
-        match.index = offset + (match.index || 0);
-        matches.push(match);
+      const match = line.match(header);
+      if (match) {
+        const open = match[1]; const close = match[3];
+        const decorated = (open === "[" && close === "]") || (open === "**" && close === "**") || close === ":";
+        if (decorated && !isSeverityCountLine(match[4])) {
+          match.index = offset + (match.index || 0);
+          matches.push(match);
+        }
       }
     }
     offset += line.length + 1;
@@ -473,7 +640,7 @@ export function extractReviewFindings(lane: string, text: string): ReviewFinding
   if (!body || /^No findings\.?$/i.test(body)) return [];
   const matches = findingHeaderMatches(body);
   return matches.map((match, index) => {
-    const severity = match[1].toUpperCase() === "BLOCKING" ? "CRITICAL" : match[1].toUpperCase() as ReviewFindingSeverity;
+    const severity = match[2].toUpperCase() === "BLOCKING" ? "CRITICAL" : match[2].toUpperCase() as ReviewFindingSeverity;
     const start = match.index || 0;
     const end = matches[index + 1]?.index ?? body.length;
     const block = body.slice(start, end).trim();
@@ -483,7 +650,7 @@ export function extractReviewFindings(lane: string, text: string): ReviewFinding
     return {
       lane,
       severity,
-      title: cleanReviewText(match[2]),
+      title: cleanReviewText(match[4]) || "(untitled)",
       file,
       issue,
       fix,
@@ -835,15 +1002,17 @@ export function shouldReconcileOpenPr(input: OpenPrReconcileInput): OpenPrReconc
 // shouldReconcileOpenPr decides WHETHER a head is reconcilable; this decides what the
 // reconciler DOES with it. The locked design is: an in-session push still AUTO-STARTS the
 // review exactly like the onToolEnd boundary path, and only a fresh clone/checkout of a repo
-// with a pre-existing open PR is OFFERED (notify + persist the offered marker) so the user
-// runs /review-run or /review-skip. `inSessionContinuation` is the caller's verdict that this
-// head is continuous work on a branch we have ALREADY reviewed (the new head descends from a
-// previously-acked head), which means the onToolEnd auto-start was MISSED (compound `&&`,
-// here-doc, `gh pr edit`, or a reload between the command and its event) rather than this being
-// a fresh clone — so we auto-start to honour the design. A fresh clone has no prior ack on this
-// repo, so it falls through to OFFER, and `git clone` never auto-spawns an unstoppable review.
-// Offer is once-per-head (the marker is head-keyed, so a new commit re-offers). Pure: no fs, no
-// notify — the caller performs the side effects keyed off the returned action.
+// with a pre-existing open PR is OFFERED (a durable chat message + toast) so the user runs
+// /review-run or /review-skip. `inSessionContinuation` is the caller's verdict that THIS session
+// advanced the head (a boundary command ran this session, or the head descends from this session's
+// branch baseline), which means the onToolEnd auto-start was MISSED (compound `&&`, here-doc, `gh pr
+// edit`, or a reload between the command and its event) rather than this being a fresh clone — so we
+// auto-start to honour the design. A head merely inherited at launch has neither signal, so it falls
+// through to OFFER, and `git clone` never auto-spawns an unstoppable review. The offer is deduped via
+// `alreadyOffered` — the caller passes offerSurfacedThisSession, a PER-SESSION (process-scoped) marker,
+// NOT an on-disk per-head-ever marker (that on-disk marker was removed: it suppressed the offer forever,
+// so a relaunched session saw nothing). A new `pi` re-surfaces a still-unchosen offer exactly once. Pure:
+// no fs, no notify — the caller performs the side effects keyed off the returned action.
 export type ReconcileBoundaryInput = { reconcile: boolean; alreadyOffered: boolean; inSessionContinuation: boolean };
 export type ReconcileBoundaryAction = "autostart" | "offer" | "noop";
 
@@ -854,15 +1023,18 @@ export function reconcileBoundaryAction(input: ReconcileBoundaryInput): Reconcil
   return "offer";
 }
 
-// In-session continuation = the enforced head ADVANCED during THIS Pi session, i.e. it
-// differs from and descends from the head observed when this session first reconciled
-// (the in-memory baseline, captured at session start). That is the only signal of an
-// in-session push whose on-tool-end auto-start was dropped (so reconciliation should
-// auto-start). A head present at session start (baseline undefined, or baseline === head)
-// was NOT pushed during this session — it is a fresh launch/clone/checkout and must OFFER,
-// never auto-start. Deriving continuation from the on-disk ack marker instead (the prior
-// implementation) wrongly treated ANY descendant-of-a-prior-ack head as continuation, so
-// every bare Pi start auto-spawned reviewers — the regression this restores to offering.
+// reviewBaselineContinuation is the BACKSTOP signal for missed-boundary autostart: "the current head
+// advanced beyond the head this session first saw on this branch" (a strict descendant of `baseline`).
+// It exists to catch the one case the primary signal (boundaryActed, in review-enforcement) misses — a
+// jiti reload that ate the boundary tool-event, so onToolEnd never ran to record the push, yet the head
+// clearly moved forward from where the session started. It is NOT sufficient alone: a bare `git checkout`
+// of a pre-existing descendant branch also "descends from baseline", which is why review-enforcement keys
+// the baseline by repo+BRANCH (a checkout changes the branch → its baseline is the inherited head →
+// baseline === head → returns false → OFFER, never autostart). A head present at session start (baseline
+// undefined or === head) was NOT pushed this session, so it returns false and the caller OFFERS.
+// Historical note: deriving this from the on-disk ack marker instead (a prior implementation) wrongly
+// treated ANY descendant-of-a-prior-ack head as continuation, so every bare Pi start auto-spawned
+// reviewers on every launch. The repo+branch baseline + boundaryActed design replaced it.
 export function reviewBaselineContinuation(
   baseline: string | undefined,
   head: string,
@@ -870,6 +1042,85 @@ export function reviewBaselineContinuation(
 ): boolean {
   if (!baseline || !head || baseline === head) return false;
   return isAncestor(baseline, head);
+}
+
+// reviewInSessionContinuation is the FULL autostart-vs-offer signal for missed-boundary reconciliation
+// (REQ-AGENT-058). The reconcile AUTOSTARTS reviewers for a missed boundary only
+// when THIS session is what advanced the head — never for a head merely inherited at launch (a fresh
+// clone, a relaunch, or a bare checkout), which instead OFFERS so reviewers are never silently spawned on
+// work the user did not do this session. Two independent signals, OR'd:
+//   • boundaryActed (PRIMARY): a real PR-boundary command (push / pr create / …) actually executed this
+//     session for this repo+branch. Recorded in onToolEnd BEFORE any window-creation guard, so even a
+//     dropped window (dedup, unresolved head, reload after the event fired) still leaves the fact for
+//     reconcile to autostart on. True exactly when we pushed — independent of head ancestry, so it covers
+//     the no-PR-at-launch + in-session push case that the baseline signal alone missed.
+//   • baseline backstop (reviewBaselineContinuation): covers the reload-ate-the-tool-event case where
+//     boundaryActed was never recorded but the head still advanced beyond the session's branch baseline.
+// A bare checkout sets neither (no boundary command ran; the new branch's baseline equals its inherited
+// head), so it correctly OFFERS — whereas advancing a repo-keyed baseline on ack made a mere
+// checkout of a descendant branch autostart.
+export function reviewInSessionContinuation(input: {
+  boundaryActed: boolean;
+  baseline: string | undefined;
+  head: string;
+  isAncestor: (ancestor: string, current: string) => boolean;
+  ackedThisSession?: boolean;
+}): boolean {
+  if (input.boundaryActed) return true;
+  // Once this branch has been ACKED this session, the baseline backstop is SUPPRESSED: a further
+  // descendant of the session baseline is either an in-session push (already covered by boundaryActed
+  // above) or a remote-actor head FETCHED via `git pull`, which must OFFER, not auto-start a duplicate
+  // review (R7). The backstop only covers the pre-first-ack window, where a dropped boundary tool-event
+  // is the plausible reason boundaryActed is missing despite an in-session advance.
+  if (input.ackedThisSession) return false;
+  return reviewBaselineContinuation(input.baseline, input.head, input.isAncestor);
+}
+
+// Pure decision for the `gh pr merge` gate — the LAST line of defense, so it must fail in the safe
+// (block) direction whenever review is demonstrably required and the PR state can't be trusted. The
+// caller feeds the state for the PR the merge command actually targets (so `gh pr merge 42` is gated
+// against PR 42, not the cwd branch — P1) plus every locally-known unacked merge-blocking head. Returns
+// one of: allow / bypass (a user-only sentinel was present, consume it + ack) / block (with an audit
+// reason code). The reason codes feed the durable `merge_blocked` audit event.
+//
+//   prReadable  — `gh pr view` for the target succeeded (false = transient gh failure: auth/network/
+//                 rate-limit/timeout; NOT "no PR", which is prReadable:true + prExists:false).
+//   prMalformed — readable + OPEN but base or headRefOid missing (the transient-parse edge the push
+//                 path fails OPEN for; here we fail CLOSED if review is pending — R1).
+//   prEnforced  — OPEN + base main/master + headRefOid present.
+//   candidates  — locally-known unacked heads that each independently require review even when the PR
+//                 itself is unreadable/malformed: the pending head, a latched-breaker head, an
+//                 outstanding-offer head (R2 — breaker/offer states deliberately have no pending.json).
+export type MergeGateInput = {
+  prReadable: boolean;
+  prExists: boolean;
+  prEnforced: boolean;
+  prMalformed: boolean;
+  enforcedHead: string;
+  headAcked: boolean;
+  candidates: Array<{ head: string; acked: boolean }>;
+  bypassPresent: boolean;
+};
+export type MergeGateDecision =
+  | { action: "allow" }
+  | { action: "bypass"; head: string }
+  | { action: "block"; head: string; reason: string };
+export function mergeGateDecision(input: MergeGateInput): MergeGateDecision {
+  const firstUnacked = input.candidates.find((c) => c.head && !c.acked)?.head;
+  let block: { head: string; reason: string } | undefined;
+  if (!input.prReadable) {
+    // gh is down — block only if a review is demonstrably pending for an unacked head; with nothing
+    // pending we cannot even assert this is an enforced PR, so we allow (no basis to block).
+    if (firstUnacked) block = { head: firstUnacked, reason: "pr_state_unreadable_review_pending" };
+  } else if (input.prMalformed) {
+    if (firstUnacked) block = { head: firstUnacked, reason: "pr_state_malformed_review_pending" };
+  } else if (input.prEnforced) {
+    if (!input.headAcked) block = { head: input.enforcedHead, reason: "head_not_acked" };
+  }
+  // readable + (no PR OR not enforced: base not protected / closed / draft-by-policy) -> allow.
+  if (!block) return { action: "allow" };
+  if (input.bypassPresent) return { action: "bypass", head: block.head };
+  return { action: "block", head: block.head, reason: block.reason };
 }
 
 // Resolve which repo a review handler should act on, WITHOUT consulting the shared graphify
@@ -885,15 +1136,93 @@ export function reviewBaselineContinuation(
 //   -> processCwd (Pi process dir, last resort).
 // commandCwd/sessionCwd/processCwd are directories resolved to a git root via gitRootOf;
 // sessionReviewRepo is already a git root and is returned verbatim.
+// activeRepo (added) is the IN-MEMORY active-cwd codeflare-pi.ts tracks on every tool execution —
+// the SAME signal the statusline footer resolves the repo from. It is load-bearing when the Pi
+// session cwd is a NON-repo parent workspace (/home/user/workspace) and the user works in a nested
+// clone via `cd`/`git -C`: commandCwd is absent on a slash command (/review-run) and on a
+// no-command reconciliation tick, sessionCwd/processCwd resolve to the parentless workspace, and
+// sessionReviewRepo is unset until a review has already run — so without activeRepo BOTH /review-run
+// AND open-PR reconciliation returned undefined ("not inside an SDD repository" / reconciliation
+// silently bailed on hasRepo=false and never auto-started) even though the footer showed the repo.
+// It sits after the reliable signals, before processCwd, validated through gitRootOf. This is the
+// recallActiveRepo() in-memory value (this Pi process only), NOT the cross-process on-disk sentinel
+// that flaps under concurrent agents — so it is safe for routing, unlike the sentinel above.
 export function resolveReviewRepo(
-  input: { commandCwd?: string; sessionCwd?: string; sessionReviewRepo?: string; processCwd?: string },
+  input: { commandCwd?: string; sessionCwd?: string; sessionReviewRepo?: string; activeRepo?: string; processCwd?: string },
   gitRootOf: (dir: string) => string | undefined,
 ): string | undefined {
   const fromDir = (dir: string | undefined): string | undefined => (dir ? gitRootOf(dir) : undefined);
   return fromDir(input.commandCwd)
     ?? fromDir(input.sessionCwd)
     ?? input.sessionReviewRepo
+    ?? fromDir(input.activeRepo)
     ?? fromDir(input.processCwd);
+}
+
+// In-session memory of the repos this Pi session is tracking, shared across
+// extensions via globalThis. Under Pi 0.79.1's extension loader
+// (createJiti(import.meta.url, { moduleCache:false }) per extension), each
+// extension gets a SEPARATE instance of this module — a module-local `let`
+// written by codeflare-pi.ts is invisible to review-enforcement.ts and
+// local-statusline.ts. globalThis[Symbol.for(...)] is the only cross-extension
+// channel (the codebase uses it for Symbol.for("codeflare.activeRepo") /
+// Symbol.for("codeflare.reviewRepo"), the prCache, and the autostart signals).
+// reviewRepo = the repo THIS session is
+// reviewing (review-enforcement remembers it whenever a ctx-bearing handler
+// resolves the repo; the no-ctx reaper and the footer recall it). activeRepo =
+// the repo the USER is working in (codeflare-pi remembers it on every command
+// that resolves a git root). Display + the activeRepo rung of resolveReviewRepo
+// read these; review ROUTING precedence stays in resolveReviewRepo unchanged.
+const ACTIVE_REPO_KEY = Symbol.for("codeflare.activeRepo");
+const REVIEW_REPO_KEY = Symbol.for("codeflare.reviewRepo");
+
+// REVIEW_REPO_KEY is the LAST-pinned review repo (used by the footer and single-repo callers).
+// REVIEW_REPOS_KEY accumulates the SET of every repo this session armed/reconciled a review for, so the
+// no-ctx reaper can finalize ALL of them, not just the last one (P6) — otherwise a second repo's review
+// hangs unfinalized until the user returns to it.
+const REVIEW_REPOS_KEY = Symbol.for("codeflare.reviewRepos");
+type CodeflareRepoMemory = { [ACTIVE_REPO_KEY]?: string; [REVIEW_REPO_KEY]?: string; [REVIEW_REPOS_KEY]?: Set<string> };
+const repoMemory = globalThis as unknown as CodeflareRepoMemory;
+
+export function rememberReviewRepo(repo: string | undefined): void {
+  if (!repo) return;
+  repoMemory[REVIEW_REPO_KEY] = repo;
+  if (!repoMemory[REVIEW_REPOS_KEY]) repoMemory[REVIEW_REPOS_KEY] = new Set<string>();
+  repoMemory[REVIEW_REPOS_KEY]!.add(repo);
+}
+export function recallReviewRepo(): string | undefined {
+  return repoMemory[REVIEW_REPO_KEY];
+}
+export function recallReviewRepos(): string[] {
+  return repoMemory[REVIEW_REPOS_KEY] ? [...repoMemory[REVIEW_REPOS_KEY]!] : [];
+}
+
+export function rememberActiveRepo(repo: string | undefined): void {
+  if (repo) repoMemory[ACTIVE_REPO_KEY] = repo;
+}
+export function recallActiveRepo(): string | undefined {
+  return repoMemory[ACTIVE_REPO_KEY];
+}
+
+// Last-resort display-only fallback for the footer's repo:branch segment: the
+// on-disk graphify active-cwd sentinel. It is written by BOTH Claude's hook and
+// Pi's codeflare-pi extension, so under concurrent agents it flaps to whichever
+// acted last — hence the guards: the value must be a git repo AND live inside one
+// of this session's roots (session cwd / ctx cwd), so an unrelated repo touched
+// by another agent elsewhere can never hijack this session's footer. Pure so the
+// guards are unit-testable; the caller injects file content and the .git check.
+export function activeRepoSentinelForDisplay(input: {
+  sentinelContent: string | undefined;
+  sessionRoots: (string | undefined)[];
+  hasGitDir: (path: string) => boolean;
+}): string | undefined {
+  const value = input.sentinelContent?.trim();
+  if (!value || !input.hasGitDir(value)) return undefined;
+  const inside = input.sessionRoots.some((root) => {
+    if (!root) return false;
+    return value === root || value.startsWith(root.endsWith("/") ? root : `${root}/`);
+  });
+  return inside ? value : undefined;
 }
 
 // Npm package source strings a durable review lane should load as additionalExtensionPaths.

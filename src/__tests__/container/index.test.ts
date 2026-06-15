@@ -880,6 +880,41 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
       expect(order).toEqual(['finalsync', 'stop']);
     });
 
+    it('REQ-SESSION-011: the final-sync drain authenticates with the container token captured BEFORE the storage clear (401 regression)', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'test-bucket';
+        if (key === 'containerAuthToken') return 'tok-teardown-456';
+        return null;
+      });
+      mockContainerRuntime.running = true;
+
+      // Capture the drain request init so the Authorization header is assertable.
+      // The raw port.fetch bypasses the DO fetch override that injects auth; pre-fix
+      // this request carried no header and the in-container host 401'd it on EVERY
+      // stop/delete (observed: 30 days of outcome:incomplete httpStatus:401 audits,
+      // zero successes) - the actual bisync-on-delete data loss.
+      let drainInit: RequestInit | undefined;
+      mockTcpPortFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (typeof url === 'string' && url.includes('/internal/final-sync')) {
+          drainInit = init;
+          // The drain fires AFTER the operational-storage clear (REQ-SESSION-009
+          // ordering), so a header here proves the token was captured pre-clear,
+          // not read late from already-wiped storage.
+          expect(mockStorage.delete).toHaveBeenCalledWith('containerAuthToken');
+        }
+        return new Response(JSON.stringify({ synced: true }), { status: 200 });
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+      vi.spyOn(instance, 'stop' as any).mockImplementation(async () => {
+        mockContainerRuntime.running = false;
+      });
+
+      await instance.destroy();
+
+      expect((drainInit?.headers as Record<string, string> | undefined)?.Authorization).toBe('Bearer tok-teardown-456');
+    });
+
     it('REQ-SESSION-011: still stops when the final-sync drain fails (best-effort, no throw)', async () => {
       mockStorage.get.mockImplementation(async (key: string) => {
         if (key === 'bucketName') return 'test-bucket';
@@ -932,10 +967,64 @@ describe('container DO class / REQ-SESSION-002 (one container per session)', () 
       expect((auditPut![1] as { outcome: string }).outcome).toBe('completed');
     });
 
-    it('#516: persists outcome "errored" and still completes destroy when the drain rejects under a transient not-running reading', async () => {
+    // Any non-OK final-sync HTTP response (res.ok === false) must be recorded as a
+    // non-completed, queryable audit outcome carrying the session id + http
+    // status/reason - never swallowed - and the session must still delete (data
+    // loss past the window is acceptable per the fix decision; a SILENT loss is
+    // not). Post budget-inversion fix a host *timeout* 504 no longer reaches the DO
+    // (the DO's AbortSignal at FINAL_SYNC_BUDGET_MS=120s fires before the host's
+    // 125s 504), so the authoritative ceiling path is the fetch *rejection* covered
+    // by the "errored" sibling test below; this case guards the reachable non-OK
+    // branch (e.g. a fast 503/non-2xx) and the body-capture plumbing. The 504 here
+    // is illustrative of the res.ok===false mapping, not the timeout race.
+    it('REQ-SESSION-011: a non-OK final-sync response is audited as "incomplete" with the session id + http status/reason, and the delete still proceeds', async () => {
+      mockStorage.get.mockImplementation(async (key: string) => {
+        if (key === 'bucketName') return 'test-bucket';
+        if (key === '_sessionId') return 'sess123';
+        return null;
+      });
+      mockContainerRuntime.running = true;
+
+      mockTcpPortFetch.mockImplementation(async (url: string) => {
+        if (typeof url === 'string' && url.includes('/internal/final-sync')) {
+          return new Response(JSON.stringify({ synced: false, reason: 'timeout' }), { status: 504 });
+        }
+        return new Response('', { status: 200 });
+      });
+
+      const instance = new ContainerClass(mockCtx as any, mockEnv);
+      // The constructor loads _sessionId via blockConcurrencyWhile; the test mock
+      // does not await that init, so set the in-memory field directly (as the
+      // containerStartedAt test does). destroy() captures host._sessionId before
+      // the storage-clear nulls it.
+      (instance as any)._sessionId = 'sess123';
+      const stopSpy = vi.spyOn(instance, 'stop' as any).mockImplementation(async () => {
+        mockContainerRuntime.running = false;
+      });
+
+      await expect(instance.destroy()).resolves.toBeUndefined();
+      expect(stopSpy).toHaveBeenCalledWith('SIGTERM');
+
+      const auditPut = mockStorage.put.mock.calls.find((c) => c[0] === 'finalSyncAudit');
+      expect(auditPut).toBeDefined();
+      const event = auditPut![1] as { outcome: string; sessionId?: string; httpStatus?: number; reason?: string };
+      expect(event.outcome).toBe('incomplete'); // 504 is res.ok===false -> not completed
+      expect(event.sessionId).toBe('sess123'); // captured before the storage-clear nulls _sessionId
+      expect(event.httpStatus).toBe(504);
+      expect(event.reason).toBe('timeout');
+    });
+
+    // This is the AUTHORITATIVE ceiling path post budget-inversion fix: when the
+    // sync runs past the DO's FINAL_SYNC_BUDGET_MS, the DO's AbortSignal.timeout
+    // aborts the fetch (an 'AbortError' rejection) before the host's 125s 504 can
+    // return - so the drain rejects, and that must audit as 'errored' (not a
+    // swallowed completion) while destroy still proceeds. Also covers a transient
+    // not-running reading where the port fetch simply fails.
+    it('#516: persists outcome "errored" and still completes destroy when the drain fetch is aborted/rejected (DO AbortSignal ceiling)', async () => {
       mockStorage.get.mockImplementation(async (key: string) => (key === 'bucketName' ? 'test-bucket' : null));
       mockContainerRuntime.running = false;
-      mockTcpPortFetch.mockRejectedValue(new Error('Connection refused'));
+      const abortErr = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+      mockTcpPortFetch.mockRejectedValue(abortErr);
       const instance = new ContainerClass(mockCtx as any, mockEnv);
       await expect(instance.destroy()).resolves.toBeUndefined();
       const auditPut = mockStorage.put.mock.calls.find((c) => c[0] === 'finalSyncAudit');

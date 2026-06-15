@@ -1,0 +1,274 @@
+---
+/**
+ * The Codeflare enterprise landing page: one governed run threaded across the
+ * whole page. A single pull request (the spine, REQ-PAY-014 / AC3 / PR #207)
+ * is followed from intent to merge, and the proof artifacts are camera angles
+ * on it: the hero terminal opens it, the enforcement gate catches it drifting,
+ * the boundary + egress strip show where its traffic may go, the context terminal
+ * shows how it reads the web safely, the review board judges it in parallel,
+ * and the cost ledger is its bill closing on zero unattributed. Governance
+ * carries the page; the platform capability lands afterwards as the payoff the
+ * boundary makes safe. Calm, sans prose, mono for proof, mobile-first.
+ *
+ * The page is pure composition: every band is a <Section> + <SectionHead>, every
+ * terminal wraps the shared <Terminal> chrome with a <Transcript> (cursor / typed
+ * / roll-middle styler) or <GateSteps> (rolling-rows styler) body, and the cards
+ * are <FeatureGrid>. Content lives in content/site.ts; styling in global.css +
+ * tokens.css; behaviour in the page scripts. Nothing here is tuned per-instance.
+ */
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/Header.astro';
+import Section from '../components/Section.astro';
+import SectionHead from '../components/SectionHead.astro';
+import Terminal from '../components/Terminal.astro';
+import Transcript from '../components/Transcript.astro';
+import GateSteps from '../components/GateSteps.astro';
+import FeatureGrid from '../components/FeatureGrid.astro';
+import MicroCta from '../components/MicroCta.astro';
+import TrustStrip from '../components/TrustStrip.astro';
+import LedgerTable from '../components/LedgerTable.astro';
+import ReviewBoard from '../components/ReviewBoard.astro';
+import OrchTree from '../components/OrchTree.astro';
+import Hero from '../components/Hero.astro';
+import FeatureTerminals from '../components/FeatureTerminals.astro';
+import ContactForm from '../components/ContactForm.astro';
+import Footer from '../components/Footer.astro';
+import {
+  SECTION_KICKERS,
+  AGENTS,
+  SHIFT,
+  METHOD,
+  LEGACY,
+  SECURITY,
+  EGRESS,
+  OPERATIONS,
+  BROWSER,
+  PLATFORM,
+  CONTEXT,
+  PIPELINE,
+  COST,
+  TENANCY,
+  FAQ_SECTION,
+  FAQ_ITEMS,
+  CONTACT_FORM,
+  DOGFOOD,
+  ORCHESTRATION,
+  MCP,
+} from '../content/site';
+
+// Each rolling-rows artifact maps its own content (GateStep / BoundaryRow /
+// EgressRow / McpRow / seed row) to the GateSteps row shape: actor, the state
+// pill label, text, and the state colour class. Kept here so GateSteps stays a
+// pure renderer and the page reads declaratively.
+const stateLabel = (s: 'fail' | 'work' | 'pass') =>
+  s === 'fail' ? 'failed' : s === 'work' ? 'correcting' : 'passed';
+const methodGateRows = METHOD.gate.steps.map((step) => ({
+  actor: step.actor,
+  label: stateLabel(step.state),
+  text: step.text,
+  state: `is-${step.state}`,
+}));
+const boundaryRows = SECURITY.boundary.rows.map((row) => ({
+  actor: row.actor,
+  label: row.label,
+  text: row.text,
+  state: `is-${row.state}`,
+}));
+const egressRows = EGRESS.rows.map((row) => ({
+  actor: row.actor,
+  label: row.label,
+  text: row.text,
+  state: `is-${row.state}`,
+}));
+const seedRows = PLATFORM.seed.rows.map((row) => ({
+  actor: row.actor,
+  label: row.label,
+  text: row.text,
+}));
+const mcpRows = MCP.portal.rows.map((row) => ({
+  actor: row.actor,
+  label: row.label,
+  text: row.text,
+  state: `is-${row.state}`,
+}));
+---
+
+<BaseLayout
+  jsonLd={{
+    '@type': 'SoftwareApplication',
+    name: 'Codeflare',
+    applicationCategory: 'DeveloperApplication',
+    operatingSystem: 'Cloud',
+    url: 'https://codeflare.ch/',
+    description:
+      'The enterprise agentic coding engine: autonomous coding agents that build, review, test, and ship inside your own cloud boundary, governed by spec-driven and test-driven enforcement, attributed, and encrypted.',
+    publisher: { '@id': 'https://codeflare.ch/#organization' },
+  }}
+>
+  <Header variant="landing" />
+
+  <main id="top">
+    <Hero />
+
+    <!-- The shift: the assistant-to-engine leap shown the way the page trades,
+         as terminals. Four short feature terminals (gateway, session, review,
+         spec) replace the old stat band and the old checkmark comparison. -->
+    <Section id={SHIFT.id}>
+      <SectionHead kicker={SECTION_KICKERS.shift} title={SHIFT.title} leadHtml={SHIFT.lead} />
+      <FeatureTerminals />
+    </Section>
+
+    <!-- Method: spec-driven development, enforced. The gate (the receipt)
+         precedes the prose, and the two pillars read as plain label-and-prose
+         clauses, with no numbered counters of their own. -->
+    <Section id={METHOD.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.method} title={METHOD.title} lead={METHOD.lead} />
+      <Terminal variant="gate" foot={METHOD.gate.caption}>
+        <Fragment slot="bar">
+          <span class="gate-req">{METHOD.gate.req}</span>
+          <span class="gate-crit">{METHOD.gate.criterion}</span>
+          <span class="gate-pr">{METHOD.gate.pr}</span>
+        </Fragment>
+        <GateSteps rows={methodGateRows} />
+      </Terminal>
+      <ol class="method-clauses" data-stagger>
+        {
+          METHOD.pillars.map((card) => (
+            <li>
+              <h3>{card.title}</h3>
+              <p>{card.body}</p>
+            </li>
+          ))
+        }
+      </ol>
+    </Section>
+
+    <!-- Legacy: legacy code transformed into an agentic baseline. /sdd init turns
+         a legacy codebase into a spec-driven baseline and /sdd clean realigns a
+         drifted spec, in the page's existing terminal idiom. -->
+    <Section id={LEGACY.id}>
+      <SectionHead kicker={SECTION_KICKERS.legacy} title={LEGACY.title} lead={LEGACY.lead} />
+      <Terminal variant="proof-terminal" title={LEGACY.terminal.title} foot={LEGACY.terminal.foot}>
+        <Transcript lines={LEGACY.terminal.lines} animate="cursor" />
+      </Terminal>
+    </Section>
+
+    <!-- Security: zero trust is the architecture. One merged receipt: the
+         boundary's approved and impossible paths, a thin in-terminal divider,
+         then one real call obeying the boundary, closing on a single in-chrome
+         foot. Operations folds in below as a substation on the same boundary. -->
+    <Section id={SECURITY.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.security} title={SECURITY.title} lead={SECURITY.lead}>
+        <MicroCta href="#contact" label={SECURITY.microCta} dataTopic="security-compliance" />
+      </SectionHead>
+      <Terminal variant="gate boundary" foot={SECURITY.boundary.caption}>
+        <span class="gate-req" slot="bar">{SECURITY.boundary.title}</span>
+        <GateSteps rows={boundaryRows} />
+        <div class="gate-echo"><span class="gate-echo-prompt" aria-hidden="true">❯</span> {EGRESS.call}</div>
+        <GateSteps rows={egressRows} />
+      </Terminal>
+      <SectionHead substation kicker={OPERATIONS.tag} title={OPERATIONS.title} lead={OPERATIONS.lead} />
+      <FeatureGrid cards={OPERATIONS.cards} cols={2} />
+    </Section>
+
+    <!-- Context: the open web, rendered clean, never trusted. One real fetch from
+         the spine run, then the same throwaway browser DRIVES an e2e (substation). -->
+    <Section id={CONTEXT.id}>
+      <SectionHead kicker={SECTION_KICKERS.context} title={CONTEXT.title} lead={CONTEXT.lead} />
+      <Terminal variant="proof-terminal" title={CONTEXT.terminal.title} foot={CONTEXT.terminal.foot}>
+        <Transcript lines={CONTEXT.terminal.lines} animate="cursor" />
+      </Terminal>
+      <SectionHead substation kicker={CONTEXT.e2e.tag} title={CONTEXT.e2e.heading} lead={CONTEXT.e2e.lead} />
+      <Terminal variant="proof-terminal" title={CONTEXT.e2e.terminal.title} foot={CONTEXT.e2e.terminal.foot}>
+        <Transcript lines={CONTEXT.e2e.terminal.lines} animate="cursor" />
+      </Terminal>
+    </Section>
+
+    <!-- Pipeline: the parallel review board. Six specialist agents on one diff at
+         once, two catching a finding and re-proving it, all converging on one
+         human triage gate. -->
+    <Section id={PIPELINE.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.pipeline} title={PIPELINE.title} lead={PIPELINE.lead} />
+      <ReviewBoard />
+    </Section>
+
+    <!-- Orchestration: the operator's live view of the same review, ticking. -->
+    <Section id={ORCHESTRATION.id}>
+      <SectionHead kicker={SECTION_KICKERS.orchestration} title={ORCHESTRATION.title} lead={ORCHESTRATION.lead} />
+      <OrchTree />
+    </Section>
+
+    <!-- Cost: no unattributed spend. The ledger is the literal bill for the spine
+         run, closing on zero unattributed. Tenancy folds in below as a substation
+         (the spend and the cloud it lands in are one story: your account). -->
+    <Section id={COST.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.cost} title={COST.title} lead={COST.lead} />
+      <LedgerTable />
+      <FeatureGrid cards={COST.cards} cols={3} />
+      <SectionHead substation kicker={TENANCY.tag} title={TENANCY.title} leadHtml={TENANCY.lead} />
+    </Section>
+
+    <!-- Platform: the payoff band, after the governance sections so capability
+         reads as the payoff the boundary makes safe. Runs-everywhere folds in
+         below as a substation. -->
+    <Section id={PLATFORM.id}>
+      <SectionHead kicker={SECTION_KICKERS.platform} title={PLATFORM.title} lead={PLATFORM.lead} />
+      <Terminal variant="gate" foot={PLATFORM.seed.caption}>
+        <Fragment slot="bar">
+          <span class="gate-req">{PLATFORM.seed.title}</span>
+          <span class="gate-pr">{PLATFORM.seed.meta}</span>
+        </Fragment>
+        <GateSteps rows={seedRows} />
+      </Terminal>
+      <div class="agent-chips reveal" aria-label="Supported coding agents">
+        {AGENTS.map((agent) => <span>{agent}</span>)}
+      </div>
+      <SectionHead substation kicker={BROWSER.tag} title={BROWSER.title} lead={BROWSER.lead} />
+      <FeatureGrid cards={BROWSER.cards} cols={3} />
+    </Section>
+
+    <!-- MCP portals: the external tools an agent can reach, governed. Many MCP
+         servers collapse to one endpoint; every call runs as the signed-in user;
+         code mode collapses the tool surface into one typed `code` tool. -->
+    <Section id={MCP.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.mcp} title={MCP.title} lead={MCP.lead} />
+      <Terminal variant="gate" foot={MCP.portal.caption}>
+        <span class="gate-req" slot="bar">{MCP.portal.title}</span>
+        <GateSteps rows={mcpRows} />
+      </Terminal>
+    </Section>
+
+    <!-- Proof: this very page is a Codeflare-governed requirement. The trust-logo
+         strip folds in as its social-proof tail, before the FAQ. -->
+    <Section id={DOGFOOD.id}>
+      <SectionHead kicker={SECTION_KICKERS.dogfood} title={DOGFOOD.title} lead={DOGFOOD.lead} />
+      <Terminal variant="dogfood-terminal" title={DOGFOOD.terminalTitle} foot={DOGFOOD.foot}>
+        <Transcript lines={DOGFOOD.lines} animate="roll-middle" />
+      </Terminal>
+      <MicroCta href={DOGFOOD.cta.href} label={DOGFOOD.cta.label} external class="dogfood-cta" reveal />
+      <TrustStrip />
+    </Section>
+
+    <Section id={FAQ_SECTION.id} alt>
+      <SectionHead kicker={SECTION_KICKERS.faq} title={FAQ_SECTION.title} />
+      <div class="faq reveal">
+        {
+          FAQ_ITEMS.map((item) => (
+            <details class="faq-item">
+              <summary>{item.question}</summary>
+              <p class="faq-answer">{item.answer}</p>
+            </details>
+          ))
+        }
+      </div>
+    </Section>
+
+    <!-- Contact -->
+    <Section id={CONTACT_FORM.id}>
+      <SectionHead kicker={SECTION_KICKERS.contact} title={CONTACT_FORM.title} />
+      <ContactForm />
+    </Section>
+  </main>
+
+  <Footer />
+</BaseLayout>

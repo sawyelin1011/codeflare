@@ -22,7 +22,7 @@ Codeflare supports two fundamentally different authentication flows:
 
 | | CF Access (with GitHub as IdP) | Direct GitHub OAuth |
 |---|---|---|
-| **When** | Default, onboarding, or SaaS without `OAUTH_CLIENT_ID` | SaaS mode with `OAUTH_CLIENT_ID` configured |
+| **When** | Default/enterprise, or SaaS without `OAUTH_CLIENT_ID` | SaaS or onboarding mode with `OAUTH_CLIENT_ID` configured (onboarding uses a landing-integrated `/login`) |
 | **Auth layer** | Cloudflare Access (external service) | Worker handles auth directly |
 | **Login page** | CF Access branded login page | Codeflare login page (`/login`) |
 | **GitHub role** | One of several IdPs configured in CF Access dashboard | The sole auth provider, managed by the Worker |
@@ -36,20 +36,20 @@ Codeflare supports two fundamentally different authentication flows:
 | **E2E auth** | `CF_ACCESS_CLIENT_SECRET` (CF Access + service headers) | `OAUTH_E2E_TEST_SECRET` (X-Service-Auth only) |
 | **Logout** | `/cdn-cgi/access/logout` (CF Access system endpoint) | `/auth/github/logout` (clears `codeflare_session` cookie) |
 
-The frontend always calls `/auth/logout` - the backend dispatches to the correct logout flow based on mode.
+The frontend always calls `/auth/logout` - the backend dispatches to the correct logout flow based on mode: any mode that issues a `codeflare_session` (SaaS or onboarding) takes the `/auth/github/logout` path, and only default/enterprise CF Access deployments use the CF Access system endpoint. Onboarding must not be sent to CF Access logout - it rejects the `returnTo` as an invalid redirect URL.
 
 ### Auth Resolution Order
 
 `getUserFromRequest()` in `src/lib/access.ts` checks auth methods in this order:
 
 1. **Service token** (`X-Service-Auth` header) - E2E testing, all modes. Constant-time comparison against `SERVICE_AUTH_SECRET`.
-2. **Direct GitHub OAuth** (`codeflare_session` cookie) - only when `SAAS_MODE=active` AND `OAUTH_CLIENT_ID` is set. HMAC-SHA256 JWT verified against `OAUTH_JWT_SECRET`. When this branch is entered, CF Access is never checked.
+2. **Direct GitHub OAuth** (`codeflare_session` cookie) - only when (`SAAS_MODE=active` OR `ONBOARDING_LANDING_PAGE=active`) AND `OAUTH_CLIENT_ID` is set. HMAC-SHA256 JWT verified against `OAUTH_JWT_SECRET`. When this branch is entered, CF Access is never checked.
 3. **Cloudflare Access** (`cf-access-jwt-assertion` header or `CF_Authorization` cookie) - all other modes. RS256 JWT verified against CF Access JWKS endpoint.
 4. **Pre-setup fallback** (`cf-access-authenticated-user-email` header) - trusted only before setup completes.
 
 ### Direct GitHub OAuth Flow
 
-When `SAAS_MODE=active` and `OAUTH_CLIENT_ID` is configured, the Worker handles the entire OAuth flow:
+When `SAAS_MODE=active` or `ONBOARDING_LANDING_PAGE=active`, and `OAUTH_CLIENT_ID` is configured, the Worker handles the entire OAuth flow:
 
 ```
 User clicks "Sign in with GitHub" on /login
@@ -120,7 +120,7 @@ flowchart TD
     D --> E["getUserFromRequest()"]
     E --> F{Service token?}
     F -->|Yes| G[Return admin user]
-    F -->|No| H{SaaS + OIDC?}
+    F -->|No| H{SaaS or Onboarding + OIDC?}
     H -->|Yes| I[Verify codeflare_session cookie]
     H -->|No| J[Verify CF Access JWT]
     I --> K[Normalize email]
@@ -158,6 +158,8 @@ When `SAAS_MODE=active`, Codeflare replaces the Cloudflare Access interstitial w
 
 ### Complete SaaS Authentication Flow
 
+> Note: this flow depicts SaaS mode without `OAUTH_CLIENT_ID` (CF Access-backed). When `OAUTH_CLIENT_ID` is set, the Direct GitHub OAuth flow above applies instead and CF Access is bypassed.
+
 ```mermaid
 flowchart TD
     A["Visitor arrives at domain"] --> B["CF Access intercepts request"]
@@ -190,7 +192,7 @@ flowchart TD
 
 SaaS mode uses a layered middleware stack on every request to protected routes (`src/middleware/auth.ts`):
 
-1. **`requireIdentity`** - Resolves the user from CF Access JWT. If the user is not in KV, auto-provisions them with `pending` tier. Sets `c.get('user')`. Used for endpoints like `/api/auth/status` and `/api/auth/subscribe`.
+1. **`requireIdentity`** - Resolves the user from whichever credential the mode issues (the `codeflare_session` cookie in SaaS/onboarding OIDC mode, the CF Access JWT in default/enterprise mode). If the user is not in KV, auto-provisions them with `pending` tier. Sets `c.get('user')`. Used for endpoints like `/api/auth/status` and `/api/auth/subscribe`.
 
 2. **`requireActiveUser`** - Authenticates then checks `subscriptionTier ?? accessTier` is an active tier via `isActiveTier()`. Pending users get 403 `{ code: 'PENDING' }` - frontend redirects to `/app/subscribe`. Blocked users get 403 `{ code: 'BLOCKED' }`. In non-SaaS mode, behaves identically to `requireIdentity`.
 
@@ -202,6 +204,7 @@ SaaS mode uses a layered middleware stack on every request to protected routes (
 - Setup complete, default mode -> `/` redirects to `/app/`
 - Setup complete, onboarding mode -> authenticated users to `/app/`, unauthenticated to public landing
 - Setup complete, SaaS mode -> `/` shows login page with "Sign in with GitHub" button
+- Unauthenticated marketing-landing visitors who click Sign in go to `/login` (`APP_LINKS.signIn` in `landing/src/config.ts`), the SPA provider chooser (GitHub, Google, OIDC, one-time-pin). `/app/` is not used as the Sign-in link target because the SPA guard redirects an unauthenticated request back to `/` before the login UI renders.
 
 ---
 

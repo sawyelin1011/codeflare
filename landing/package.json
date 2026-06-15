@@ -1,0 +1,25 @@
+{
+  "name": "codeflare-landing",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "astro": "^6.4.6",
+    "motion": "^12.40.0"
+  },
+  "devDependencies": {
+    "happy-dom": "^17.4.4",
+    "vitest": "^4.1.8"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
+  }
+}

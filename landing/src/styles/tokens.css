@@ -1,0 +1,109 @@
+/* ==========================================================================
+   Codeflare Landing — Design Tokens (the single control panel)
+
+   One accent, locked. Sans (Inter) carries all prose; mono (JetBrains) is
+   reserved for the one terminal demo and inline code. Change a value here
+   and it propagates through global.css and every component.
+   ========================================================================== */
+
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
+
+:root {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* Surfaces — warm near-black with clear elevation steps */
+  --bg-base: #0a0a0c;
+  --bg-base-rgb: 10 10 12;
+  --bg-surface: #101015;
+  --bg-elevated: #16161d;
+  --bg-elevated-rgb: 22 22 29;
+  --bg-surface-rgb: 16 16 21;
+  --bg-terminal: #0c0c11;
+  --bg-terminal-rgb: 12 12 17;
+
+  /* Glass surfaces — translucent panels that float over the page-wide flare
+     fluid (desktop only; activated by html.flare-on). Dense-text panels stay
+     near-opaque so prose keeps AA contrast and the fluid only whispers through;
+     the showcase artifacts (terminal, code, diagram, form) lean glassier and
+     carry the backdrop blur that makes the frosted look intentional. */
+  --glass-panel: rgb(var(--bg-surface-rgb) / 0.92);
+  --glass-elevated: rgb(var(--bg-elevated-rgb) / 0.92);
+  --glass-artifact: rgb(var(--bg-terminal-rgb) / 0.9);
+  --glass-blur: blur(12px) saturate(120%);
+
+  /* Hairlines */
+  --border-subtle: #1c1c22;
+  --border-default: #2a2a33;
+  --border-strong: #3a3a45;
+
+  /* Text ramp */
+  --text-primary: #f6f6f7;
+  --text-secondary: #adadb6;
+  /* Muted lifted from #7b7b86 so small labels clear AA (4.5:1) on the solid
+     surfaces and still pass over the near-opaque glass panels. */
+  --text-muted: #8a8a94;
+  --text-dimmed: #565660;
+  --white-rgb: 255 255 255;
+
+  /* The one accent — a warm coral, locked across the whole page */
+  --accent: #ff5c3c;
+  --accent-rgb: 255 92 60;
+  --accent-hover: #ff734f;
+  --accent-soft: rgb(var(--accent-rgb) / 0.12);
+  --accent-line: rgb(var(--accent-rgb) / 0.32);
+
+  /* Brand flare gradient — used ONLY on the single hero accent word */
+  --flare-gradient: linear-gradient(96deg, #ff8a3d 0%, #ff5c3c 52%, #ff3f7c 100%);
+
+  /* Terminal output tones (mono demo only) */
+  --term-green: #4ade80;
+  --term-cyan: #67e8f9;
+  /* Lifted from #6b6b76, which was below AA (3.6:1) on the terminal even before
+     the fluid; now clears 4.5:1 on the solid terminal and the glass terminal. */
+  --term-dim: #85858f;
+  --term-warn: #fbbf24;
+
+  /* Selection */
+  --selection-bg: rgb(var(--accent-rgb) / 0.28);
+
+  /* Fluid type scale (clamped, mobile-first) */
+  --fs-display: clamp(2.5rem, 1.6rem + 4.4vw, 4.5rem);
+  --fs-h2: clamp(1.75rem, 1.3rem + 2.1vw, 2.6rem);
+  --fs-h3: clamp(1.15rem, 1.05rem + 0.5vw, 1.35rem);
+  /* Sub-section head: fills the empty gap between h2 and h3 so a substation head
+     (e.g. "Not just code. The systems behind it.") sits a decisive >=1.4x step
+     above its 1rem card terms at every viewport. Without it, h3/lead/body cluster
+     at 1.35/1.2/1.0 (~1.1x apart) and the hierarchy reads as an accidental near-miss. */
+  --fs-subhead: clamp(1.4rem, 1.2rem + 1.1vw, 1.7rem);
+  --fs-lead: clamp(1.05rem, 0.98rem + 0.4vw, 1.2rem);
+  --fs-body: 1rem;
+  --fs-small: 0.875rem;
+  /* Interactive-control text (buttons, inputs, micro-CTAs, SSO rows): one size,
+     between body and small, kept as its own token so every control stays uniform. */
+  --fs-ui: 0.95rem;
+  --fs-mono: 0.8125rem;
+  /* Two subordinate mono sizes carry ALL terminal chrome and dense-table text,
+     so the page uses three mono sizes total (body / ui / micro) instead of the
+     dozen one-off sizes that had accreted. --fs-mono-ui: bars, titles, ids,
+     chips, ledger rows. --fs-mono-micro: captions, column heads, state pills. */
+  --fs-mono-ui: 0.72rem;
+  --fs-mono-micro: 0.65rem;
+  --fs-kicker: 0.75rem;
+
+  /* Spacing rhythm */
+  --section-y: clamp(3rem, 2rem + 4vw, 5.5rem);
+  --gap: clamp(1rem, 0.6rem + 1.5vw, 1.75rem);
+
+  /* Layout */
+  --max-width: 72rem;
+  --measure: 60ch;
+  --nav-height: 4rem;
+  --radius: 14px;
+  --radius-sm: 10px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --dur: 0.5s;
+}

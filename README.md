@@ -2,12 +2,12 @@
 
 ![Codeflare](documentation/images/login-hero.png)
 
-An ephemeral IDE where AI coding agents reach their full potential. Fully autonomous, no boundaries, zero risk. Every session runs in an isolated container on Cloudflare's edge. Your files persist. Your bad decisions don't.
+**The enterprise agentic coding engine.** This is not a coding assistant. Codeflare runs autonomous coding agents inside your own cloud, where every change is backed by a spec, proven by tests, documented, and handed to your team as a pull request to merge.
 
-It runs wherever you happen to find yourself — on the Cloudflare edge that spans the planet, accessible from anything with a browser. Because the best commits in history were made from places without desks.
+The engineer specifies, steers, and judges; the agents do everything else — build, review, test, and ship — subject to your git, your CI, and your zero-trust boundary. Spec-driven and test-driven development run as enforced, self-healing loops, so drift is caught as a blocking finding instead of shipping. Every model call is inspected and every token of spend is attributed.
 
 ![Codeflare on a foldable tablet](documentation/images/mobile-foldable.jpg)
-*Ideas don't care where you are. Any screen with a browser, zero setup. Open the link and start building.*
+*One governed run, from intent to merge — reachable from any screen with a browser, zero setup.*
 
 **Try it:** [codeflare.ch](https://codeflare.ch)
 
@@ -56,7 +56,7 @@ Cloudflare Containers run as root, and both Claude Code and Antigravity launch w
 ![Dashboard](documentation/images/dashboard.png)
 *Manage sessions, browse persistent storage, and monitor live resource usage — all from one view.*
 
-**Built for Cloudflare — not adapted, not ported.**
+**Native integrations, wired in — not bolted on.**
 
 - **Native GitHub integration** — connect once. Every session gets automatic `git push`, `gh` CLI, and CI/CD access. No SSH keys, no per-session auth.
 - **Native Cloudflare integration** — connect once. Deploy Workers and manage D1, R2, KV, and DNS from the terminal, already authenticated.
@@ -214,7 +214,7 @@ Modes are additive flags; pick the one that matches your deployment. A flag left
 | Mode | Turn on with | What it adds | Authentication |
 |---|---|---|---|
 | **Default** | *(nothing)* | The baseline above | Cloudflare Access |
-| **Onboarding** | `ONBOARDING_LANDING_PAGE=active` | Public waitlist landing page at `/` with Turnstile CAPTCHA | Cloudflare Access |
+| **Onboarding** | `ONBOARDING_LANDING_PAGE=active` | Public marketing landing at `/`, a landing-styled `/login` with GitHub sign-in, and a post-sign-in access-request flow; Turnstile CAPTCHA on public forms | Cloudflare Access (`/login` GitHub OAuth needs the `OAUTH_*` secrets, same three as SaaS mode) |
 | **SaaS** | `SAAS_MODE=active` | Custom login page, JIT user provisioning, 8-tier subscriptions, Stripe billing, usage tracking, `/admin/users` | GitHub OAuth *or* Cloudflare Access |
 | **Enterprise** | `ENTERPRISE_MODE=active` | Single-tenant in **your** Cloudflare account; all users unlimited + Pro; LLM traffic routed through **your** AI Gateway | Cloudflare Access |
 
@@ -223,7 +223,7 @@ Modes are additive flags; pick the one that matches your deployment. A flag left
 | Mode | What to set | Auto-configured by the wizard |
 |---|---|---|
 | **Default** | Nothing beyond the two required secrets | CF Access app, groups, policies |
-| **Onboarding** | `ONBOARDING_LANDING_PAGE=active`; optionally `RESEND_API_KEY` | CF Access, Turnstile keys |
+| **Onboarding** | `ONBOARDING_LANDING_PAGE=active`; optionally `RESEND_API_KEY` and the `OAUTH_*` secrets (to enable `/login` GitHub sign-in) | CF Access, Turnstile keys |
 | **SaaS + GitHub OAuth** | `SAAS_MODE=active`; `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET` + `OAUTH_JWT_SECRET`; optionally `STRIPE_*`, `RESEND_API_KEY`, `MAX_INSTANCES` | Turnstile keys (GitHub OAuth handles auth) |
 | **SaaS + CF Access** | `SAAS_MODE=active`; optionally `STRIPE_*`, `RESEND_API_KEY`, `MAX_INSTANCES` | CF Access, Turnstile keys |
 | **Enterprise** | `ENTERPRISE_MODE=active`; `AIG_GATEWAY_URL` + `AIG_TOKEN`; optionally `AIG_LANGUAGE_MODEL` | CF Access; AI Gateway config in the Cloudflare dashboard |
@@ -250,14 +250,16 @@ All optional. **Type** is where the value goes in GitHub.
 </details>
 
 <details>
-<summary><strong>Onboarding mode — public waitlist</strong></summary>
+<summary><strong>Onboarding mode — public landing, login, and access requests</strong></summary>
 
 Set `ONBOARDING_LANDING_PAGE=active`. Turnstile CAPTCHA keys are auto-created by the wizard — no manual setup.
 
+Unauthenticated `/` serves the public marketing landing (the same page SaaS mode serves), and `/login` is served from the landing's design system with a GitHub sign-in plus enterprise-SSO request affordances. When a GitHub sign-in resolves to a user who isn't yet approved, the Worker records an access request (idempotent), emails the operators and the visitor, and shows a "request submitted" confirmation — instead of dropping them at a subscribe page. The `/login` GitHub sign-in requires the `OAUTH_*` secrets (see SaaS mode); without them, authentication stays on Cloudflare Access. A `POST /public/waitlist` signup endpoint remains available in onboarding mode.
+
 | Setting | Type | Required? | Effect |
 |---|---|---|---|
-| `ONBOARDING_LANDING_PAGE` | Variable | to enable | `active` shows a public waitlist page at `/`. Unset/`inactive` → `/` redirects to the app |
-| `RESEND_API_KEY` | Secret | recommended | [Resend](https://resend.com) API key ([resend.com/api-keys](https://resend.com/api-keys)) for waitlist welcome emails. When unset, signups still work; no email is sent |
+| `ONBOARDING_LANDING_PAGE` | Variable | to enable | `active` serves the public marketing landing at `/` and the landing-styled `/login`. Unset/`inactive` → `/` redirects to the app |
+| `RESEND_API_KEY` | Secret | recommended | [Resend](https://resend.com) API key ([resend.com/api-keys](https://resend.com/api-keys)) for waitlist welcome and access-request emails. When unset, signups and access requests still work; no email is sent |
 | `RESEND_EMAIL` | Secret | optional | Sender identity (e.g. `Codeflare <hello@yourdomain.com>`). Must be a verified Resend sender. Defaults to `Codeflare <onboarding@resend.dev>` |
 
 </details>

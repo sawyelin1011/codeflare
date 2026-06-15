@@ -1,28 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="Codeflare — your new ephemeral cloud IDE.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="Codeflare: the enterprise agentic coding engine.">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#09090b"/>
-      <stop offset="1" stop-color="#18181b"/>
+      <stop offset="0" stop-color="#0a0a0c"/>
+      <stop offset="1" stop-color="#101014"/>
     </linearGradient>
-    <radialGradient id="glow" cx="0.2" cy="0.4" r="0.8">
-      <stop offset="0" stop-color="#3B82F6" stop-opacity="0.20"/>
-      <stop offset="1" stop-color="#3B82F6" stop-opacity="0"/>
+    <radialGradient id="glow" cx="0.15" cy="0.16" r="0.95">
+      <stop offset="0" stop-color="#ff5c3c" stop-opacity="0.18"/>
+      <stop offset="0.55" stop-color="#ff5c3c" stop-opacity="0"/>
     </radialGradient>
   </defs>
+
   <rect width="1200" height="630" fill="url(#bg)"/>
   <rect width="1200" height="630" fill="url(#glow)"/>
-  <image href="logo-original-transparent.png" x="80" y="155" width="240" height="209" preserveAspectRatio="xMidYMid meet"/>
-  <g font-family="JetBrains Mono, monospace">
-    <text x="360" y="276" font-size="96" font-weight="700" letter-spacing="-2">
-      <tspan fill="#3B82F6">code</tspan><tspan fill="#fafafa">flare</tspan>
-    </text>
-    <text x="360" y="335" font-size="28" font-weight="400" fill="#a1a1aa" letter-spacing="-0.5">Ideas don't care where you are.</text>
-    <text x="360" y="378" font-size="28" font-weight="400" fill="#a1a1aa" letter-spacing="-0.5">Neither does your new ephemeral IDE.</text>
+
+  <!-- Brand lockup: the Codeflare code-glyph mark (coral tile, dark glyph) + wordmark -->
+  <rect x="80" y="56" width="64" height="64" rx="15" fill="#ff5c3c"/>
+  <g transform="translate(92,68) scale(1.667)">
+    <path d="M12.89,3L14.85,3.4L11.11,21L9.15,20.6L12.89,3M19.59,12L16,8.41V5.58L22.42,12L16,18.41V15.58L19.59,12M1.58,12L8,5.58V8.41L4.41,12L8,15.58V18.41L1.58,12Z" fill="#0a0a0c"/>
   </g>
-  <line x1="96" y1="530" x2="1104" y2="530" stroke="#27272a" stroke-width="1"/>
-  <g font-family="JetBrains Mono, monospace">
-    <text x="96" y="580" font-size="20" font-weight="600" fill="#fafafa" letter-spacing="4">CODEFLARE.CH</text>
-    <text x="1104" y="580" text-anchor="end" font-size="16" font-weight="400" fill="#71717a" letter-spacing="2">GRAY MATTER GMBH</text>
-  </g>
+  <text x="164" y="100" font-family="JetBrains Mono" font-size="34" font-weight="700" fill="#fafafa" letter-spacing="-1">codeflare</text>
+
+  <!-- Main block: vertically centered between the lockup and the footer. One font
+       (JetBrains Mono), three sizes (52 headline / 34 wordmark / 20 the rest). -->
+  <text x="80" y="236" font-family="JetBrains Mono" font-size="20" font-weight="600" fill="#ff5c3c" letter-spacing="3">NOT A CODING ASSISTANT</text>
+  <text x="80" y="306" font-family="JetBrains Mono" font-size="52" font-weight="700" fill="#fafafa" letter-spacing="-1.6">The enterprise agentic</text>
+  <text x="80" y="370" font-family="JetBrains Mono" font-size="52" font-weight="700" fill="#fafafa" letter-spacing="-1.6">coding engine.</text>
+  <text x="80" y="424" font-family="JetBrains Mono" font-size="20" font-weight="400" fill="#a1a1aa" letter-spacing="0">Coding agents that run where your code already lives.</text>
+  <text x="80" y="454" font-family="JetBrains Mono" font-size="20" font-weight="400" fill="#a1a1aa" letter-spacing="0">Spec-driven, tested, and attributed end to end.</text>
+
+  <!-- Foot: separated by space, no rule. -->
+  <text x="80" y="588" font-family="JetBrains Mono" font-size="20" font-weight="600" fill="#fafafa" letter-spacing="3">CODEFLARE.CH</text>
+  <text x="1120" y="588" text-anchor="end" font-family="JetBrains Mono" font-size="20" font-weight="400" fill="#71717a" letter-spacing="2">GRAY MATTER GMBH</text>
 </svg>

@@ -1656,18 +1656,38 @@ warm_pi_npm_dependencies() {
         echo "[entrypoint] Pi extension npm dependencies symlinked"
     fi
 
+    # Expose the image-baked jiti transpile cache at jiti's tmpdir fallback
+    # path (this pi build ignores a path-valued JITI_FS_CACHE env; it caches
+    # under $TMPDIR/jiti). The cache is content-addressed, so entries baked at
+    # image build hit for the seeded extensions + npm packages and the first
+    # Pi launch loads warm (~4s instead of ~9s of cold transpile) — keeping
+    # the host pre-warm under its 20s cap. Skipped if something already
+    # created a real /tmp/jiti (its entries would be newer truth).
+    if [ -d /opt/codeflare/jiti-cache ] && [ ! -e /tmp/jiti ]; then
+        ln -s /opt/codeflare/jiti-cache /tmp/jiti
+        echo "[entrypoint] Pi jiti transpile cache symlinked (image-baked warm cache)"
+    fi
+
     local pi_settings="${PI_SETTINGS_FILE:-$USER_HOME/.pi/agent/settings.json}"
     mkdir -p "$(dirname "$pi_settings")"
     node - "$pi_settings" <<'NODE'
 const fs = require('fs');
 const path = process.argv[2];
 const required = [
-  'npm:@gotgenes/pi-subagents@14.0.1',
+  'npm:@gotgenes/pi-subagents@16.2.1',
+  // context-mode is now enabled by default for Pi (was disabled): its ctx_* tools
+  // and the bash-curl-redirect hook are active without an explicit `/ctx on`.
+  'npm:context-mode@1.0.162',
+  // Pi tool extensions, always enabled (in `required`) so they are available
+  // independently of the context-mode toggle — toggling /ctx off never disables them.
+  'npm:@juicesharp/rpiv-advisor@1.19.1',
+  'npm:@juicesharp/rpiv-ask-user-question@1.19.1',
+  'npm:@juicesharp/rpiv-todo@1.19.1',
+  'npm:pi-web-access@0.10.7',
+  'npm:pi-mcp-adapter@2.9.0',
 ];
-const disabledPackageIds = new Set(['npm:context-mode']);
-const disabledPackages = [
-  { source: 'npm:context-mode@1.0.162', extensions: [], skills: [] },
-];
+const disabledPackageIds = new Set([]);
+const disabledPackages = [];
 // Migration: hard-remove the deprecated third-party graphify wrapper from existing settings.
 // graphify is now the first-party graphify-native.ts extension; loading both registers the same
 // tools (graphify_query/path/explain) and Pi refuses to start. Unlike disabled packages this is
@@ -1746,31 +1766,97 @@ echo "[entrypoint] Claude Code bypass permissions consent pre-accepted"
 # contract; see REQ-MEM-002 AC6). The hook script mkdir -p's it on first
 # fire - no boot-time provisioning needed.
 
-# Configure consult-llm-mcp MCP server when LLM API keys are present
-if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${GEMINI_API_KEY:-}" ]; then
-    # Build env object with only the keys that are set
-    LLM_ENV="{}"
-    if [ -n "${OPENAI_API_KEY:-}" ]; then
-        LLM_ENV=$(echo "$LLM_ENV" | jq --arg k "$OPENAI_API_KEY" '. + {"OPENAI_API_KEY": $k}')
-    fi
-    if [ -n "${GEMINI_API_KEY:-}" ]; then
-        LLM_ENV=$(echo "$LLM_ENV" | jq --arg k "$GEMINI_API_KEY" '. + {"GEMINI_API_KEY": $k}')
-    fi
-
-    LLM_MCP_CONFIG=$(jq -n --argjson env "$LLM_ENV" '{"mcpServers":{"consult-llm":{"command":"npx","args":["-y","consult-llm-mcp"],"env":$env}}}')
-    if [ -f "$USER_CLAUDE_JSON" ]; then
-        TMP_JSON=$(mktemp)
-        if jq --argjson mcp "$LLM_MCP_CONFIG" '. * $mcp' "$USER_CLAUDE_JSON" > "$TMP_JSON" 2>/dev/null; then
-            mv "$TMP_JSON" "$USER_CLAUDE_JSON"
+# ---------------------------------------------------------------------------
+# consult-llm-mcp MCP server (Claude Code + Pi).
+#
+# The provider keys reach this server ONLY: container-env.ts injects them as
+# CODEFLARE_OPENAI_API_KEY / CODEFLARE_GEMINI_API_KEY (never the bare
+# OPENAI_API_KEY / GEMINI_API_KEY), so the coding agents (Pi, opencode,
+# antigravity) cannot auto-detect them and silently bill the user's API account.
+# We map them back to the standard names ONLY inside this server's scoped `env`.
+#
+# Backend per provider (prefer the subscription, fall back to the API key):
+#   OpenAI - Codex CLI (subscription) when the user is logged into Codex
+#            (~/.codex/auth.json); the API key, if configured, is also passed as a
+#            fallback. Otherwise the API key.
+#   Gemini - API key (no consult-llm-compatible Gemini subscription CLI ships;
+#            gemini-cli was replaced by Antigravity per AD65, opencode's Google is
+#            Vertex/API-key only).
+#
+# Disabled entirely in Enterprise Mode (models route through the AI Gateway BYOK,
+# "LLM API Keys" is hidden, and any seeded consult-llm skill is removed).
+#
+# Wrapped in a function called with `|| echo WARNING` so a jq/IO failure can never
+# abort the entrypoint before the init-complete flag (would crash-loop the
+# container, the AD-class bug fixed for the enterprise block).
+_merge_consult_llm_mcp() {
+    # $1 target json, $2 config json, $3 human label
+    local target="$1" cfg="$2" label="$3" tmp
+    if [ -f "$target" ]; then
+        tmp=$(mktemp)
+        if jq --argjson mcp "$cfg" '. * $mcp' "$target" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$target"
         else
-            echo "[entrypoint] WARNING: Could not merge consult-llm MCP config (malformed .claude.json?)"
-            rm -f "$TMP_JSON"
+            echo "[entrypoint] WARNING: could not merge consult-llm MCP config into $target (malformed?)"
+            rm -f "$tmp"
+            return 0
         fi
     else
-        echo "$LLM_MCP_CONFIG" | jq '.' > "$USER_CLAUDE_JSON"
+        printf '%s\n' "$cfg" | jq '.' > "$target"
     fi
-    echo "[entrypoint] consult-llm MCP server configured for Claude Code"
-fi
+    echo "[entrypoint] consult-llm MCP server configured for $label"
+}
+
+configure_consult_llm() {
+    if [ "${ENTERPRISE_MODE:-}" = "active" ]; then
+        # No per-user LLM keys in enterprise; ensure the skill is absent for all agents.
+        rm -rf "$USER_HOME/.claude/skills/consult-llm" "$USER_HOME/.pi/agent/skills/consult-llm" 2>/dev/null || true
+        echo "[entrypoint] Enterprise Mode: consult-llm disabled (no per-user LLM keys)"
+        return 0
+    fi
+
+    local env_obj="{}" ok=0
+    # OpenAI: Codex subscription if logged in (+ API key as fallback), else API key.
+    if [ -f "$USER_HOME/.codex/auth.json" ]; then
+        env_obj=$(printf '%s' "$env_obj" | jq -c '. + {"CONSULT_LLM_OPENAI_BACKEND":"codex-cli","CONSULT_LLM_CODEX_REASONING_EFFORT":"high"}')
+        ok=1
+        if [ -n "${CODEFLARE_OPENAI_API_KEY:-}" ]; then
+            env_obj=$(printf '%s' "$env_obj" | jq -c --arg k "$CODEFLARE_OPENAI_API_KEY" '. + {"OPENAI_API_KEY":$k}')
+        fi
+        echo "[entrypoint] consult-llm: OpenAI -> Codex CLI (subscription)"
+    elif [ -n "${CODEFLARE_OPENAI_API_KEY:-}" ]; then
+        env_obj=$(printf '%s' "$env_obj" | jq -c --arg k "$CODEFLARE_OPENAI_API_KEY" '. + {"OPENAI_API_KEY":$k}')
+        ok=1
+        echo "[entrypoint] consult-llm: OpenAI -> API key"
+    fi
+    # Gemini: API key.
+    if [ -n "${CODEFLARE_GEMINI_API_KEY:-}" ]; then
+        env_obj=$(printf '%s' "$env_obj" | jq -c --arg k "$CODEFLARE_GEMINI_API_KEY" '. + {"GEMINI_API_KEY":$k}')
+        ok=1
+        echo "[entrypoint] consult-llm: Gemini -> API key"
+    fi
+    [ "$ok" = "1" ] || { echo "[entrypoint] consult-llm: no usable provider; skipping"; return 0; }
+
+    # consult-llm-mcp is installed globally at image build (Dockerfile, pinned +
+    # shadow-tracked in bump-shadow-pins.yml), so the MCP server invokes the global
+    # bin directly from PATH — no per-session `npx -y` registry fetch / first-call
+    # delay. Mirrors the context-mode pre-warm pattern.
+    # Claude Code reads ~/.claude.json mcpServers.
+    _merge_consult_llm_mcp "$USER_CLAUDE_JSON" \
+        "$(jq -n --argjson env "$env_obj" '{"mcpServers":{"consult-llm":{"command":"consult-llm-mcp","args":[],"env":$env}}}')" \
+        "Claude Code"
+
+    # Pi's pi-mcp-adapter reads ~/.pi/agent/mcp.json (same shape); directTools
+    # promotes consult_llm to a first-class Pi tool (not buried behind the proxy).
+    mkdir -p "$USER_HOME/.pi/agent"
+    # lifecycle:keep-alive — pi-mcp-adapter defaults a server with no lifecycle to "lazy", which
+    # closes the consult-llm process on idle and shows the footer as "0/1
+    # servers ... cached". keep-alive connects on startup and auto-reconnects if it drops.
+    _merge_consult_llm_mcp "$USER_HOME/.pi/agent/mcp.json" \
+        "$(jq -n --argjson env "$env_obj" '{"mcpServers":{"consult-llm":{"command":"consult-llm-mcp","args":[],"env":$env,"lifecycle":"keep-alive","directTools":["consult_llm"]}}}')" \
+        "Pi"
+}
+configure_consult_llm || echo "[entrypoint] WARNING: consult-llm configuration failed; continuing startup"
 
 # ---------------------------------------------------------------------------
 # Enterprise Mode agent routing. (Implements REQ-ENTERPRISE-004 / 005)
@@ -1980,24 +2066,41 @@ COPILOT_BYOK_EOF
     # can raise the level when a route model supports reasoning over chat/completions
     # (e.g. Gemini); gpt-5.5 stays 400 at levels above off until CF fixes
     # /ai/v1/responses -- that is the documented, user-visible tradeoff.
-    PI_MODELS_ARRAY="$(echo "$ENTERPRISE_ROUTE_CATALOG" | jq -c --arg def "$ENTERPRISE_DEFAULT_ROUTE" '
-        (if type=="array" and length>0 then . else [$def] end)
-        | map({ id: ., reasoning: true, input: ["text", "image"] })')"
-    PI_PROVIDER_CONFIG=$(jq -n \
-        --arg baseUrl "$PI_GATEWAY_BASE_URL" \
-        --arg apiKey "$ENTERPRISE_PLACEHOLDER_TOKEN" \
-        --argjson models "$PI_MODELS_ARRAY" '{
-        providers: {
-            "codeflare-gateway": {
-                baseUrl: $baseUrl,
-                api: "openai-completions",
-                apiKey: $apiKey,
-                authHeader: true,
-                models: $models
+    # NOTE: the jq arg is named `defroute`, NOT `def`. `def` is a reserved jq
+    # keyword (function definition), so `--arg def ... $def` is a compile error
+    # on jq 1.6 (the Debian bookworm base image's version) — and because this is
+    # an unguarded command-substitution under `set -euo pipefail`, that aborted
+    # entrypoint.sh and crash-looped every enterprise container.
+    # Build the provider config defensively. These jq command-substitutions run
+    # under `set -euo pipefail`; an UNGUARDED failure here kills PID 1 and
+    # crash-loops the container with no shipped logs (the failure mode this whole
+    # section was hardened against). A malformed catalog must degrade to "Pi
+    # unpinned, container stays up", never a dead container — so the `|| OK=0`
+    # guards keep set -e from aborting and we skip the pin on any jq failure.
+    PI_GATEWAY_CONFIG_OK=1
+    PI_MODELS_ARRAY="$(echo "$ENTERPRISE_ROUTE_CATALOG" | jq -c --arg defroute "$ENTERPRISE_DEFAULT_ROUTE" '
+        (if type=="array" and length>0 then . else [$defroute] end)
+        | map({ id: ., reasoning: true, input: ["text", "image"] })' 2>/dev/null)" || PI_GATEWAY_CONFIG_OK=0
+    PI_PROVIDER_CONFIG=""
+    if [ "$PI_GATEWAY_CONFIG_OK" = "1" ]; then
+        PI_PROVIDER_CONFIG="$(jq -n \
+            --arg baseUrl "$PI_GATEWAY_BASE_URL" \
+            --arg apiKey "$ENTERPRISE_PLACEHOLDER_TOKEN" \
+            --argjson models "$PI_MODELS_ARRAY" '{
+            providers: {
+                "codeflare-gateway": {
+                    baseUrl: $baseUrl,
+                    api: "openai-completions",
+                    apiKey: $apiKey,
+                    authHeader: true,
+                    models: $models
+                }
             }
-        }
-    }')
-    if [ -f "$PI_MODELS_JSON" ]; then
+        }' 2>/dev/null)" || PI_GATEWAY_CONFIG_OK=0
+    fi
+    if [ "$PI_GATEWAY_CONFIG_OK" != "1" ] || [ -z "$PI_PROVIDER_CONFIG" ]; then
+        echo "[entrypoint] WARNING: could not build Pi enterprise gateway config (catalog=$ENTERPRISE_ROUTE_CATALOG); leaving Pi unpinned — container stays up"
+    elif [ -f "$PI_MODELS_JSON" ]; then
         TMP_JSON=$(mktemp)
         # Authoritative for codeflare-gateway only: replace that provider key wholesale
         # (so a removed route disappears) while preserving any other providers.
@@ -2169,15 +2272,17 @@ echo "[entrypoint] graphify MCP server registered in .claude.json (version $GRAP
 # WebFetch fallback for bot-protection, login walls, redirect chains, and
 # JS-only pages. (Implements REQ-BROWSER-001 / REQ-BROWSER-003)
 #
-# Per-agent transport differs because the agents differ in MCP support:
-#   - Claude Code: chrome-devtools-mcp (Cloudflare's canonical MCP client path)
-#     pointed at the Browser Run CDP /devtools WebSocket, registered HERE in
-#     ~/.claude.json.
-#   - Pi: a NATIVE wrapper extension (preseed/agents/pi/extensions/browser-run.ts,
-#     seeded to ~/.pi/agent/extensions/) that calls the Browser Run REST Quick
-#     Actions. Pi does not consume MCP servers, so it gets native browser_*
-#     tools instead — no wiring needed here; the extension self-gates on the
-#     same CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID env vars.
+# Both coding agents get the SAME chrome-devtools-mcp server pointed at the
+# Browser Run CDP /devtools WebSocket, so both have full interactive control
+# (navigate, click, fill, take_screenshot, take_snapshot, resize_page for a
+# mobile viewport) — the foundation the browser-e2e skill rests on:
+#   - Claude Code: registered in ~/.claude.json mcpServers (canonical MCP path).
+#   - Pi: registered in ~/.pi/agent/mcp.json; Pi's pi-mcp-adapter bridges it in
+#     (reachable through the `mcp` proxy tool), exactly as consult-llm is wired
+#     for Pi above. lifecycle:lazy so an idle session does not pin a remote
+#     browser open. Pi ALSO keeps its native browser_* tools (the REST Quick
+#     Actions wrapper in preseed/agents/pi/extensions/browser-run.ts) as the
+#     cheap one-shot read path — markdown/content/scrape with no CDP session.
 #   - GitHub Copilot: deferred (not wired yet).
 #
 # CDP endpoint (Claude):
@@ -2220,8 +2325,49 @@ if [ "${SESSION_MODE:-default}" = "advanced" ] \
         echo "$BROWSER_MCP_CLAUDE" | jq '.' > "$USER_CLAUDE_JSON"
     fi
     echo "[entrypoint] chrome-devtools MCP server registered in .claude.json (Cloudflare Browser Run)"
-    # Pi gets native browser_* tools via its preseeded extension (self-gated on
-    # the same env vars); nothing to wire here.
+
+    # Pi (~/.pi/agent/mcp.json) - the SAME chrome-devtools server, bridged in by
+    # the pi-mcp-adapter (reachable via the `mcp` proxy). Mirrors the Claude merge
+    # above and the consult-llm Pi merge in configure_consult_llm. lifecycle:lazy
+    # connects on first use and disconnects on idle, so an idle Pi session does
+    # not hold a remote browser open. Pi keeps its native browser_* tools too (the
+    # cheap one-shot REST read path); chrome-devtools adds the interactive flow.
+    BROWSER_MCP_PI=$(jq -n --arg ep "$CDP_WS_ENDPOINT" --arg hdr "$CDP_WS_HEADERS" \
+        '{mcpServers:{"chrome-devtools":{command:"npx",args:["-y","chrome-devtools-mcp@1.1.1",("--wsEndpoint=" + $ep),("--wsHeaders=" + $hdr)],lifecycle:"lazy"}}}')
+    PI_MCP_JSON="$USER_HOME/.pi/agent/mcp.json"
+    mkdir -p "$USER_HOME/.pi/agent"
+    if [ -f "$PI_MCP_JSON" ]; then
+        TMP_JSON=$(mktemp)
+        if jq --argjson mcp "$BROWSER_MCP_PI" '. * $mcp' "$PI_MCP_JSON" > "$TMP_JSON" 2>/dev/null; then
+            mv "$TMP_JSON" "$PI_MCP_JSON"
+        else
+            echo "[entrypoint] WARNING: Could not merge chrome-devtools MCP config into Pi mcp.json (malformed?)"
+            rm -f "$TMP_JSON"
+        fi
+    else
+        echo "$BROWSER_MCP_PI" | jq '.' > "$PI_MCP_JSON"
+    fi
+    echo "[entrypoint] chrome-devtools MCP server registered in Pi mcp.json (Cloudflare Browser Run)"
+
+    # Claude (~/.claude.json) - the cheap one-shot page-read surface (markdown /
+    # content / scrape), giving Claude parity with Pi's native browser_* tools.
+    # Backed by /opt/codeflare/browser-run-mcp (built in the Dockerfile). The CF
+    # token + account are passed in the server's scoped env. With this, both
+    # agents have BOTH surfaces: interactive (chrome-devtools) + markdown (REST).
+    BROWSER_RUN_MCP_CLAUDE=$(jq -n --arg tok "$CLOUDFLARE_API_TOKEN" --arg acct "$CLOUDFLARE_ACCOUNT_ID" \
+        '{mcpServers:{"browser-run":{command:"node",args:["/opt/codeflare/browser-run-mcp/index.mjs"],env:{CLOUDFLARE_API_TOKEN:$tok,CLOUDFLARE_ACCOUNT_ID:$acct}}}}')
+    if [ -f "$USER_CLAUDE_JSON" ]; then
+        TMP_JSON=$(mktemp)
+        if jq --argjson mcp "$BROWSER_RUN_MCP_CLAUDE" '. * $mcp' "$USER_CLAUDE_JSON" > "$TMP_JSON" 2>/dev/null; then
+            mv "$TMP_JSON" "$USER_CLAUDE_JSON"
+        else
+            echo "[entrypoint] WARNING: Could not merge browser-run MCP config into .claude.json (malformed?)"
+            rm -f "$TMP_JSON"
+        fi
+    else
+        echo "$BROWSER_RUN_MCP_CLAUDE" | jq '.' > "$USER_CLAUDE_JSON"
+    fi
+    echo "[entrypoint] browser-run MCP server registered in .claude.json (Cloudflare Browser Run markdown/content/scrape)"
 fi
 
 # Configure Claude Code settings.json with hooks (advanced) or just settings (default)

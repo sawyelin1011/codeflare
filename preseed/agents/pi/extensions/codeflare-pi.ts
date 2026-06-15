@@ -8,7 +8,8 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { cloneTargetPath, effectiveCwdForCommand, graphifyClonePromptDecision, isFailedToolExecution, renderGraphifyCloneDirective } from "./graphify-helpers";
+import { cloneTargetPath, effectiveCwdForCommand, ENV_PREFIX, graphifyClonePromptDecision, isFailedToolExecution, renderGraphifyCloneDirective } from "./graphify-helpers";
+import { rememberActiveRepo } from "./review-job-helpers";
 import { sddCommandDecision, type SddRepoState, SDD_HELP_TEXT } from "./sdd-helpers";
 import { attributionBlockReason, localBuildBlockReason } from "./guard-helpers";
 
@@ -113,6 +114,9 @@ function updateActiveRepoFromPath(path: string): string | undefined {
   if (!repo) return undefined;
   ensureCacheDir();
   writeFileSync(ACTIVE_REPO_FILE, repo + "\n", "utf8");
+  // Also remember in-session (shared module state) so the local-statusline
+  // footer can render repo:branch without trusting the shared on-disk sentinel.
+  rememberActiveRepo(repo);
   return repo;
 }
 
@@ -130,10 +134,6 @@ function activeRepo(ctx: ExtensionContext): string | undefined {
 
 function hasGraph(repo: string): boolean {
   return existsSync(join(repo, "graphify-out", "graph.json"));
-}
-
-function reviewLaneActive(): boolean {
-  return ((globalThis as { __codeflareReviewLaneDepth?: number }).__codeflareReviewLaneDepth ?? 0) > 0;
 }
 
 type GraphFreshness = {
@@ -233,6 +233,20 @@ function commandText(event: any): string {
   return "";
 }
 
+// Shell-only command text for CLONE detection (git-push-review-reminder.sh:74-84): Bash
+// `.command`; ctx_execute `.code` only when language === "shell"; ctx_batch_execute
+// `.commands[].command`. Prevents a JS/TS/python ctx_execute body whose source contains a
+// clone-looking string literal from false-firing the clone prompt (Issue 2B). Deliberately
+// NARROWER than commandText() above — the attribution / build-block / active-repo callers
+// still need any command text, so only the clone branch uses this.
+function shellCommandText(event: any): string {
+  const input = event?.input ?? event?.params ?? event?.args ?? {};
+  if (typeof input.command === "string") return input.command;
+  if (input.language === "shell" && typeof input.code === "string") return input.code;
+  if (Array.isArray(input.commands)) return input.commands.map((cmd: any) => (cmd && typeof cmd.command === "string" ? cmd.command : "")).join("\n");
+  return "";
+}
+
 function resultText(event: any): string {
   const content = event?.content;
   if (Array.isArray(content)) {
@@ -319,7 +333,8 @@ function fallbackGraphifyToolResult(event: any, ctx: ExtensionContext): { conten
 }
 
 function isGitClone(command: string): boolean {
-  return /(^|[;&|\n]\s*)git\s+clone\b/.test(command) || /(^|[;&|\n]\s*)gh\s+repo\s+clone\b/.test(command);
+  return new RegExp(String.raw`(^|[;&|\n]\s*)` + ENV_PREFIX + String.raw`git\s+clone\b`).test(command)
+    || new RegExp(String.raw`(^|[;&|\n]\s*)` + ENV_PREFIX + String.raw`gh\s+repo\s+clone\b`).test(command);
 }
 
 export function shouldHandleClonePrompt(command: string, targetWasAlreadyCloned: boolean, reviewLaneDepth: number): boolean {
@@ -434,8 +449,8 @@ function setContextModeEnabled(enabled: boolean): "enabled" | "disabled" {
 function contextModeStatusText(): string {
   const enabled = contextModeEnabled();
   return enabled
-    ? "context-mode is enabled for this running Pi session. It will be disabled again on the next Codeflare container start. Use `/ctx off` to disable now."
-    : "context-mode is disabled. Use `/ctx on` to enable it for this running Pi session, then Pi will reload resources.";
+    ? "context-mode is enabled (the default for Pi). Use `/ctx off` to disable it for this running Pi session; the next Codeflare container start re-enables it."
+    : "context-mode is disabled for this running Pi session. Use `/ctx on` to re-enable it now (Pi reloads resources); the next Codeflare container start re-enables it by default.";
 }
 
 function newestVaultMtime(): number | undefined {
@@ -543,10 +558,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    // Durable PR-boundary review lanes load this extension in-process for the build-blocker and
-    // other guards, but must not re-run the per-repo global-graph merge (redundant; the main
-    // session already merged it). The lane runner sets this depth counter around the session.
-    if (reviewLaneActive()) return;
     const repo = activeRepo(ctx);
     if (repo) maybeMergeGlobalGraph(repo);
     const summary = repo ? graphSummary(repo) : undefined;
@@ -581,8 +592,9 @@ export default function (pi: ExtensionAPI) {
     // and `git -C ...` forms into the active-repo sentinel before graph-first gating fires.
     if (command) {
       const id = toolEventId(event);
-      if (id && isGitClone(command) && !cloneTargetHadGit.has(id)) {
-        const target = cloneTargetPath(command, ctx.sessionManager.getCwd());
+      const cloneCmd = shellCommandText(event);
+      if (id && isGitClone(cloneCmd) && !cloneTargetHadGit.has(id)) {
+        const target = cloneTargetPath(cloneCmd, ctx.sessionManager.getCwd());
         if (target) cloneTargetHadGit.set(id, existsSync(join(target, ".git")));
       }
       try {
@@ -616,24 +628,30 @@ export default function (pi: ExtensionAPI) {
 
   const onToolEnd = (event: any, ctx: any) => {
     const command = commandText(event);
+    const cloneCmd = shellCommandText(event);
     const cwd = ctx.sessionManager.getCwd();
     const id = toolEventId(event);
     const targetWasAlreadyCloned = id ? cloneTargetHadGit.get(id) === true : false;
-    const shouldHandleClone = shouldHandleClonePrompt(command, targetWasAlreadyCloned, (globalThis as { __codeflareReviewLaneDepth?: number }).__codeflareReviewLaneDepth ?? 0);
+    // Lane depth is 0 here: detached PR-boundary review lanes (AD76) run as separate `pi --mode json`
+    // processes that load review-lane-guards.ts, not this extension in-process, so there is no in-process
+    // lane to suppress. The depth param is retained on shouldHandleClonePrompt for its own unit tests.
+    const shouldHandleClone = shouldHandleClonePrompt(cloneCmd, targetWasAlreadyCloned, 0);
     const decision = shouldHandleClone
       ? graphifyClonePromptDecision({
-        command,
+        command: cloneCmd,
         cwd,
         sessionId: String(ctx.sessionManager?.getSessionId?.() ?? process.ppid),
         failed: isFailedToolExecution(event),
         output: resultText(event),
         findGitRoot,
         hasGraph,
+        exists: existsSync,
+        freshness: (repo: string) => graphFreshness(repo).status,
       })
       : undefined;
     const repo = updateActiveRepoFromPath(decision?.repo ?? (command ? effectivePathForCommand(command, cwd) : cwd));
 
-    if (repo && hasGraph(repo) && !reviewLaneActive()) maybeMergeGlobalGraph(repo);
+    if (repo && hasGraph(repo)) maybeMergeGlobalGraph(repo);
 
     if (decision && !existsSync(decision.marker)) {
       writeFileSync(decision.marker, "1", "utf8");

@@ -163,11 +163,34 @@ describe('shadow-pin bump workflow / REQ-OPS-020 (shadow-pin version bump automa
     assert.match(body, /npm view context-mode version/, 'context-mode job must check npm registry');
   });
 
+  test('AC2: EVERY Pi preseed dep is watched (data-driven over the manifest)', () => {
+    const body = readWorkflow('bump-shadow-pins.yml');
+    assert.match(body, /^\s+pi-preseed:/m, 'bump-shadow-pins.yml must declare a `pi-preseed:` job');
+    // The job iterates every dependency in the Pi preseed package.json and checks
+    // npm latest for each (not just @gotgenes/pi-subagents + context-mode), so the
+    // rpiv family / pi-web-access / pi-mcp-adapter are tracked too.
+    assert.match(body, /execFileSync\('npm', \['view', name, 'version'\]/, 'pi-preseed job must check npm latest for every preseed dep');
+    assert.match(body, /preseed\/agents\/pi\/package\.json/, 'pi-preseed job must read the pins from the Pi preseed package.json');
+  });
+
   test('AC2: graphify (graphifyy) PyPI package is watched', () => {
     const body = readWorkflow('bump-shadow-pins.yml');
     assert.match(body, /^\s+graphify:/m, 'bump-shadow-pins.yml must declare a `graphify:` job');
     assert.match(body, /pypi\.org\/pypi\/graphifyy\/json/, 'graphify job must check the PyPI registry for graphifyy');
     assert.match(body, /plugins\/graphify\/\.claude-plugin\/plugin\.json/, 'graphify job must read the pin from plugin.json');
+  });
+
+  test('AC2: consult-llm-mcp npm package (Dockerfile global pin) is watched', () => {
+    const body = readWorkflow('bump-shadow-pins.yml');
+    assert.match(body, /^\s+consult-llm-mcp:/m, 'bump-shadow-pins.yml must declare a `consult-llm-mcp:` job');
+    assert.match(body, /npm view consult-llm-mcp version/, 'consult-llm-mcp job must check the npm registry');
+  });
+
+  test('AC2: @modelcontextprotocol/sdk (browser-run-mcp package.json) is watched', () => {
+    const body = readWorkflow('bump-shadow-pins.yml');
+    assert.match(body, /^\s+browser-run-mcp:/m, 'bump-shadow-pins.yml must declare a `browser-run-mcp:` job');
+    assert.match(body, /npm view @modelcontextprotocol\/sdk version/, 'browser-run-mcp job must check the npm registry');
+    assert.match(body, /preseed\/agents\/claude\/browser-run-mcp\/package\.json/, 'browser-run-mcp job must read+write the pin from the server package.json');
   });
 
   test('AC3: SHA256 is invalidated on Dockerfile bumps', () => {

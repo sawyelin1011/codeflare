@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeReviewStateFrom, shouldReconcileOpenPr, reconcileBoundaryAction, reviewBaselineContinuation, resolveReviewRepo, type ComputeReviewStateInput, type OpenPrReconcileInput, type ReconcileBoundaryInput } from '../../../preseed/agents/pi/extensions/review-job-helpers';
+import { computeReviewStateFrom, shouldReconcileOpenPr, reconcileBoundaryAction, reviewBaselineContinuation, reviewInSessionContinuation, mergeGateDecision, resolveReviewRepo, rememberReviewRepo, recallReviewRepo, rememberActiveRepo, recallActiveRepo, activeRepoSentinelForDisplay, compactDurableReviewStatus, formatReviewElapsed, formatReviewTokens, type ComputeReviewStateInput, type OpenPrReconcileInput, type ReconcileBoundaryInput, type MergeGateInput } from '../../../preseed/agents/pi/extensions/review-job-helpers';
 
 /**
  * computeReviewStateFrom is the canonical review-state definition (review.md §17.2).
@@ -209,6 +209,48 @@ describe('reviewBaselineContinuation (bug-A fix: offer on launch, autostart only
 });
 
 /**
+ * reviewInSessionContinuation is the FULL autostart-vs-offer signal. boundaryActed
+ * (a real push happened this session for this repo+branch) is the PRIMARY signal; the baseline
+ * descendant check is the backstop for a reload that ate the boundary tool-event. A bare checkout sets
+ * neither, so it OFFERS.
+ */
+describe('reviewInSessionContinuation (boundaryActed primary, baseline backstop)', () => {
+  const descends = () => true;
+  const unrelated = () => false;
+
+  it('autostarts when a boundary command ran this session, even with no/equal baseline', () => {
+    // No baseline (e.g. no open PR at launch, PR created mid-session) — boundaryActed alone autostarts.
+    expect(reviewInSessionContinuation({ boundaryActed: true, baseline: undefined, head: 'h2', isAncestor: unrelated })).toBe(true);
+    expect(reviewInSessionContinuation({ boundaryActed: true, baseline: 'h2', head: 'h2', isAncestor: unrelated })).toBe(true);
+  });
+
+  it('autostarts via the baseline backstop when boundaryActed was missed but the head advanced', () => {
+    // Reload ate the tool-event: boundaryActed false, but head descends from the session branch baseline.
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: 'h1', head: 'h2', isAncestor: descends })).toBe(true);
+  });
+
+  it('OFFERS an inherited head: no boundary command and head equals/does-not-descend baseline', () => {
+    // Bare checkout / fresh launch: no push this session, baseline === head (just-seeded) → offer.
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: 'h1', head: 'h1', isAncestor: descends })).toBe(false);
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: undefined, head: 'h1', isAncestor: descends })).toBe(false);
+    // Cross-branch checkout to an unrelated descendant: not boundary-acted, does not descend → offer.
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: 'h1', head: 'h9', isAncestor: unrelated })).toBe(false);
+  });
+
+  it('suppresses the baseline backstop once the branch was acked this session (offers a fetched remote head)', () => {
+    // After an in-session ack, a descendant of the session baseline reached WITHOUT a boundary command is
+    // a remote-actor head fetched via `git pull` (a CI bot / concurrent Claude) — it must OFFER, not
+    // auto-start a duplicate review. Without the ackedThisSession suppression the baseline backstop fired.
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: 'h1', head: 'h3', isAncestor: descends, ackedThisSession: true })).toBe(false);
+    // A genuine in-session push after the ack still autostarts: boundaryActed is the strong signal and is
+    // checked BEFORE the suppression, so ackedThisSession never blocks a real push.
+    expect(reviewInSessionContinuation({ boundaryActed: true, baseline: 'h1', head: 'h3', isAncestor: descends, ackedThisSession: true })).toBe(true);
+    // Before any ack this session, the backstop still works (the reload-ate-the-tool-event case).
+    expect(reviewInSessionContinuation({ boundaryActed: false, baseline: 'h1', head: 'h3', isAncestor: descends, ackedThisSession: false })).toBe(true);
+  });
+});
+
+/**
  * resolveReviewRepo picks the repo a review handler acts on FROM ITS OWN candidate dirs, never the
  * shared graphify active-cwd sentinel (a cross-agent file that flaps to whichever agent acted
  * last). These fail if the precedence regresses, or if the resolver ever reaches outside its given
@@ -234,6 +276,29 @@ describe('resolveReviewRepo (review-repo resolution detached from the graphify s
 
   it('uses the remembered in-session review repo for the no-ctx reaper, before the process cwd', () => {
     expect(resolveReviewRepo({ sessionReviewRepo: '/ws/ai-news-digest', processCwd: '/pi/proc' }, gitRootOf)).toBe('/ws/ai-news-digest');
+  });
+
+  it('falls back to the in-memory active repo (walked to its git root) before the process cwd', () => {
+    // The /review-run + no-ctx-reaper fix: no commandCwd, the session cwd is the parentless
+    // workspace, and sessionReviewRepo is unset until a review has already run — so the active-cwd
+    // codeflare-pi.ts tracks on every tool execution is the only signal that finds the nested clone.
+    expect(resolveReviewRepo({ activeRepo: '/ws/ai-news-digest/src', processCwd: '/pi/proc' }, gitRootOf)).toBe('/ws/ai-news-digest');
+  });
+
+  it('resolves the nested clone for /review-status when the session cwd is a non-repo parent workspace', () => {
+    // The /review-status nested-workspace bug: the Pi session cwd is the parentless workspace
+    // (/home/user/workspace, no .git) while the user worked in a nested clone via `cd repo && ...`.
+    // /review-status now passes exactly this shape to resolveReviewRepo, so the in-memory active
+    // repo (codeflare-pi tracks it per tool execution) resolves the nested clone instead of warning
+    // "not inside a git repository" — and it beats processCwd, which would resolve the wrong repo.
+    expect(resolveReviewRepo(
+      { sessionCwd: '/home/user/workspace', sessionReviewRepo: undefined, activeRepo: '/ws/ai-news-digest/src', processCwd: '/pi/proc' },
+      gitRootOf,
+    )).toBe('/ws/ai-news-digest');
+  });
+
+  it('prefers a remembered sessionReviewRepo over the active repo', () => {
+    expect(resolveReviewRepo({ sessionReviewRepo: '/ws/ai-news-digest', activeRepo: '/pi/proc' }, gitRootOf)).toBe('/ws/ai-news-digest');
   });
 
   it('falls back to the process cwd only when nothing else resolves', () => {
@@ -294,5 +359,195 @@ describe('REQ-AGENT-058 AC4: every suppressed reconcile gate names its own reaso
   it('each gate names a DISTINCT reason so the audit event identifies which gate fired', () => {
     const reasons = gates.map(([, input]) => shouldReconcileOpenPr(input).reason);
     expect(new Set(reasons).size).toBe(reasons.length);
+  });
+});
+
+/**
+ * Shared in-session review-repo memory. review-enforcement remembers the resolved repo and the
+ * no-ctx reaper + the local-statusline footer recall it — the single mechanism that fixes the blank
+ * footer, the missing live lane row, and the on-turn summary that never emits for a nested clone.
+ */
+describe('rememberReviewRepo / recallReviewRepo (shared in-session review-repo memory)', () => {
+  it('recall returns the last remembered repo so the no-ctx reaper + footer resolve the nested clone', () => {
+    rememberReviewRepo('/ws/ai-news-digest');
+    expect(recallReviewRepo()).toBe('/ws/ai-news-digest');
+  });
+
+  it('remembering undefined does NOT clobber a previously remembered repo (a failed resolve must not erase it)', () => {
+    rememberReviewRepo('/ws/ai-news-digest');
+    rememberReviewRepo(undefined);
+    expect(recallReviewRepo()).toBe('/ws/ai-news-digest');
+  });
+});
+
+/**
+ * Shared in-session active-repo memory (display-only). codeflare-pi remembers the git root each
+ * time a command resolves one (git -C <repo>, cd <repo> && ..., clone); the footer recalls it so
+ * repo:branch renders when the session cwd is a non-repo parent workspace and the work happens
+ * in a nested repo via git -C (the footer was blank in exactly that session shape).
+ */
+describe('rememberActiveRepo / recallActiveRepo (shared in-session active-repo memory)', () => {
+  it('recall returns the last remembered repo so the footer resolves a nested working repo', () => {
+    rememberActiveRepo('/home/user/workspace/ai-news-digest');
+    expect(recallActiveRepo()).toBe('/home/user/workspace/ai-news-digest');
+  });
+
+  it('remembering undefined does NOT clobber a previously remembered repo', () => {
+    rememberActiveRepo('/home/user/workspace/ai-news-digest');
+    rememberActiveRepo(undefined);
+    expect(recallActiveRepo()).toBe('/home/user/workspace/ai-news-digest');
+  });
+
+  it('is a separate slot from the review-repo memory (working repo must not leak into review routing)', () => {
+    rememberReviewRepo('/ws/review-clone');
+    rememberActiveRepo('/home/user/workspace/ai-news-digest');
+    expect(recallReviewRepo()).toBe('/ws/review-clone');
+    expect(recallActiveRepo()).toBe('/home/user/workspace/ai-news-digest');
+  });
+});
+
+/**
+ * Guards for the on-disk graphify active-cwd sentinel as the footer's LAST display-only fallback.
+ * The sentinel is written by both Claude's hook and Pi's codeflare-pi, so under concurrent agents
+ * it flaps to whichever acted last — the inside-session-root guard is what stops an unrelated repo
+ * from hijacking this session's footer.
+ */
+describe('activeRepoSentinelForDisplay (guarded on-disk sentinel fallback)', () => {
+  const hasGit = (real: string[]) => (path: string) => real.includes(path);
+
+  it('accepts a git repo nested inside a session root', () => {
+    expect(activeRepoSentinelForDisplay({
+      sentinelContent: '/home/user/workspace/ai-news-digest\n',
+      sessionRoots: ['/home/user/workspace'],
+      hasGitDir: hasGit(['/home/user/workspace/ai-news-digest']),
+    })).toBe('/home/user/workspace/ai-news-digest');
+  });
+
+  it('accepts the session root itself', () => {
+    expect(activeRepoSentinelForDisplay({
+      sentinelContent: '/home/user/workspace/repo\n',
+      sessionRoots: [undefined, '/home/user/workspace/repo'],
+      hasGitDir: hasGit(['/home/user/workspace/repo']),
+    })).toBe('/home/user/workspace/repo');
+  });
+
+  it('REJECTS a repo outside every session root (concurrent-agent hijack guard)', () => {
+    expect(activeRepoSentinelForDisplay({
+      sentinelContent: '/somewhere/else/other-repo\n',
+      sessionRoots: ['/home/user/workspace'],
+      hasGitDir: hasGit(['/somewhere/else/other-repo']),
+    })).toBeUndefined();
+  });
+
+  it('REJECTS a sibling whose path merely string-prefixes the root (boundary match, not prefix match)', () => {
+    expect(activeRepoSentinelForDisplay({
+      sentinelContent: '/home/user/workspace-other/repo\n',
+      sessionRoots: ['/home/user/workspace'],
+      hasGitDir: hasGit(['/home/user/workspace-other/repo']),
+    })).toBeUndefined();
+  });
+
+  it('REJECTS a path that is not a git repo (stale sentinel)', () => {
+    expect(activeRepoSentinelForDisplay({
+      sentinelContent: '/home/user/workspace/deleted-clone\n',
+      sessionRoots: ['/home/user/workspace'],
+      hasGitDir: hasGit([]),
+    })).toBeUndefined();
+  });
+
+  it('returns undefined for missing or empty sentinel content', () => {
+    expect(activeRepoSentinelForDisplay({ sentinelContent: undefined, sessionRoots: ['/r'], hasGitDir: hasGit([]) })).toBeUndefined();
+    expect(activeRepoSentinelForDisplay({ sentinelContent: '  \n', sessionRoots: ['/r'], hasGitDir: hasGit([]) })).toBeUndefined();
+  });
+});
+
+describe('compactDurableReviewStatus timer + token badge (footer enhancement)', () => {
+  const base = { head: 'h', lanes: ['code-reviewer', 'spec-reviewer', 'doc-updater'], completed: [] as string[], running: ['code-reviewer'] };
+
+  it('renders the bare row with no badge when neither elapsedMs nor tokens are given (back-compat)', () => {
+    expect(compactDurableReviewStatus(base)).toBe('Review code | spec | docs');
+  });
+
+  it('prepends a leading M:SS timer badge when elapsedMs is given', () => {
+    expect(compactDurableReviewStatus({ ...base, elapsedMs: 78_000 })).toBe('Review 1:18 · code | spec | docs');
+  });
+
+  it('appends per-lane token totals to the matching lane label', () => {
+    const row = compactDurableReviewStatus({ ...base, completed: ['code-reviewer'], laneTokens: { 'code-reviewer': 2_120 } });
+    expect(row).toContain('code 2.1k');
+  });
+
+  it('omits a lane token figure when its count is absent or zero', () => {
+    expect(compactDurableReviewStatus({ ...base, laneTokens: { 'spec-reviewer': 0 } })).toBe('Review code | spec | docs');
+  });
+});
+
+describe('formatReviewElapsed / formatReviewTokens', () => {
+  it('formats elapsed as M:SS, zero-padding seconds', () => {
+    expect(formatReviewElapsed(0)).toBe('0:00');
+    expect(formatReviewElapsed(9_000)).toBe('0:09');
+    expect(formatReviewElapsed(78_000)).toBe('1:18');
+    expect(formatReviewElapsed(605_000)).toBe('10:05');
+  });
+
+  it('formats tokens compactly (raw < 1k, 1-decimal k, integer k for >= 100k)', () => {
+    expect(formatReviewTokens(950)).toBe('950');
+    expect(formatReviewTokens(2_000)).toBe('2k');
+    expect(formatReviewTokens(2_120)).toBe('2.1k');
+    expect(formatReviewTokens(124_000)).toBe('124k');
+  });
+});
+
+describe('mergeGateDecision (the gh-pr-merge last-line-of-defense)', () => {
+  const base: MergeGateInput = {
+    prReadable: true, prExists: true, prEnforced: true, prMalformed: false,
+    enforcedHead: 'h1', headAcked: false, candidates: [], bypassPresent: false,
+  };
+
+  it('blocks an enforced PR whose head is not acked', () => {
+    expect(mergeGateDecision(base)).toEqual({ action: 'block', head: 'h1', reason: 'head_not_acked' });
+  });
+
+  it('allows an enforced PR whose head is acked', () => {
+    expect(mergeGateDecision({ ...base, headAcked: true })).toEqual({ action: 'allow' });
+  });
+
+  it('allows a readable non-enforced PR (base not protected / closed) even with the head unacked', () => {
+    expect(mergeGateDecision({ ...base, prEnforced: false })).toEqual({ action: 'allow' });
+  });
+
+  it('allows when gh is readable but there is genuinely no PR', () => {
+    expect(mergeGateDecision({ ...base, prExists: false, prEnforced: false })).toEqual({ action: 'allow' });
+  });
+
+  it('fails CLOSED on a transient gh failure when a review is pending unacked (R2)', () => {
+    const d = mergeGateDecision({ ...base, prReadable: false, prEnforced: false, enforcedHead: '', candidates: [{ head: 'p1', acked: false }] });
+    expect(d).toEqual({ action: 'block', head: 'p1', reason: 'pr_state_unreadable_review_pending' });
+  });
+
+  it('allows on a transient gh failure when NOTHING is pending (no basis to block)', () => {
+    expect(mergeGateDecision({ ...base, prReadable: false, prEnforced: false, enforcedHead: '', candidates: [] })).toEqual({ action: 'allow' });
+  });
+
+  it('does not fail closed on a transient failure when the only pending candidate is already acked', () => {
+    expect(mergeGateDecision({ ...base, prReadable: false, prEnforced: false, enforcedHead: '', candidates: [{ head: 'p1', acked: true }] })).toEqual({ action: 'allow' });
+  });
+
+  it('fails CLOSED on a readable-but-malformed PR (OPEN, empty base/oid) with a pending review (R1)', () => {
+    const d = mergeGateDecision({ ...base, prMalformed: true, prEnforced: false, enforcedHead: '', candidates: [{ head: 'p1', acked: false }] });
+    expect(d).toEqual({ action: 'block', head: 'p1', reason: 'pr_state_malformed_review_pending' });
+  });
+
+  it('uses a latched-breaker / outstanding-offer head as a fail-closed candidate (R2, no pending.json)', () => {
+    const d = mergeGateDecision({ ...base, prReadable: false, prEnforced: false, enforcedHead: '', candidates: [{ head: 'breaker1', acked: false }] });
+    expect(d).toEqual({ action: 'block', head: 'breaker1', reason: 'pr_state_unreadable_review_pending' });
+  });
+
+  it('converts any would-be block into a bypass when the user-only sentinel is present', () => {
+    expect(mergeGateDecision({ ...base, bypassPresent: true })).toEqual({ action: 'bypass', head: 'h1' });
+  });
+
+  it('does not consume a bypass when the merge would be allowed anyway', () => {
+    expect(mergeGateDecision({ ...base, headAcked: true, bypassPresent: true })).toEqual({ action: 'allow' });
   });
 });

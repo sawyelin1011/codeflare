@@ -1,0 +1,42 @@
+---
+/**
+ * Onboarding-mode sign-in. Served at /login when the deployment runs in
+ * onboarding mode (the Worker rewrites /login -> /landing/login/ there; SaaS
+ * mode keeps its SPA login untouched). Built in the landing so it inherits the
+ * same design tokens, fonts, and the page-wide flare-fluid splash (BaseLayout),
+ * letting the marketing landing and sign-in flow into one another.
+ *
+ * Pure composition: the shared <Header variant="login"> nav, the <LoginCard>
+ * (GitHub primary + enterprise-SSO accordion + the hidden access-requested
+ * confirmation), the build-time error map login.ts reads, and the shared
+ * <Footer>. Markup, copy, and behaviour live in those + content/site.ts +
+ * scripts/login.ts. No em/en dashes in any rendered copy.
+ */
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Header from '../components/Header.astro';
+import LoginCard from '../components/LoginCard.astro';
+import Footer from '../components/Footer.astro';
+import { LOGIN } from '../content/site';
+---
+
+<BaseLayout
+  title="Sign in · Codeflare"
+  description="Sign in to Codeflare with GitHub, or request access to your enterprise workspace."
+  canonical="https://codeflare.ch/login/"
+  robots="noindex, nofollow"
+>
+  <Header variant="login" />
+
+  <main class="login-main">
+    <LoginCard />
+
+    <!-- OAuth-error copy, keyed by ?error=<code>; login.ts reads this map. -->
+    <script type="application/json" id="login-errors" set:html={JSON.stringify(LOGIN.errors)}></script>
+  </main>
+
+  <Footer />
+
+  <script>
+    import '../scripts/login';
+  </script>
+</BaseLayout>
