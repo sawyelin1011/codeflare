@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { experimental_AstroContainer as AstroContainer } from 'astro/container';
+import HeroKicker from '../components/HeroKicker.astro';
 import Terminal from '../components/Terminal.astro';
 import Transcript from '../components/Transcript.astro';
 import GateSteps from '../components/GateSteps.astro';
@@ -16,7 +17,7 @@ import FeatureGrid from '../components/FeatureGrid.astro';
 import MicroCta from '../components/MicroCta.astro';
 import Header from '../components/Header.astro';
 import { dom } from './_helpers/dom';
-import { NAV_LINKS, LOGIN, type TranscriptLine } from '../content/site';
+import { HERO, NAV_LINKS, LOGIN, type TranscriptLine } from '../content/site';
 import { APP_LINKS } from '../config';
 
 let container: AstroContainer;
@@ -30,6 +31,23 @@ const LINES: TranscriptLine[] = [
   { tone: 'ok', text: 'third' },
   { tone: 'dim', text: 'fourth' },
 ];
+
+describe('HeroKicker', () => {
+  it('renders one active capability word plus the queued vertical stack from the content model', async () => {
+    const kicker = dom(await container.renderToString(HeroKicker)).querySelector('[data-hero-kicker]')!;
+    expect(kicker).not.toBeNull();
+    const words = kicker.querySelectorAll('[data-hero-kicker-word]');
+    expect(words).toHaveLength(HERO.kicker.words.length);
+    expect(words[0].getAttribute('data-active')).toBe('true');
+    const queuedOpacity = parseFloat((words[1] as HTMLElement).style.opacity);
+    expect(queuedOpacity).toBeGreaterThan(0);
+    expect(queuedOpacity).toBeLessThan(1);
+    expect(kicker.querySelector('.hero-kicker-reel')?.getAttribute('aria-hidden')).toBe('true');
+    const measure = kicker.querySelector('[data-hero-kicker-measure]');
+    expect(measure).not.toBeNull();
+    expect(measure?.parentElement?.classList.contains('hero-kicker-reel')).toBe(true);
+  });
+});
 
 describe('Transcript (styler 1: last line + scrolling cursor)', () => {
   it("animate='cursor' puts one caret on the last line and wraps that line for type-on-view", async () => {
@@ -206,8 +224,8 @@ describe('Section + SectionHead', () => {
   });
 
   it('SectionHead leadHtml renders inline markup; no lead renders no .lead; the slot trails the lead', async () => {
-    const withHtml = dom(await container.renderToString(SectionHead, { props: { kicker: 'k', title: 't', leadHtml: 'Deployed in <strong>your own cloud</strong>.' } })).querySelector('.section-head')!;
-    expect(withHtml.querySelector('.lead strong')?.textContent).toBe('your own cloud');
+    const withHtml = dom(await container.renderToString(SectionHead, { props: { kicker: 'k', title: 't', leadHtml: 'Deployed in <strong>your own estate</strong>.' } })).querySelector('.section-head')!;
+    expect(withHtml.querySelector('.lead strong')?.textContent).toBe('your own estate');
 
     const noLead = dom(await container.renderToString(SectionHead, { props: { kicker: 'k', title: 't' } })).querySelector('.section-head')!;
     expect(noLead.querySelector('.lead')).toBeNull();

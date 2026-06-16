@@ -99,6 +99,39 @@
   background: rgba(5, 5, 8, 0.9);
 }
 
+/* Panel flip (GitHub ↔ R2). Desktop: faces are transparent wrappers so both
+   panels stack exactly as before, and the flip-back control is hidden. Mobile
+   rules below show one face at a time with a flip-in animation. */
+.panel-flip-face {
+  display: contents;
+}
+
+.panel-flip-back-btn {
+  display: none;
+}
+
+/* Files panel header — mirrors the GitHub panel header (.github-panel-header /
+   .github-panel-title) so that in enterprise mode the stacked right-column
+   panels share one visual treatment: an uppercase label and a gray bottom
+   border. Only rendered when the GitHub panel (and its flip control) exists. */
+.files-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.files-panel-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 /* New Session Wrapper (for dialog positioning) */
 .dashboard-new-session-wrapper {
   position: relative;
@@ -195,5 +228,40 @@
     min-height: 300px;
     max-height: 50vh;
     overflow: hidden;
+  }
+
+  /* Mobile: one face at a time; flipping swaps GitHub ↔ R2 with an up→down flip. */
+  .panel-flip-face {
+    display: none;
+  }
+
+  .panel-flip-face[data-active="true"] {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    transform-origin: top center;
+    animation: panel-flip-in 260ms ease;
+  }
+
+  .panel-flip-back-btn {
+    display: flex;
+  }
+
+  /* Match the GitHub panel header's narrow-breakpoint padding. */
+  .files-panel-header {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+}
+
+@keyframes panel-flip-in {
+  from { transform: rotateX(-90deg); opacity: 0; }
+  to { transform: rotateX(0); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-flip-face[data-active="true"] {
+    animation: none;
   }
 }

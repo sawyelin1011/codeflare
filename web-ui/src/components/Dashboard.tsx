@@ -1,7 +1,8 @@
 import { Component, Show, For, onMount, createSignal, createMemo, createEffect } from 'solid-js';
 import { Portal } from 'solid-js/web';
-import { mdiXml, mdiCogOutline, mdiShieldAccount, mdiAccountOutline, mdiRocketLaunchOutline, mdiChartBar, mdiLogout } from '@mdi/js';
+import { mdiXml, mdiCogOutline, mdiShieldAccount, mdiAccountOutline, mdiRocketLaunchOutline, mdiChartBar, mdiLogout, mdiFlipVertical } from '@mdi/js';
 import Icon from './Icon';
+import IconButton from './ui/IconButton';
 import type { SessionWithStatus, AgentType, TabConfig } from '../types';
 import { storageStore } from '../stores/storage';
 import { getDownloadUrl } from '../api/storage';
@@ -10,6 +11,7 @@ import SessionStatCard from './SessionStatCard';
 import SessionContextMenu from './SessionContextMenu';
 import StatCards from './StatCards';
 import StorageBrowser from './StorageBrowser';
+import GitHubPanel from './github/GitHubPanel';
 import FilePreview from './FilePreview';
 import CreateSessionDialog from './CreateSessionDialog';
 import SessionLimitPopup from './SessionLimitPopup';
@@ -17,8 +19,8 @@ import ScrambleText from './ScrambleText';
 import KittScanner from './KittScanner';
 import DashboardCard from './TipsRotator';
 import { sessionStore, isAtUsageQuota } from '../stores/session';
+import { githubStore } from '../stores/github';
 import { getBrowserTimezone, syncBrowserTimezone } from '../lib/timezone-sync';
-import { sweepOrphanVaultCaches } from '../lib/vault-cache';
 import UsageInlineBadge from './UsageInlineBadge';
 import '../styles/dashboard.css';
 
@@ -37,6 +39,14 @@ interface DashboardProps {
 
 const Dashboard: Component<DashboardProps> = (props) => {
   const [collapseReady, setCollapseReady] = createSignal(false);
+  // Mobile-only: which right-column face is shown (GitHub vs R2 storage). The
+  // flip control in each panel header toggles it; desktop shows both stacked.
+  const [panelFace, setPanelFace] = createSignal<'github' | 'storage'>('github');
+  // On mobile only one right-column face is visible at a time. The GitHub face is
+  // only a valid target when GitHub is enabled; when it is not (non-enterprise /
+  // onboarding) force the storage (R2) face so the empty GitHub panel can never
+  // become the active face and cover the file browser. (REQ-GITHUB-002)
+  const effectiveFace = () => (githubStore.enabled ? panelFace() : 'storage');
   const [showCreateDialog, setShowCreateDialog] = createSignal(false);
   const [showLimitPopup, setShowLimitPopup] = createSignal(false);
   const [showUserMenu, setShowUserMenu] = createSignal(false);
@@ -59,15 +69,6 @@ const Dashboard: Component<DashboardProps> = (props) => {
   onMount(() => {
     sessionStore.startR2Polling();
     storageStore.fetchStats();
-
-    // REQ-VAULT-015 AC4: sweep orphan SilverBullet IDB caches whose
-    // sid is not in the user's current session list. Catches the case
-    // where a session was deleted via API in another tab or after a
-    // browser crash before cleanupSessionVaultCache could run.
-    const activeIds = (props.sessions ?? []).map((s) => s.id);
-    void sweepOrphanVaultCaches(activeIds).catch(() => {
-      // Best-effort; never block dashboard mount on cache sweep.
-    });
 
     // REQ-MEM-001 AC4: capture the browser's IANA timezone and sync it
     // to the user's preferences so the next session start propagates
@@ -312,8 +313,24 @@ const Dashboard: Component<DashboardProps> = (props) => {
             </div>
           </div>
 
-          {/* Right Column */}
-          <div class="dashboard-panel-right" data-testid="dashboard-panel-right">
+          {/* Right Column — on mobile the two panels flip; on desktop they stack. */}
+          <div class="dashboard-panel-right" data-testid="dashboard-panel-right" data-face={effectiveFace()}>
+            <div class="panel-flip-face panel-flip-face--github" data-active={effectiveFace() === 'github'}>
+              <GitHubPanel onFlip={() => setPanelFace('storage')} />
+            </div>
+            <div class="panel-flip-face panel-flip-face--storage" data-active={effectiveFace() === 'storage'}>
+              <Show when={githubStore.enabled}>
+                <div class="files-panel-header" data-testid="files-panel-header">
+                  <h2 class="files-panel-title" data-testid="files-panel-title">Files</h2>
+                  <IconButton
+                    icon={mdiFlipVertical}
+                    label="Show GitHub"
+                    onClick={() => setPanelFace('github')}
+                    class="panel-flip-back-btn"
+                    testId="storage-flip-btn"
+                  />
+                </div>
+              </Show>
             <Show when={sessionStore.r2Ready} fallback={
               <div class="storage-skeleton" data-testid="storage-skeleton">
                 <div class="storage-skeleton-header">
@@ -339,6 +356,7 @@ const Dashboard: Component<DashboardProps> = (props) => {
                 <FilePreview file={storageStore.previewFile} onBack={handlePreviewBack} onDownload={handlePreviewDownload} />
               </Show>
             </Show>
+            </div>
           </div>
         </div>
 

@@ -1,6 +1,6 @@
 # Codeflare Specification
 
-Codeflare is the enterprise agentic coding engine: it runs autonomous AI coding agents in isolated containers on Cloudflare's edge. Each session spins up a dedicated container pre-loaded with the user's choice of agent (Claude Code, Codex, Antigravity, GitHub Copilot, OpenCode, Pi, or Bash), provides a browser-native terminal accessible from any device, and tears itself down when idle. Files persist in per-user R2 storage via bidirectional sync; containers do not. The product targets teams who want zero-setup AI coding from any screen -- phone, tablet, or laptop -- without touching their local machine.
+Codeflare is the enterprise agentic engine: it runs autonomous AI coding agents in isolated containers on Cloudflare's edge. Each session spins up a dedicated container pre-loaded with the user's choice of agent (Claude Code, Codex, Antigravity, GitHub Copilot, OpenCode, Pi, or Bash), provides a browser-native terminal accessible from any device, and tears itself down when idle. Files persist in per-user R2 storage via bidirectional sync; containers do not. The product targets teams who want zero-setup AI coding from any screen -- phone, tablet, or laptop -- without touching their local machine.
 
 ## Principles
 
@@ -36,6 +36,7 @@ Codeflare is the enterprise agentic coding engine: it runs autonomous AI coding 
 | [Storage](spec/storage.md) | R2 persistence, rclone bisync, quotas | P0 | Active |
 | [Subscription](spec/subscription.md) | Tiers, billing, usage tracking, quotas | P1 | Active |
 | [Agents](spec/agents.md) | Multi-agent support, preseed, session modes | P1 | Active |
+| [GitHub](spec/github.md) | Connect GitHub, repo panel, clone-into-session, enterprise egress-injected git auth | P1 | Active |
 | [Enterprise Mode](spec/enterprise-mode.md) | Deploy-time enterprise instance, subscription bypass, Worker-side LLM proxy | P1 | Active |
 | [Browser Run](spec/browser-run.md) | Real-browser WebFetch fallback via Cloudflare Browser Run | P2 | Active |
 | [Setup](spec/setup.md) | Onboarding wizard, deployment modes, DNS | P1 | Active |

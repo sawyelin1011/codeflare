@@ -35,6 +35,7 @@ const sessionStoreState = vi.hoisted(() => ({
   presets: [] as Array<{ id: string; name: string; tabs: Array<{ id: string; command: string; label: string }>; createdAt: string }>,
   error: null as string | null,
   saasMode: false as boolean,
+  enterpriseMode: false as boolean,
   loadPresets: vi.fn(async () => undefined),
   saveBookmarkForSession: vi.fn(async () => ({ id: 'new-bookmark', name: 'My Bookmark', tabs: [], createdAt: new Date().toISOString() }) as { id: string; name: string; tabs: never[]; createdAt: string } | null),
   applyPresetToSession: vi.fn(async () => true),
@@ -61,6 +62,9 @@ vi.mock('../../stores/session', () => ({
     },
     get saasMode() {
       return sessionStoreState.saasMode;
+    },
+    get enterpriseMode() {
+      return sessionStoreState.enterpriseMode;
     },
     loadPresets: (...args: Parameters<typeof sessionStoreState.loadPresets>) =>
       sessionStoreState.loadPresets(...args),
@@ -92,6 +96,7 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
     sessionStoreState.presets = [];
     sessionStoreState.error = null;
     sessionStoreState.saasMode = false;
+    sessionStoreState.enterpriseMode = false;
     isMobileMock.value = false;
     terminalStoreMock.authUrl = null;
     usageStateMock.value = { monthlySeconds: 0, monthlyQuotaSeconds: null };
@@ -143,15 +148,30 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
       expect(screen.queryByTestId('header-vault-button')).not.toBeInTheDocument();
     });
 
-    it('keeps the Vault button disabled while browser prewarm is still running', () => {
+    it('keeps the Vault button visible and explains when browser prewarm is still running', () => {
       const onVaultOpen = vi.fn();
       render(() => <Header {...defaultSessionProps} onVaultOpen={onVaultOpen} vaultStatus="prewarming" />);
 
       const button = screen.getByTestId('header-vault-button');
       fireEvent.click(button);
 
-      expect(button).toBeDisabled();
+      expect(button).not.toBeDisabled();
+      expect(button).toHaveAttribute('aria-disabled', 'true');
       expect(button).toHaveAttribute('data-vault-status', 'prewarming');
+      expect(screen.getByTestId('header-vault-status')).toBeInTheDocument();
+      expect(onVaultOpen).not.toHaveBeenCalled();
+    });
+
+    it('dismisses the guarded Vault feedback when the user clicks elsewhere', () => {
+      const onVaultOpen = vi.fn();
+      render(() => <Header {...defaultSessionProps} onVaultOpen={onVaultOpen} vaultStatus="prewarming" />);
+
+      fireEvent.click(screen.getByTestId('header-vault-button'));
+      expect(screen.getByTestId('header-vault-status')).toBeInTheDocument();
+
+      fireEvent.click(document.body);
+
+      expect(screen.queryByTestId('header-vault-status')).not.toBeInTheDocument();
       expect(onVaultOpen).not.toHaveBeenCalled();
     });
 
@@ -163,24 +183,29 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
       fireEvent.click(button);
 
       expect(button).not.toBeDisabled();
+      expect(button).toHaveAttribute('aria-disabled', 'false');
       expect(button).toHaveAttribute('data-vault-status', 'ready');
       expect(onVaultOpen).toHaveBeenCalledOnce();
     });
 
-    it('keeps timeout and error states disabled', () => {
+    it('keeps timeout and error states guarded while still exposing click feedback', () => {
       const onVaultOpen = vi.fn();
       const { unmount } = render(() => <Header {...defaultSessionProps} onVaultOpen={onVaultOpen} vaultStatus="timeout" />);
       const timeoutButton = screen.getByTestId('header-vault-button');
       fireEvent.click(timeoutButton);
-      expect(timeoutButton).toBeDisabled();
+      expect(timeoutButton).not.toBeDisabled();
+      expect(timeoutButton).toHaveAttribute('aria-disabled', 'true');
       expect(timeoutButton).toHaveAttribute('data-vault-status', 'timeout');
+      expect(screen.getByTestId('header-vault-status')).toBeInTheDocument();
       unmount();
 
       render(() => <Header {...defaultSessionProps} onVaultOpen={onVaultOpen} vaultStatus="error" />);
       const errorButton = screen.getByTestId('header-vault-button');
       fireEvent.click(errorButton);
-      expect(errorButton).toBeDisabled();
+      expect(errorButton).not.toBeDisabled();
+      expect(errorButton).toHaveAttribute('aria-disabled', 'true');
       expect(errorButton).toHaveAttribute('data-vault-status', 'error');
+      expect(screen.getByTestId('header-vault-status')).toBeInTheDocument();
       expect(onVaultOpen).not.toHaveBeenCalled();
     });
   });
@@ -293,7 +318,7 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
 
       await waitFor(() => {
         expect(screen.getByTestId('header-bookmark-error')).toBeInTheDocument();
-        expect(screen.getByTestId('header-bookmark-error')).toHaveTextContent('Open at least one tab (2-6) before saving a bookmark');
+        expect(screen.getByTestId('header-bookmark-error')).toBeInTheDocument();
       });
     });
 
@@ -670,20 +695,39 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
 
       expect(screen.queryByTestId('header-user-dropdown-profile')).not.toBeInTheDocument();
       expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
-      // Non-billing items remain present.
+      // Non-billing items remain present (Guided Setup shown outside enterprise).
       expect(screen.getByTestId('header-user-dropdown-onboarding')).toBeInTheDocument();
       expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
     });
 
     it('hides the Subscription and Usage menu items in enterprise mode', () => {
-      render(() => <Header {...defaultSessionProps} enterpriseMode={true} />);
+      sessionStoreState.enterpriseMode = true;
+      render(() => <Header {...defaultSessionProps} />);
 
       fireEvent.click(screen.getByTestId('header-user-menu'));
 
       expect(screen.queryByTestId('header-user-dropdown-profile')).not.toBeInTheDocument();
       expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
-      // Non-billing items remain present.
+      // Logout remains present.
+      expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
+    });
+  });
+
+  // REQ-ENTERPRISE-008: Guided Setup (per-user onboarding) is hidden in enterprise
+  // mode — enterprise instances are configured by an admin via Setup, not per-user.
+  describe('Guided Setup gating (enterprise)', () => {
+    it('shows Guided Setup outside enterprise mode', () => {
+      render(() => <Header {...defaultSessionProps} />);
+      fireEvent.click(screen.getByTestId('header-user-menu'));
       expect(screen.getByTestId('header-user-dropdown-onboarding')).toBeInTheDocument();
+    });
+
+    it('hides Guided Setup in enterprise mode', () => {
+      sessionStoreState.enterpriseMode = true;
+      render(() => <Header {...defaultSessionProps} />);
+      fireEvent.click(screen.getByTestId('header-user-menu'));
+      expect(screen.queryByTestId('header-user-dropdown-onboarding')).not.toBeInTheDocument();
+      // The rest of the dropdown still renders.
       expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
     });
   });

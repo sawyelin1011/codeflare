@@ -37,12 +37,15 @@ export default defineConfig({
     hookTimeout: 30000,
     include: ['src/**/*.test.ts'],
     exclude: ['web-ui/**', 'e2e/**'],
-    // Serialize the Workers pool — @cloudflare/vitest-pool-workers spins one workerd
-    // isolate per worker and parallel isolates flake harder at teardown.
-    // DO NOT add `isolate: false` here: with pool-workers 0.16.x it crashes workerd
-    // during collection ("Worker exited unexpectedly", 0 tests run) — verified in CI.
-    // The teardown crash that survives (after all tests pass) is a known upstream flake,
-    // tolerated by the "Run backend tests" guard in .github/workflows/test.yml.
+    // Serialize the Workers pool to one worker. @cloudflare/vitest-pool-workers
+    // crashes workerd at pool teardown ("Worker exited unexpectedly") AFTER every
+    // test passes — the documented WebSockets + Durable Objects under per-file
+    // storage-isolation limitation (known-issues#websockets). Cloudflare's only
+    // documented fix (--max-workers=1 --no-isolate) is NOT usable here: isolate:false
+    // crashes workerd during *collection* (0 tests run) on pool-workers 0.16.14 AND
+    // 0.16.16 — both verified in CI 2026-06-16. So per-file isolation stays and the
+    // benign post-pass teardown crash is tolerated by the fingerprinted guard in
+    // .github/workflows/test.yml + deploy.yml (which still fails on any real failure).
     maxWorkers: 1,
 
     // v8 coverage configuration (FIX-54)
