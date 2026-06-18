@@ -16,9 +16,9 @@ import { getContainer } from '@cloudflare/containers';
 import type { Env } from '../types';
 import { authMiddleware, AuthVariables } from '../middleware/auth';
 import { createRateLimiter } from '../middleware/rate-limit';
-import { isEnterpriseMode } from '../lib/subscription';
 import { getBaseUrl } from '../lib/kv-keys';
 import { signOauthState } from '../lib/oauth-state';
+import { githubScopeForTier } from '../lib/oauth-scopes';
 import { createLogger } from '../lib/logger';
 import { toError } from '../lib/error-types';
 import { getContainerId } from '../lib/container-helpers';
@@ -55,12 +55,15 @@ const CloneBody = z.object({
 }).strict();
 
 /**
- * Whether the GitHub panel/feature is available for this deployment.
- * Enterprise only (REQ-GITHUB-002 AC3). Broadening to SaaS-advanced + a per-user
- * toggle is tracked as REQ-GITHUB-007 (Planned) and intentionally deferred.
+ * Whether the GitHub repo-browser panel (status/repos/clone) is available for this
+ * deployment. Available in every mode now (REQ-GITHUB-007); the advanced-session
+ * entitlement is enforced in the frontend (sessionMode === 'advanced'), matching the
+ * Vault gate. Connect/disconnect are intentionally NOT gated on this — they are
+ * authMiddleware-only so the Guided Setup + Settings connect surfaces work for every
+ * authenticated user, independent of the panel.
  */
-function githubFeatureEnabled(env: Env): boolean {
-  return isEnterpriseMode(env);
+function githubFeatureEnabled(_env: Env): boolean {
+  return true;
 }
 
 interface RepoSummary {
@@ -142,8 +145,7 @@ app.get('/repos', reposRateLimiter, async (c) => {
 // Browser-navigated (the panel sets window.location), so it carries the session
 // cookie through authMiddleware; the matching callback re-derives identity.
 app.get('/connect', connectRateLimiter, async (c) => {
-  if (!githubFeatureEnabled(c.env)) return c.json({ error: 'GitHub integration disabled', code: 'GITHUB_DISABLED' }, 403);
-
+  // NOT panel-gated: any authenticated user can connect (Guided Setup + Settings).
   const provider = await getGithubProvider(c.env);
   if (!provider) return c.json({ error: 'GitHub integration not configured', code: 'GITHUB_NOT_CONFIGURED' }, 503);
 
@@ -157,12 +159,15 @@ app.get('/connect', connectRateLimiter, async (c) => {
   // bucket (the callback re-derives identity from the ambient cookie).
   const state = await signOauthState(secret, c.get('bucketName'));
   const redirectUri = `${base}${CONNECT_CALLBACK_PATH}`;
-  return c.redirect(provider.authorizeUrl({ state, redirectUri }));
+  // Scope tier (minimal|recommended|advanced) from the connect URL; the OAuth-App
+  // path honours it, the GitHub App path ignores it (fixed App permissions).
+  const scope = githubScopeForTier(c.req.query('tier'));
+  return c.redirect(provider.authorizeUrl({ state, redirectUri, scope }));
 });
 
 // POST /api/github/disconnect — revoke at GitHub (app/oauth) + clear the token.
 app.post('/disconnect', connectRateLimiter, async (c) => {
-  if (!githubFeatureEnabled(c.env)) return c.json({ error: 'GitHub integration disabled', code: 'GITHUB_DISABLED' }, 403);
+  // NOT panel-gated: connect/disconnect are authMiddleware-only (see /connect).
   await disconnectGithub(c.env, c.get('bucketName'));
   return c.json({ success: true });
 });

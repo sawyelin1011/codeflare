@@ -60,8 +60,8 @@ Cloudflare Containers run as root, and both Claude Code and Antigravity launch w
 
 **Native integrations, wired in, not bolted on.**
 
-- **Native GitHub integration** — connect once. Every session gets automatic `git push`, `gh` CLI, and CI/CD access. No SSH keys, no per-session auth.
-- **Native Cloudflare integration** — connect once. Deploy Workers and manage D1, R2, KV, and DNS from the terminal, already authenticated.
+- **Native GitHub integration** — connect once via OAuth (no token paste). Every session gets automatic `git push`, `gh` CLI, and CI/CD access. No SSH keys, no per-session auth.
+- **Native Cloudflare integration** — connect your own Cloudflare account once via OAuth. Deploy Workers and manage D1, R2, KV, and DNS from the terminal, already authenticated.
 - **Build, push, and deploy skills** — pre-loaded agent skills scaffold Workers projects, configure `wrangler.toml`, push to GitHub, set up CI, and deploy. Describe what you want; the agent builds, pushes, and deploys it to a live URL.
 - **Guided onboarding** — new users are walked through connecting GitHub and Cloudflare and choosing an agent. No prior Cloudflare knowledge required.
 
@@ -146,6 +146,8 @@ Find your worker URL at [dash.cloudflare.com](https://dash.cloudflare.com/) → 
 *Connect your accounts and pick an agent. No prior Cloudflare or GitHub knowledge required.*
 
 That's it, you're live. You'll need an active subscription to at least one supported agent; log in directly from the terminal.
+
+> To let users connect their own GitHub and Cloudflare accounts (automatic `git push` / `wrangler` deploy from a session), an admin registers one OAuth app per provider and enters the credentials in the wizard — see [Connecting GitHub &amp; Cloudflare (per-user OAuth)](#advanced-configuration-optional) under Advanced configuration.
 
 <details>
 <summary><strong id="api-token-scopes">API token scopes</strong></summary>
@@ -240,7 +242,7 @@ All optional. **Type** is where the value goes in GitHub.
 | Setting | Type | Default | Effect |
 |---|---|---|---|
 | `CLOUDFLARE_WORKER_NAME` | Variable | `codeflare` | Worker name + R2 bucket prefix + Access group prefix. Set a unique name to run multiple instances on one account |
-| `RESSOURCE_TIER` | Variable | *unset* (= `default`) | Container size. `low`: Cloudflare `basic` preset (≈0.25 vCPU / 1 GiB / 4 GB) · *default*: 1 vCPU / 3 GiB / 6 GB · `high`: 2 vCPU / 6 GiB / 8 GB · `saas`: alias of *default*. (Spelling intentional — do not "fix".) |
+| `RESSOURCE_TIER` | Variable | *unset* (= `default`) | Container size. `low`: Cloudflare `basic` preset (≈0.25 vCPU / 1 GiB / 4 GB) · *default*: 1 vCPU / 3 GiB / 6 GB · `high`: 2 vCPU / 6 GiB / 12 GB · `saas`: alias of *default*. (Spelling intentional — do not "fix".) |
 | `MAX_INSTANCES` | Variable | `10` | Max concurrent containers. Positive integer; set per environment (e.g. `1400` for production) |
 | `MAX_SESSIONS_USER` | Variable | `3` | Max concurrent sessions per user. Ignored in SaaS mode (tier config controls limits) |
 | `MAX_SESSIONS_ADMIN` | Variable | `10` | Max concurrent sessions per admin. Ignored in SaaS mode |
@@ -289,6 +291,106 @@ Set `SAAS_MODE=active`. Pair with `MAX_INSTANCES` for your target concurrency. T
 3. **Add as environment secrets** (**Settings → Environments →** your environment **→ Environment secrets**): `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_JWT_SECRET`.
 
 Create one OAuth App per environment (integration vs production) with the matching callback URL, then deploy.
+
+</details>
+
+<details>
+<summary><strong>Connecting GitHub &amp; Cloudflare (per-user OAuth) — so sessions can push &amp; deploy</strong></summary>
+
+This is **separate** from the login OAuth above. *Login* OAuth (`OAUTH_*`, env secrets) decides how users **sign in** to Codeflare. *Connect* OAuth lets each signed-in user **authorize their own GitHub and Cloudflare accounts** so their sessions get an automatic `git push` / `gh` token and a `wrangler` deploy token — no pasted PATs. Users connect from the dashboard GitHub panel, **Guided Setup**, or **Settings → Push &amp; Deploy** — all three are the same per-user OAuth flow.
+
+Unlike login OAuth, the Connect client credentials are **not** GitHub Actions secrets — an admin enters them once in the in-app **Setup wizard**, which stores them in KV (client id in plain, client secret **encrypted**). Applies to default / onboarding / SaaS modes. **Enterprise does not use this** (it injects an admin-global Cloudflare token and uses the admin-configured GitHub App instead).
+
+**Prerequisite:** set **`ENCRYPTION_KEY`** (see Core settings). The Connect client secrets are encrypted at rest; without the key the wizard treats them as unconfigured and connect fails closed.
+
+---
+
+**1. Register a GitHub OAuth App for Connect**
+
+At [github.com/settings/developers](https://github.com/settings/developers) → **OAuth Apps → New OAuth App**:
+
+- Homepage URL: `https://{your-domain}`
+- **Authorization callback URL: `https://{your-domain}/auth/github/connect/callback`** — note `/connect/callback`; this is a *different* app from the login one (whose callback is `/auth/github/callback`).
+- Generate a **client secret**; copy the **Client ID** + secret.
+
+> ⚠️ **Gotcha:** if you skip the wizard step below, the connect flow silently falls back to your **login** OAuth App — whose callback is `/auth/github/callback`, not `/connect/callback` — and GitHub rejects the redirect. You must register this as the Connect provider in Setup.
+
+Then in the app: **Setup wizard → GitHub provider →** choose **OAuth App**, paste the Client ID + secret. (Choose **GitHub App** instead only if your users are Enterprise-Managed Users / EMU — those cannot authorize third-party OAuth Apps. A GitHub App's permissions are fixed at install and ignore the scope tier.)
+
+---
+
+**2. Register a Cloudflare OAuth client for Connect** *(the fiddly one)*
+
+In the Cloudflare dashboard → **Manage Account → OAuth clients → Create client**:
+
+| Field | Value |
+|---|---|
+| Response type | **Code** |
+| Grant type | **Authorization Code, Refresh Token** |
+| Token authentication method | **Client Secret Post** — **not** *None (PKCE)*. The Worker sends a client secret; PKCE-only yields `invalid_client`/no secret. |
+| Redirect (Callback) URL | `https://{your-domain}/auth/cloudflare/connect/callback` |
+| Scopes | The **Advanced superset** (below). The registered scopes are a *ceiling*; the per-connect tier requests a subset within it. |
+
+`offline_access` is requested automatically (it issues the refresh token). One client can hold **multiple** redirect URIs — add both your integration and production callback URLs to a single client rather than making two.
+
+**Private vs public client:**
+- **Private** (default) — only members of *your* Cloudflare account can connect. No logo or domain verification needed. Fine for a single-operator or integration instance.
+- **Public** — any Cloudflare user can connect (needed for multi-tenant SaaS). Requires two extra steps:
+  1. **`logo_uri`** — any public image URL, e.g. `https://codeflare.ch/icon-512.png`.
+  2. **`client_uri` domain verification** — set `client_uri` to a domain you control, then add a **DNS `TXT` record** on that host with the full value Cloudflare shows, including the prefix: `cloudflare_oauth_client_publisher=<code>`. Cloudflare polls it (times out after 2 days). ⚠️ The verified domain is **permanent** — it can't be changed afterwards, so use your canonical domain.
+
+Then in the app: **Setup wizard → Cloudflare provider →** paste the Client ID + secret.
+
+---
+
+**3. Scope tiers**
+
+Non-enterprise users pick a scope level when connecting — **Minimal / Recommended / Advanced**, each with a description. On the dashboard GitHub panel the **Connect GitHub** button opens a tier chooser (a popover under the button on desktop, a bottom sheet on mobile — the "+ New Session" pattern); on **Guided Setup** and **Settings → Push &amp; Deploy** the same choice is a segmented Minimal/Recommended/Advanced toggle with the selected level's description beneath it. The selected tier is sent as the OAuth `scope` and must be within the client's **registered** scopes — so register the Advanced superset. Cloudflare scope IDs come from `GET /client/v4/oauth/scopes`; these map the capabilities the old token deeplink granted:
+
+| Tier | GitHub scopes | Cloudflare scope IDs (cumulative) |
+|---|---|---|
+| **Minimal** | `repo` | `workers-scripts.write` `workers-kv-storage.write` `workers-r2.write` `d1.write` `workers-routes.write` `account-settings.read` `user-details.read` `zone.read` |
+| **Recommended** | `repo read:org workflow` | + `dns.write` `zone-access.write` `access-acct.write` |
+| **Advanced** | `repo read:org workflow admin:repo_hook read:user` | + `page.write` `containers.write` `queues.write` `ai.write` `browser-rendering.write` `vectorize.write` `workers-ci.write` `workers-observability.write` `r2-catalog.write` `agw.write` |
+
+(GitHub *App* providers and Enterprise mode ignore the tier — permissions are fixed at install.)
+
+#### Selecting these scopes on the Cloudflare dashboard
+
+When you create/edit the OAuth client, Cloudflare's picker shows **descriptive names** — the literal scope ID only appears *after* you save, which makes it easy to pick the wrong one. Match by the table below, and register the **full Advanced superset** (all 21, **plus `offline_access`**); each per-connect tier just requests a subset of it.
+
+> ⚠️ **"Access: Apps and Policies Write" is listed twice** with different IDs. Select the one whose ID is **`zone-access.write`** — *not* `access.write`.
+
+| Cloudflare dashboard name | Scope ID | Dashboard section | Tier |
+|---|---|---|---|
+| Workers Scripts Write | `workers-scripts.write` | Developer Platform | Minimal |
+| Workers KV Storage Write | `workers-kv-storage.write` | Developer Platform | Minimal |
+| Workers R2 Storage Write | `workers-r2.write` | Developer Platform | Minimal |
+| D1 Write | `d1.write` | Developer Platform | Minimal |
+| Workers Routes Write | `workers-routes.write` | Developer Platform | Minimal |
+| Account Settings Read | `account-settings.read` | Account & Billing | Minimal |
+| User Details Read | `user-details.read` | Account & Billing | Minimal |
+| Zone Read | `zone.read` | DNS & Zones | Minimal |
+| DNS Write | `dns.write` | DNS & Zones | Recommended |
+| Access: Apps and Policies Write | `zone-access.write` | Cloudflare One / Zero Trust | Recommended |
+| Access: Organizations, Identity Providers, and Groups Write | `access-acct.write` | Cloudflare One / Zero Trust | Recommended |
+| Pages Write | `page.write` | Developer Platform | Advanced |
+| Workers Containers Write | `containers.write` | Developer Platform | Advanced |
+| Queues Write | `queues.write` | Developer Platform | Advanced |
+| Workers AI Write | `ai.write` | AI & Machine Learning | Advanced |
+| Browser Rendering Write | `browser-rendering.write` | Developer Platform | Advanced |
+| Vectorize Write | `vectorize.write` | Developer Platform | Advanced |
+| Workers CI Write | `workers-ci.write` | Developer Platform | Advanced |
+| Workers Observability Write | `workers-observability.write` | Developer Platform | Advanced |
+| Workers R2 Data Catalog Write | `r2-catalog.write` | Developer Platform | Advanced |
+| Agents Gateway Write | `agw.write` | AI & Machine Learning | Advanced |
+| offline_access (refresh tokens) | `offline_access` | Other | All tiers |
+
+The connect flow always appends `offline_access`, so it must be enabled on the client or token refresh silently breaks. `ai.read` is **not** required — `ai.write` already covers Workers AI.
+
+---
+
+**Where the credentials live.** The wizard writes `setup:github_*` and `setup:cloudflare_oauth_client_*` to KV (ids plain, secrets AES-256-GCM-encrypted via `ENCRYPTION_KEY`). When a user connects, their per-user token + refresh token land encrypted in `deploy-keys:<bucket>` and are injected into the container as `GH_TOKEN` / `CLOUDFLARE_API_TOKEN` on session start, refreshed on expiry. See [configuration](documentation/lanes/configuration.md) and [authentication](documentation/lanes/authentication.md) for the full reference.
 
 </details>
 

@@ -461,17 +461,19 @@ None.
 
 ---
 
-<!-- @test: web-ui/src/__tests__/components/OnboardingPage.test.tsx (OnboardingPage / REQ-AUTH-015 describe -> renders 4-step flow (idle timeout, GitHub PAT, Cloudflare API token, agent subscription) + free-tier 15m locked + paying-tier 5m-2h selector + auto-redirect for first-time users + onboardingComplete flag prevents re-redirect -> AC1, AC2, AC3, AC4) -->
+<!-- @test: web-ui/src/__tests__/components/OnboardingPage.test.tsx (OnboardingPage / REQ-AUTH-015 describe -> renders 4-step flow (idle timeout, Connect GitHub OAuth, Connect Cloudflare OAuth, agent subscription) + free-tier 15m locked + paying-tier 5m-2h selector + auto-redirect for first-time users + onboardingComplete flag prevents re-redirect -> AC1, AC2, AC3, AC4) -->
 ### REQ-AUTH-015: Guided onboarding flow
 
 <!-- @impl: web-ui/src/components/OnboardingPage.tsx -->
+<!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+<!-- @impl: web-ui/src/lib/oauth-connections.ts -->
 **Intent:** First-time users are walked through connecting their accounts step by step.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. The onboarding page shows four steps: idle timeout selector, GitHub PAT, Cloudflare API token, and agent subscription. <!-- @impl: web-ui/src/components/OnboardingPage.tsx::OnboardingPage -->
+1. The onboarding page shows four steps: idle timeout selector, **Connect GitHub** (OAuth), **Connect Cloudflare** (OAuth), and agent subscription. The GitHub and Cloudflare steps reuse the shared OAuth connect card ([REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-AGENT-064](agents.md#req-agent-064-connect-to-cloudflare-via-oauth)) — no manual token paste. <!-- @impl: web-ui/src/components/OnboardingPage.tsx::OnboardingPage --> <!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
 2. The idle timeout step explains compute usage and lets users choose their auto-sleep duration. Free-tier users see a locked 15m selector with upgrade hint; paying users can select 5m-2h. <!-- @impl: web-ui/src/components/OnboardingPage.tsx::OnboardingPage -->
 3. First-time users are auto-redirected to onboarding.
 4. Once onboarding has been completed, the user is not redirected there again.
@@ -482,7 +484,7 @@ None.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AUTH-007](#req-auth-007-jit-user-provisioning-in-saas-mode), [REQ-SESSION-014](session-lifecycle.md#req-session-014-user-configurable-auto-sleep-timeout-in-settings)
+**Dependencies:** [REQ-AUTH-007](#req-auth-007-jit-user-provisioning-in-saas-mode), [REQ-SESSION-014](session-lifecycle.md#req-session-014-user-configurable-auto-sleep-timeout-in-settings), [REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-AGENT-064](agents.md#req-agent-064-connect-to-cloudflare-via-oauth)
 
 **Verification:** [Integration test](../../web-ui/src/__tests__/components/OnboardingPage.test.tsx)
 
@@ -505,7 +507,7 @@ None.
 
 **Constraints:**
 
-None.
+- In Enterprise Mode the dropdown does not open — the avatar/username stays visible but its click is inert — per [REQ-ENTERPRISE-008](enterprise-mode.md#req-enterprise-008-enterprise-frontend-surface-suppression) AC8. This REQ describes the non-enterprise dropdown.
 
 **Priority:** P2
 

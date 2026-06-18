@@ -218,6 +218,10 @@ export const SetupPrefillResponseSchema = z.object({
   githubAppClientSecretSet: z.boolean().default(false),
   githubOauthClientId: z.string().default(''),
   githubOauthClientSecretSet: z.boolean().default(false),
+  // Connect-to-Cloudflare OAuth client (masked — only whether the secret is set) +
+  // the non-secret client id. Surfaced in any mode (the Setup wizard is admin-gated).
+  cloudflareOauthClientId: z.string().default(''),
+  cloudflareOauthClientSecretSet: z.boolean().default(false),
   // REQ-ENTERPRISE-013: per-group routing map (route names only, no secrets).
   groupRouting: z
     .record(z.string(), z.object({
@@ -378,6 +382,17 @@ export const GithubStatusResponseSchema = z.object({
   connected: z.boolean(),
   login: z.string().optional(),
   source: z.union([z.literal('app'), z.literal('oauth'), z.literal('pat')]).optional(),
+});
+
+// GET /api/cloudflare/status. `accounts` is surfaced only when connected without a
+// selected account (the picker case). Connect is NOT tier-gated, so there is no
+// `enabled` flag (unlike GitHub's repo-browser panel).
+export const CloudflareStatusResponseSchema = z.object({
+  configured: z.boolean(),
+  connected: z.boolean(),
+  accountId: z.string().optional(),
+  source: z.union([z.literal('oauth'), z.literal('pat')]).optional(),
+  accounts: z.array(z.object({ id: z.string(), name: z.string() })).optional(),
 });
 
 // A single repository from GET /api/github/repos.

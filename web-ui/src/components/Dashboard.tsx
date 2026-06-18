@@ -46,7 +46,14 @@ const Dashboard: Component<DashboardProps> = (props) => {
   // only a valid target when GitHub is enabled; when it is not (non-enterprise /
   // onboarding) force the storage (R2) face so the empty GitHub panel can never
   // become the active face and cover the file browser. (REQ-GITHUB-002)
-  const effectiveFace = () => (githubStore.enabled ? panelFace() : 'storage');
+  // The GitHub repo panel is an advanced-session feature in non-enterprise modes
+  // (matches the Vault button gate, sessionMode === 'advanced'); enterprise shows it
+  // whenever the backend enables it. Connect itself is not gated here — it lives in
+  // Guided Setup + the Settings accordion and works for every user.
+  const githubPanelAvailable = () =>
+    githubStore.enabled &&
+    (sessionStore.enterpriseMode || sessionStore.preferences?.sessionMode === 'advanced');
+  const effectiveFace = () => (githubPanelAvailable() ? panelFace() : 'storage');
   const [showCreateDialog, setShowCreateDialog] = createSignal(false);
   const [showLimitPopup, setShowLimitPopup] = createSignal(false);
   const [showUserMenu, setShowUserMenu] = createSignal(false);
@@ -146,6 +153,10 @@ const Dashboard: Component<DashboardProps> = (props) => {
           </div>
           <div class="header-spacer" />
           <div class="header-actions">
+            {/* The avatar/username stays visible in every mode. In enterprise the
+                dropdown has no entries (Subscription/Usage SaaS-only, Guided
+                Setup/Logout hidden under SSO), so the avatar's click is inert —
+                it opens nothing rather than an empty dropdown. */}
             <div class="header-user-wrapper">
               <button
                 type="button"
@@ -154,6 +165,7 @@ const Dashboard: Component<DashboardProps> = (props) => {
                 data-testid="header-user-menu"
                 title="User menu"
                 onClick={() => {
+                  if (sessionStore.enterpriseMode) return;
                   if (!showUserMenu() && userBtnRef) {
                     const rect = userBtnRef.getBoundingClientRect();
                     setUserMenuPos({ top: rect.bottom + 8, right: window.innerWidth - rect.right });
@@ -192,6 +204,10 @@ const Dashboard: Component<DashboardProps> = (props) => {
                         <Icon path={mdiAccountOutline} size={16} />
                         <span>Subscription</span>
                       </a>
+                    </Show>
+                    {/* Usage is SaaS-only — the enterprise usage view is disabled
+                        for now (it always reports 0; fix deferred). */}
+                    <Show when={sessionStore.saasMode}>
                       <a
                         href="/app/usage"
                         class="header-user-dropdown-item"
@@ -202,6 +218,10 @@ const Dashboard: Component<DashboardProps> = (props) => {
                         <UsageInlineBadge />
                       </a>
                     </Show>
+                    {/* Guided Setup + Logout are not per-item enterprise-gated: the
+                        dropdown only opens outside enterprise (the avatar's onClick is
+                        inert in enterprise, REQ-ENTERPRISE-008 AC8/AC9), so reaching
+                        here implies non-enterprise. */}
                     <a
                       href="/app/onboarding"
                       class="header-user-dropdown-item"
@@ -308,7 +328,7 @@ const Dashboard: Component<DashboardProps> = (props) => {
 
 
             <div class="dashboard-stats-section">
-              <div class="dashboard-section-divider"><span>Storage</span></div>
+              <div class="dashboard-section-divider"><span>Storage Usage</span></div>
               <StatCards stats={storageStore.stats} />
             </div>
           </div>
@@ -319,9 +339,9 @@ const Dashboard: Component<DashboardProps> = (props) => {
               <GitHubPanel onFlip={() => setPanelFace('storage')} />
             </div>
             <div class="panel-flip-face panel-flip-face--storage" data-active={effectiveFace() === 'storage'}>
-              <Show when={githubStore.enabled}>
+              <Show when={githubPanelAvailable()}>
                 <div class="files-panel-header" data-testid="files-panel-header">
-                  <h2 class="files-panel-title" data-testid="files-panel-title">Storage</h2>
+                  <h2 class="files-panel-title" data-testid="files-panel-title">Storage Browser</h2>
                   <IconButton
                     icon={mdiFlipVertical}
                     label="Show GitHub"

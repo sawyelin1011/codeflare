@@ -1,0 +1,169 @@
+/* Shared OAuthConnectCard styling (GitHub / Cloudflare connect surfaces).
+   Tokens only — no magic numbers — so retuning is a one-line change. */
+
+.oauth-connect-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-elevated);
+}
+
+.oauth-connect-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.oauth-connect-icon {
+  color: var(--color-text-secondary);
+  flex-shrink: 0;
+}
+
+.oauth-connect-name {
+  flex: 1;
+  font-weight: var(--font-semibold);
+  color: var(--color-text-primary);
+}
+
+/* Connected pill + Disconnect link — matches the production scope-tier card. */
+.oauth-connect-badge {
+  padding: 3px 10px;
+  border-radius: var(--radius-full);
+  background: var(--color-success-bg);
+  color: var(--color-success);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+  font-size: var(--text-xs);
+  font-weight: var(--font-medium);
+}
+
+.oauth-connect-disconnect {
+  padding: var(--space-1) var(--space-2);
+  border: none;
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+
+.oauth-connect-disconnect:hover {
+  color: var(--color-error);
+}
+
+.oauth-connect-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.oauth-connect-identity {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.oauth-connect-account {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.oauth-connect-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  cursor: pointer;
+  transition: var(--transition-fast);
+}
+
+.oauth-connect-btn--connect {
+  border: none;
+  color: #fff;
+  background: var(--color-accent);
+}
+
+/* Tier selector for the Settings / Guided Setup connect cards: a segmented
+   Minimal│Recommended│Advanced toggle + a subtitle describing the selected
+   level. Mirrors the production scope-tier control so the two surfaces read
+   identically. Tokens only. */
+.oauth-connect-tier {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  width: 100%;
+}
+
+.oauth-connect-tier-control {
+  display: flex;
+  flex-wrap: wrap;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.oauth-connect-tier-option {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2) var(--space-3);
+  min-width: 80px;
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium);
+  color: var(--color-text-secondary);
+  background: var(--color-bg-base);
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.oauth-connect-tier-option input[type="radio"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.oauth-connect-tier-option + .oauth-connect-tier-option {
+  border-left: 1px solid var(--color-border-subtle);
+}
+
+.oauth-connect-tier-option--selected {
+  background: var(--color-accent);
+  color: var(--color-accent-contrast);
+}
+
+.oauth-connect-tier-option:not(.oauth-connect-tier-option--selected):hover {
+  background: var(--color-bg-muted);
+}
+
+.oauth-connect-tier-desc {
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--color-text-secondary);
+}
+
+.oauth-connect-spinner {
+  width: var(--space-4);
+  height: var(--space-4);
+  border: 2px solid var(--color-border-subtle);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: oauth-connect-spin 0.8s linear infinite;
+}
+
+@keyframes oauth-connect-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .oauth-connect-spinner { animation: none; }
+}

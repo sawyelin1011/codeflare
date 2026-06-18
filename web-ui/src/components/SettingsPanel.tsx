@@ -1,4 +1,4 @@
-import { Component, createSignal, createEffect, on, Show, onMount, JSX } from 'solid-js';
+import { Component, createSignal, createEffect, createRenderEffect, on, Show, onMount, JSX } from 'solid-js';
 import {
   mdiClose,
   mdiCogOutline,
@@ -289,6 +289,11 @@ const SettingsPanel: Component<SettingsPanelProps> = (props) => {
         role="dialog"
         aria-label="Settings"
         aria-hidden={!props.isOpen}
+        // inert when closed: removes the subtree (incl. the close button) from the
+        // tab/focus order, so focus cannot be retained under aria-hidden (a11y warning).
+        // Set imperatively (ref + render effect) so it compiles regardless of the JSX
+        // typing for `inert`, while staying reactive to isOpen and set during render.
+        ref={(el) => createRenderEffect(() => el.toggleAttribute('inert', !props.isOpen))}
       >
         {/* Header */}
         <header class="settings-header">

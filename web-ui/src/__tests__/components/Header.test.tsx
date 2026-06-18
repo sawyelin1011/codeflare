@@ -675,10 +675,11 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
     });
   });
 
-  // REQ-ENTERPRISE-008 AC2: the Subscription + Usage menu items are SaaS-billing
-  // surfaces, gated on saasMode (shown only in SaaS; hidden in onboarding/default
-  // and enterprise alike).
-  describe('Subscription/Usage gating (SaaS-only)', () => {
+  // REQ-ENTERPRISE-008 AC2: Subscription (SaaS billing) and Usage (consumption)
+  // are both gated on saasMode — shown only in SaaS, hidden in onboarding/default.
+  // In enterprise the dropdown never opens (see 'enterprise user menu' below), so
+  // neither entry can appear.
+  describe('Subscription/Usage gating', () => {
     it('shows the Subscription menu item in SaaS mode', () => {
       sessionStoreState.saasMode = true;
       render(() => <Header {...defaultSessionProps} />);
@@ -700,35 +701,30 @@ describe('Header Component / REQ-VAULT-012 (vault button render and readiness ga
       expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
     });
 
-    it('hides the Subscription and Usage menu items in enterprise mode', () => {
-      sessionStoreState.enterpriseMode = true;
-      render(() => <Header {...defaultSessionProps} />);
-
-      fireEvent.click(screen.getByTestId('header-user-menu'));
-
-      expect(screen.queryByTestId('header-user-dropdown-profile')).not.toBeInTheDocument();
-      expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
-      // Logout remains present.
-      expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
-    });
   });
 
-  // REQ-ENTERPRISE-008: Guided Setup (per-user onboarding) is hidden in enterprise
-  // mode — enterprise instances are configured by an admin via Setup, not per-user.
-  describe('Guided Setup gating (enterprise)', () => {
-    it('shows Guided Setup outside enterprise mode', () => {
+  // REQ-ENTERPRISE-008 AC8: in enterprise the avatar/username stays visible (users
+  // always see their identity) but every dropdown entry is gated away — admin-
+  // configured via Setup (Guided Setup), ineffective under SSO (Logout), SaaS-only
+  // (Subscription), or a broken 0-reporting surface (Usage). With nothing to show,
+  // clicking the avatar opens no dropdown.
+  describe('enterprise user menu', () => {
+    it('shows Guided Setup and Logout outside enterprise mode', () => {
       render(() => <Header {...defaultSessionProps} />);
       fireEvent.click(screen.getByTestId('header-user-menu'));
       expect(screen.getByTestId('header-user-dropdown-onboarding')).toBeInTheDocument();
+      expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
     });
 
-    it('hides Guided Setup in enterprise mode', () => {
+    it('keeps the avatar visible but opens no dropdown in enterprise mode', () => {
       sessionStoreState.enterpriseMode = true;
       render(() => <Header {...defaultSessionProps} />);
+      // Avatar/username trigger stays rendered so the user sees their identity.
+      expect(screen.getByTestId('header-user-menu')).toBeInTheDocument();
+      // Clicking it is inert — no dropdown opens.
       fireEvent.click(screen.getByTestId('header-user-menu'));
-      expect(screen.queryByTestId('header-user-dropdown-onboarding')).not.toBeInTheDocument();
-      // The rest of the dropdown still renders.
-      expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
+      expect(screen.queryByTestId('header-user-dropdown')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
     });
   });
 });

@@ -17,7 +17,6 @@
 import type { DeployKeys, Env } from '../types';
 import { getDeployKeysKey, SETUP_KEYS } from './kv-keys';
 import { getAndDecrypt, encryptAndStore, getOrImportKey } from './kv-crypto';
-import { isEnterpriseMode } from './subscription';
 import { createLogger } from './logger';
 
 const logger = createLogger('github-token');
@@ -135,7 +134,8 @@ export async function getGithubConnectionStatus(
 
 export interface GithubOAuthProvider {
   readonly source: 'app' | 'oauth';
-  authorizeUrl(params: { state: string; redirectUri: string }): string;
+  /** `scope` (OAuth-App only) overrides the default scope set; the App path ignores it. */
+  authorizeUrl(params: { state: string; redirectUri: string; scope?: string }): string;
   exchangeCode(code: string, redirectUri: string): Promise<GithubConnection>;
   /** Throws if refresh is unsupported (OAuth App) or fails. */
   refresh(refreshToken: string): Promise<GithubConnection>;
@@ -212,9 +212,9 @@ class GitHubAppUserProvider implements GithubOAuthProvider {
   readonly source = 'app' as const;
   constructor(private env: Env, private clientId: string, private clientSecret: string) {}
 
-  authorizeUrl({ state, redirectUri }: { state: string; redirectUri: string }): string {
+  authorizeUrl({ state, redirectUri }: { state: string; redirectUri: string; scope?: string }): string {
     // GitHub App user-to-server: scopes come from the App's installed permissions,
-    // so no `scope` param is sent.
+    // so no `scope` param is sent (the tier-derived scope is ignored here).
     const p = new URLSearchParams({ client_id: this.clientId, state, redirect_uri: redirectUri });
     return `https://${webHost(this.env)}/login/oauth/authorize?${p.toString()}`;
   }
@@ -261,12 +261,12 @@ class OAuthAppProvider implements GithubOAuthProvider {
   private static readonly SCOPES = 'repo read:org workflow';
   constructor(private env: Env, private clientId: string, private clientSecret: string) {}
 
-  authorizeUrl({ state, redirectUri }: { state: string; redirectUri: string }): string {
+  authorizeUrl({ state, redirectUri, scope }: { state: string; redirectUri: string; scope?: string }): string {
     const p = new URLSearchParams({
       client_id: this.clientId,
       state,
       redirect_uri: redirectUri,
-      scope: OAuthAppProvider.SCOPES,
+      scope: scope ?? OAuthAppProvider.SCOPES,
     });
     return `https://${webHost(this.env)}/login/oauth/authorize?${p.toString()}`;
   }
@@ -300,12 +300,14 @@ interface StoredGithubSecret {
 }
 
 /**
- * Resolve the admin-configured provider from Setup→KV (enterprise, REQ-GITHUB-008).
- * GITHUB_PROVIDER_TYPE selects the pair; the client id is plain, the secret encrypted.
- * Fails closed (null) when the selected provider's id/secret are not both present, or
- * the secret cannot be decrypted (no ENCRYPTION_KEY) — never an ambiguous provider.
+ * Resolve the admin-configured provider from Setup→KV (REQ-GITHUB-008). Set by an
+ * admin in the Setup wizard, which is admin-gated in ANY mode (enterprise AND
+ * non-enterprise), so this path applies everywhere. GITHUB_PROVIDER_TYPE selects
+ * the pair; the client id is plain, the secret encrypted. Fails closed (null) when
+ * the selected provider's id/secret are not both present, or the secret cannot be
+ * decrypted (no ENCRYPTION_KEY) — never an ambiguous provider.
  */
-async function getEnterpriseProviderFromKv(env: Env): Promise<GithubOAuthProvider | null> {
+async function getProviderFromKv(env: Env): Promise<GithubOAuthProvider | null> {
   const type = await env.KV.get(SETUP_KEYS.GITHUB_PROVIDER_TYPE);
   if (type !== 'app' && type !== 'oauth') return null;
   const idKey = type === 'app' ? SETUP_KEYS.GITHUB_APP_CLIENT_ID : SETUP_KEYS.GITHUB_OAUTH_CLIENT_ID;
@@ -322,16 +324,14 @@ async function getEnterpriseProviderFromKv(env: Env): Promise<GithubOAuthProvide
 }
 
 /**
- * Select the GitHub OAuth/App provider. In enterprise mode the admin configures it in
- * the Setup wizard (KV); a complete config wins. Otherwise — and as the enterprise
- * fail-closed fallback — deploy-time env vars are used (GitHub App precedence over
- * OAuth App), the unchanged non-enterprise path. Neither configured ⇒ null.
+ * Select the GitHub OAuth/App provider. An admin can configure it in the Setup
+ * wizard (KV) in ANY mode; a complete config wins. Otherwise deploy-time env vars
+ * are used (GitHub App precedence over OAuth App) — the unchanged env fallback that
+ * non-enterprise deployments without a Setup config keep relying on. Neither ⇒ null.
  */
 export async function getGithubProvider(env: Env): Promise<GithubOAuthProvider | null> {
-  if (isEnterpriseMode(env)) {
-    const fromKv = await getEnterpriseProviderFromKv(env);
-    if (fromKv) return fromKv;
-  }
+  const fromKv = await getProviderFromKv(env);
+  if (fromKv) return fromKv;
   if (env.GITHUB_APP_CLIENT_ID && env.GITHUB_APP_CLIENT_SECRET) {
     return new GitHubAppUserProvider(env, env.GITHUB_APP_CLIENT_ID, env.GITHUB_APP_CLIENT_SECRET);
   }

@@ -47,7 +47,7 @@ Multi-agent support, preseed system, and session modes.
 2. The `AgentType` type is enforced via Zod schema (`AgentTypeSchema`). <!-- @impl: src/types.ts::AgentTypeSchema -->
 3. Each agent's CLI is pre-installed in the container image as a global npm package (or native binary for Go-based agents).
 4. Node.js-based agent CLIs (Codex, Copilot, Pi) are pre-warmed at image build time so V8's compile cache is populated before the user's first interactive launch. Claude Code is installed as a global npm package and is warmed by the version smoke-test run at install time, so it is excluded from the dedicated warm-up block; Go-based agents (OpenCode, Antigravity) are natively compiled.
-5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install.
+5. Pi extension npm dependencies are installed into an image-local cache at build time; the entrypoint symlinks `node_modules` to the cache (zero-copy, instant) so Pi starts without a first-launch package install. Because `@earendil-works/pi-coding-agent` is only a transitive dependency of those extensions, a build-time version bridge forces it to the exact version the global `@latest` runtime agent resolved (an npm `overrides` entry plus a lockfile-free reinstall, replacing the frozen `npm ci`), so the prewarm SDK never drifts from the runtime agent and cannot ship a stale transitive CVE; the bridge fails closed if the global version cannot be read or the post-install pin does not match.
 
 **Constraints:**
 
@@ -580,24 +580,29 @@ None.
 
 ---
 
-<!-- @test: src/__tests__/routes/deploy-keys.test.ts (Deploy Keys routes / REQ-AGENT-018 describe -> POST validates token against provider before save + encrypted-at-rest in KV + GET returns masked tokens -> AC2 validation, AC3 encrypted-at-rest, AC4 env-var injection) -->
+<!-- @test: src/__tests__/routes/deploy-keys.test.ts (Deploy Keys routes / REQ-AGENT-018 describe -> POST validates token against provider before save + encrypted-at-rest in KV + GET returns masked tokens -> AC2 encrypted-at-rest, AC4 env-var injection) -->
 <!-- @test: src/__tests__/container/container-env.test.ts (buildEnvVars describe -> emits GH_TOKEN/CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID when state has deploy keys -> AC4 env-var injection) -->
 ### REQ-AGENT-018: Push & Deploy credential management UI
 
-<!-- @impl: web-ui/src/components -->
-<!-- @impl: src/routes/deploy-keys.ts -->
-<!-- @test: src/__tests__/routes/deploy-keys.test.ts (Deploy Keys routes + GET/PUT/DELETE describes -> AC1/AC2/AC3/AC4 settings UI route + provider validation + KV encryption + container env propagation) -->
+<!-- @impl: web-ui/src/components/settings/DeployKeysSection.tsx -->
+<!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+<!-- @impl: web-ui/src/lib/oauth-connections.ts -->
+<!-- @impl: src/routes/github.ts -->
+<!-- @impl: src/routes/cloudflare.ts -->
+<!-- @test: web-ui/src/__tests__/components/settings/DeployKeysSection.test.tsx (accordion composes the shared OAuth connect cards for both providers -> AC1,AC3) -->
+<!-- @test: web-ui/src/__tests__/components/connect/OAuthConnectCard.test.tsx (connect navigation, tier, disconnect, account contracts -> AC2,AC3) -->
+<!-- @test: src/__tests__/routes/deploy-keys.test.ts (deploy credentials propagate to container env -> AC4) -->
 
-**Intent:** Users connect GitHub and Cloudflare accounts through a visual interface without CLI commands.
+**Intent:** Users connect their GitHub and Cloudflare accounts through a visual interface — OAuth, with no CLI commands and no manual token paste.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. Settings panel has Deploy Keys section with provider rows for GitHub and Cloudflare.
-2. Tokens validated against provider APIs before saving.
-3. Stored encrypted in KV.
-4. Deploy credentials are propagated into the container environment so the agent CLIs can authenticate to GitHub and Cloudflare without additional configuration.
+1. The Settings "Push & Deploy" accordion presents one shared OAuth connect card per provider (GitHub, Cloudflare) — the same composable card reused by the dashboard panel and Guided Setup ([REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-AGENT-064](#req-agent-064-connect-to-cloudflare-via-oauth)). <!-- @impl: web-ui/src/components/settings/DeployKeysSection.tsx --> <!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+2. Connecting runs the provider OAuth flow (no manual token entry); the per-user token is stored encrypted server-side and never reaches the browser, and disconnect revokes + clears it. <!-- @impl: src/routes/github.ts --> <!-- @impl: src/routes/cloudflare.ts -->
+3. A connected card shows the account identity and (Cloudflare) an account picker; a scope tier can be selected before connecting. <!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+4. Deploy credentials are propagated into the container environment so the agent CLIs can authenticate to GitHub and Cloudflare without additional configuration. <!-- @impl: src/routes/container/lifecycle.ts -->
 
 **Constraints:**
 
@@ -605,9 +610,9 @@ None.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AGENT-010](#req-agent-010-deploy-credential-storage-github-pat-cf-api-token)
+**Dependencies:** [REQ-AGENT-010](#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-AGENT-064](#req-agent-064-connect-to-cloudflare-via-oauth)
 
-**Verification:** [Integration test](../../src/__tests__/routes/deploy-keys.test.ts)
+**Verification:** [Accordion test](../../web-ui/src/__tests__/components/settings/DeployKeysSection.test.tsx) + [Connect card test](../../web-ui/src/__tests__/components/connect/OAuthConnectCard.test.tsx) + [Propagation test](../../src/__tests__/routes/deploy-keys.test.ts) + [Env-var injection test](../../src/__tests__/container/container-env.test.ts)
 
 **Status:** Implemented
 
@@ -817,7 +822,7 @@ None.
 1. The Pi `/review` command injects a dedicated Pi-native `review` skill that mirrors the Claude `commands/review.md` workflow, instead of injecting the `git-review-pipeline` enforcement skill.
 2. The Pi `review` skill is the user-invoked review workflow (multi-perspective specialist subagents, cross-reference, architecture-decision filter, optional external verification, interactive triage), explicitly distinct from PR-boundary enforcement; it does not run the `git-review-pipeline`.
 3. The skill scopes review by `--all` or `--diff` parsed from the appended command line, prints help and runs no phases when neither flag is present, and supports the `--deep` and `--verify-high` flags.
-4. The skill is static-analysis only: it never runs builds, tests, or linters (the container has 1 vCPU).
+4. The skill is static-analysis only: it never runs builds, tests, or linters (the container is resource-constrained).
 5. The skill maps Claude primitives to Pi-native ones: subagents spawn via Pi's `Agent` tool with `subagent_type`, graph queries use Pi-native `graphify_query`/`graphify_path`/`graphify_explain` (with a `--graph <repo>/graphify-out/graph.json` CLI fallback), and plan entry uses the `Plan` agent or an explicit written-and-approved plan.
 6. The skill is delivered advanced-only via the Pi manifest (`skills/review/SKILL.md`) through the standard seed pipeline.
 
@@ -2061,28 +2066,111 @@ None.
 
 ### REQ-AGENT-028: Deploy Credential Token-Creation UX
 
-<!-- @impl: web-ui/src/components/settings/ProviderRow.tsx -->
-<!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (GITHUB_TIERS + getGithubTokenUrl describes -> AC1 three-tier GitHub scope selector; CLOUDFLARE_TIERS + getCloudflareTokenUrl describes -> AC2 three-tier Cloudflare scope selector with 7/10/22 scope counts) -->
+<!-- @impl: web-ui/src/lib/token-scopes.ts -->
+<!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+<!-- @impl: web-ui/src/components/connect/TierChooserDialog.tsx -->
+<!-- @impl: src/lib/oauth-scopes.ts -->
+<!-- @test: web-ui/src/__tests__/lib/token-scopes.test.ts (tier catalogs: three tiers in order + non-empty label+description -> AC1,AC2) -->
+<!-- @test: web-ui/src/__tests__/components/connect/TierChooserDialog.test.tsx (dashboard tier dialog renders all tiers + descriptions, pick fires onPick -> AC1,AC2) -->
+<!-- @test: web-ui/src/__tests__/components/connect/OAuthConnectCard.test.tsx (Settings/Setup segmented tier control lists all tiers, marks the selected one, pick fires onSelect, selected tier in the connect URL's tier param -> AC1,AC2) -->
+<!-- @test: web-ui/src/__tests__/components/settings/DeployKeysSection.test.tsx (both providers render the segmented tier control + subtitle -> AC1,AC2) -->
+<!-- @test: src/__tests__/lib/oauth-scopes.test.ts (tier->scope mapping, offline_access invariant, monotonic growth -> AC3) -->
 
-**Intent:** Token creation for GitHub and Cloudflare must guide users through scope selection so they create the smallest token that still unlocks the features they need, without copy-pasting raw scope strings.
+**Intent:** Connecting GitHub and Cloudflare must guide users through scope selection so they grant the smallest scope set that unlocks the features they need, without copy-pasting raw scope strings — the chosen tier flows into the OAuth `scope` parameter.
 
 **Applies To:** User
 
 **Acceptance Criteria:**
 
-1. GitHub token creation offers three scope tiers (Minimal, Recommended, Advanced) via a selector in the connect flow, with Recommended pre-selected and the URL pre-filling the correct scopes per tier. <!-- @impl: web-ui/src/lib/token-scopes.ts::GITHUB_TIERS --> <!-- @impl: web-ui/src/lib/token-scopes.ts::getGithubTokenUrl -->
-2. Cloudflare token creation offers three scope tiers (Minimal, Recommended, Advanced) via the same selector pattern, with Recommended pre-selected and the URL pre-filling the correct permission group keys per tier. <!-- @impl: web-ui/src/lib/token-scopes.ts::CLOUDFLARE_TIERS --> <!-- @impl: web-ui/src/lib/token-scopes.ts::getCloudflareTokenUrl -->
-3. A documentation page lists all scopes per tier with explanations of why each is needed, linked from the UI via "See all scopes". <!-- @impl: web-ui/src/lib/token-scopes.ts::SCOPES_DOCS_URL -->
+1. The GitHub connect card offers three scope tiers (Minimal, Recommended, Advanced) with Recommended pre-selected; the selection is sent to the server as the connect URL's `tier` query param. <!-- @impl: web-ui/src/lib/token-scopes.ts::GITHUB_TIERS --> <!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+2. The Cloudflare connect card offers the same three-tier selector with Recommended pre-selected, sent the same way. <!-- @impl: web-ui/src/lib/token-scopes.ts::CLOUDFLARE_TIERS --> <!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+3. The server maps the requested tier to the OAuth `scope` parameter from a backend scope catalog (the catalog never leaves the server); higher tiers are supersets of lower tiers, and the Cloudflare scope always includes `offline_access`. <!-- @impl: src/lib/oauth-scopes.ts::githubScopeForTier --> <!-- @impl: src/lib/oauth-scopes.ts::cloudflareScopeForTier -->
 
 **Constraints:**
 
-- GitHub Minimal: 1 scope (contents). Recommended: 6 scopes (contents, PRs, actions, workflows, administration, secrets). Advanced: all 19 scopes including Copilot.
-- Cloudflare Minimal: 7 scopes (Workers Scripts, KV, R2, D1, Routes, Account Settings read, Zone read). Recommended: 10 scopes (Minimal + DNS, Access Apps+Policies, Access Orgs+IdPs). Advanced: 22 scopes (Recommended + Pages, Containers, API Tokens, Queues, AI read+write, Vectorize, Turnstile, Builds, Observability, R2 Data Catalog, Agents).
+- The client sends only the tier name (untrusted, normalized server-side to a known tier; default `recommended`); the concrete scope strings are defined once, server-side ([REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise) AC6, [REQ-AGENT-064](#req-agent-064-connect-to-cloudflare-via-oauth)).
+- A GitHub App's permissions are fixed at registration, so the tier affects only the OAuth-App path.
 
 **Priority:** P1
 
-**Dependencies:** [REQ-AGENT-010](#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-019](#req-agent-019-branded-settings-ui)
+**Dependencies:** [REQ-AGENT-018](#req-agent-018-push--deploy-credential-management-ui), [REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-AGENT-064](#req-agent-064-connect-to-cloudflare-via-oauth)
 
-**Verification:** [Token scope tests](../../web-ui/src/__tests__/lib/token-scopes.test.ts)
+**Verification:** [Tier catalog test](../../web-ui/src/__tests__/lib/token-scopes.test.ts) + [Connect card test](../../web-ui/src/__tests__/components/connect/OAuthConnectCard.test.tsx) + [Scope mapping test](../../src/__tests__/lib/oauth-scopes.test.ts)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-064: Connect to Cloudflare via OAuth
+
+<!-- @impl: src/lib/cloudflare-token.ts -->
+<!-- @impl: src/routes/cloudflare.ts -->
+<!-- @impl: src/routes/cloudflare-auth.ts -->
+<!-- @impl: src/lib/oauth-scopes.ts::cloudflareScopeForTier -->
+<!-- @impl: src/routes/setup/index.ts -->
+<!-- @impl: web-ui/src/components/connect/OAuthConnectCard.tsx -->
+<!-- @impl: web-ui/src/components/setup/CloudflareProviderChooser.tsx -->
+<!-- @impl: web-ui/src/api/cloudflare.ts -->
+<!-- @test: src/__tests__/lib/cloudflare-token.test.ts (provider authorize/exchange/refresh/revoke + getValidCloudflareToken refresh matrix + KV client resolution + applyCloudflareOAuthToken injection -> AC1,AC4,AC7) -->
+<!-- @test: src/__tests__/routes/cloudflare-oauth.test.ts (connect 302 + state, not tier-gated, callback exchange + single/multi account, replayed-state rejection, tier->scope -> AC2,AC3,AC5) -->
+<!-- @test: src/__tests__/routes/setup.test.ts (cloudflare oauth client persist + fail-closed -> AC6) -->
+<!-- @test: web-ui/src/__tests__/components/CloudflareProviderChooser.test.tsx (admin client id+secret inputs -> AC6) -->
+
+**Intent:** In non-enterprise modes a user connects their own Cloudflare account via OAuth — mirroring the GitHub connect — so the per-user deploy token is obtained without pasting a dashboard-created API token. One operator-registered OAuth client serves every user; each user authorizes their own account.
+
+**Applies To:** User
+
+**Acceptance Criteria:**
+
+1. A `CloudflareOAuthProvider` implements the same provider interface as GitHub (authorizeUrl / exchangeCode / refresh / revoke) against Cloudflare's OAuth endpoints (`dash.cloudflare.com/oauth2/auth` + `/oauth2/token` + `/oauth2/revoke`); the access token, refresh token, and expiry persist across the existing `deploy-keys:<bucket>` Cloudflare fields (source `'oauth'`), encrypted at rest — no new KV key. <!-- @impl: src/lib/cloudflare-token.ts -->
+2. `GET /api/cloudflare/connect`, its callback, and `POST /api/cloudflare/disconnect` are gated by authentication only (any authenticated user) — reachable from Guided Setup and the Settings accordion, never tier-gated — and the token never reaches the browser. <!-- @impl: src/routes/cloudflare.ts --> <!-- @impl: src/routes/cloudflare-auth.ts -->
+3. The callback binds an HMAC-signed, single-use state to the initiating user's bucket (token-fixation CSRF defense); a forged, expired, or replayed state is rejected without exchanging the code. On success it stores the token and auto-selects the account when exactly one is accessible, else redirects to an account picker. <!-- @impl: src/routes/cloudflare-auth.ts --> <!-- @impl: src/lib/cloudflare-token.ts::connectCloudflare -->
+4. `getValidCloudflareToken` returns a currently-valid token, refreshing within the skew window and failing closed (never a stale token); the resolved token is injected into the container env via `applyCloudflareOAuthToken` on session start. <!-- @impl: src/lib/cloudflare-token.ts::getValidCloudflareToken --> <!-- @impl: src/lib/cloudflare-token.ts::applyCloudflareOAuthToken -->
+5. The connect URL carries a scope `tier`; the server maps it to the OAuth `scope`, always including `offline_access` so a refresh token is issued. <!-- @impl: src/lib/oauth-scopes.ts::cloudflareScopeForTier -->
+6. The operator's Cloudflare OAuth client id + secret are configured in the admin-gated Setup wizard (KV; id plain, secret encrypted at rest, fail-closed without `ENCRYPTION_KEY`), mirroring the GitHub provider config ([REQ-GITHUB-008](github.md#req-github-008-enterprise-github-provider-configuration-via-setup)). <!-- @impl: src/routes/setup/index.ts --> <!-- @impl: web-ui/src/components/setup/CloudflareProviderChooser.tsx -->
+7. Enterprise is unchanged: `getCloudflareProvider` returns null in enterprise, so every Cloudflare-OAuth route fails closed there; enterprise keeps the admin-global Browser Rendering token ([REQ-BROWSER-007](browser-run.md#req-browser-007-enterprise-admin-configured-browser-rendering-token)). <!-- @impl: src/lib/cloudflare-token.ts::getCloudflareProvider -->
+
+**Constraints:**
+
+- One public OAuth client per operator account; each user authorizes their own Cloudflare account.
+- The exact OAuth scope set must be granted on the operator's client — see the [Configuration](../../documentation/lanes/configuration.md) lane and verify against `GET /client/v4/oauth/scopes`.
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-029](#req-agent-029-deploy-credential-propagation-to-container), [REQ-GITHUB-007](github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise), [REQ-GITHUB-008](github.md#req-github-008-enterprise-github-provider-configuration-via-setup)
+
+**Verification:** [Lib test](../../src/__tests__/lib/cloudflare-token.test.ts) + [Route test](../../src/__tests__/routes/cloudflare-oauth.test.ts) + [Setup test](../../src/__tests__/routes/setup.test.ts) + [Chooser test](../../web-ui/src/__tests__/components/CloudflareProviderChooser.test.tsx)
+
+**Status:** Implemented
+
+---
+
+### REQ-AGENT-065: Engineering Constitution Preseeded to All Agents
+
+<!-- @impl: preseed/agents/claude/rules/engineering-constitution.md -->
+<!-- @impl: preseed/agents/claude/manifest.json -->
+<!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::ENGINEERING_CONSTITUTION -->
+<!-- @test: host/__tests__/engineering-constitution.test.js (constitution seeded advanced-gated for Claude + always-on Pi injection → AC1/AC2) -->
+
+**Intent:** One always-on engineering constitution is hardwired into every preseed-managed agent so its four mandates are applied to all planning and coding without being restated each task: (1) no overengineering, (2) behavioral tests only — no theater or text-matching, (3) reusable/composable components and best practices, (4) SDD + TDD enforced (failing behavioral test first, every change traces to a REQ, specs/anchors/docs move with the code, nothing left `Partial`). It also imposes a **plan gate** (every plan must restate the four mandates as concrete success criteria) and a **done gate** (confirm them before declaring work complete). The preseed is the single source of truth; the per-user `~/.claude` copy is a downstream seed artifact.
+
+**Applies To:** Agent
+
+**Acceptance Criteria:**
+
+1. In advanced session mode, the constitution is seeded as a Claude rule — the preseed rule file is present and the seed manifest gates it to `advanced` only, matching the other engineering rules ([REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)). <!-- @impl: preseed/agents/claude/rules/engineering-constitution.md --> <!-- @impl: preseed/agents/claude/manifest.json -->
+2. The constitution is injected into every Pi agent system prompt on `before_agent_start` as an always-on, self-contained `<codeflare_constitution>` block (placed in the base prompt parts, not behind a conditional), so it is present in every Pi session. <!-- @impl: preseed/agents/pi/extensions/codeflare-pi.ts::ENGINEERING_CONSTITUTION -->
+
+**Constraints:**
+
+- The preseed is the single source of truth; the per-user `~/.claude/rules/engineering-constitution.md` is a downstream seed artifact, not separately authored.
+- The Claude rule and the Pi `<codeflare_constitution>` block carry the same four mandates and must be kept in sync.
+- Mode parity with the other engineering rules (advanced session mode); content correctness is prose and is intentionally not pinned by tests (mandate #2).
+
+**Priority:** P1
+
+**Dependencies:** [REQ-AGENT-024](#req-agent-024-advanced-session-mode-graph-first-discipline)
+
+**Verification:** [Automated test](../../host/__tests__/engineering-constitution.test.js)
 
 **Status:** Implemented

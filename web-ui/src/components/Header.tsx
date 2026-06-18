@@ -19,7 +19,7 @@ import {
 } from '@mdi/js';
 import Icon from './Icon';
 import SessionSwitcher from './SessionSwitcher';
-import VaultButton from './VaultButton';
+import VaultButton, { type VaultButtonStatus } from './VaultButton';
 import { sessionStore } from '../stores/session';
 import { getSleepTimerInfo } from '../lib/sleep-timer';
 import UsageInlineBadge from './UsageInlineBadge';
@@ -28,7 +28,6 @@ import { terminalStore } from '../stores/terminal';
 import { getGravatarUrl, gravatarExists } from '../lib/gravatar';
 import { isTouchDevice, getKeyboardHeight } from '../lib/mobile';
 import type { SessionWithStatus, AgentType, TabConfig } from '../types';
-import type { VaultPrewarmStatus } from '../lib/vault-prewarm';
 import '../styles/header.css';
 
 interface HeaderProps {
@@ -37,7 +36,7 @@ interface HeaderProps {
   onStoragePanelToggle?: () => void;
   onVaultOpen?: () => void;
   vaultReady?: boolean;
-  vaultStatus?: VaultPrewarmStatus;
+  vaultStatus?: VaultButtonStatus;
   onLogoClick?: () => void;
   sessions: SessionWithStatus[];
   activeSessionId: string | null;
@@ -45,7 +44,6 @@ interface HeaderProps {
   onStopSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
   onCreateSession: (name: string, agentType?: AgentType, tabConfig?: TabConfig[]) => void;
-  enterpriseMode?: boolean;
   // Note: logout goes through /auth/logout which routes to OIDC or CF Access as appropriate
 }
 
@@ -266,14 +264,17 @@ const Header: Component<HeaderProps> = (props) => {
           </button>
         </Show>
 
-        {/* User menu with dropdown */}
+        {/* The avatar/username stays visible in every mode. In enterprise the
+            dropdown has no entries (Subscription/Usage SaaS-only, Guided
+            Setup/Logout hidden under SSO), so the avatar's click is inert —
+            it opens nothing rather than an empty dropdown. */}
         <div class="header-user-wrapper" ref={userMenuRef}>
           <button
             type="button"
             class="header-user-menu"
             data-testid="header-user-menu"
             title="User menu"
-            onClick={() => setShowUserMenu(!showUserMenu())}
+            onClick={() => { if (!sessionStore.enterpriseMode) setShowUserMenu(!showUserMenu()); }}
           >
             <Show when={props.userName && gravatarOk()} fallback={<Icon path={mdiShieldAccount} size={24} class="header-user-avatar" />}>
               <img
@@ -302,6 +303,8 @@ const Header: Component<HeaderProps> = (props) => {
                   <span>Subscription</span>
                 </a>
               </Show>
+              {/* Usage is SaaS-only — the enterprise usage view is disabled for
+                  now (it always reports 0; fix deferred). */}
               <Show when={sessionStore.saasMode}>
                 <a
                   href="/app/usage"
@@ -313,18 +316,18 @@ const Header: Component<HeaderProps> = (props) => {
                   <UsageInlineBadge />
                 </a>
               </Show>
-              {/* REQ-ENTERPRISE-008: enterprise deployments are configured by an
-                  admin via Setup, not per-user onboarding — hide Guided Setup. */}
-              <Show when={!sessionStore.enterpriseMode}>
-                <a
-                  href="/app/onboarding"
-                  class="header-user-dropdown-item"
-                  data-testid="header-user-dropdown-onboarding"
-                >
-                  <Icon path={mdiRocketLaunchOutline} size={16} />
-                  <span>Guided Setup</span>
-                </a>
-              </Show>
+              {/* Guided Setup + Logout are not per-item enterprise-gated: the
+                  dropdown only opens outside enterprise (the avatar's onClick is
+                  inert in enterprise, REQ-ENTERPRISE-008 AC8/AC9), so reaching here
+                  already implies non-enterprise. */}
+              <a
+                href="/app/onboarding"
+                class="header-user-dropdown-item"
+                data-testid="header-user-dropdown-onboarding"
+              >
+                <Icon path={mdiRocketLaunchOutline} size={16} />
+                <span>Guided Setup</span>
+              </a>
               <button
                 type="button"
                 class="header-user-dropdown-item header-user-dropdown-item--danger"

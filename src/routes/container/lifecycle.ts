@@ -23,6 +23,7 @@ import { resolveEffectiveSleepAfter, validateSessionAndCheckLimits } from './lif
 import { setupR2Credentials, ensureBucketAndSeed, configureContainerDO } from './lifecycle-init';
 import { resolveSessionAccessGroup, loadEnterpriseRouteConfig } from '../../lib/access';
 import { applyEnterpriseBrowserToken } from '../../lib/browser-render-token';
+import { applyCloudflareOAuthToken } from '../../lib/cloudflare-token';
 
 // Re-exported so existing importers (and the spec-anchored unit tests that
 // import these from './lifecycle') keep resolving them after the CF-024b split
@@ -202,7 +203,12 @@ app.post('/start', containerStartRateLimiter, async (c) => {
     // so the Cloudflare Browser Rendering token + account that browser-run needs come
     // from the admin-global Setup value rather than per-user deploy-keys. No-op in
     // every other mode (returns deployKeys unchanged).
-    const effectiveDeployKeys = await applyEnterpriseBrowserToken(c.env, deployKeys, cryptoKey);
+    let effectiveDeployKeys = await applyEnterpriseBrowserToken(c.env, deployKeys, cryptoKey);
+
+    // Refresh an expiring Connect-to-Cloudflare OAuth token before injection so the
+    // container always receives a currently-valid CLOUDFLARE_API_TOKEN (no-op for a
+    // pasted PAT or the enterprise browser token; fails closed if un-refreshable).
+    effectiveDeployKeys = await applyCloudflareOAuthToken(c.env, effectiveDeployKeys, bucketName);
 
     // Step 2: Ensure R2 bucket exists and seed if new
     const { r2Config } = await ensureBucketAndSeed({

@@ -75,7 +75,7 @@ User clicks "Sign in with GitHub" on /login
 
 ### Connect GitHub (link mode)
 
-"Connect GitHub" is an explicit, additive action - a button in the GitHub panel, separate from login. It is **never** the Codeflare login. Login stays Cloudflare Access (enterprise) or the existing mode; Connect only authorizes Codeflare to act as the user on GitHub. Availability is currently enterprise-only (`githubFeatureEnabled` = `isEnterpriseMode`); broadening the gate is Planned ([REQ-GITHUB-007](../../sdd/spec/github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise)).
+"Connect GitHub" is an explicit, additive action - a button in the GitHub panel, separate from login. It is **never** the Codeflare login. Login stays Cloudflare Access (enterprise) or the existing mode; Connect only authorizes Codeflare to act as the user on GitHub. The repo panel is available in every mode; outside enterprise it is gated to the `advanced` session in the dashboard frontend. Connect/disconnect are `authMiddleware`-only (any authenticated user), so they work from Guided Setup and the Settings accordion even when the panel is hidden ([REQ-GITHUB-007](../../sdd/spec/github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise)).
 
 **Flow** ([REQ-GITHUB-001](../../sdd/spec/github.md#req-github-001-github-token-capture-and-storage)):
 
@@ -106,13 +106,45 @@ User clicks "Connect GitHub" in the GitHub panel
 
 A configured GitHub App takes precedence. With neither configured, Connect is unavailable (`503 GITHUB_NOT_CONFIGURED`).
 
-**Provider configuration source.** `getGithubProvider` is async. In **enterprise** mode the provider type + credentials are admin-configured in the Setup wizard and stored in KV (client id plain, client secret encrypted): the resolver reads that config first and only falls back to the deploy-config env vars (`GITHUB_APP_*` / `OAUTH_*`) when KV is unconfigured — so enterprise GitHub works without GitHub-Actions/Cloudflare-secret access. In **non-enterprise** modes the resolver uses the env vars only (unchanged). A stored client secret that cannot be decrypted (no `ENCRYPTION_KEY`) is treated as unconfigured (fails closed). See [REQ-GITHUB-008](../../sdd/spec/github.md#req-github-008-enterprise-github-provider-configuration-via-setup) and the [Configuration](configuration.md#github-integration) lane.
+**Provider configuration source.** `getGithubProvider` is async and resolves the same way in **every** mode: the provider type + credentials are admin-configured in the Setup wizard and stored in KV (client id plain, client secret encrypted) via `getProviderFromKv`; the resolver reads that config first and only falls back to the deploy-config env vars (`GITHUB_APP_*` / `OAUTH_*`) when KV is unconfigured. (This was enterprise-only; it is now admin-gated in any mode, so GitHub works without GitHub-Actions/Cloudflare-secret access everywhere.) A stored client secret that cannot be decrypted (no `ENCRYPTION_KEY`) is treated as unconfigured (fails closed). See [REQ-GITHUB-008](../../sdd/spec/github.md#req-github-008-enterprise-github-provider-configuration-via-setup) and the [Configuration](configuration.md#github-integration) lane.
 
-**Scopes / permissions:** the OAuth App requests `repo read:org workflow`. The GitHub App's equivalent permissions (Contents R/W, Pull requests R/W, Workflows W, Metadata R) are set at registration. Enterprise GitHub Apps must be **internal** to the customer's enterprise - EMU managed users cannot authorize third-party apps.
+**Connect is decoupled from the repo panel.** `GET /api/github/connect` + callback + `POST /api/github/disconnect` are `authMiddleware`-only (any authenticated user), reachable from Guided Setup + the Settings accordion even when the advanced-gated panel is hidden; only `status`/`repos`/`clone` follow the panel gate ([REQ-GITHUB-007](../../sdd/spec/github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise)). The same shared `OAuthConnectCard` drives connect on all three surfaces. **Cloudflare** has a parallel per-user OAuth connect in non-enterprise modes ([REQ-AGENT-064](../../sdd/spec/agents.md#req-agent-064-connect-to-cloudflare-via-oauth)); enterprise has none (`getCloudflareProvider` returns null).
+
+**Scopes / permissions:** the OAuth App's `scope` is derived per connect from the selected tier (default `repo read:org workflow`; [REQ-GITHUB-007](../../sdd/spec/github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise)). The GitHub App's equivalent permissions (Contents R/W, Pull requests R/W, Workflows W, Metadata R) are set at registration and ignore the tier. Enterprise GitHub Apps must be **internal** to the customer's enterprise - EMU managed users cannot authorize third-party apps.
 
 **At rest:** the token is encrypted (kv-crypto) and never returned to the browser. Disconnect/offboarding revokes it ([REQ-GITHUB-005](../../sdd/spec/github.md#req-github-005-disconnect-and-offboarding-revocation)). For the enterprise egress-injection security model and at-rest detail, see [Security](security.md) rather than duplicating it here.
 
 Connect reuses the OAuth App from [REQ-AUTH-002](../../sdd/spec/authentication.md#req-auth-002-saas-mode-uses-direct-github-oauth) (SaaS login OAuth) in SaaS mode, but is distinct from login.
+
+### Connect Cloudflare (per-user OAuth, non-enterprise)
+
+The parallel to "Connect GitHub": a non-enterprise user authorizes **their own** Cloudflare account so sessions deploy with `wrangler` without a pasted API token ([REQ-AGENT-064](../../sdd/spec/agents.md#req-agent-064-connect-to-cloudflare-via-oauth)). Like GitHub Connect it is additive and never the Codeflare login; `GET /api/cloudflare/connect` + callback + `POST /api/cloudflare/disconnect` are `authMiddleware`-only, reachable from Guided Setup and the Settings "Push & Deploy" accordion via the shared `OAuthConnectCard`. **Enterprise has none** — `getCloudflareProvider` returns null and every Cloudflare-connect route fails closed; enterprise injects the admin-global Browser Rendering token instead ([REQ-BROWSER-007](../../sdd/spec/browser-run.md#req-browser-007-enterprise-admin-configured-browser-rendering-token)).
+
+The tier is chosen in the UI before the redirect: on Guided Setup and Settings, the connect card (GitHub and Cloudflare alike) presents the Minimal/Recommended/Advanced choice as a segmented toggle with the selected level's description beneath it (the popover/bottom-sheet tier dialog is specific to the GitHub dashboard panel).
+
+**Flow:**
+
+```
+User clicks "Connect" on the Cloudflare card (panel / Guided Setup / Settings)
+  -> GET /api/cloudflare/connect?tier=<minimal|recommended|advanced>
+  -> Sign an HMAC OAuth state BOUND to the caller's bucket (anti-CSRF)
+  -> 302 to dash.cloudflare.com/oauth2/auth (response_type=code, scope from tier
+     + offline_access, client_secret_post)
+  -> User authorizes on Cloudflare
+  -> Cloudflare redirects to GET /auth/cloudflare/connect/callback
+     (src/routes/cloudflare-auth.ts)
+  -> Re-derive identity from the EXISTING session; verify state against THIS
+     session's bucket
+  -> Exchange code for access + refresh token; resolve the account(s)
+  -> Persist token/refreshToken/expiresAt to the existing deploy-keys:<bucket>
+     Cloudflare fields (source 'oauth', encrypted) - no new KV key
+```
+
+**Provider seam (`getCloudflareProvider`):** `CloudflareOAuthProvider` mirrors the GitHub provider against `dash.cloudflare.com/oauth2/{auth,token,revoke}` (token endpoint auth = **Client Secret Post**, not PKCE). The operator's client id + secret are admin-configured in the Setup wizard (`setup:cloudflare_oauth_client_id` plain, `setup:cloudflare_oauth_client_secret` encrypted); a secret that cannot be decrypted (no `ENCRYPTION_KEY`) is treated as unconfigured (fails closed → `503 CLOUDFLARE_NOT_CONFIGURED`).
+
+**Token lifecycle:** `getValidCloudflareToken` refreshes within the skew window and fails closed when an expired token cannot be refreshed (never returns a stale token); `applyCloudflareOAuthToken` injects the valid token into the container env as `CLOUDFLARE_API_TOKEN` on session start. Disconnect revokes the grant (the refresh token when present) and clears the stored fields.
+
+**Scopes:** the connect URL's `tier` maps server-side to dot-notation Cloudflare OAuth scope IDs (`<resource>.<read|write>`, always `offline_access`); see [Configuration → Cloudflare Connect](configuration.md#cloudflare-connect-oauth). The registered client scopes are the ceiling; a tier requests a subset.
 
 ### CF Access Flow
 
@@ -288,6 +320,25 @@ Both `SAAS_MODE` and `ONBOARDING_LANDING_PAGE` are passed to the Worker via `--v
 
 ---
 
+## Header User Dropdown
+
+The avatar/username widget in the header and dashboard is always visible regardless of mode — users always see their identity. Clicking it opens a dropdown in non-enterprise modes only.
+
+**Enterprise mode:** the avatar trigger's `onClick` is inert. `Dashboard.tsx` uses an early-return guard (`if (sessionStore.enterpriseMode) return;`); `Header.tsx` uses the equivalent inverted guard (`if (!sessionStore.enterpriseMode) setShowUserMenu(...)`). Either way no dropdown opens — the avatar element itself stays present and styled normally.
+
+**Dropdown entries by mode:**
+
+| Entry | SaaS (`saasMode`) | Onboarding / default | Enterprise |
+|---|---|---|---|
+| Subscription | shown | hidden | not reachable (dropdown inert) |
+| Usage | shown | hidden | not reachable (dropdown inert) |
+| Guided Setup | shown | shown | not reachable (dropdown inert) |
+| Logout | shown | shown | not reachable (dropdown inert) |
+
+Subscription and Usage are gated on `saasMode`. Enterprise previously exposed a read-only Usage view, but it was reverted because the Timekeeper read path is not wired for enterprise (it always reported zero); the entry is deferred until the data source is fixed.
+
+Implements [REQ-AUTH-016](../../sdd/spec/authentication.md#req-auth-016-header-user-dropdown) (non-enterprise dropdown) and [REQ-ENTERPRISE-008](../../sdd/spec/enterprise-mode.md#req-enterprise-008-enterprise-frontend-surface-suppression) AC2/AC8 (enterprise avatar inert, Usage SaaS-only).
+
 ## Specification Coverage
 
 - [REQ-AUTH-004](../../sdd/spec/authentication.md#req-auth-004-service-token-authentication-for-e2e-testing) - Service token authentication for E2E testing
@@ -299,9 +350,12 @@ Both `SAAS_MODE` and `ONBOARDING_LANDING_PAGE` are passed to the Worker via `--v
 - [REQ-AUTH-015](../../sdd/spec/authentication.md#req-auth-015-guided-onboarding-flow) - Guided onboarding flow
 - [REQ-AUTH-016](../../sdd/spec/authentication.md#req-auth-016-header-user-dropdown) - Header user dropdown
 - [REQ-AUTH-017](../../sdd/spec/authentication.md#req-auth-017-gravatar-integration) - Gravatar integration
+- [REQ-ENTERPRISE-008](../../sdd/spec/enterprise-mode.md#req-enterprise-008-enterprise-frontend-surface-suppression) - Enterprise frontend surface suppression (avatar/dropdown inert, Usage SaaS-only)
 - [REQ-ENTERPRISE-010](../../sdd/spec/enterprise-mode.md#req-enterprise-010-access-gated-jit-user-provisioning) - Access-gated JIT provisioning runs before SaaS path in enterprise mode
 - [REQ-ENTERPRISE-014](../../sdd/spec/enterprise-mode.md#req-enterprise-014-admin-access-via-cloudflare-access-groups) - Admin authorization via Cloudflare Access groups (live requireAdmin elevation)
-- [REQ-GITHUB-008](../../sdd/spec/github.md#req-github-008-enterprise-github-provider-configuration-via-setup) - Enterprise GitHub provider config (admin-configured in Setup, KV-first resolution)
+- [REQ-GITHUB-007](../../sdd/spec/github.md#req-github-007-broaden-the-panel-gate-beyond-enterprise) - Broaden the panel gate beyond enterprise (connect decoupled from panel gate; advanced-session entitlement in dashboard frontend)
+- [REQ-GITHUB-008](../../sdd/spec/github.md#req-github-008-enterprise-github-provider-configuration-via-setup) - GitHub provider config, admin-gated any mode (admin-configured in Setup, KV-first resolution)
+- [REQ-AGENT-064](../../sdd/spec/agents.md#req-agent-064-connect-to-cloudflare-via-oauth) - Connect to Cloudflare via OAuth (per-user, non-enterprise; shared OAuthConnectCard)
 
 ---
 

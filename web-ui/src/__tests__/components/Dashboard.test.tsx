@@ -82,20 +82,26 @@ vi.mock('../../stores/session', () => {
   let _maxSessions = 3;
   let _r2Ready = true;
   let _preseedUpgrading = false;
+  let _enterpriseMode = false;
+  let _sessionMode = 'advanced';
   return {
     sessionStore: {
       get sessions() { return []; },
       get maxSessions() { return _maxSessions; },
       get r2Ready() { return _r2Ready; },
       get preseedUpgrading() { return _preseedUpgrading; },
+      get enterpriseMode() { return _enterpriseMode; },
+      get preferences() { return { sessionMode: _sessionMode }; },
       isAtSessionLimit: () => _isAtLimit,
       startR2Polling: vi.fn(),
+      _setSessionMode: (v: string) => { _sessionMode = v; },
       _setTestLimit: (atLimit: boolean, max?: number) => {
         _isAtLimit = atLimit;
         if (max !== undefined) _maxSessions = max;
       },
       _setR2Ready: (ready: boolean) => { _r2Ready = ready; },
       _setPreseedUpgrading: (upgrading: boolean) => { _preseedUpgrading = upgrading; },
+      _setEnterpriseMode: (v: boolean) => { _enterpriseMode = v; },
     },
     isAtUsageQuota: () => false,
     getUsageState: () => ({ monthlySeconds: 0, monthlyQuotaSeconds: null }),
@@ -170,6 +176,33 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     cleanup();
     vi.useRealTimers();
     (githubStore as any)._setEnabled(false);
+    (sessionStore as any)._setEnterpriseMode(false);
+    (sessionStore as any)._setSessionMode('advanced');
+  });
+
+  // === Enterprise dropdown gating (REQ-ENTERPRISE-008 AC2/AC8/AC9) ===
+
+  it('shows Guided Setup + Logout and hides Usage outside enterprise mode', () => {
+    (sessionStore as any)._setEnterpriseMode(false);
+    render(() => <Dashboard {...defaultProps} />);
+    fireEvent.click(screen.getByTestId('header-user-menu'));
+    expect(screen.getByTestId('header-user-dropdown-onboarding')).toBeInTheDocument();
+    expect(screen.getByTestId('header-user-dropdown-logout')).toBeInTheDocument();
+    // Not SaaS and not enterprise -> Usage hidden.
+    expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
+  });
+
+  it('keeps the avatar visible but opens no dropdown in enterprise mode', () => {
+    (sessionStore as any)._setEnterpriseMode(true);
+    render(() => <Dashboard {...defaultProps} />);
+    // Avatar/username trigger stays rendered so the user sees their identity.
+    expect(screen.getByTestId('header-user-menu')).toBeInTheDocument();
+    // Every dropdown entry is gated away in enterprise (Usage 0-reports, Subscription
+    // is SaaS billing, Guided Setup + Logout are admin/SSO concerns), so clicking the
+    // avatar is inert — no dropdown opens.
+    fireEvent.click(screen.getByTestId('header-user-menu'));
+    expect(screen.queryByTestId('header-user-dropdown')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('header-user-dropdown-usage')).not.toBeInTheDocument();
   });
 
   // === Initialization Tests ===
@@ -316,6 +349,26 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     // The storage panel gets a STORAGE header mirroring the GitHub panel header.
     expect(screen.getByTestId('files-panel-title')).toBeInTheDocument();
     expect(screen.getByTestId('files-panel-header')).toBeInTheDocument();
+  });
+
+  it('hides the GitHub face for a non-advanced non-enterprise session even when enabled (advanced gate)', () => {
+    (githubStore as any)._setEnabled(true);
+    (sessionStore as any)._setSessionMode('standard'); // not advanced
+    render(() => <Dashboard {...defaultProps} />);
+
+    const right = screen.getByTestId('dashboard-panel-right');
+    expect(right.getAttribute('data-face')).toBe('storage');
+    expect(screen.queryByTestId('storage-flip-btn')).not.toBeInTheDocument();
+  });
+
+  it('shows the GitHub face for an enterprise session regardless of session mode', () => {
+    (githubStore as any)._setEnabled(true);
+    (sessionStore as any)._setSessionMode('standard');
+    (sessionStore as any)._setEnterpriseMode(true);
+    render(() => <Dashboard {...defaultProps} />);
+
+    const right = screen.getByTestId('dashboard-panel-right');
+    expect(right.getAttribute('data-face')).toBe('github');
   });
 
   it('flips GitHub <-> storage when enabled and the flip controls are used', () => {
