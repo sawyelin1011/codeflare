@@ -1,7 +1,7 @@
 
 # Architecture Decisions
 
-Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD81](#ad81-reuse-the-container-egress-injection-layer-for-per-user-github-tokens) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
+Architecture Decision Records for Codeflare. Each decision documents a design trade-off with rationale. Referenced as [AD1](#ad1-one-container-per-session) through [AD82](#ad82-visible-terminal-panes-own-websockets-and-multiview-is-virtual) throughout the codebase and documentation. Most ADRs carry active content; a few are superseded ([AD4](#ad4-periodic-rclone-bisync) by [AD56](#ad56-15-minute-bisync-cadence-with-manual-triggers) + [AD57](#ad57-135-second-shutdown-budget-for-final-bisync); [AD38](#ad38-github-oidc-replaces-cf-access-in-saas-mode) by [AD48](#ad48-oauth-state-replaced-by-hmac-signed-stateless-token); [AD45](#ad45-user-overrides-recorded-as-adrs-not-skip-list) and [AD50](#ad50-unified-adr-file-with-structural-doc-allow-large-exemption) by [AD51](#ad51-rip-out-six-overengineered-sdd-framework-features); [AD64](#ad64-durable-review-lanes-load-extensions-additively-behind-the-noextensions-shield) by [AD76](#ad76-durable-review-lanes-run-as-detached-headless-pi-processes); [AD65](#ad65-gemini-cli-replaced-by-antigravity-agy)'s no-preseed-lane clause by [AD67](#ad67-antigravity-reads-the-gemini-cli-config-tree-preseed-lane-restored)) or are redirect anchors (merged or reclassified per the documentation-discipline "What is NOT an ADR" rule).
 
 **Audience:** Developers
 
@@ -92,6 +92,7 @@ Architecture Decision Records for Codeflare. Each decision documents a design tr
 | [AD79](#ad79-image-baked-pi-extension-transpile-cache) | Image-baked Pi extension transpile cache | Performance |
 | [AD80](#ad80-pi-pr-boundary-merge-gate-is-report-only-and-defended-in-depth) | Pi PR-boundary merge gate is report-only and defended in depth | Agents |
 | [AD81](#ad81-reuse-the-container-egress-injection-layer-for-per-user-github-tokens) | Reuse the container egress-injection layer for per-user GitHub tokens | Architecture, Security |
+| [AD82](#ad82-visible-terminal-panes-own-websockets-and-multiview-is-virtual) | Visible terminal panes own WebSockets, and MultiView is virtual | Architecture, UI/Frontend |
 
 ---
 
@@ -1063,6 +1064,8 @@ Three smaller decisions bundled in:
 - The prefilter shifts work to spawn time. The transcript is reduced to user/assistant text before the subagent reads it, so the subagent never sees raw tool I/O and recency bias is structurally prevented as on the Claude path.
 - Stale captures written by the old thin-contract Pi path are not migrated; they remain as historical record.
 - Later refinement ([REQ-MEM-001](../../sdd/spec/memory.md#req-mem-001-conversation-context-automatically-captured-to-vault) AC8, 2026-05-30): the prefilter input is the durable on-disk session transcript Pi persists for `/resume`, read via `ctx.sessionManager.getSessionFile()` and parsed by `parseSessionMessages` - not the volatile in-memory message buffer the original Pi path used. That buffer was empty immediately after a Pi reload/resume, so the first capture-boundary prompt produced a hollow "no substantive content" note even though the full session JSONL was on disk; reading the persisted file fixed it, and a skip-empty guard now suppresses the capture rather than writing a placeholder note.
+- Later refinement ([REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages), 2026-06-19): Pi treats the `.vars` carrier as the pending-capture lock and advances the prompt counter only after the capture note is written.
+- Capture retry impact ([REQ-MEM-002](../../sdd/spec/memory.md#req-mem-002-capture-triggers-every-15-user-messages) AC5-AC6): a stopped capture leaves the old counter intact and retries after the stale pending marker clears instead of skipping the 15-prompt window; source: `preseed/agents/pi/extensions/memory-vault.ts::memoryVarsPending`, `preseed/agents/pi/extensions/memory-vault.ts::captureVars`, and `preseed/agents/pi/prompts/memory-agent-prompt.md::Advance the counter and clear the pending marker`.
 
 **Alternative considered:** Keep the thin inline Pi contract and ratchet its prompt. Rejected for the same reason [AD58](#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad) rejected prompt-only tightening: recency bias is a function of feeding raw tool records to the model, not a prompt-comprehension gap, and a divergent contract drifts from the [AD58](#ad58-sonnet-for-memory-capture-with-prefilter-and-scratchpad) source of truth over time.
 
@@ -1438,7 +1441,7 @@ Load only explicit `-e` extensions: `graphify-native.ts`, `review-lane-guards.ts
 **Consequences:**
 
 - Lanes survive the spawning session and are reaped from disk. <!-- @impl: preseed/agents/pi/extensions/review-jobs.ts::reapDurableReviewLanes -->
-- The idle reaper advances and finalizes durable jobs without a user turn. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick -->
+- The idle reaper advances durable jobs without a user turn, and completed windows start a background `review-monitor` that reports `REVIEW_RESULT` back to the main session. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::autonomousReviewReaperTick --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::startReviewMonitor --> <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::finalizeCompletedReview -->
 - Reviewers get a bounded inspection tool allowlist: bash for git/gh inspection, graphify tools, local-build blockers, and optional `ctx_search`.
 - Lanes do not load `codeflare-pi.ts`, `review-enforcement`, or `@gotgenes/pi-subagents`.
 
@@ -1552,6 +1555,7 @@ Load only explicit `-e` extensions: `graphify-native.ts`, `review-lane-guards.ts
 
 - The merge gate's correctness is pinned by `mergeGateDecision` unit tests; the inline handler is thin wiring.
 - An unreviewed merge that bypasses the pre-block is no longer silent — it leaves a durable audit and a visible toast.
+- A subagent/Agent push is treated as an in-session PR-boundary event when the enforced PR head changes during the Agent tool call, because child Bash events are invisible to the parent session. <!-- @impl: preseed/agents/pi/extensions/review-enforcement.ts::reconcileAgentHeadAdvance -->
 - A reviewed head with unaddressed CRITICAL findings can still be merged; the findings are surfaced, not enforced. If that proves too weak, AD80 is the place to revisit.
 
 **Related:** [REQ-AGENT-055](../../sdd/spec/agents.md#req-agent-055-pi-pr-boundary-review-window-advancement), [REQ-AGENT-058](../../sdd/spec/agents.md#req-agent-058-pr-boundary-review-reconciliation-and-missed-event-recovery), [AD78](#ad78-pr-boundary-review-lanes-run-in-parallel-report-only-reviewers).
@@ -1572,6 +1576,27 @@ Load only explicit `-e` extensions: `graphify-native.ts`, `review-lane-guards.ts
 - Alternatives rejected: a git credential-helper callback (covers git but not `gh`/REST, and the agent can still request the token — security by obscurity); placing the real `GH_TOKEN` in the enterprise container (defeats the no-secret-in-container guarantee).
 
 **Related:** [REQ-GITHUB-003](../../sdd/spec/github.md#req-github-003-enterprise-egress-injected-github-credentials), [REQ-GITHUB-001](../../sdd/spec/github.md#req-github-001-github-token-capture-and-storage), [REQ-ENTERPRISE-005](../../sdd/spec/enterprise-mode.md#req-enterprise-005-container-side-enterprise-routing-ca-trust--constant-base-urls), [CON-GH-002](../../sdd/spec/constraints.md#con-gh-002-the-real-github-token-never-enters-the-enterprise-container), [CON-GH-003](../../sdd/spec/constraints.md#con-gh-003-egress-injection-is-scoped-by-the-per-session-binding).
+
+---
+
+### AD82: Visible terminal panes own WebSockets, and MultiView is virtual
+
+**Status:** Accepted (2026-06-18)
+
+**Decision:** The browser opens terminal WebSockets only for panes visible in the current frontend workspace. Dashboard has zero visible panes, a real session has one visible pane, and `MultiView #1` is a local virtual workspace that renders one visible pane for each selected real session. MultiView is never represented as a backend session ID. <!-- @impl: web-ui/src/stores/terminal-workspace.ts::terminalWorkspaceStore --> <!-- @impl: web-ui/src/stores/terminal-workspace.ts::createOrUpdateMultiView -->
+
+**Context:** Dashboard and hidden session surfaces previously mounted terminals for every running session. Those hidden terminals attached extra WebSocket clients to server PTYs, sent stale resize frames, and made the Dashboard status look connected even when the user was not viewing a terminal. The same problem would become worse with a multi-session view unless running, visible, connected, and focused were separated. <!-- @impl: web-ui/src/components/TerminalArea.tsx::TerminalArea -->
+
+**Consequences:**
+
+- Dashboard status and storage polling are no longer coupled to terminal side effects.
+- Hidden running sessions do not mount terminals, reconnect, resize, forward input, or run URL detection. <!-- @impl: web-ui/src/components/TerminalArea.tsx::TerminalArea -->
+- Browser visibility return reconnects only the current workspace's visible pane keys. <!-- @impl: web-ui/src/components/Layout.tsx::visibleTerminalKeys -->
+- `MultiView #1` can compose existing running or initializing sessions without quota, storage, lifecycle, or terminal-route changes. <!-- @impl: web-ui/src/stores/terminal-workspace.ts::createOrUpdateMultiView -->
+- A shared `TerminalGrid` renders tiled terminal surfaces for both per-session tab tiling and MultiView, so repeated layout structure stays centralized. <!-- @impl: web-ui/src/components/TerminalGrid.tsx::TerminalGrid -->
+- The host terminal server assigns resize authority to the focused WebSocket so stale clients cannot shrink a shared PTY. <!-- @impl: host/src/session.ts::claimResizeAuthority -->
+
+**Related:** [REQ-TERM-011](../../sdd/spec/terminal.md#req-term-011-visible-terminal-panes-own-websocket-connections), [REQ-TERM-012](../../sdd/spec/terminal.md#req-term-012-multiview-virtual-session-workspace), [REQ-TERM-013](../../sdd/spec/terminal.md#req-term-013-multiview-selection-flow), [REQ-TERM-014](../../sdd/spec/terminal.md#req-term-014-terminal-scroll-anchoring-under-scrollback-trimming).
 
 ---
 

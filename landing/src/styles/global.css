@@ -32,6 +32,10 @@ html {
 
 body {
   background: var(--bg-base);
+  /* Scope the fixed negative-z ambient glow + WebGL field to the body stacking
+     context so they paint above the page background and below content on every
+     page (including login, whose main is not explicitly positioned). */
+  isolation: isolate;
   color: var(--text-secondary);
   font-family: var(--font-sans);
   font-size: var(--fs-body);
@@ -368,15 +372,6 @@ svg {
   padding-top: clamp(3.5rem, 4rem + 4vw, 6rem);
   padding-bottom: var(--section-y);
   overflow: hidden;
-}
-
-.hero-glow {
-  position: absolute;
-  inset: -20% -10% auto -10%;
-  height: 60vh;
-  background: radial-gradient(60% 60% at 30% 0%, rgb(var(--accent-rgb) / 0.16), transparent 70%);
-  pointer-events: none;
-  z-index: 0;
 }
 
 .hero .container {
@@ -1229,16 +1224,6 @@ svg {
   will-change: opacity, transform;
 }
 
-/* Smooth cross-document navigation (landing <-> /login): a default cross-fade
-   between same-origin pages, so clicking "Sign in" transitions instead of a hard
-   cut. Progressive enhancement (Chromium); unsupported browsers navigate
-   normally. Gated on motion preference so reduced-motion gets the plain cut. */
-@media (prefers-reduced-motion: no-preference) {
-  @view-transition {
-    navigation: auto;
-  }
-}
-
 /* --------------------------------------------------------------------------
    Proof artifacts — turn the load-bearing claims into evidence in the
    terminal/mono aesthetic of the hero. Each [data-proof] renders its resolved
@@ -1751,15 +1736,26 @@ svg {
    A fixed full-viewport WebGL canvas (injected by splash.ts into .flare-field)
    sits behind every section as a cursor- and scroll-reactive background (cursor
    on desktop, page scroll on touch), with a readability veil above it. All of
-   this activates only once the fluid is actually live: splash.ts sets
-   html.flare-on, so no-WebGL / reduced-motion visitors keep the solid default
-   surfaces and never see a darkened, empty field.
+   the layout server-renders html.flare-on on the landing page so the visual
+   treatment is stable before first paint; splash.ts only mounts the canvas.
    -------------------------------------------------------------------------- */
 .flare-field {
   position: fixed;
   inset: 0;
-  z-index: 0;
+  z-index: -2;
   pointer-events: none;
+}
+
+/* Shared ambient accent glow: one fixed, top-centred halo on every page, painted
+   above the WebGL veil (z -2) but below content (body { isolation } scopes these
+   negative layers above the page background and below the slot), so it reads
+   identically whether or not the page runs the flare fluid. */
+.page-ambient-glow {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--page-glow);
 }
 
 .flare-fluid-canvas {
@@ -2024,6 +2020,7 @@ svg {
   margin: 0 auto;
   padding: clamp(2.5rem, 1.5rem + 5vw, 5rem) 1.25rem var(--section-y);
   min-height: calc(100vh - var(--nav-height));
+  min-height: calc(100svh - var(--nav-height));
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -2164,7 +2161,7 @@ svg {
 }
 
 .sso-panel {
-  padding: 0 0.95rem 0.95rem;
+  padding: 0.95rem;
   text-align: left;
 }
 

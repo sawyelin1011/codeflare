@@ -76,9 +76,12 @@ vi.mock('../../stores/terminal', () => ({
     connect: vi.fn(() => vi.fn()),
     disconnect: vi.fn(),
     resize: vi.fn(),
+    claimResizeAuthority: vi.fn(),
+    clearPendingResizeAuthority: vi.fn(),
     // FitAddon management for layout changes
     registerFitAddon: vi.fn(),
     unregisterFitAddon: vi.fn(),
+    disposeLocalTerminal: vi.fn(),
     triggerLayoutResize: vi.fn(),
     layoutChangeCounter: 0,
     startUrlDetection: vi.fn(),
@@ -119,6 +122,7 @@ vi.mock('../../lib/mobile', () => ({
   disableVirtualKeyboardOverlay: vi.fn(),
   resetKeyboardStateIfStale: vi.fn(),
   forceResetKeyboardState: vi.fn(),
+  isFocusOnTerminalInput: vi.fn(() => false),
   isSamsungBrowser: false,
 }));
 

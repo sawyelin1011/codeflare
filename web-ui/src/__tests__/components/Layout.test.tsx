@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@solidjs/testing-library';
 import { createSignal } from 'solid-js';
+import type { SessionWithStatus } from '../../types';
 
 // Mock all child components to isolate Layout testing
 vi.mock('../../components/Header', () => ({
@@ -90,6 +91,12 @@ const vaultPrewarmProof = {
 let mockSessions: any[] = [];
 let mockActiveSessionId: string | null = null;
 let mockPreferences: Record<string, any> = {};
+let mockVisiblePanes: Array<{ sessionId: string; terminalId: string }> = [];
+let mockTerminalsForSession: any = null;
+let mockTilingForSession: any = null;
+let mockTabOrder: string[] = [];
+let mockSaasMode = false;
+let mockActiveWorkspace: { kind: 'dashboard' } | { kind: 'session'; sessionId: string } | { kind: 'multiview'; id: 'multiview:1' } = { kind: 'dashboard' };
 let readSessionStoreVersion = () => 0;
 let bumpSessionStoreVersion = () => {};
 
@@ -97,6 +104,7 @@ vi.mock('../../stores/session', () => ({
   sessionStore: {
     get sessions() { readSessionStoreVersion(); return mockSessions; },
     get activeSessionId() { readSessionStoreVersion(); return mockActiveSessionId; },
+    get saasMode() { readSessionStoreVersion(); return mockSaasMode; },
     get error() { return null; },
     get loading() { return false; },
     loadSessions: vi.fn(),
@@ -115,7 +123,7 @@ vi.mock('../../stores/session', () => ({
     getInitProgressForSession: vi.fn(() => null),
     getMetricsForSession: vi.fn(() => null),
     stopAllPolling: vi.fn(),
-    getTerminalsForSession: vi.fn(() => null),
+    getTerminalsForSession: vi.fn(() => mockTerminalsForSession),
     initializeTerminalsForSession: vi.fn(),
     addTerminalTab: vi.fn(),
     removeTerminalTab: vi.fn(),
@@ -123,8 +131,8 @@ vi.mock('../../stores/session', () => ({
     cleanupTerminalsForSession: vi.fn(),
     reorderTerminalTabs: vi.fn(),
     setTilingLayout: vi.fn(),
-    getTilingForSession: vi.fn(() => null),
-    getTabOrder: vi.fn(() => []),
+    getTilingForSession: vi.fn(() => mockTilingForSession),
+    getTabOrder: vi.fn(() => mockTabOrder),
     renameSession: vi.fn(),
     loadPreferences: vi.fn(),
     updatePreferences: vi.fn(),
@@ -149,6 +157,30 @@ vi.mock('../../stores/terminal', () => ({
   cancelScheduledDisconnect: vi.fn(),
 }));
 
+vi.mock('../../stores/terminal-workspace', () => ({
+  terminalWorkspaceStore: {
+    getActiveWorkspace: vi.fn(() => mockActiveWorkspace),
+    getVisiblePanes: vi.fn(() => mockVisiblePanes),
+    setDashboardWorkspace: vi.fn(() => { mockActiveWorkspace = { kind: 'dashboard' }; mockVisiblePanes = []; bumpSessionStoreVersion(); }),
+    setSingleSessionWorkspace: vi.fn((sessionId: string, terminalId = '1') => {
+      mockActiveWorkspace = { kind: 'session', sessionId };
+      mockVisiblePanes = [{ sessionId, terminalId }];
+      bumpSessionStoreVersion();
+    }),
+    openMultiView: vi.fn(() => {
+      mockActiveWorkspace = { kind: 'multiview', id: 'multiview:1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }, { sessionId: 'sess2', terminalId: '1' }];
+      bumpSessionStoreVersion();
+      return true;
+    }),
+    closeMultiView: vi.fn(() => {
+      mockActiveWorkspace = { kind: 'dashboard' };
+      mockVisiblePanes = [];
+      bumpSessionStoreVersion();
+    }),
+  },
+}));
+
 let mockIsSamsungBrowser = false;
 vi.mock('../../lib/mobile', () => ({
   forceResetKeyboardState: vi.fn(),
@@ -158,7 +190,9 @@ vi.mock('../../lib/mobile', () => ({
 }));
 
 import { forceResetKeyboardState } from '../../lib/mobile';
-import { reconnectOnVisibilityReturn } from '../../stores/terminal';
+import { reconnectDisconnectedTerminals, reconnectOnVisibilityReturn } from '../../stores/terminal';
+import { getUsageWarningLevel, getDismissedQuotaLevel, setDismissedQuotaLevel } from '../../stores/session';
+import { terminalWorkspaceStore } from '../../stores/terminal-workspace';
 import Layout, { clearPrewarmingVaultStatus } from '../../components/Layout';
 
 // Helper to create a mock session
@@ -179,6 +213,12 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
     mockSessions = [];
     mockActiveSessionId = null;
     mockPreferences = {};
+    mockVisiblePanes = [];
+    mockTerminalsForSession = null;
+    mockTilingForSession = null;
+    mockTabOrder = [];
+    mockActiveWorkspace = { kind: 'dashboard' };
+    mockSaasMode = false;
     const [sessionStoreVersion, setSessionStoreVersion] = createSignal(0);
     readSessionStoreVersion = sessionStoreVersion;
     bumpSessionStoreVersion = () => setSessionStoreVersion((value) => value + 1);
@@ -282,7 +322,7 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
   // We assert the gating by inspecting the prop Layout hands to Header.
   // =========================================================================
 
-  describe('Vault button gating (CF-075 / REQ-VAULT-012 / REQ-VAULT-018)', () => {
+  describe('Vault button gating (CF-075 / REQ-VAULT-012 / REQ-VAULT-018 / REQ-VAULT-019 / REQ-VAULT-020)', () => {
     it('does NOT pass onVaultOpen (vault button hidden) when active session is default mode', () => {
       mockSessions = [createMockSession({ status: 'running' })];
       mockActiveSessionId = 'sess1';
@@ -333,7 +373,24 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
       expect((window as any).__headerProps.vaultStatus).toBe('ready');
     });
 
-    it('rechecks this browser cache before opening the Vault tab', async () => {
+    it('REQ-VAULT-020: starts browser prewarm even when terminal input is focused', async () => {
+      mockSessions = [createMockSession({ status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockPreferences = { sessionMode: 'advanced' };
+      const input = document.createElement('textarea');
+      input.className = 'xterm-helper-textarea';
+      document.body.append(input);
+      input.focus();
+
+      render(() => <Layout />);
+      vaultProbeMock.latestOptions.setLatch();
+
+      await waitFor(() => expect(vaultPrewarmMock.start).toHaveBeenCalled());
+      expect(document.activeElement).toBe(input);
+      expect((window as any).__headerProps.vaultStatus).toBe('prewarming');
+    });
+
+    it('REQ-VAULT-019: rechecks this browser cache before opening the Vault tab', async () => {
       mockSessions = [createMockSession({ status: 'running' })];
       mockActiveSessionId = 'sess1';
       mockPreferences = { sessionMode: 'advanced' };
@@ -653,6 +710,176 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
   });
 
   // =========================================================================
+  // Terminal workspace transitions
+  // =========================================================================
+
+  describe('Terminal workspace transitions / REQ-TERM-011 through REQ-TERM-013', () => {
+    it('REQ-TERM-012: activates MultiView from the header callback', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' }), createMockSession({ id: 'sess2', status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onOpenMultiView).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onOpenMultiView();
+
+      expect(terminalWorkspaceStore.openMultiView).toHaveBeenCalledTimes(1);
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith(null);
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(true);
+    });
+
+    it('REQ-TERM-012: deactivates MultiView through the Layout-owned header callback', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' }), createMockSession({ id: 'sess2', status: 'running' })];
+      mockActiveSessionId = null;
+      mockActiveWorkspace = { kind: 'multiview', id: 'multiview:1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }, { sessionId: 'sess2', terminalId: '1' }];
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onCloseMultiView).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onCloseMultiView();
+
+      expect(terminalWorkspaceStore.closeMultiView).toHaveBeenCalledTimes(1);
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith(null);
+      await waitFor(() => expect((window as any).__terminalAreaProps.showTerminal).toBe(false));
+      expect((window as any).__terminalAreaProps.viewState).toBe('dashboard');
+    });
+
+    it('REQ-TERM-011: selecting a running session while in MultiView opens a single-session workspace', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' }), createMockSession({ id: 'sess2', status: 'running' })];
+      mockActiveSessionId = null;
+      mockActiveWorkspace = { kind: 'multiview', id: 'multiview:1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }, { sessionId: 'sess2', terminalId: '1' }];
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onSelectSession).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onSelectSession('sess2');
+
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith('sess2');
+      expect(terminalWorkspaceStore.setSingleSessionWorkspace).toHaveBeenCalledWith('sess2', '1');
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(true);
+      expect(mockActiveWorkspace).toEqual({ kind: 'session', sessionId: 'sess2' });
+    });
+
+    it('REQ-TERM-011: selecting an initializing session opens it instead of silently doing nothing', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' }), createMockSession({ id: 'sess2', status: 'initializing' })];
+      mockActiveSessionId = null;
+      mockActiveWorkspace = { kind: 'multiview', id: 'multiview:1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }, { sessionId: 'sess2', terminalId: '1' }];
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onSelectSession).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onSelectSession('sess2');
+
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith('sess2');
+      expect(terminalWorkspaceStore.setSingleSessionWorkspace).toHaveBeenCalledWith('sess2', '1');
+      expect(sessionStore.startSession).not.toHaveBeenCalled();
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(true);
+    });
+
+    it('REQ-TERM-011: dashboard button leaves terminal view immediately', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onLogoClick).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onLogoClick();
+
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith(null);
+      await waitFor(() => expect((window as any).__terminalAreaProps.showTerminal).toBe(false));
+      expect((window as any).__terminalAreaProps.viewState).toBe('collapsing');
+    });
+
+    it('REQ-TERM-011: selecting a stopped session from the header switcher opens the starting terminal surface', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [
+        createMockSession({ id: 'sess1', status: 'running' }),
+        createMockSession({ id: 'sess2', status: 'stopped' }),
+      ];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+      vi.mocked(sessionStore.startSession).mockReturnValue(new Promise(() => {}) as any);
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onSelectSession).toBeTypeOf('function'));
+
+      (window as any).__headerProps.onSelectSession('sess2');
+
+      expect(sessionStore.setActiveSession).toHaveBeenCalledWith('sess2');
+      expect(terminalWorkspaceStore.setSingleSessionWorkspace).toHaveBeenCalledWith('sess2', '1');
+      expect(sessionStore.startSession).toHaveBeenCalledWith('sess2');
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(true);
+      expect((window as any).__terminalAreaProps.viewState).not.toBe('dashboard');
+    });
+
+    it('REQ-TERM-011: dashboard return cancels an in-flight terminal transition', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [
+        createMockSession({ id: 'sess1', status: 'running' }),
+        createMockSession({ id: 'sess2', status: 'stopped' }),
+      ];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+      vi.mocked(sessionStore.startSession).mockReturnValue(new Promise(() => {}) as any);
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onSelectSession).toBeTypeOf('function'));
+      vi.useFakeTimers();
+
+      (window as any).__headerProps.onSelectSession('sess2');
+      (window as any).__headerProps.onLogoClick();
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(false);
+      expect((window as any).__terminalAreaProps.viewState).toBe('dashboard');
+    });
+
+    it('REQ-TERM-014: creating a session from terminal view keeps the starting surface visible', async () => {
+      const { sessionStore } = await import('../../stores/session');
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+      const newSession = createMockSession({ id: 'sess-new', name: 'New Session', status: 'stopped' }) as SessionWithStatus;
+      vi.mocked(sessionStore.createSession).mockImplementation(async () => {
+        mockSessions = [...mockSessions, newSession];
+        bumpSessionStoreVersion();
+        return newSession;
+      });
+      let resolveStart: (() => void) | undefined;
+      vi.mocked(sessionStore.startSession).mockImplementation(() => new Promise<void>((resolve) => { resolveStart = resolve; }));
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onCreateSession).toBeTypeOf('function'));
+
+      const createPromise = (window as any).__headerProps.onCreateSession('New Session');
+      await waitFor(() => expect(sessionStore.startSession).toHaveBeenCalledWith('sess-new'));
+
+      expect(mockActiveSessionId).toBe('sess-new');
+      expect(terminalWorkspaceStore.setSingleSessionWorkspace).toHaveBeenCalledWith('sess-new', '1');
+      expect((window as any).__terminalAreaProps.showTerminal).toBe(true);
+      expect((window as any).__terminalAreaProps.viewState).not.toBe('dashboard');
+
+      resolveStart?.();
+      await createPromise;
+    });
+  });
+
+  // =========================================================================
   // Session Lifecycle
   // =========================================================================
 
@@ -720,10 +947,12 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
     it('calls forceResetKeyboardState on visibility return in terminal view', () => {
       mockSessions = [createMockSession({ status: 'running' })];
       mockActiveSessionId = 'sess1';
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '2' }];
 
       render(() => <Layout />);
 
       vi.mocked(forceResetKeyboardState).mockClear();
+      vi.mocked(reconnectDisconnectedTerminals).mockClear();
       vi.mocked(reconnectOnVisibilityReturn).mockClear();
 
       // Simulate returning from backgrounded browser
@@ -731,7 +960,27 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
       document.dispatchEvent(new Event('visibilitychange'));
 
       expect(forceResetKeyboardState).toHaveBeenCalled();
-      expect(reconnectOnVisibilityReturn).toHaveBeenCalled();
+      expect(reconnectOnVisibilityReturn).toHaveBeenCalledWith(undefined, ['sess1:2']);
+    });
+
+    it('REQ-TERM-011: reconnects only visible tiled slots after visibility return', () => {
+      mockSessions = [createMockSession({ status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '4' }];
+      mockTerminalsForSession = { tabs: [{ id: '1' }, { id: '2' }, { id: '3' }, { id: '4' }], activeTabId: '4' };
+      mockTilingForSession = { enabled: true, layout: '2-split' };
+      mockTabOrder = ['1', '2', '3', '4'];
+
+      render(() => <Layout />);
+
+      vi.mocked(reconnectOnVisibilityReturn).mockClear();
+
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      const reconnectCalls = vi.mocked(reconnectOnVisibilityReturn).mock.calls;
+      expect(reconnectCalls[reconnectCalls.length - 1]?.[1]).toEqual(['sess1:1', 'sess1:2']);
     });
 
     it('does NOT call forceResetKeyboardState when on dashboard', () => {
@@ -761,6 +1010,138 @@ describe('Layout Component / REQ-AUTH-014 (session expiry handling on 401)', () 
 
       // Should deactivate session immediately (dashboard bounce)
       expect(sessionStore.setActiveSession).toHaveBeenCalledWith(null);
+    });
+  });
+
+  // =========================================================================
+  // REQ-SUB-018 AC3 / AC6 — usage quota banner surfacing + dismissibility
+  //
+  // usageWarning() === getUsageWarningLevel(); the banners render only in SaaS
+  // mode. We drive getUsageWarningLevel per threshold and assert the matching
+  // data-testid banner is surfaced, and that the 100% banner is NOT dismissible.
+  // =========================================================================
+
+  describe('REQ-SUB-018 AC3/AC6 (usage quota banners)', () => {
+    it('AC3: surfaces the 80% banner when usage warning level is 80 (SaaS)', () => {
+      mockSaasMode = true;
+      vi.mocked(getUsageWarningLevel).mockReturnValue('80');
+      vi.mocked(getDismissedQuotaLevel).mockReturnValue(null);
+
+      render(() => <Layout />);
+
+      expect(screen.getByTestId('usage-warning-80')).toBeInTheDocument();
+      expect(screen.queryByTestId('usage-warning-95')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('usage-warning-100')).not.toBeInTheDocument();
+    });
+
+    it('AC3: surfaces the 95% banner when usage warning level is 95 (SaaS)', () => {
+      mockSaasMode = true;
+      vi.mocked(getUsageWarningLevel).mockReturnValue('95');
+      vi.mocked(getDismissedQuotaLevel).mockReturnValue(null);
+
+      render(() => <Layout />);
+
+      expect(screen.getByTestId('usage-warning-95')).toBeInTheDocument();
+      expect(screen.queryByTestId('usage-warning-80')).not.toBeInTheDocument();
+    });
+
+    it('AC3: surfaces the 100% banner when usage warning level is 100 (SaaS)', () => {
+      mockSaasMode = true;
+      vi.mocked(getUsageWarningLevel).mockReturnValue('100');
+      vi.mocked(getDismissedQuotaLevel).mockReturnValue(null);
+
+      render(() => <Layout />);
+
+      expect(screen.getByTestId('usage-warning-100')).toBeInTheDocument();
+    });
+
+    it('AC3: surfaces no usage banner outside SaaS mode even at 100% usage', () => {
+      mockSaasMode = false;
+      vi.mocked(getUsageWarningLevel).mockReturnValue('100');
+
+      render(() => <Layout />);
+
+      expect(screen.queryByTestId('usage-warning-80')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('usage-warning-95')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('usage-warning-100')).not.toBeInTheDocument();
+    });
+
+    it('AC6: the 80% and 95% banners carry a dismiss control; the 100% banner does not', () => {
+      mockSaasMode = true;
+      vi.mocked(getDismissedQuotaLevel).mockReturnValue(null);
+
+      vi.mocked(getUsageWarningLevel).mockReturnValue('80');
+      const { unmount: unmount80 } = render(() => <Layout />);
+      const banner80 = screen.getByTestId('usage-warning-80');
+      expect(banner80.querySelector('.layout-banner-dismiss')).toBeInTheDocument();
+      unmount80();
+
+      vi.mocked(getUsageWarningLevel).mockReturnValue('95');
+      const { unmount: unmount95 } = render(() => <Layout />);
+      const banner95 = screen.getByTestId('usage-warning-95');
+      expect(banner95.querySelector('.layout-banner-dismiss')).toBeInTheDocument();
+      unmount95();
+
+      vi.mocked(getUsageWarningLevel).mockReturnValue('100');
+      render(() => <Layout />);
+      const banner100 = screen.getByTestId('usage-warning-100');
+      // The exceeded banner cannot be dismissed — no dismiss button.
+      expect(banner100.querySelector('.layout-banner-dismiss')).not.toBeInTheDocument();
+    });
+
+    it('AC6: dismissing the 80% banner records the dismissed level', async () => {
+      mockSaasMode = true;
+      vi.mocked(getUsageWarningLevel).mockReturnValue('80');
+      vi.mocked(getDismissedQuotaLevel).mockReturnValue(null);
+
+      render(() => <Layout />);
+
+      const dismiss = screen
+        .getByTestId('usage-warning-80')
+        .querySelector('.layout-banner-dismiss') as HTMLButtonElement;
+      dismiss.click();
+
+      expect(setDismissedQuotaLevel).toHaveBeenCalledWith('80');
+    });
+  });
+
+  // =========================================================================
+  // REQ-VAULT-019 AC4 — vault open-intent is cleared when the target session
+  // is no longer the active running session.
+  //
+  // handleVaultOpen sets the per-session open intent to 'preparing' when the
+  // key is not recoverable; that intent overrides the button status (surfaced
+  // to Header via the vaultStatus prop). When the active running session goes
+  // away, the createEffect on activeRunningSid() clears the open intent, so the
+  // button status reverts off 'preparing'.
+  // =========================================================================
+
+  describe('REQ-VAULT-019 AC4 (vault open-intent clearing)', () => {
+    it('clears the open-intent (vaultStatus leaves "preparing") when the session is no longer active-running', async () => {
+      mockSessions = [createMockSession({ id: 'sess1', status: 'running' })];
+      mockActiveSessionId = 'sess1';
+      mockPreferences = { sessionMode: 'advanced' };
+      mockActiveWorkspace = { kind: 'session', sessionId: 'sess1' };
+      mockVisiblePanes = [{ sessionId: 'sess1', terminalId: '1' }];
+      // Local readiness holds but the encryption key is NOT recoverable, so the
+      // open path parks the session in 'preparing' instead of opening a tab.
+      vaultLocalReadinessMock.check.mockResolvedValue({ ready: true, recordedDbs: ['sb_data_a'], hasIndexedDbDatabasesApi: true });
+      vaultLocalReadinessMock.keyRecoverable.mockResolvedValue(false);
+
+      render(() => <Layout />);
+      await waitFor(() => expect((window as any).__headerProps?.onVaultOpen).toBeTypeOf('function'));
+
+      await (window as any).__headerProps.onVaultOpen();
+
+      // Intent took hold: the button reflects 'preparing'.
+      await waitFor(() => expect((window as any).__headerProps.vaultStatus).toBe('preparing'));
+
+      // Session is no longer the active *running* session (mode flips so the
+      // probe gate drops it) — the clearing effect should reset the intent.
+      mockPreferences = { sessionMode: 'standard' };
+      bumpSessionStoreVersion();
+
+      await waitFor(() => expect((window as any).__headerProps.vaultStatus).not.toBe('preparing'));
     });
   });
 

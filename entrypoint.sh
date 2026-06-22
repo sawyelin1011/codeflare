@@ -502,8 +502,10 @@ recover_vanished_files() {
             continue
         fi
 
-        # Check if already excluded
-        if grep -qF "- $file_path" "$RECOVERY_FILTER_FILE" 2>/dev/null; then
+        # Check if already excluded. The `--` terminator is required: the
+        # search pattern begins with "- ", which grep would otherwise parse as
+        # an option (exit 2, never matching) and append a duplicate every pass.
+        if grep -qxF -- "- $file_path" "$RECOVERY_FILTER_FILE" 2>/dev/null; then
             continue
         fi
 
@@ -1674,17 +1676,17 @@ warm_pi_npm_dependencies() {
 const fs = require('fs');
 const path = process.argv[2];
 const required = [
-  'npm:@gotgenes/pi-subagents@16.2.1',
+  'npm:@gotgenes/pi-subagents@17.2.0',
   // context-mode is now enabled by default for Pi (was disabled): its ctx_* tools
   // and the bash-curl-redirect hook are active without an explicit `/ctx on`.
-  'npm:context-mode@1.0.162',
+  'npm:context-mode@1.0.163',
   // Pi tool extensions, always enabled (in `required`) so they are available
   // independently of the context-mode toggle — toggling /ctx off never disables them.
-  'npm:@juicesharp/rpiv-advisor@1.19.1',
-  'npm:@juicesharp/rpiv-ask-user-question@1.19.1',
-  'npm:@juicesharp/rpiv-todo@1.19.1',
+  'npm:@juicesharp/rpiv-advisor@1.20.0',
+  'npm:@juicesharp/rpiv-ask-user-question@1.20.0',
+  'npm:@juicesharp/rpiv-todo@1.20.0',
   'npm:pi-web-access@0.10.7',
-  'npm:pi-mcp-adapter@2.9.0',
+  'npm:pi-mcp-adapter@2.10.0',
 ];
 const disabledPackageIds = new Set([]);
 const disabledPackages = [];
@@ -1714,6 +1716,28 @@ for (const spec of existing) {
 for (const spec of required) byName.set(identity(spec), spec);
 for (const spec of disabledPackages) byName.set(identity(spec.source), spec);
 fs.writeFileSync(path, JSON.stringify({ ...settings, packages: [...byName.values()] }, null, 2) + '\n');
+NODE
+
+    # The rpiv-advisor npm package ships proactive prompt guidance by default.
+    # Codeflare policy is stricter: only the user may invoke advisor or /advisor.
+    # Merge only the guidance fields so a user's selected advisor model/effort survive.
+    local advisor_config="${ADVISOR_CONFIG_FILE:-$USER_HOME/.config/rpiv-advisor/advisor.json}"
+    mkdir -p "$(dirname "$advisor_config")"
+    node - "$advisor_config" <<'NODE'
+const fs = require('fs');
+const path = process.argv[2];
+let config = {};
+try { config = JSON.parse(fs.readFileSync(path, 'utf8')); } catch { config = {}; }
+config.guidance = {
+  promptSnippet: 'Advisor is user-invoked only. Do not call advisor or run /advisor unless the user explicitly asks for advisor in the current message.',
+  promptGuidelines: [
+    'Only the user may invoke advisor. Never call `advisor`, run `/advisor`, or suggest `/advisor` proactively.',
+    'Do not use advisor for planning, stuck states, routine debugging, code review, CI fixes, risk checks, pushes, deploys, or completion checks unless the user explicitly asks for advisor in the current message.',
+    'If the user asks for a generic second opinion without naming advisor, ask a normal clarification question or continue without advisor. Do not route generic second-opinion requests to advisor.',
+    'If the user explicitly asks for advisor, call `advisor` once with no parameters and relay its guidance.',
+  ],
+};
+fs.writeFileSync(path, JSON.stringify(config, null, 2) + '\n');
 NODE
 }
 
@@ -1794,7 +1818,7 @@ _merge_consult_llm_mcp() {
     local target="$1" cfg="$2" label="$3" tmp
     if [ -f "$target" ]; then
         tmp=$(mktemp)
-        if jq --argjson mcp "$cfg" '. * $mcp' "$target" > "$tmp" 2>/dev/null; then
+        if jq --argjson mcp "$cfg" '.mcpServers = ((.mcpServers // {}) + {"consult-llm": $mcp.mcpServers["consult-llm"]})' "$target" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$target"
         else
             echo "[entrypoint] WARNING: could not merge consult-llm MCP config into $target (malformed?)"
@@ -1853,14 +1877,12 @@ configure_consult_llm() {
         "$(jq -n --argjson env "$env_obj" '{"mcpServers":{"consult-llm":{"command":"consult-llm-mcp","args":[],"env":$env}}}')" \
         "Claude Code"
 
-    # Pi's pi-mcp-adapter reads ~/.pi/agent/mcp.json (same shape); directTools
-    # promotes consult_llm to a first-class Pi tool (not buried behind the proxy).
+    # Pi's pi-mcp-adapter reads ~/.pi/agent/mcp.json (same shape). Keep the
+    # server behind the adapter's lazy `mcp` proxy so consult-llm-mcp starts only
+    # when the user explicitly asks to consult an external LLM.
     mkdir -p "$USER_HOME/.pi/agent"
-    # lifecycle:keep-alive — pi-mcp-adapter defaults a server with no lifecycle to "lazy", which
-    # closes the consult-llm process on idle and shows the footer as "0/1
-    # servers ... cached". keep-alive connects on startup and auto-reconnects if it drops.
     _merge_consult_llm_mcp "$USER_HOME/.pi/agent/mcp.json" \
-        "$(jq -n --argjson env "$env_obj" '{"mcpServers":{"consult-llm":{"command":"consult-llm-mcp","args":[],"env":$env,"lifecycle":"keep-alive","directTools":["consult_llm"]}}}')" \
+        "$(jq -n --argjson env "$env_obj" '{"mcpServers":{"consult-llm":{"command":"consult-llm-mcp","args":[],"env":$env,"lifecycle":"lazy"}}}')" \
         "Pi"
 }
 configure_consult_llm || echo "[entrypoint] WARNING: consult-llm configuration failed; continuing startup"

@@ -26,7 +26,7 @@ import {
   getLastUrlFromBuffer,
 } from '../../stores/terminal-url-detection';
 
-describe('terminal-url-detection / REQ-AGENT-013 (browser shim for OAuth)', () => {
+describe('terminal-url-detection / REQ-AGENT-013 / REQ-TERM-015 (browser shim for OAuth)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -92,6 +92,45 @@ describe('terminal-url-detection / REQ-AGENT-013 (browser shim for OAuth)', () =
     // After stop, both URL signals should be cleared
     expect(setAuthUrl).toHaveBeenCalledWith(null);
     expect(setNormalUrl).toHaveBeenCalledWith(null);
+  });
+
+  it('REQ-TERM-015: keeps the focused pane scanner when an older pane cleans up', () => {
+    const scanned: string[] = [];
+    const setAuthUrl = vi.fn();
+    const setNormalUrl = vi.fn();
+
+    const focusedTerminal = {
+      cols: 80,
+      rows: 24,
+      buffer: {
+        active: {
+          length: 1,
+          viewportY: 0,
+          getLine: () => ({ isWrapped: false, translateToString: () => 'https://console.anthropic.com/login' }),
+        },
+      },
+    } as unknown as Terminal;
+
+    registerUrlDetectionDeps(
+      (sessionId: string, terminalId: string) => {
+        scanned.push(`${sessionId}:${terminalId}`);
+        return sessionId === 'session-b' && terminalId === '1' ? focusedTerminal : undefined;
+      },
+      setAuthUrl,
+      setNormalUrl,
+    );
+
+    startUrlDetection('session-a', '1');
+    startUrlDetection('session-b', '1');
+    setAuthUrl.mockClear();
+    setNormalUrl.mockClear();
+    stopUrlDetection('session-a', '1');
+
+    vi.advanceTimersByTime(60);
+
+    expect(scanned).toContain('session-b:1');
+    expect(scanned).not.toContain('session-a:1');
+    expect(setAuthUrl).toHaveBeenCalledWith(expect.stringContaining('console.anthropic.com'));
   });
 
   it('joins a long OAuth URL whose tail wraps past the viewport edge (no truncation)', () => {

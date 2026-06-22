@@ -1,14 +1,16 @@
-import { Component, Show, For, createMemo, Setter } from 'solid-js';
+import { Component, For, Show, createEffect, createMemo, Setter } from 'solid-js';
 import Terminal from './Terminal';
 import TerminalTabs from './TerminalTabs';
 import TilingButton from './TilingButton';
 import TilingOverlay from './TilingOverlay';
 import TiledTerminalContainer from './TiledTerminalContainer';
+import TerminalGrid, { type TerminalGridPane } from './TerminalGrid';
 import FloatingTerminalButtons from './FloatingTerminalButtons';
 import InitProgress from './InitProgress';
 import Dashboard from './Dashboard';
 import { sessionStore } from '../stores/session';
-import type { TileLayout, AgentType, TabConfig } from '../types';
+import { terminalWorkspaceStore } from '../stores/terminal-workspace';
+import type { TileLayout, AgentType, TabConfig, VisibleTerminalPane } from '../types';
 import { generateSessionName } from '../lib/session-utils';
 
 interface TerminalAreaProps {
@@ -19,6 +21,7 @@ interface TerminalAreaProps {
   onCloseTilingOverlay: () => void;
   onTileClick: (tabId: string) => void;
   onOpenSessionById: (sessionId: string) => void;
+  onOpenMultiView?: () => void;
   onDashboardSessionSelect?: (sessionId: string) => void;
   onStartSession: (id: string) => void;
   onStopSession: (id: string) => void;
@@ -38,10 +41,13 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
   const activeSession = createMemo(() => sessionStore.getActiveSession() ?? null);
   const activeSessionId = () => sessionStore.activeSessionId;
 
-  const runningSessions = createMemo(() =>
-    sessionStore.sessions.filter((s) =>
-      s.status === 'running' || s.status === 'initializing' || sessionStore.isSessionInitializing(s.id)
-    )
+  const visiblePanes = createMemo(() => terminalWorkspaceStore.getVisiblePanes());
+  const focusedPaneId = createMemo(() => terminalWorkspaceStore.getFocusedPaneId());
+  const isMultiViewWorkspace = createMemo(() =>
+    visiblePanes().some((pane) => pane.source === 'multiview')
+  );
+  const singleSessionPane = createMemo(() =>
+    visiblePanes().find((pane) => pane.source === 'session') ?? null
   );
 
   const hasInitializingSession = createMemo(() =>
@@ -71,8 +77,37 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
     return sessionStore.getTerminalsForSession(sid);
   });
 
-  const getTerminalsForSession = (sessionId: string) =>
-    sessionStore.getTerminalsForSession(sessionId);
+  const resolveTerminalIdForSession = (sessionId: string) =>
+    sessionStore.getTerminalsForSession(sessionId)?.activeTabId || '1';
+
+  const sessionNamesById = createMemo((previous: { key: string; names: Map<string, string> } | undefined) => {
+    const entries = sessionStore.sessions.map((session) => [session.id, session.name] as const);
+    const key = entries.map(([id, name]) => `${id}\u0000${name}`).join('\u0001');
+    if (previous?.key === key) return previous;
+    return { key, names: new Map(entries) };
+  });
+
+  createEffect(() => {
+    if (!props.showTerminal) return;
+    if (isMultiViewWorkspace()) return;
+
+    const sessionId = activeSessionId();
+    if (!sessionId) return;
+    terminalWorkspaceStore.setSingleSessionWorkspace(sessionId, resolveTerminalIdForSession(sessionId));
+  });
+
+  const multiViewGridPanes = createMemo<TerminalGridPane<VisibleTerminalPane>[]>((previous) => {
+    const panes = visiblePanes().filter((pane) => pane.source === 'multiview');
+    const previousIds = previous?.map((pane) => pane.id).join('\u0000');
+    const nextIds = panes.map((pane) => pane.id).join('\u0000');
+    if (previous && previousIds === nextIds) return previous;
+
+    return panes.map((pane) => ({
+      id: pane.id,
+      data: pane,
+      get active() { return pane.id === focusedPaneId(); },
+    }));
+  });
 
   return (
     <main class="layout-main">
@@ -87,16 +122,16 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
       </Show>
 
       {/* Terminal tabs - show when active session is running/initializing */}
-      <Show when={props.showTerminal && activeSessionId()}>
+      <Show when={props.showTerminal && activeSessionId() && !isMultiViewWorkspace()}>
         <TerminalTabs sessionId={activeSessionId()!} />
       </Show>
 
-      {/* Terminal container - keep all terminals mounted for instant switching.
+      {/* Terminal container: render only visible workspace panes.
           Hidden (display:none) when on dashboard to prevent bleed-through and
           floating buttons from appearing during session creation. */}
       <div class="layout-terminal-container" style={{ display: props.showTerminal ? undefined : 'none' }}>
         {/* Tiling button - only show when active session is running with 2+ tabs */}
-        <Show when={props.showTerminal && activeSessionId() && activeTerminals()}>
+        <Show when={props.showTerminal && !isMultiViewWorkspace() && activeSessionId() && activeTerminals()}>
           <div class="layout-tiling-button-wrapper">
             <TilingButton
               sessionId={activeSessionId()!}
@@ -120,7 +155,7 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
         <FloatingTerminalButtons showTerminal={props.showTerminal} />
 
         {/* Tiled terminal view - when tiling is enabled */}
-        <Show when={props.showTerminal && activeTiling()?.enabled && activeSessionId() && activeTerminals()}>
+        <Show when={props.showTerminal && !isMultiViewWorkspace() && activeTiling()?.enabled && activeSessionId() && activeTerminals()}>
           {/* Single InitProgress overlay for tiled mode (instead of per-terminal) */}
           <Show when={isActiveSessionInitializing()}>
             <div class="terminal-init-overlay">
@@ -147,6 +182,9 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
                   terminalId={tabId}
                   sessionName={session.name}
                   active={true}
+                  visible={true}
+                  focused={tabId === activeTerminals()!.activeTabId}
+                  connect={true}
                   alwaysObserveResize={true}
                   hideInitProgress={true}
                   onError={props.onTerminalError}
@@ -157,40 +195,50 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
           />
         </Show>
 
-        {/* Standard tabbed view - when tiling is disabled */}
-        <Show when={!activeTiling()?.enabled}>
-          <For each={runningSessions()}>
-            {(session) => {
-              // Get terminals for this session
-              const terminals = createMemo(() => getTerminalsForSession(session.id));
-
+        {/* MultiView session grid - each pane is one existing session, not a nested tab set. */}
+        <Show when={props.showTerminal && isMultiViewWorkspace()}>
+          <TerminalGrid
+            layout={terminalWorkspaceStore.getLayout()}
+            panes={multiViewGridPanes()}
+            onPaneClick={(paneId) => terminalWorkspaceStore.setFocusedPane(paneId)}
+            renderPane={(pane) => {
+              const sessionName = createMemo(() => sessionNamesById().names.get(pane.data.sessionId) || 'Terminal');
               return (
-                <For each={terminals()?.tabs || [{ id: '1', createdAt: '' }]}>
-                  {(tab) => {
-                    // Terminal is active if: session is active AND this tab is the active tab
-                    // During initialization, sessionTerminals is null - use fallback logic
-                    const isActive = createMemo(() => {
-                      const isActiveSession = session.id === activeSessionId();
-                      const sessionTerminals = getTerminalsForSession(session.id);
-                      // If no terminals yet (initializing), fallback tab '1' is active
-                      const isActiveTab = sessionTerminals
-                        ? sessionTerminals.activeTabId === tab.id
-                        : tab.id === '1';  // Fallback tab is always '1'
-                      return isActiveSession && isActiveTab;
-                    });
+                <Terminal
+                  sessionId={pane.data.sessionId}
+                  terminalId={pane.data.terminalId}
+                  sessionName={sessionName()}
+                  active={true}
+                  visible={true}
+                  focused={pane.active}
+                  connect={true}
+                  alwaysObserveResize={true}
+                  hideInitProgress={true}
+                  onError={props.onTerminalError}
+                  onInitComplete={() => props.onOpenSessionById(pane.data.sessionId)}
+                />
+              );
+            }}
+          />
+        </Show>
 
-                    return (
-                      <Terminal
-                        sessionId={session.id}
-                        terminalId={tab.id}
-                        sessionName={session.name}
-                        active={isActive()}
-                        onError={props.onTerminalError}
-                        onInitComplete={() => props.onOpenSessionById(session.id)}
-                      />
-                    );
-                  }}
-                </For>
+        {/* Standard tabbed view - only the visible workspace pane mounts/connects. */}
+        <Show when={props.showTerminal && !isMultiViewWorkspace() && !activeTiling()?.enabled}>
+          <For each={singleSessionPane() ? [singleSessionPane()!] : []}>
+            {(pane) => {
+              const session = createMemo(() => sessionStore.sessions.find((candidate) => candidate.id === pane.sessionId));
+              return (
+                <Terminal
+                  sessionId={pane.sessionId}
+                  terminalId={pane.terminalId}
+                  sessionName={session()?.name || 'Terminal'}
+                  active={true}
+                  visible={true}
+                  focused={pane.id === focusedPaneId()}
+                  connect={true}
+                  onError={props.onTerminalError}
+                  onInitComplete={() => props.onOpenSessionById(pane.sessionId)}
+                />
               );
             }}
           </For>
@@ -206,6 +254,7 @@ const TerminalArea: Component<TerminalAreaProps> = (props) => {
           onStopSession={props.onStopSession}
           onDeleteSession={props.onDeleteSession}
           onOpenSessionById={props.onDashboardSessionSelect || props.onOpenSessionById}
+          onOpenMultiView={props.onOpenMultiView}
           viewState={props.viewState === 'terminal' ? 'dashboard' : props.viewState as 'dashboard' | 'expanding' | 'collapsing'}
           userName={props.userName}
           onSettingsClick={props.onSettingsClick}

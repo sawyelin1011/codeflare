@@ -82,6 +82,7 @@ const TOOL_MAP = {
 
 const CLAUDE_ONLY_CATEGORIES = new Set(['hook', 'command', 'plugin']);
 const CLAUDE_ONLY_FILES = new Set(['rules/memory.md']);
+const PI_EXCLUDED_CLAUDE_FILES = new Set(['rules/git-workflow.md']);
 // impeccable is Claude-only in the transform fan-out: it ships ~57 files incl. an
 // offline detector, so embedding it into codex/gemini/opencode would bloat the seed for
 // agents that won't use it. Pi gets a DEDICATED native copy (preseed/agents/pi/skills/
@@ -231,11 +232,17 @@ function adaptAgentFrontmatter(content, agentId) {
     newLines.push('prompt_mode: replace');
     newLines.push('extensions: true');
     newLines.push('skills: true');
-    newLines.push('inherit_context: true');
-    newLines.push('run_in_background: false');
+    if (/^name:\s*memory-capture\s*$/m.test(frontmatter)) newLines.push('run_in_background: true');
   }
 
-  return `---\n${newLines.join('\n')}\n---\n${adaptPaths(body, agentId)}`;
+  let adaptedBody = adaptPaths(body, agentId);
+  if (agentId === 'pi' && /^name:\s*memory-capture\s*$/m.test(frontmatter)) {
+    adaptedBody = adaptedBody
+      .replace('The contract\'s first step is to delete the `.vars` file (dedup gate).', 'On Pi, the contract keeps the `.vars` file as the pending-capture lock until the note is written and the counter is advanced.')
+      .replace('`VARS_FILE`: path to the trigger marker at `/tmp/.memory-counter/<session_id>.vars` (delete first).', '`VARS_FILE`: path to the trigger marker at `/tmp/.memory-counter/<session_id>.vars` (cleared after the note is written and the counter is advanced).');
+  }
+
+  return `---\n${newLines.join('\n')}\n---\n${adaptedBody}`;
 }
 
 const PI_SDD_SKILLS = new Set([
@@ -335,6 +342,7 @@ function validateModes(manifest, label) {
 function piNativeKey(withinPi) {
   if (withinPi.startsWith('extensions/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('skills/')) return `.pi/agent/${withinPi}`;
+  if (withinPi.startsWith('rules/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('scripts/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('prompts/')) return `.pi/agent/${withinPi}`;
   if (withinPi.startsWith('agents/')) return `.pi/agent/${withinPi}`;
@@ -433,6 +441,7 @@ async function generate() {
   const piManifestPath = path.join(piDir, 'manifest.json');
   let piNativeCount = 0;
   const piNativeSkillKeys = new Set();
+  const piNativeRuleFiles = [];
   try {
     const piManifest = JSON.parse(await fs.readFile(piManifestPath, 'utf8'));
     validateModes(piManifest, 'Pi');
@@ -446,6 +455,9 @@ async function generate() {
         content = await fs.readFile(absolutePath, 'utf8');
       } catch {
         throw new Error(`Pi manifest references "${withinPi}" but file does not exist`);
+      }
+      if (withinPi.startsWith('rules/')) {
+        piNativeRuleFiles.push({ withinClaude: withinPi, content, modes: entry.modes, category: 'rule' });
       }
       documents.push({
         key: piNativeKey(withinPi),
@@ -463,12 +475,16 @@ async function generate() {
   for (const [agentId, config] of Object.entries(AGENT_CONFIGS)) {
     // Instructions files (one per mode, same key, different content)
     for (const mode of ['default', 'advanced']) {
-      const rules = sourceFiles.filter(
-        (f) =>
-          f.category === 'rule' &&
-          f.modes.includes(mode) &&
-          !isClaudeOnlyFile(f.withinClaude)
-      );
+      const rules = [
+        ...sourceFiles.filter(
+          (f) =>
+            f.category === 'rule' &&
+            f.modes.includes(mode) &&
+            !isClaudeOnlyFile(f.withinClaude) &&
+            !(agentId === 'pi' && PI_EXCLUDED_CLAUDE_FILES.has(f.withinClaude))
+        ),
+        ...(agentId === 'pi' ? piNativeRuleFiles.filter((f) => f.modes.includes(mode)) : []),
+      ];
       if (rules.length > 0) {
         documents.push({
           key: config.instructionsKey,

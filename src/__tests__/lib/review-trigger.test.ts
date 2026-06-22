@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isPrBoundaryTrigger, isPrBoundaryCommand, isGhPrMergeCommand, isGitPushOnlyCommand, mergeCommandTarget, prBoundaryCommandBase, prEditBoundaryBase, prEnforcedForPush, classifyReviewFiles, isGeneratedArtifactPath, isGeneratedOnlyDiff, prUrlFromText, enforcedHeadDecision, ghPrCreateBase } from '../../../preseed/agents/pi/extensions/review-helpers';
+import { boundaryFallbackHead, boundaryTriggerCommands, commandTextFromEvent, completeTranscriptDelta, gitPushCommandTarget, isFailedToolExecution, isPrBoundaryTrigger, isPrBoundaryCommand, isGhPrMergeCommand, isGitPushOnlyCommand, mergeCommandTarget, prBoundaryCommandBase, prCreateCommandTarget, prEditBoundaryBase, prEditCommandTarget, prEnforcedForPush, prUpdateBranchCommandTarget, classifyReviewFiles, isGeneratedArtifactPath, isGeneratedOnlyDiff, prUrlFromText, enforcedHeadDecision, ghPrCreateBase, startedBoundaryCommandForToolEnd } from '../../../preseed/agents/pi/extensions/review-helpers';
 
 /**
  * isPrBoundaryTrigger is the single "should this command start a review?" predicate.
@@ -27,9 +27,11 @@ describe('isPrBoundaryTrigger', () => {
     expect(isPrBoundaryTrigger('gh pr create --title x')).toBe(true);
   });
 
-  it('does NOT treat gh pr create targeting a non-main base as a boundary', () => {
+  it('does NOT treat gh pr create targeting a non-main base, draft, or dry-run as a boundary', () => {
     expect(ghPrCreateBase('gh pr create --base develop --title x')).toBe('develop');
     expect(isPrBoundaryTrigger('gh pr create --base develop --title x')).toBe(false);
+    expect(isPrBoundaryTrigger('gh pr create --base main --draft')).toBe(false);
+    expect(isPrBoundaryTrigger('gh pr create --base main --dry-run')).toBe(false);
   });
 
   it('treats gh pr edit retargeting an existing PR onto main/master as a boundary', () => {
@@ -52,9 +54,11 @@ describe('isPrBoundaryTrigger', () => {
     expect(isPrBoundaryTrigger('cd /repo && git add -A && git commit -m x && git push')).toBe(true);
   });
 
-  it('returns false for non-boundary commands', () => {
+  it('returns false for non-boundary commands, including clone-only setup', () => {
     expect(isPrBoundaryTrigger('git status')).toBe(false);
     expect(isPrBoundaryTrigger('git commit -m "wip"')).toBe(false);
+    expect(isPrBoundaryTrigger('git clone https://github.com/o/r.git')).toBe(false);
+    expect(isPrBoundaryTrigger('gh repo clone o/r')).toBe(false);
     expect(isPrBoundaryTrigger('ls -la')).toBe(false);
   });
 
@@ -65,10 +69,64 @@ describe('isPrBoundaryTrigger', () => {
     expect(isPrBoundaryTrigger('git push -n origin main')).toBe(false);
     expect(isPrBoundaryTrigger('git push origin --delete oldbranch')).toBe(false);
     expect(isGitPushOnlyCommand('git push -d origin oldbranch')).toBe(false);
-    // But a real push — including a branch+tags push or a force push — is still a boundary.
+    expect(isPrBoundaryTrigger('git push --tags')).toBe(false);
+    expect(isPrBoundaryTrigger('git push origin --tags')).toBe(false);
+    expect(isPrBoundaryTrigger('git push origin tag v1')).toBe(false);
+    expect(isPrBoundaryTrigger('git push origin refs/tags/v1')).toBe(false);
+    // But a real push — including a branch+tags push, follow-tags, or a force push — is still a boundary.
     expect(isPrBoundaryTrigger('git push origin main')).toBe(true);
     expect(isPrBoundaryTrigger('git push origin main --tags')).toBe(true);
+    expect(isPrBoundaryTrigger('git push --follow-tags')).toBe(true);
     expect(isPrBoundaryTrigger('git push --force origin main')).toBe(true);
+  });
+});
+
+
+describe('command target parsing for PR-boundary recovery (REQ-AGENT-063 / REQ-AGENT-066)', () => {
+  it('extracts explicit push refspec target branches and ignores tag/delete-only pushes', () => {
+    expect(gitPushCommandTarget('git push origin HEAD:multiview')).toEqual({ advancing: true, branch: 'multiview', source: 'HEAD', targets: [{ branch: 'multiview', source: 'HEAD' }] });
+    expect(gitPushCommandTarget('git push origin feature:refs/heads/multiview')).toEqual({ advancing: true, branch: 'multiview', source: 'feature', targets: [{ branch: 'multiview', source: 'feature' }] });
+    expect(gitPushCommandTarget('git push origin already-reviewed multiview')).toEqual({ advancing: true, branch: 'already-reviewed', source: 'already-reviewed', targets: [{ branch: 'already-reviewed', source: 'already-reviewed' }, { branch: 'multiview', source: 'multiview' }] });
+    expect(gitPushCommandTarget('git push origin HEAD')).toEqual({ advancing: true, branch: undefined, source: 'HEAD', targets: [{ source: 'HEAD' }] });
+    expect(gitPushCommandTarget('git push origin @')).toEqual({ advancing: true, branch: undefined, source: '@', targets: [{ source: '@' }] });
+    expect(gitPushCommandTarget('git push origin HEAD multiview')).toEqual({ advancing: true, branch: undefined, source: 'HEAD', targets: [{ source: 'HEAD' }, { branch: 'multiview', source: 'multiview' }] });
+    expect(gitPushCommandTarget('git push origin :oldbranch')).toEqual({ advancing: false });
+    expect(gitPushCommandTarget('git push --tags')).toEqual({ advancing: false });
+    expect(gitPushCommandTarget('git push origin --tags')).toEqual({ advancing: false });
+    expect(gitPushCommandTarget('git push origin tag v1')).toEqual({ advancing: false });
+    expect(gitPushCommandTarget('git push --follow-tags')).toEqual({ advancing: true, branch: undefined, source: undefined, targets: undefined });
+  });
+
+  it('extracts target selectors from the same protected-boundary shell segment', () => {
+    expect(prEditBoundaryBase('gh pr edit 111 --title x && gh pr edit 222 --base main')).toBe('main');
+    expect(prEditCommandTarget('gh pr edit 111 --title x && gh pr edit 222 --base main')).toEqual({ prNumber: 222 });
+    expect(prBoundaryCommandBase('gh pr create --base develop --title x && gh pr create --head multiview --base main')).toBe('main');
+    expect(prCreateCommandTarget('gh pr create --base develop --title x && gh pr create --head multiview --base main')).toEqual({ headBranch: 'multiview', draft: false, dryRun: false });
+  });
+
+  it('extracts gh pr create and update-branch targets without treating flag values as selectors', () => {
+    expect(prCreateCommandTarget('gh pr create --repo owner/repo --head feature --base main')).toEqual({ repoSlug: 'owner/repo', headBranch: 'feature', draft: false, dryRun: false });
+    expect(prCreateCommandTarget('gh pr create --draft --dry-run --base main')).toEqual({ draft: true, dryRun: true });
+    expect(prUpdateBranchCommandTarget('gh pr update-branch 563 --rebase')).toEqual({ prNumber: 563 });
+    expect(prUpdateBranchCommandTarget('gh pr update-branch feature-branch --repo owner/repo')).toEqual({ repoSlug: 'owner/repo', prBranch: 'feature-branch' });
+  });
+
+  it('selects concrete trigger segments without merging targets across compound commands', () => {
+    expect(boundaryTriggerCommands('gh pr create --repo other/repo --base main && git push origin multiview')).toEqual([
+      'gh pr create --repo other/repo --base main',
+      'git push origin multiview',
+    ]);
+  });
+
+  it('selects a later real boundary from batched tool commands over an earlier broad non-trigger', () => {
+    const event = { input: { commands: [{ command: 'gh pr create --base develop' }, { command: 'git push origin multiview' }] } };
+    expect(commandTextFromEvent(event)).toBe('git push origin multiview');
+  });
+
+  it('treats failed and nonzero tool executions as failed boundaries', () => {
+    expect(isFailedToolExecution({ status: 'failed' })).toBe(true);
+    expect(isFailedToolExecution({ exitCode: 1 })).toBe(true);
+    expect(isFailedToolExecution({ status: 'success', exitCode: 0 })).toBe(false);
   });
 });
 
@@ -108,6 +166,66 @@ describe('isGhPrMergeCommand / isGitPushOnlyCommand are env-prefix tolerant', ()
   it('does not match gh repo sync or non-push git', () => {
     expect(isGitPushOnlyCommand('gh repo sync')).toBe(false);
     expect(isGitPushOnlyCommand('git status')).toBe(false);
+  });
+});
+
+describe('completeTranscriptDelta', () => {
+  function bashToolCallLine(command: string): string {
+    return `${JSON.stringify({
+      message: {
+        role: 'assistant',
+        content: [{ type: 'toolCall', name: 'bash', arguments: { command } }],
+      },
+    })}\n`;
+  }
+
+  function commandFromToolCallLine(line: string): string {
+    const entry = JSON.parse(line);
+    const part = entry.message.content[0];
+    return commandTextFromEvent({ toolName: part.name, input: part.arguments, args: part.arguments, params: part.arguments, arguments: part.arguments });
+  }
+
+  it('keeps the first new complete record after an existing cursor', () => {
+    const line = bashToolCallLine('cd /repo && git commit -m x && git push origin multiview');
+    const delta = completeTranscriptDelta({ text: line, start: 12_345, fromCursor: true });
+
+    expect(delta).toEqual({
+      text: line,
+      start: 12_345,
+      nextCursor: 12_345 + Buffer.byteLength(line, 'utf8'),
+    });
+    expect(commandFromToolCallLine(delta?.text.trim() || '')).toBe('cd /repo && git commit -m x && git push origin multiview');
+  });
+
+  it('drops only the first partial record for fallback scans', () => {
+    const line = bashToolCallLine('git push origin multiview');
+    const delta = completeTranscriptDelta({ text: `partial-json-record\n${line}`, start: 10, fromCursor: false });
+
+    expect(delta?.text).toBe(line);
+    expect(commandFromToolCallLine(delta?.text.trim() || '')).toBe('git push origin multiview');
+  });
+
+  it('does not advance past an incomplete trailing record', () => {
+    const partial = bashToolCallLine('git push origin multiview').trimEnd();
+
+    expect(completeTranscriptDelta({ text: partial, start: 0, fromCursor: true })).toBeUndefined();
+  });
+});
+
+describe('startedBoundaryCommandForToolEnd', () => {
+  const base = { endToolId: 'tool-1', startedToolId: 'tool-1', ageMs: 500, maxAgeMs: 120_000 };
+
+  it('recovers same-tool PR-boundary commands whose end event lost command text', () => {
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'git push origin multiview' })).toBe('git push origin multiview');
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'gh pr create --base main' })).toBe('gh pr create --base main');
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'gh pr edit 563 --base main' })).toBe('gh pr edit 563 --base main');
+  });
+
+  it('does not recover clone-only, stale, or mismatched-tool commands', () => {
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'git clone https://github.com/o/r.git' })).toBeUndefined();
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'gh repo clone o/r' })).toBeUndefined();
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'git push origin multiview', startedToolId: 'other-tool' })).toBeUndefined();
+    expect(startedBoundaryCommandForToolEnd({ ...base, startedCommand: 'git push origin multiview', ageMs: 121_000 })).toBeUndefined();
   });
 });
 
@@ -222,6 +340,30 @@ describe('prEditBoundaryBase (gh pr edit retarget)', () => {
 
   it('finds the retarget inside a compound command', () => {
     expect(prEditBoundaryBase('cd /repo && gh pr edit 286 --base main')).toBe('main');
+  });
+
+  it('extracts the explicit PR selector so retarget review reads that PR, not the current branch', () => {
+    expect(prEditCommandTarget('gh pr edit 286 --base main')).toEqual({ prNumber: 286 });
+    expect(prEditCommandTarget('gh pr edit feature-branch --base main')).toEqual({ prBranch: 'feature-branch' });
+    expect(prEditCommandTarget('gh pr edit https://github.com/o/r/pull/563 --base main')).toEqual({ prNumber: 563 });
+    expect(prEditCommandTarget('gh pr edit --repo owner/repo 286 --base main')).toEqual({ repoSlug: 'owner/repo', prNumber: 286 });
+    expect(prEditCommandTarget('gh pr edit --base main --title x')).toEqual({});
+  });
+
+  it('skips body-file, project, and milestone edit flag values before selecting the explicit PR', () => {
+    expect(prEditCommandTarget('gh pr edit --body-file /tmp/body.md --base main')).toEqual({});
+    expect(prEditCommandTarget('gh pr edit -F /tmp/body.md 286 --base main')).toEqual({ prNumber: 286 });
+    expect(prEditCommandTarget('gh pr edit --add-project Roadmap 286 --base main')).toEqual({ prNumber: 286 });
+    expect(prEditCommandTarget('gh pr edit --remove-project Roadmap 286 --base main')).toEqual({ prNumber: 286 });
+    expect(prEditCommandTarget('gh pr edit -m Sprint-7 286 --base main')).toEqual({ prNumber: 286 });
+  });
+});
+
+describe('boundaryFallbackHead', () => {
+  it('uses the selected PR head for explicit PR retargets and local HEAD for current-branch boundaries', () => {
+    expect(boundaryFallbackHead({ localHead: 'checkout-head', prHead: 'selected-pr-head', preferPrHead: true })).toBe('selected-pr-head');
+    expect(boundaryFallbackHead({ localHead: 'checkout-head', prHead: 'current-pr-head', preferPrHead: false })).toBe('checkout-head');
+    expect(boundaryFallbackHead({ localHead: 'checkout-head', preferPrHead: true })).toBe('checkout-head');
   });
 });
 

@@ -40,6 +40,44 @@ export function registerProcessNameCallback(
   onProcessName = cb;
 }
 
+// Discriminated result of inspecting a single WebSocket frame.
+// Server control messages always start with {"type": — raw PTY output never does.
+export type ControlMessage =
+  | { kind: 'restore'; state: string | undefined }
+  | { kind: 'process-name'; processName: string }
+  | { kind: 'raw' };
+
+/**
+ * Classify a raw WebSocket frame as a server control message or raw terminal data.
+ *
+ * Pure (no side effects) so it can be unit-tested without a live WebSocket.
+ * A frame is a control message only if it both starts with the `{"type":`
+ * discriminator AND parses as JSON with a recognized `type`. A recognized
+ * `restore` frame is always consumed (kind 'restore') even with no/empty
+ * state — matching the original handler, which returned early on `type ===
+ * 'restore'` and only conditionally rendered when `state` was present. A
+ * `process-name` frame requires a non-empty `processName`. Everything else —
+ * raw PTY bytes, malformed JSON, or unknown control types — is `raw`, which
+ * the caller writes verbatim to the terminal.
+ */
+export function parseControlMessage(messageData: string): ControlMessage {
+  if (!messageData.startsWith('{"type":')) {
+    return { kind: 'raw' };
+  }
+  try {
+    const msg = JSON.parse(messageData);
+    if (msg.type === 'restore') {
+      return { kind: 'restore', state: msg.state };
+    }
+    if (msg.type === 'process-name' && msg.processName) {
+      return { kind: 'process-name', processName: msg.processName };
+    }
+  } catch {
+    // Not JSON, fall through to raw
+  }
+  return { kind: 'raw' };
+}
+
 // Helper to create compound key from sessionId and terminalId
 function makeKey(sessionId: string, terminalId: string): string {
   return `${sessionId}:${terminalId}`;
@@ -74,6 +112,10 @@ const connections = new Map<string, WebSocket>();
 const terminals = new Map<string, Terminal>();
 const retryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const abortControllers = new Map<string, AbortController>();
+const pendingFocusClaims = new Set<string>();
+const desiredFocusClaims = new Set<string>();
+const connectionOwners = new Map<string, number>();
+let nextConnectionOwner = 0;
 
 // Bug 1 fix: Store inputDisposable outside the connect function to properly clean up
 const inputDisposables = new Map<string, { dispose: () => void }>();
@@ -259,6 +301,8 @@ function connect(
   // Close existing connection if any
   disconnect(sessionId, terminalId);
 
+  const owner = ++nextConnectionOwner;
+  connectionOwners.set(key, owner);
   terminals.set(key, terminal);
 
   // Bug 1 fix: Dispose any existing input handler before creating a new one
@@ -281,8 +325,10 @@ function connect(
   // Whether this terminal has ever successfully connected (for dead container detection).
 
   // Attempt connection with retries
+  const ownsConnection = () => connectionOwners.get(key) === owner;
+
   function attemptConnection(attemptNumber: number): void {
-    if (signal.aborted) return;
+    if (signal.aborted || !ownsConnection()) return;
 
     // Clear any existing retry timeout
     const existingTimeout = retryTimeouts.get(key);
@@ -292,6 +338,7 @@ function connect(
     }
 
     setConnectionState(sessionId, terminalId, 'connecting');
+    if (desiredFocusClaims.has(key)) pendingFocusClaims.add(key);
 
     if (attemptNumber > 1) {
       setRetryMessage(sessionId, terminalId, `Reconnecting... (attempt ${attemptNumber})`);
@@ -305,7 +352,7 @@ function connect(
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
-      if (signal.aborted) {
+      if (signal.aborted || !ownsConnection()) {
         ws.close();
         return;
       }
@@ -333,6 +380,11 @@ function connect(
       inputDisposables.set(key, inputDisposable);
       logger.debug(`[Terminal ${key}] Created new input handler`);
 
+      if (pendingFocusClaims.has(key)) {
+        ws.send(JSON.stringify({ type: 'focus' }));
+        pendingFocusClaims.delete(key);
+      }
+
       // Bug 5 fix: Send initial resize to sync PTY dimensions with xterm.js
       // Without this, PTY starts with default 80x24 but xterm.js may have different dimensions
       // causing garbled/duplicated text until user manually resizes window
@@ -346,7 +398,7 @@ function connect(
     };
 
     function handleWebSocketMessage(event: MessageEvent): void {
-      if (signal.aborted) return;
+      if (signal.aborted || !ownsConnection()) return;
 
       // Server sends RAW terminal data - write directly to xterm
       let messageData: string;
@@ -361,56 +413,53 @@ function connect(
 
       recordFrame(key, messageData.length);
 
-      // Check for JSON control messages from server (restore, process-name)
-      // Server control messages always start with {"type": — raw PTY output never does
-      if (messageData.startsWith('{"type":')) {
-        try {
-          const msg = JSON.parse(messageData);
-          if (msg.type === 'restore') {
-            if (msg.state) {
-              // Diagnostic: capture restore frame size + a "duplication
-              // signature" — the count of "Claude Code v" substrings inside
-              // the saved state. Single-copy = 1; >1 means the server's
-              // saved state already contains duplicated content (server-
-              // side render bug). Single-copy here while client still
-              // shows duplication = client-side render bug
-              // (terminal.reset() not synchronously clearing).
-              const claudeSignatureCount = (msg.state.match(/Claude Code v/g) || []).length;
-              recordRestore(key, msg.state.length, claudeSignatureCount);
+      // Discriminate JSON control messages (restore, process-name) from raw
+      // PTY output by the leading {"type": field (REQ-TERM-009 AC2).
+      const control = parseControlMessage(messageData);
+      if (control.kind === 'restore') {
+        if (control.state) {
+          // Diagnostic: capture restore frame size + a "duplication
+          // signature" — the count of "Claude Code v" substrings inside
+          // the saved state. Single-copy = 1; >1 means the server's
+          // saved state already contains duplicated content (server-
+          // side render bug). Single-copy here while client still
+          // shows duplication = client-side render bug
+          // (terminal.reset() not synchronously clearing).
+          const claudeSignatureCount = (control.state.match(/Claude Code v/g) || []).length;
+          recordRestore(key, control.state.length, claudeSignatureCount);
 
-              // Belt-and-suspenders clear: xterm's terminal.reset() has
-              // had async-renderer quirks where the buffer wasn't
-              // synchronously zeroed before the next write landed. Issue
-              // ANSI clear-screen + clear-scrollback + cursor-home FIRST
-              // (synchronous PTY-level clear), then call .clear() (xterm
-              // viewport clear), then .reset() (full terminal state
-              // reset), and only then write the restored state.
-              terminal.write('\x1b[2J\x1b[3J\x1b[H');
-              terminal.clear();
-              terminal.reset();
-              terminal.write(msg.state);
-              terminal.scrollToBottom();
-              terminal.refresh(0, terminal.rows - 1);
-            }
-            return;
-          }
-          if (msg.type === 'process-name' && msg.processName) {
-            logger.debug(`[Terminal ${key}] Process name: ${msg.processName}`);
-            onProcessName?.(sessionId, terminalId, msg.processName);
-            return;
-          }
-        } catch {
-          // Not JSON, write as raw data
+          // Belt-and-suspenders clear: xterm's terminal.reset() has
+          // had async-renderer quirks where the buffer wasn't
+          // synchronously zeroed before the next write landed. Issue
+          // ANSI clear-screen + clear-scrollback + cursor-home FIRST
+          // (synchronous PTY-level clear), then call .clear() (xterm
+          // viewport clear), then .reset() (full terminal state
+          // reset), and only then write the restored state.
+          terminal.write('\x1b[2J\x1b[3J\x1b[H');
+          terminal.clear();
+          terminal.reset();
+          terminal.write(control.state);
+          terminal.scrollToBottom();
+          terminal.refresh(0, terminal.rows - 1);
         }
+        return;
+      }
+      if (control.kind === 'process-name') {
+        logger.debug(`[Terminal ${key}] Process name: ${control.processName}`);
+        onProcessName?.(sessionId, terminalId, control.processName);
+        return;
       }
 
       scheduleWrite(key, terminal, messageData);
     }
 
     function handleWebSocketClose(event: CloseEvent): void {
-      if (signal.aborted) return;
+      if (signal.aborted || !ownsConnection()) return;
 
-      logger.warn(`[Terminal ${key}] WS CLOSED: code=${event.code}, reason="${event.reason}", state=${getConnectionState(sessionId, terminalId)}`);
+      const expectedStartupClose = event.code === WS_CONTAINER_STOPPED_CODE || event.code === 1013;
+      const closeLog = `[Terminal ${key}] WS CLOSED: code=${event.code}, reason="${event.reason}", state=${getConnectionState(sessionId, terminalId)}`;
+      if (expectedStartupClose) logger.debug(closeLog);
+      else logger.warn(closeLog);
       connections.delete(key);
 
       // Intentional disconnect from dashboard — do not reconnect
@@ -431,7 +480,9 @@ function connect(
       // Retry on retryable close codes (flat delay, no limit).
       // Network errors (1006) just retry — KV polling handles session status.
       if (WS_RETRYABLE_CLOSE_CODES.has(event.code) && !signal.aborted) {
-        logger.warn(`[Terminal ${key}] Retrying connection, attempt ${attemptNumber + 1}, code=${event.code}`);
+        const retryLog = `[Terminal ${key}] Retrying connection, attempt ${attemptNumber + 1}, code=${event.code}`;
+        if (event.code === 1013) logger.debug(retryLog);
+        else logger.warn(retryLog);
         const timeout = setTimeout(() => {
           attemptConnection(attemptNumber + 1);
         }, WS_RETRY_DELAY_MS);
@@ -461,6 +512,8 @@ function connect(
   // Return cleanup function
   return () => {
     controller.abort();
+    if (!ownsConnection()) return;
+
     cancelPendingFlush(key);
 
     // Bug 1 fix: Dispose input handler from the external Map
@@ -496,6 +549,15 @@ function disconnect(sessionId: string, terminalId: string): void {
     abortControllers.delete(key);
   }
 
+  connectionOwners.delete(key);
+
+  // Clear any pending retry
+  const timeout = retryTimeouts.get(key);
+  if (timeout) {
+    clearTimeout(timeout);
+    retryTimeouts.delete(key);
+  }
+
   // Bug 1 fix: Dispose input handler before closing WebSocket
   const disposable = inputDisposables.get(key);
   if (disposable) {
@@ -509,7 +571,27 @@ function disconnect(sessionId: string, terminalId: string): void {
     ws.close();
     connections.delete(key);
   }
+  pendingFocusClaims.delete(key);
+  desiredFocusClaims.delete(key);
   setConnectionState(sessionId, terminalId, 'disconnected');
+}
+
+function claimResizeAuthority(sessionId: string, terminalId: string): void {
+  const key = makeKey(sessionId, terminalId);
+  desiredFocusClaims.add(key);
+  const ws = connections.get(key);
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'focus' }));
+    pendingFocusClaims.delete(key);
+  } else if (ws?.readyState === WebSocket.CONNECTING) {
+    pendingFocusClaims.add(key);
+  }
+}
+
+function clearPendingResizeAuthority(sessionId: string, terminalId: string): void {
+  const key = makeKey(sessionId, terminalId);
+  pendingFocusClaims.delete(key);
+  desiredFocusClaims.delete(key);
 }
 
 // Send resize event to terminal
@@ -526,6 +608,19 @@ function isConnected(sessionId: string, terminalId: string): boolean {
   return getConnectionState(sessionId, terminalId) === 'connected';
 }
 
+// Dispose terminal UI resources without killing the server-side PTY.
+function disposeLocalTerminal(sessionId: string, terminalId: string): void {
+  const key = makeKey(sessionId, terminalId);
+  disconnect(sessionId, terminalId);
+  clearPendingResizeAuthority(sessionId, terminalId);
+  _unregisterFitAddon(sessionId, terminalId);
+  const terminal = terminals.get(key);
+  if (terminal) {
+    terminal.dispose();
+    terminals.delete(key);
+  }
+}
+
 // Dispose terminal and connection
 function dispose(sessionId: string, terminalId: string): void {
   const key = makeKey(sessionId, terminalId);
@@ -537,6 +632,7 @@ function dispose(sessionId: string, terminalId: string): void {
   }
 
   disconnect(sessionId, terminalId);
+  clearPendingResizeAuthority(sessionId, terminalId);
   const terminal = terminals.get(key);
   if (terminal) {
     terminal.dispose();
@@ -563,6 +659,12 @@ function disposeSession(sessionId: string): void {
   cleanupMapByPrefix(inputDisposables, prefix, (disposable) => disposable.dispose());
   cleanupMapByPrefix(pendingFlushes, prefix, (rafId) => clearTimeout(rafId));
   cleanupMapByPrefix(writeBuffers, prefix);
+  for (const key of [...pendingFocusClaims]) {
+    if (key.startsWith(prefix)) pendingFocusClaims.delete(key);
+  }
+  for (const key of [...desiredFocusClaims]) {
+    if (key.startsWith(prefix)) desiredFocusClaims.delete(key);
+  }
 
   // Clean up state
   setState(produce((s) => {
@@ -613,6 +715,9 @@ function disposeAll(): void {
     controller.abort();
   }
   abortControllers.clear();
+  connectionOwners.clear();
+  pendingFocusClaims.clear();
+  desiredFocusClaims.clear();
 
   clearFitAddons();
 }
@@ -687,9 +792,11 @@ let disconnectTimerId: ReturnType<typeof setTimeout> | null = null;
  *   filter, `container.fetch()` on a stopped DO auto-starts its container
  *   (SDK `containerFetch` line 525), causing phantom containers.
  */
-export function reconnectDisconnectedTerminals(activeSessionId?: string): void {
+export function reconnectDisconnectedTerminals(activeSessionId?: string, visibleKeys?: string[]): void {
+  const allowedKeys = visibleKeys ? new Set(visibleKeys) : null;
   for (const [key] of terminals) {
     const [sessionId, terminalId] = key.split(':');
+    if (allowedKeys && !allowedKeys.has(key)) continue;
     if (activeSessionId && sessionId !== activeSessionId) continue;
     if (getConnectionState(sessionId, terminalId) === 'disconnected') {
       logger.info(`[Terminal ${key}] Disconnected, triggering reconnect`);
@@ -704,9 +811,11 @@ export function reconnectDisconnectedTerminals(activeSessionId?: string): void {
  * terminals stuck in a retry loop (state === 'connecting') after the browser
  * tab was backgrounded long enough for the retry timers to stall.
  */
-export function reconnectOnVisibilityReturn(activeSessionId?: string): void {
+export function reconnectOnVisibilityReturn(activeSessionId?: string, visibleKeys?: string[]): void {
+  const allowedKeys = visibleKeys ? new Set(visibleKeys) : null;
   for (const [key] of terminals) {
     const [sessionId, terminalId] = key.split(':');
+    if (allowedKeys && !allowedKeys.has(key)) continue;
     if (activeSessionId && sessionId !== activeSessionId) continue;
     const state = getConnectionState(sessionId, terminalId);
     if (state === 'disconnected' || state === 'connecting') {
@@ -735,6 +844,8 @@ function disconnectAll(): void {
     ws.close(1000, 'dashboard-disconnect');
   }
   connections.clear();
+  pendingFocusClaims.clear();
+  desiredFocusClaims.clear();
 
   // Clear pending retries — we intentionally disconnected
   for (const timeout of retryTimeouts.values()) {
@@ -818,6 +929,9 @@ export const terminalStore = {
   connect,
   disconnect,
   reconnect,
+  disposeLocalTerminal,
+  claimResizeAuthority,
+  clearPendingResizeAuthority,
   resize,
   dispose,
   disposeSession,

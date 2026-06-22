@@ -134,22 +134,30 @@
 }
 
 /* ── Repo list ── */
-/* The viewport caps the visible rows and scrolls the rest (no visible
-   scrollbar). Desktop (>=1024px) caps at 7 rows, tablet (600-1023px) at 5
-   rows; mobile (below) grows to fill available height, min 3 rows. */
+/* The list wrapper must be a bounded flex column so the inner rows region can own
+   the scroll: it fills the panel's remaining height (flex: 1 + min-height: 0) and
+   lets `.github-repo-rows` overflow-scroll inside it. Without this the wrapper is a
+   plain block that grows to its content, the rows never get a bounded height, and
+   the list overflows the panel instead of scrolling (leaving a clipped row + the
+   panel border reading as a doubled line at the bottom). */
+.github-repo-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* The list flexes to fill its panel's measured allotment (the adaptive split in
+   Dashboard.tsx sets the panel max-height from the natural content) and scrolls
+   the overflow; there is no fixed row cap. */
 .github-repo-rows {
   --repo-row-h: 52px;
   display: flex;
   flex-direction: column;
-  max-height: calc(var(--repo-row-h) * 7);
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   scrollbar-width: none;
-}
-
-@media (min-width: 600px) and (max-width: 1023px) {
-  .github-repo-rows {
-    max-height: calc(var(--repo-row-h) * 5);
-  }
 }
 
 .github-repo-rows::-webkit-scrollbar {
@@ -162,6 +170,19 @@
   gap: var(--space-3);
   padding: var(--space-2) var(--space-4);
   border-bottom: 1px solid var(--color-border-subtle);
+  /* Fixed, deterministic row height. flex-shrink: 0 keeps each row full-height
+     when the flex list scrolls past its measured allotment; the two text lines
+     are pinned (line-height below) so content never exceeds it. */
+  box-sizing: border-box;
+  height: var(--repo-row-h);
+  flex-shrink: 0;
+}
+
+/* No trailing divider on the final row — it otherwise reads as a phantom
+   line clipped by the panel's rounded bottom corner. The load-more button
+   (when present) carries its own border-top separator. */
+.github-repo-row:last-child {
+  border-bottom: none;
 }
 
 .github-repo-icon {
@@ -186,6 +207,7 @@
 .github-repo-name {
   font-size: var(--text-sm);
   font-weight: var(--font-medium);
+  line-height: 1.3;
   color: var(--color-text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -194,6 +216,7 @@
 
 .github-repo-fullname {
   font-size: var(--text-xs);
+  line-height: 1.3;
   color: var(--color-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -499,11 +522,6 @@
 
   .github-repo-updated {
     display: none;
-  }
-
-  /* Fill available vertical space, but never show fewer than 3 rows. */
-  .github-repo-rows {
-    max-height: max(calc(var(--repo-row-h) * 3), 60dvh);
   }
 
   /* Show the GitHub↔storage flip control on mobile. */

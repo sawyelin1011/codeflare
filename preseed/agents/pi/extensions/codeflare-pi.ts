@@ -46,11 +46,10 @@ type ExtensionAPI = {
 
 const CACHE_DIR = "/home/user/.cache/codeflare-hooks";
 const ACTIVE_REPO_FILE = join(CACHE_DIR, "graphify-active-cwd");
-const REVIEW_ACTIVE_REPO_FILE = join(CACHE_DIR, "review-active-cwd");
 const VAULT_ROOT = "/home/user/Vault";
 const GLOBAL_GRAPH_LOCK = "/tmp/graphify-global.lock";
 const PI_SETTINGS_FILE = "/home/user/.pi/agent/settings.json";
-const CONTEXT_MODE_PACKAGE = "npm:context-mode@1.0.162";
+const CONTEXT_MODE_PACKAGE = "npm:context-mode@1.0.163";
 const CONTEXT_MODE_PACKAGE_ID = "npm:context-mode";
 const CONTEXT_MODE_DISABLED_PACKAGE = { source: CONTEXT_MODE_PACKAGE, extensions: [], skills: [] };
 
@@ -64,6 +63,11 @@ const ENGINEERING_CONSTITUTION = [
   "2. Behavioral tests only — assert behavior/contract values (state, DOM, status codes, parsed values), never UI copy/prose; a test must fail if the implementation is gutted.",
   "3. Reusable, composable components — extract any structure used more than twice; tokens/one source of truth; validate at boundaries; immutability.",
   "4. SDD + TDD enforced — failing behavioral test first; every change traces to a REQ; specs/anchors/docs move with the code; never leave a REQ Partial.",
+  "Work continuity: when a new user message arrives mid-task, do not switch topics just because it arrived; queue it, finish the current concrete step to a safe stopping point, then handle the new request unless the user explicitly says to stop/pause/reprioritize.",
+  "Review push gate: do not push while a PR-boundary review is running, pending, missing, stale, or otherwise not complete for the current head unless the user explicitly authorizes pushing despite that active/incomplete review; wait for the final merged review summary for the exact head, then fix legitimate findings before pushing another head.",
+  "Review-result handoff gate: when a background review-monitor completes with REVIEW_RESULT, the very next assistant response MUST start by printing a detailed user-facing review summary before analysis, excuses, tool calls, todo updates, or fixes. Include the exact result line, severity counts, lane status, ranked findings, summary path, monitor transcript path if available, and planned next action.",
+  "CI-result handoff gate: when a background CI monitor completes with CI_RESULT, the very next assistant response MUST start by printing a user-facing CI summary before analysis, tool calls, todo updates, review-status checks, fixes, deploys, or pushes. Include the exact result line, monitored head, workflow/run id and URL when present, log path, failed-log command when present, and planned next action.",
+  "No blocking waits: any long-running wait/monitor/poll (CI, deploy status, review completion, log tailing, watch, tail -f, gh run watch, while sleep loops, or ctx_execute/Bash used as a blocking monitor) must run detached/background or in a subagent/background task. Never keep the main session busy waiting for external state.",
   "Plan gate: present no plan without a Success-criteria/verification section covering these four. Fix legitimate findings in-session.",
   "</codeflare_constitution>",
 ].join("\n");
@@ -127,7 +131,6 @@ function repoIdentity(repo: string): string {
 function persistActiveRepo(repo: string): void {
   ensureCacheDir();
   writeFileSync(ACTIVE_REPO_FILE, repo + "\n", "utf8");
-  writeFileSync(REVIEW_ACTIVE_REPO_FILE, repo + "\n", "utf8");
 }
 
 function updateActiveRepoFromPath(path: string): string | undefined {
@@ -144,13 +147,11 @@ export function restoreActiveRepoFromPersistedFiles(
   paths: string[],
   read: (path: string) => string,
   exists: (path: string) => boolean,
-  remember: (repo: string) => void,
 ): string | undefined {
   for (const path of paths) {
     try {
       const value = read(path).trim();
       if (!value || !exists(value)) continue;
-      remember(value);
       return value;
     } catch {
       // Try the next persisted source.
@@ -163,14 +164,12 @@ function activeRepo(ctx: ExtensionContext): string | undefined {
   const liveRepo = updateActiveRepoFromPath(ctx.sessionManager.getCwd());
   if (liveRepo) return liveRepo;
   const restored = restoreActiveRepoFromPersistedFiles(
-    [REVIEW_ACTIVE_REPO_FILE, ACTIVE_REPO_FILE],
+    [ACTIVE_REPO_FILE],
     (path) => readFileSync(path, "utf8"),
     existsSync,
-    rememberActiveRepo,
   );
   if (restored) {
-    // Display/Graphify fallback only. PR-boundary review routing revalidates this memory against the
-    // session roots and SDD marker before it can influence review reconciliation or merge gating.
+    // Display/Graphify fallback only; do not write sentinel-restored paths into review-routing memory.
     persistActiveRepo(restored);
     return restored;
   }

@@ -1,12 +1,28 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library';
-import { mdiXml } from '@mdi/js';
+import { render, screen, fireEvent, cleanup, waitFor } from '@solidjs/testing-library';
+import { mdiViewCompactOutline, mdiXml } from '@mdi/js';
 import Dashboard from '../../components/Dashboard';
 import { sessionStore } from '../../stores/session';
 import { storageStore } from '../../stores/storage';
 import { githubStore } from '../../stores/github';
 import * as vaultCache from '../../lib/vault-cache';
 import type { SessionWithStatus } from '../../types';
+
+const viewportMock = vi.hoisted(() => ({
+  setViewport: undefined as undefined | ((viewport: 'mobile' | 'tablet' | 'desktop') => void),
+}));
+
+vi.mock('../../lib/mobile', async () => {
+  const actual = await vi.importActual<typeof import('../../lib/mobile')>('../../lib/mobile');
+  const { createSignal } = await vi.importActual<typeof import('solid-js')>('solid-js');
+  const [viewport, setViewport] = createSignal<'mobile' | 'tablet' | 'desktop'>('desktop');
+  viewportMock.setViewport = setViewport;
+  return {
+    ...actual,
+    getTerminalViewportClass: viewport,
+    createTerminalViewportClass: () => viewport,
+  };
+});
 
 // Mock child components to isolate Dashboard testing
 vi.mock('../../components/SessionStatCard', () => ({
@@ -63,7 +79,7 @@ vi.mock('../../components/FilePreview', () => ({
 }));
 
 vi.mock('../../components/Icon', () => ({
-  default: (props: any) => <svg data-testid="icon" data-path={props.path} />
+  default: (props: any) => <svg data-testid="icon" data-path={props.path}><path d={props.path} /></svg>
 }));
 
 vi.mock('../../components/SessionLimitPopup', () => ({
@@ -150,11 +166,21 @@ vi.mock('../../components/TipsRotator', () => ({
   default: () => <div data-testid="tips-card" />
 }));
 
+let mockMultiView: any = null;
+
+vi.mock('../../stores/terminal-workspace', () => ({
+  terminalWorkspaceStore: {
+    reconcileMultiView: vi.fn(() => mockMultiView),
+    openMultiView: vi.fn(() => true),
+  },
+}));
+
 const mockSessions: SessionWithStatus[] = [
   { id: 'sess1', name: 'Test Session 1', createdAt: '2024-01-15T10:00:00Z', lastAccessedAt: '2024-01-15T12:00:00Z', status: 'running' },
   { id: 'sess2', name: 'Test Session 2', createdAt: '2024-01-14T10:00:00Z', lastAccessedAt: '2024-01-14T12:00:00Z', status: 'stopped' },
 ];
 
+// REQ-ENTERPRISE-015: Enterprise-mode admin and dropdown suppressions
 describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
   const defaultProps = {
     sessions: mockSessions,
@@ -170,6 +196,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    viewportMock.setViewport?.('desktop');
   });
 
   afterEach(() => {
@@ -178,6 +205,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     (githubStore as any)._setEnabled(false);
     (sessionStore as any)._setEnterpriseMode(false);
     (sessionStore as any)._setSessionMode('advanced');
+    mockMultiView = null;
   });
 
   // === Enterprise dropdown gating (REQ-ENTERPRISE-008 AC2/AC8/AC9) ===
@@ -206,6 +234,45 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
   });
 
   // === Initialization Tests ===
+
+  it('REQ-TERM-012: keeps MultiView virtual and opens it from the dashboard icon action', () => {
+    mockMultiView = {
+      id: 'multiview:1',
+      name: 'MultiView #1',
+      memberSessionIds: ['sess1', 'sess2'],
+      focusedSessionId: 'sess1',
+      layout: '2-split',
+    };
+
+    const onOpenMultiView = vi.fn();
+    render(() => <Dashboard {...defaultProps} onOpenMultiView={onOpenMultiView} />);
+
+    expect(screen.getByTestId('session-card-sess1')).toBeInTheDocument();
+    expect(screen.getByTestId('session-card-sess2')).toBeInTheDocument();
+    expect(screen.queryByTestId('dashboard-multiview-card')).not.toBeInTheDocument();
+
+    const action = screen.getByTestId('dashboard-multiview-action');
+    expect(action).toHaveAttribute('aria-label', 'Open MultiView');
+    expect(action.querySelector('path')?.getAttribute('d')).toBe(mdiViewCompactOutline);
+
+    fireEvent.click(action);
+    expect(onOpenMultiView).toHaveBeenCalledTimes(1);
+    expect(defaultProps.onCreateSession).not.toHaveBeenCalled();
+    expect(defaultProps.onOpenSessionById).not.toHaveBeenCalledWith('multiview:1');
+  });
+
+  it('REQ-TERM-013: reconciles MultiView against the current viewport after resize', async () => {
+    render(() => <Dashboard {...defaultProps} />);
+
+    const store = await import('../../stores/terminal-workspace');
+    vi.mocked(store.terminalWorkspaceStore.reconcileMultiView).mockClear();
+
+    viewportMock.setViewport?.('mobile');
+
+    await waitFor(() => {
+      expect(store.terminalWorkspaceStore.reconcileMultiView).toHaveBeenCalledWith(expect.any(Array), 'mobile');
+    });
+  });
 
   it('calls storageStore.fetchStats on mount', () => {
     render(() => <Dashboard {...defaultProps} />);
@@ -316,9 +383,9 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(right.classList.contains('dashboard-panel-right')).toBe(true);
   });
 
-  // === Mobile right-column flip face (REQ-GITHUB-002) ===
+  // === Mobile right-column flip face (REQ-GITHUB-010) ===
 
-  it('forces the storage face active when GitHub is disabled so the empty GitHub panel cannot cover R2', () => {
+  it('REQ-GITHUB-010: forces the storage face active when GitHub is disabled so the empty GitHub panel cannot cover R2', () => {
     (githubStore as any)._setEnabled(false);
     render(() => <Dashboard {...defaultProps} />);
 
@@ -335,7 +402,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(screen.queryByTestId('files-panel-title')).not.toBeInTheDocument();
   });
 
-  it('defaults to the GitHub face and offers the storage back-button when GitHub is enabled', () => {
+  it('REQ-GITHUB-010: defaults to the GitHub face and offers the storage back-button when GitHub is enabled', () => {
     (githubStore as any)._setEnabled(true);
     render(() => <Dashboard {...defaultProps} />);
 
@@ -351,7 +418,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(screen.getByTestId('files-panel-header')).toBeInTheDocument();
   });
 
-  it('hides the GitHub face for a non-advanced non-enterprise session even when enabled (advanced gate)', () => {
+  it('REQ-GITHUB-007: hides the GitHub face for a non-advanced non-enterprise session even when enabled (advanced gate)', () => {
     (githubStore as any)._setEnabled(true);
     (sessionStore as any)._setSessionMode('standard'); // not advanced
     render(() => <Dashboard {...defaultProps} />);
@@ -361,7 +428,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(screen.queryByTestId('storage-flip-btn')).not.toBeInTheDocument();
   });
 
-  it('shows the GitHub face for an enterprise session regardless of session mode', () => {
+  it('REQ-GITHUB-007: shows the GitHub face for an enterprise session regardless of session mode', () => {
     (githubStore as any)._setEnabled(true);
     (sessionStore as any)._setSessionMode('standard');
     (sessionStore as any)._setEnterpriseMode(true);
@@ -371,7 +438,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(right.getAttribute('data-face')).toBe('github');
   });
 
-  it('flips GitHub <-> storage when enabled and the flip controls are used', () => {
+  it('REQ-GITHUB-010: flips GitHub <-> storage when enabled and the flip controls are used', () => {
     (githubStore as any)._setEnabled(true);
     render(() => <Dashboard {...defaultProps} />);
 

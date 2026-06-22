@@ -1,19 +1,36 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@solidjs/testing-library';
+import { render, screen, fireEvent, cleanup, waitFor } from '@solidjs/testing-library';
 import SessionSwitcher from '../../components/SessionSwitcher';
 import type { SessionWithStatus } from '../../types';
+import { terminalWorkspaceStore } from '../../stores/terminal-workspace';
 
-// Mock isMobile
-const isMobileMock = vi.hoisted(() => ({ value: false }));
-vi.mock('../../lib/mobile', () => ({
-  isMobile: () => isMobileMock.value,
+// Mock responsive viewport state
+const viewportMock = vi.hoisted(() => ({
+  isMobile: false,
+  setViewport: undefined as undefined | ((viewport: 'mobile' | 'tablet' | 'desktop') => void),
 }));
+vi.mock('../../lib/mobile', async () => {
+  const { createSignal } = await vi.importActual<typeof import('solid-js')>('solid-js');
+  const [viewport, setViewport] = createSignal<'mobile' | 'tablet' | 'desktop'>('desktop');
+  viewportMock.setViewport = (next) => {
+    viewportMock.isMobile = next === 'mobile';
+    setViewport(next);
+  };
+  return {
+    isMobile: () => viewportMock.isMobile,
+    getTerminalViewportClass: viewport,
+    createTerminalViewportClass: () => viewport,
+  };
+});
+
+const dropdownProps = vi.hoisted(() => ({ latest: null as any }));
 
 // Mock SessionDropdown
 vi.mock('../../components/SessionDropdown', () => ({
-  default: (props: any) => (
-    <div data-testid="session-dropdown" data-open={String(props.isOpen)} />
-  ),
+  default: (props: any) => {
+    dropdownProps.latest = props;
+    return <div data-testid="session-dropdown" data-open={String(props.isOpen)} />;
+  },
 }));
 
 vi.mock('../../stores/session', () => ({
@@ -30,6 +47,18 @@ vi.mock('../../stores/terminal', () => ({
   },
 }));
 
+vi.mock('../../stores/terminal-workspace', () => ({
+  terminalWorkspaceStore: {
+    getActiveWorkspace: vi.fn(() => ({ kind: 'dashboard' })),
+    reconcileMultiView: vi.fn(() => null),
+    getMultiView: vi.fn(() => null),
+    getMultiViewCapacity: vi.fn((viewport: string) => viewport === 'mobile' ? 0 : 4),
+    createOrUpdateMultiView: vi.fn(() => false),
+    openMultiView: vi.fn(() => false),
+    closeMultiView: vi.fn(),
+  },
+}));
+
 function createSession(overrides: Partial<SessionWithStatus> = {}): SessionWithStatus {
   return {
     id: 'test-1',
@@ -41,6 +70,7 @@ function createSession(overrides: Partial<SessionWithStatus> = {}): SessionWithS
   };
 }
 
+// REQ-TERM-018: MultiView Reopen and Close
 describe('SessionSwitcher', () => {
   const defaultProps = {
     sessions: [createSession({ id: 's1', name: 'My Session', status: 'running' })],
@@ -53,7 +83,8 @@ describe('SessionSwitcher', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    isMobileMock.value = false;
+    viewportMock.setViewport?.('desktop');
+    dropdownProps.latest = null;
   });
   afterEach(() => cleanup());
 
@@ -78,7 +109,7 @@ describe('SessionSwitcher', () => {
 
   describe('Mobile rendering', () => {
     it('shows layers icon instead of session name on mobile', () => {
-      isMobileMock.value = true;
+      viewportMock.setViewport?.('mobile');
       render(() => <SessionSwitcher {...defaultProps} />);
       expect(screen.getByTestId('session-switcher-mobile-icon')).toBeInTheDocument();
       expect(screen.queryByTestId('session-switcher-name')).not.toBeInTheDocument();
@@ -99,6 +130,85 @@ describe('SessionSwitcher', () => {
       fireEvent.click(screen.getByTestId('session-switcher'));
       const dropdown = screen.getByTestId('session-dropdown');
       expect(dropdown).toHaveAttribute('data-open', 'false');
+    });
+  });
+
+  describe('MultiView launch', () => {
+    it('REQ-TERM-013: creates MultiView from selected session ids and delegates opening to Layout', () => {
+      const onOpenMultiView = vi.fn();
+      vi.mocked(terminalWorkspaceStore.createOrUpdateMultiView).mockReturnValue(true);
+      vi.mocked(terminalWorkspaceStore.openMultiView).mockReturnValue(true);
+
+      render(() => (
+        <SessionSwitcher
+          {...defaultProps}
+          sessions={[
+            createSession({ id: 's1', status: 'running' }),
+            createSession({ id: 's2', status: 'running' }),
+          ]}
+          onOpenMultiView={onOpenMultiView}
+        />
+      ));
+
+      dropdownProps.latest.multiView.onLaunch(['s1', 's2']);
+
+      expect(terminalWorkspaceStore.createOrUpdateMultiView).toHaveBeenCalledWith(['s1', 's2'], expect.any(Array), 'desktop');
+      expect(terminalWorkspaceStore.openMultiView).not.toHaveBeenCalled();
+      expect(onOpenMultiView).toHaveBeenCalled();
+    });
+
+    it('REQ-TERM-013: delegates existing MultiView open and close to Layout callbacks', () => {
+      const onOpenMultiView = vi.fn();
+      const onCloseMultiView = vi.fn();
+      vi.mocked(terminalWorkspaceStore.reconcileMultiView).mockReturnValue({
+        id: 'multiview:1',
+        name: 'MultiView #1',
+        memberSessionIds: ['s1', 's2'],
+        focusedSessionId: 's1',
+        layout: '2-split',
+      } as any);
+
+      render(() => (
+        <SessionSwitcher
+          {...defaultProps}
+          sessions={[
+            createSession({ id: 's1', status: 'running' }),
+            createSession({ id: 's2', status: 'running' }),
+          ]}
+          onOpenMultiView={onOpenMultiView}
+          onCloseMultiView={onCloseMultiView}
+        />
+      ));
+
+      dropdownProps.latest.multiView.onOpen();
+      dropdownProps.latest.multiView.onClose();
+
+      expect(terminalWorkspaceStore.openMultiView).not.toHaveBeenCalled();
+      expect(onOpenMultiView).toHaveBeenCalledTimes(1);
+      expect(onCloseMultiView).toHaveBeenCalledTimes(1);
+    });
+
+    it('REQ-TERM-013: updates MultiView capacity and reconciliation when viewport changes', async () => {
+      render(() => (
+        <SessionSwitcher
+          {...defaultProps}
+          sessions={[
+            createSession({ id: 's1', status: 'running' }),
+            createSession({ id: 's2', status: 'running' }),
+          ]}
+        />
+      ));
+
+      vi.mocked(terminalWorkspaceStore.reconcileMultiView).mockClear();
+      vi.mocked(terminalWorkspaceStore.getMultiViewCapacity).mockClear();
+
+      viewportMock.setViewport?.('mobile');
+
+      await waitFor(() => {
+        expect(terminalWorkspaceStore.reconcileMultiView).toHaveBeenCalledWith(expect.any(Array), 'mobile');
+        expect(terminalWorkspaceStore.getMultiViewCapacity).toHaveBeenCalledWith('mobile');
+        expect(dropdownProps.latest.multiView.capacity).toBe(0);
+      });
     });
   });
 });

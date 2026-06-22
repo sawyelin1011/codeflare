@@ -390,32 +390,32 @@ exit 99
   });
 });
 
-describe('enforce-review-spawn.sh — 3-strike circuit breaker / REQ-AGENT-044 (review-agent discipline enforcement)', () => {
-  it('blocks 3 times then exits silently on the 4th attempt for same PR HEAD', () => {
+describe('enforce-review-spawn.sh — 5-strike circuit breaker / REQ-AGENT-044 (review-agent discipline enforcement)', () => {
+  it('blocks 5 times then exits silently on the 6th attempt for same PR HEAD', () => {
     const cwd = makeFixture();
     withSdd(cwd);
     const binDir = fakeGh(cwd, ghReturning('OPEN', 'newsha'));
     const t = writeTranscript(cwd, [PUSH_LINE()]);
-    // First three runs: block (no agents spawned)
-    for (let i = 1; i <= 3; i++) {
+    // First five runs: block (no agents spawned)
+    for (let i = 1; i <= 5; i++) {
       const r = runHook(cwd, { transcriptPath: t, binDir });
       assert.equal(r.status, 0, `run ${i} exit code`);
       assert.match(r.stdout, /"decision"\s*:\s*"block"/, `run ${i} must block`);
     }
-    // Fourth run: counter exceeded, hook gives up and exits silently
-    const r4 = runHook(cwd, { transcriptPath: t, binDir });
-    assert.equal(r4.status, 0);
-    assert.equal(r4.stdout, '',
-      '4th attempt for same un-acked PR HEAD must release the user (3-strike breaker)');
+    // Sixth run: counter exceeded, hook gives up and exits silently
+    const r6 = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r6.status, 0);
+    assert.equal(r6.stdout, '',
+      '6th attempt for same un-acked PR HEAD must release the user (5-strike breaker)');
   });
 
   it('counter resets when PR HEAD advances (different SHA = new attempt window)', () => {
     const cwd = makeFixture();
     withSdd(cwd);
     const t = writeTranscript(cwd, [PUSH_LINE()]);
-    // First push: block 3x, give up on 4th
+    // First push: block 5x, give up on 6th
     let binDir = fakeGh(cwd, ghReturning('OPEN', 'firstsha'));
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 6; i++) {
       runHook(cwd, { transcriptPath: t, binDir });
     }
     // New PR HEAD: counter resets, blocks again
@@ -444,6 +444,7 @@ describe('enforce-review-spawn.sh — v4 → v5 migration', () => {
   });
 });
 
+// REQ-AGENT-071: PR-Boundary Review Agent Dispatch
 describe('enforce-review-spawn.sh — agent-spawn enforcement', () => {
   it('blocks with both agent names when nothing is spawned post-push', () => {
     const cwd = makeFixture();
@@ -944,6 +945,7 @@ describe('enforce-review-spawn.sh — MCP shell tool input shapes (issue #319)',
   });
 });
 
+// REQ-AGENT-045 + REQ-AGENT-047: while triage items remain open the entire review pipeline is suspended
 describe('enforce-review-spawn.sh - SDD transition gate (REQ-AGENT-022)', () => {
   function withTransitionConfig(cwd, { transition = true } = {}) {
     writeFileSync(
@@ -1044,28 +1046,28 @@ describe('enforce-review-spawn.sh - PR MERGED/CLOSED with un-acked HEAD', () => 
   });
 });
 
-describe('enforce-review-spawn.sh - 3-strike circuit breaker GIVEUP state', () => {
-  it('blocks 3 times for the same SHA, then sticks in GIVEUP and exits 0 forever', () => {
+describe('enforce-review-spawn.sh - 5-strike circuit breaker GIVEUP state', () => {
+  it('blocks 5 times for the same SHA, then sticks in GIVEUP and exits 0 forever', () => {
     const cwd = makeFixture();
     withSdd(cwd);
     const binDir = fakeGh(cwd, ghReturning('OPEN', 'stuckSHA', 'main'));
     const t = writeTranscript(cwd, [PUSH_LINE()]);
 
-    // First 3 calls: block
-    for (let i = 0; i < 3; i++) {
+    // First 5 calls: block
+    for (let i = 0; i < 5; i++) {
       const r = runHook(cwd, { transcriptPath: t, binDir });
       assert.equal(r.status, 0);
       assert.match(r.stdout, /"decision"\s*:\s*"block"/, `strike ${i + 1} should block`);
     }
-    // Fourth call: counter must have flipped to GIVEUP, exit 0 silently
-    const r4 = runHook(cwd, { transcriptPath: t, binDir });
-    assert.equal(r4.status, 0);
-    assert.equal(r4.stdout, '',
-      'after 3 strikes the counter is GIVEUP for this SHA; further Stop events exit 0');
-    // Fifth call: still GIVEUP (sticky, not re-armed)
-    const r5 = runHook(cwd, { transcriptPath: t, binDir });
-    assert.equal(r5.status, 0);
-    assert.equal(r5.stdout, '',
+    // Sixth call: counter must have flipped to GIVEUP, exit 0 silently
+    const r6 = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r6.status, 0);
+    assert.equal(r6.stdout, '',
+      'after 5 strikes the counter is GIVEUP for this SHA; further Stop events exit 0');
+    // Seventh call: still GIVEUP (sticky, not re-armed)
+    const r7 = runHook(cwd, { transcriptPath: t, binDir });
+    assert.equal(r7.status, 0);
+    assert.equal(r7.stdout, '',
       'GIVEUP is sticky for the same SHA - no re-arm on subsequent Stop events');
   });
 });
@@ -1298,6 +1300,7 @@ function advanceWith(cwd, mutate) {
   }).stdout.trim();
 }
 
+// REQ-AGENT-037: each review agent self-limits fix rounds scoped to its own lane
 describe('enforce-review-spawn.sh — lane gating (task #58)', () => {
   it('docs-only push: requires ONLY doc-updater (no code, no spec)', () => {
     const { cwd, baseSha } = makeLaneFixture();

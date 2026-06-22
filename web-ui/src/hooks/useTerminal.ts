@@ -5,7 +5,7 @@ import '@xterm/xterm/css/xterm.css';
 import { terminalStore } from '../stores/terminal';
 import { sessionStore } from '../stores/session';
 import { logger } from '../lib/logger';
-import { isTouchDevice, isVirtualKeyboardOpen, getKeyboardHeight, enableVirtualKeyboardOverlay, disableVirtualKeyboardOverlay, resetKeyboardStateIfStale, forceResetKeyboardState, isSamsungBrowser } from '../lib/mobile';
+import { isTouchDevice, isVirtualKeyboardOpen, getKeyboardHeight, enableVirtualKeyboardOverlay, disableVirtualKeyboardOverlay, resetKeyboardStateIfStale, forceResetKeyboardState, isFocusOnTerminalInput, isSamsungBrowser } from '../lib/mobile';
 import { attachSwipeGestures } from '../lib/touch-gestures';
 import { registerMultiLineLinkProvider } from '../lib/terminal-link-provider';
 import { isSpeechSupported, isListening, startListening, stopListening } from '../lib/speech-input';
@@ -25,6 +25,9 @@ export interface UseTerminalOptions {
   terminalId: string;
   sessionName?: string;
   active: boolean;
+  visible?: boolean;
+  focused?: boolean;
+  connect?: boolean;
   alwaysObserveResize?: boolean;
   hideInitProgress?: boolean;
   onError?: (error: string) => void;
@@ -58,6 +61,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   let hasInitialScrolled = false;
   let kbDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let handleContextMenu: ((e: MouseEvent) => void) | undefined;
+  let disposed = false;
 
   const [dimensions, setDimensions] = createSignal({ cols: 80, rows: 24 });
   const [terminalInstance, setTerminalInstance] = createSignal<Terminal | undefined>(undefined);
@@ -66,6 +70,10 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   const connectionState = createMemo(() => terminalStore.getConnectionState(props.sessionId, props.terminalId));
   const isInitializing = createMemo(() => sessionStore.isSessionInitializing(props.sessionId));
   const initProgress = createMemo(() => sessionStore.getInitProgressForSession(props.sessionId));
+  const isVisible = () => props.visible ?? props.active;
+  const isFocused = () => props.focused ?? props.active;
+  const canConnect = () => props.connect ?? isVisible();
+  const isMounted = () => !disposed && !!term && !!fitAddon && !!containerEl;
 
   function setContainerRef(el: HTMLDivElement) {
     containerEl = el;
@@ -228,7 +236,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   }
 
   onMount(() => {
-    if (!containerEl) return;
+    if (!containerEl || disposed) return;
 
     const { termBg } = initializeTerminal(containerEl);
     // initializeTerminal guarantees term and fitAddon are set
@@ -258,28 +266,34 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     let fitRetries = 0;
     const MAX_FIT_RETRIES = 20; // ~330ms at 60fps
     function tryFit() {
-      if (!fitAddon || !containerEl || !term) return;
-      if (containerEl.clientHeight === 0) {
+      if (!isMounted()) return;
+      const mountedContainer = containerEl!;
+      const mountedFitAddon = fitAddon!;
+      const mountedTerm = term!;
+      if (mountedContainer.clientHeight === 0) {
         if (fitRetries++ < MAX_FIT_RETRIES) {
           requestAnimationFrame(tryFit);
         }
         return;
       }
-      fitAddon.fit();
-      setDimensions({ cols: term.cols, rows: term.rows });
+      mountedFitAddon.fit();
+      setDimensions({ cols: mountedTerm.cols, rows: mountedTerm.rows });
     }
     requestAnimationFrame(() => requestAnimationFrame(tryFit));
 
     // Resize observer
     resizeObserver = new ResizeObserver(() => {
-      const shouldResize = props.active || props.alwaysObserveResize;
+      const shouldResize = canConnect() && (isVisible() || props.alwaysObserveResize);
       if (fitAddon && shouldResize) {
         if (kbDebounceTimer !== null) return;
         requestAnimationFrame(() => {
-          if (!fitAddon || !term || !containerEl || kbDebounceTimer !== null) return;
-          if (containerEl.clientHeight === 0) return;
-          const wasBottom = isAtBottom(term);
-          fitAddon.fit();
+          if (!isMounted() || kbDebounceTimer !== null) return;
+          const mountedContainer = containerEl!;
+          const mountedFitAddon = fitAddon!;
+          const mountedTerm = term!;
+          if (mountedContainer.clientHeight === 0) return;
+          const wasBottom = isAtBottom(mountedTerm);
+          mountedFitAddon.fit();
           // Fix 16: ResizeObserver should NOT call scrollToBottom() when keyboard
           // is open. The keyboard height change effect (leading + trailing edge)
           // already handles fit + scrollToBottom during keyboard animation.
@@ -287,12 +301,13 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
           // Only scroll on desktop/keyboard-closed when user was following output.
           if (!isTouchDevice() || !isVirtualKeyboardOpen()) {
             if (wasBottom) {
-              term.scrollToBottom();
+              mountedTerm.scrollToBottom();
             }
           }
-          const cols = term.cols;
-          const rows = term.rows;
+          const cols = mountedTerm.cols;
+          const rows = mountedTerm.rows;
           setDimensions({ cols, rows });
+          if (isFocused()) terminalStore.claimResizeAuthority(props.sessionId, props.terminalId);
           terminalStore.resize(props.sessionId, props.terminalId, cols, rows);
         });
       }
@@ -304,7 +319,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     let isCursorHidden = false;
 
     const applyCursorVisibility = () => {
-      if (!term) return;
+      if (!term || disposed) return;
       // Always keep cursor visible — CLI apps (Copilot, Claude Code, Codex)
       // in alternate buffer mode need xterm's cursor layer. Hiding it caused
       // invisible cursors in newer CLI versions that rely on it.
@@ -340,7 +355,7 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     if (document.fonts) {
       const currentFont = t.options.fontFamily;
       document.fonts.ready.then(() => {
-        if (term?.element && currentFont) {
+        if (isMounted() && term?.element && currentFont) {
           const wasBottom = isAtBottom(term);
           term.options.fontFamily = currentFont;
           fitAddon?.fit();
@@ -373,8 +388,8 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     const kbHeight = getKeyboardHeight();
     const _kbOpen = isVirtualKeyboardOpen();
     if (!isTouchDevice()) return;
-    if (!term || !fitAddon) return;
-    if (!(props.active || props.alwaysObserveResize)) return;
+    if (!isMounted()) return;
+    if (!(canConnect() && (isVisible() || props.alwaysObserveResize))) return;
 
     // Leading edge: immediate fit on first REAL keyboard change (height > 0).
     // Skip the initial mount-time run (kbHeight=0) — the onMount double-rAF
@@ -383,14 +398,17 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     // browser's rendering pipeline (layout, ResizeObserver, rAF, paint).
     if (kbDebounceTimer === null && kbHeight > 0) {
       queueMicrotask(() => {
-        if (!fitAddon || !term || !containerEl) return;
-        if (containerEl.clientHeight === 0) return;
-        fitAddon.fit();
+        if (!isMounted()) return;
+        const mountedContainer = containerEl!;
+        const mountedFitAddon = fitAddon!;
+        const mountedTerm = term!;
+        if (mountedContainer.clientHeight === 0) return;
+        mountedFitAddon.fit();
         // Read signal at execution time — not the stale closure capture
         if (isVirtualKeyboardOpen()) {
-          term.scrollToBottom();
+          mountedTerm.scrollToBottom();
         }
-        setDimensions({ cols: term.cols, rows: term.rows });
+        setDimensions({ cols: mountedTerm.cols, rows: mountedTerm.rows });
       });
     }
 
@@ -400,15 +418,19 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     if (kbDebounceTimer !== null) clearTimeout(kbDebounceTimer);
     kbDebounceTimer = setTimeout(() => {
       kbDebounceTimer = null;
-      if (!fitAddon || !term || !containerEl) return;
-      if (containerEl.clientHeight === 0) return;
-      fitAddon.fit();
+      if (!isMounted()) return;
+      const mountedContainer = containerEl!;
+      const mountedFitAddon = fitAddon!;
+      const mountedTerm = term!;
+      if (mountedContainer.clientHeight === 0) return;
+      mountedFitAddon.fit();
       // Read signal at execution time — not the stale closure capture
       if (isVirtualKeyboardOpen()) {
-        term.scrollToBottom();
+        mountedTerm.scrollToBottom();
       }
-      setDimensions({ cols: term.cols, rows: term.rows });
-      terminalStore.resize(props.sessionId, props.terminalId, term.cols, term.rows);
+      setDimensions({ cols: mountedTerm.cols, rows: mountedTerm.rows });
+      if (isFocused()) terminalStore.claimResizeAuthority(props.sessionId, props.terminalId);
+      terminalStore.resize(props.sessionId, props.terminalId, mountedTerm.cols, mountedTerm.rows);
     }, KEYBOARD_REFIT_DEBOUNCE_MS);
     onCleanup(() => {
       if (kbDebounceTimer !== null) {
@@ -426,36 +448,75 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
     // Terminal server is up at 'mounting' or 'ready' — safe to connect WS
     const shouldConnect = !initializing || stage === 'mounting' || stage === 'ready';
 
-    if (shouldConnect && term && !cleanup) {
+    if ((!canConnect() || !shouldConnect) && cleanup) {
+      cleanup();
+      cleanup = undefined;
+      terminalStore.stopUrlDetection(props.sessionId, props.terminalId);
+      return;
+    }
+
+    if (canConnect() && shouldConnect && term && !cleanup) {
       logger.debug(`[Terminal ${props.sessionId}:${props.terminalId}] Connecting WebSocket (stage: ${stage || 'running'})`);
       const terminals = sessionStore.getTerminalsForSession(props.sessionId);
       const tab = terminals?.tabs.find(t => t.id === props.terminalId);
       cleanup = terminalStore.connect(props.sessionId, props.terminalId, term, props.onError, tab?.manual);
-      terminalStore.startUrlDetection(props.sessionId, props.terminalId);
     }
+  });
+
+  createEffect(() => {
+    const focusedTerm = terminalInstance();
+    const initializing = isInitializing();
+    const stage = initProgress()?.stage;
+    const shouldConnect = !initializing || stage === 'mounting' || stage === 'ready';
+    if (!isFocused() || !canConnect() || !shouldConnect || !focusedTerm) {
+      terminalStore.clearPendingResizeAuthority(props.sessionId, props.terminalId);
+      return;
+    }
+    terminalStore.claimResizeAuthority(props.sessionId, props.terminalId);
+    terminalStore.startUrlDetection(props.sessionId, props.terminalId);
+    if (!isTouchDevice()) focusedTerm.focus();
+    if (focusedTerm.cols > 0 && focusedTerm.rows > 0) {
+      terminalStore.resize(props.sessionId, props.terminalId, focusedTerm.cols, focusedTerm.rows);
+    }
+    onCleanup(() => {
+      terminalStore.clearPendingResizeAuthority(props.sessionId, props.terminalId);
+      terminalStore.stopUrlDetection(props.sessionId, props.terminalId);
+    });
   });
 
   // Keyboard lifecycle for mobile
   createEffect(() => {
-    if (props.active && isTouchDevice()) {
+    if (isFocused() && isTouchDevice()) {
       resetKeyboardStateIfStale();
       enableVirtualKeyboardOverlay();
       requestAnimationFrame(() => {
-        if (fitAddon && term && containerEl && containerEl.clientHeight > 0) {
-          const wasBottom = isAtBottom(term);
-          fitAddon.fit();
-          if (wasBottom) term.scrollToBottom();
+        if (!isMounted()) return;
+        const mountedContainer = containerEl!;
+        const mountedFitAddon = fitAddon!;
+        const mountedTerm = term!;
+        if (mountedContainer.clientHeight > 0) {
+          const wasBottom = isAtBottom(mountedTerm);
+          mountedFitAddon.fit();
+          if (wasBottom) mountedTerm.scrollToBottom();
         }
       });
 
       // Fix 1: Samsung back-button keyboard dismiss detection via focusout.
       // Samsung doesn't fire geometrychange when back button dismisses keyboard.
       let focusoutHandler: (() => void) | undefined;
+      let focusoutDeferTimer: ReturnType<typeof setTimeout> | null = null;
       if (isSamsungBrowser) {
         const inputEl = term ? getIframeInput(term) || term.textarea : undefined;
         if (inputEl) {
           focusoutHandler = () => {
-            if (isVirtualKeyboardOpen()) forceResetKeyboardState();
+            // Defer one tick so the focus transition settles, then tell a real
+            // back-button dismiss (focus left the terminal) from a pane-to-pane
+            // handoff (focus moved to a sibling terminal input — keep keyboard).
+            focusoutDeferTimer = setTimeout(() => {
+              focusoutDeferTimer = null;
+              if (isFocusOnTerminalInput()) return;
+              if (isVirtualKeyboardOpen()) forceResetKeyboardState();
+            }, 0);
           };
           inputEl.addEventListener('focusout', focusoutHandler);
         }
@@ -466,6 +527,12 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
           const inputEl = term ? getIframeInput(term) || term.textarea : undefined;
           inputEl?.removeEventListener('focusout', focusoutHandler);
         }
+        if (focusoutDeferTimer !== null) { clearTimeout(focusoutDeferTimer); focusoutDeferTimer = null; }
+        // Focus moving to a sibling terminal pane is a handoff, not an exit:
+        // keep the shared virtual-keyboard state so the newly focused pane stays
+        // in keyboard mode. Tear down only when focus has left the terminal
+        // (true exit / unmount is covered here and by the iframe-removal cleanup).
+        if (isFocusOnTerminalInput()) return;
         const iframeInput = term ? getIframeInput(term) : undefined;
         if (iframeInput) iframeInput.blur();
         disableVirtualKeyboardOverlay();
@@ -476,22 +543,28 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
 
   // Active state changes + cursor bugfix
   createEffect(() => {
-    if (props.active && fitAddon && term) {
+    if (isVisible() && fitAddon && term) {
       requestAnimationFrame(() => {
-        if (!fitAddon || !term || !containerEl) return;
-        if (containerEl.clientHeight === 0) return;
-        const wasBottom = isAtBottom(term);
-        fitAddon.fit();
+        if (!isMounted()) return;
+        const mountedContainer = containerEl!;
+        const mountedFitAddon = fitAddon!;
+        const mountedTerm = term!;
+        if (mountedContainer.clientHeight === 0) return;
+        const wasBottom = isAtBottom(mountedTerm);
+        mountedFitAddon.fit();
         // First activation: always scroll to bottom so user sees the prompt.
         // Subsequent activations: only if user was already following output,
         // or if the mobile keyboard is open (user expects to see the prompt).
         if (!hasInitialScrolled || wasBottom || (isTouchDevice() && isVirtualKeyboardOpen())) {
-          term.scrollToBottom();
+          mountedTerm.scrollToBottom();
           hasInitialScrolled = true;
         }
-        term.refresh(0, term.rows - 1);
-        if (!isTouchDevice()) term.focus();
-        terminalStore.resize(props.sessionId, props.terminalId, term.cols, term.rows);
+        mountedTerm.refresh(0, mountedTerm.rows - 1);
+        if (isFocused() && !isTouchDevice()) mountedTerm.focus();
+        if (canConnect()) {
+          if (isFocused()) terminalStore.claimResizeAuthority(props.sessionId, props.terminalId);
+          terminalStore.resize(props.sessionId, props.terminalId, mountedTerm.cols, mountedTerm.rows);
+        }
       });
     }
   });
@@ -499,31 +572,47 @@ export function useTerminal(props: UseTerminalOptions): UseTerminalResult {
   // Refit after init overlay hides
   createEffect(() => {
     const initializing = isInitializing();
-    if (!initializing && fitAddon && term && props.active) {
+    if (!initializing && fitAddon && term && isVisible()) {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          if (!fitAddon || !term || !containerEl) return;
-          if (containerEl.clientHeight === 0) return;
-          const wasBottom = isAtBottom(term);
-          fitAddon.fit();
-          if (wasBottom) term.scrollToBottom();
-          term.refresh(0, term.rows - 1);
-          terminalStore.resize(props.sessionId, props.terminalId, term.cols, term.rows);
+          if (!isMounted()) return;
+          const mountedContainer = containerEl!;
+          const mountedFitAddon = fitAddon!;
+          const mountedTerm = term!;
+          if (mountedContainer.clientHeight === 0) return;
+          const wasBottom = isAtBottom(mountedTerm);
+          mountedFitAddon.fit();
+          if (wasBottom) mountedTerm.scrollToBottom();
+          mountedTerm.refresh(0, mountedTerm.rows - 1);
+          if (canConnect()) {
+            if (isFocused()) terminalStore.claimResizeAuthority(props.sessionId, props.terminalId);
+            terminalStore.resize(props.sessionId, props.terminalId, mountedTerm.cols, mountedTerm.rows);
+          }
         });
       });
     }
   });
 
   onCleanup(() => {
+    disposed = true;
+    const mountedContainer = containerEl;
+    if (kbDebounceTimer !== null) {
+      clearTimeout(kbDebounceTimer);
+      kbDebounceTimer = null;
+    }
     cleanup?.();
     cleanupGestures?.();
     bufferChangeDisposable?.dispose();
     cursorHideDisposable?.dispose();
     cursorShowDisposable?.dispose();
     resizeObserver?.disconnect();
-    terminalStore.stopUrlDetection();
-    terminalStore.unregisterFitAddon(props.sessionId, props.terminalId);
-    if (handleContextMenu) containerEl?.removeEventListener('contextmenu', handleContextMenu);
+    terminalStore.stopUrlDetection(props.sessionId, props.terminalId);
+    if (handleContextMenu) mountedContainer?.removeEventListener('contextmenu', handleContextMenu);
+    term = undefined;
+    fitAddon = undefined;
+    containerEl = undefined;
+    setTerminalInstance(undefined);
+    terminalStore.disposeLocalTerminal(props.sessionId, props.terminalId);
   });
 
   return {

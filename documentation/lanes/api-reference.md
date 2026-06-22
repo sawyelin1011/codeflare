@@ -74,8 +74,10 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 | Method | Endpoint | Auth | Implements | Description |
 |--------|----------|------|------------|-------------|
-| WS | `/api/terminal/:compoundId/ws` | Session cookie | [REQ-TERM-001](../../sdd/spec/terminal.md#req-term-001-up-to-6-terminal-tabs-per-session), [REQ-TERM-002](../../sdd/spec/terminal.md#req-term-002-websocket-connection-to-container-pty), [REQ-SESSION-012](../../sdd/spec/session-lifecycle.md#req-session-012-wake-loop-prevention) | Terminal WebSocket (compoundId format: `sessionId-terminalId`) |
+| WS | `/api/terminal/:compoundId/ws` | Session cookie | [REQ-TERM-001](../../sdd/spec/terminal.md#req-term-001-up-to-6-terminal-tabs-per-session), [REQ-TERM-002](../../sdd/spec/terminal.md#req-term-002-websocket-connection-to-container-pty), [REQ-TERM-011](../../sdd/spec/terminal.md#req-term-011-visible-terminal-panes-own-websocket-connections), [REQ-SESSION-012](../../sdd/spec/session-lifecycle.md#req-session-012-wake-loop-prevention) | Terminal WebSocket (compoundId format: `sessionId-terminalId`); raw terminal input/output plus JSON control frames for resize authority (`focus`, `resize`), process name, and terminal restore. Focus claims are cleared when a pane loses focus before open. |
 | GET | `/api/terminal/:sessionId/status` | Session cookie | [REQ-TERM-004](../../sdd/spec/terminal.md#req-term-004-close-code-4503-is-authoritative-no-retry) | Connection status |
+
+**Terminal frame contract:** Client→server sends raw PTY input or JSON control frames `{type:"focus"}`, `{type:"resize", cols, rows}`, or `{type:"kill"}`. Server→client sends raw PTY output or JSON frames `{type:"restore", state}` and `{type:"process-name", terminalId, processName}`. <!-- @impl: host/src/server.ts::wss --> <!-- @impl: host/src/session.ts::attach --> <!-- @impl: host/src/session.ts::start --> <!-- @impl: web-ui/src/stores/terminal.ts::claimResizeAuthority --> <!-- @impl: web-ui/src/stores/terminal.ts::dispose -->
 
 ### User Management
 
@@ -129,9 +131,9 @@ Note: `SETUP_ERROR` uses a different response shape: `{ success: false, steps, e
 
 | Method | Endpoint | Auth | Implements | Description |
 |--------|----------|------|------------|-------------|
-| GET | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push-deploy-credential-management-ui) | Get encrypted deploy credentials (masked) |
-| PUT | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push-deploy-credential-management-ui) | Save/update deploy credentials (GitHub PAT, CF API token) |
-| DELETE | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push-deploy-credential-management-ui) | Erase all deploy credentials |
+| GET | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push--deploy-credential-management-ui) | Get encrypted deploy credentials (masked) |
+| PUT | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push--deploy-credential-management-ui) | Save/update deploy credentials (GitHub PAT, CF API token) |
+| DELETE | `/api/deploy-keys` | Session cookie | [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token), [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push--deploy-credential-management-ui) | Erase all deploy credentials |
 
 ### GitHub Integration
 
@@ -491,12 +493,12 @@ Note: `/api/setup/detect-token` and `/api/setup/prefill` are also subject to the
 |--------|----------|------|------------|-------------|
 | GET | `/api/storage/browse` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser) | List objects in R2 prefix |
 | POST | `/api/storage/upload` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser), [REQ-STOR-008](../../sdd/spec/storage.md#req-stor-008-multipart-upload-for-large-files) | Upload file |
-| GET | `/api/storage/download` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser), [REQ-SEC-013](../../sdd/spec/security.md#req-sec-013-content-disposition-hardening-on-downloads) | Download file |
+| GET | `/api/storage/download` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser), [REQ-SEC-013](../../sdd/spec/security.md#req-sec-013-content-disposition-hardening-on-downloads) | Download file as an attachment; with `?disposition=inline` serves it inline for in-browser viewing (XSS-safe content-type + nosniff) |
 | POST | `/api/storage/delete` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser) | Delete objects by key and/or prefix (server-side bulk delete) |
 | GET | `/api/storage/preview` | Session cookie | [REQ-STOR-007](../../sdd/spec/storage.md#req-stor-007-web-file-browser) | Preview file content (text files inline, others return metadata only) |
 | GET | `/api/storage/stats` | Session cookie | [REQ-STOR-006](../../sdd/spec/storage.md#req-stor-006-storage-quota-enforced-per-tier-at-session-start), [REQ-STOR-014](../../sdd/spec/storage.md#req-stor-014-r2-storage-stats-caching) | File/folder counts (60s KV cache, refreshes from R2 on miss/stale) |
 | POST | `/api/storage/seed/getting-started` | Session cookie | [REQ-STOR-009](../../sdd/spec/storage.md#req-stor-009-getting-started-docs-auto-seeded-on-first-session) | Seed tutorial docs |
-| POST | `/api/storage/seed/agent-configs` | Session cookie | [REQ-AGENT-011](../../sdd/spec/agents.md#req-agent-011-agent-skills-rules-manually-recreatable-from-settings), [REQ-STOR-009](../../sdd/spec/storage.md#req-stor-009-getting-started-docs-auto-seeded-on-first-session) | Recreate AI agent skills & rules (overwrites, respects session mode) |
+| POST | `/api/storage/seed/agent-configs` | Session cookie | [REQ-AGENT-011](../../sdd/spec/agents.md#req-agent-011-agent-skills--rules-manually-recreatable-from-settings), [REQ-STOR-009](../../sdd/spec/storage.md#req-stor-009-getting-started-docs-auto-seeded-on-first-session) | Recreate AI agent skills & rules (overwrites, respects session mode) |
 | POST | `/api/storage/upload/initiate` | Session cookie | [REQ-STOR-008](../../sdd/spec/storage.md#req-stor-008-multipart-upload-for-large-files) | Initiate multipart upload |
 | POST | `/api/storage/upload/part` | Session cookie | [REQ-STOR-008](../../sdd/spec/storage.md#req-stor-008-multipart-upload-for-large-files) | Upload a single part (base64 body) |
 | POST | `/api/storage/upload/complete` | Session cookie | [REQ-STOR-008](../../sdd/spec/storage.md#req-stor-008-multipart-upload-for-large-files) | Complete multipart upload |
@@ -518,7 +520,7 @@ GET `/api/llm-keys` - returns masked keys (`****` + last 4 chars), never full ke
 PUT `/api/llm-keys` - set or clear keys. Body: `{ openaiApiKey?: string | null, geminiApiKey?: string | null }`. `null` deletes the key, `undefined`/omitted = no change, string = set. Returns masked keys. When `ENCRYPTION_KEY` is set, values are encrypted with AES-256-GCM before KV storage.
 DELETE `/api/llm-keys` - removes all LLM keys from KV.
 
-Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected as `OPENAI_API_KEY` / `GEMINI_API_KEY` env vars. The `entrypoint.sh` detects these env vars and configures the `consult-llm-mcp` MCP server in `~/.claude.json`. The LLM Keys accordion in Settings is only visible when the user can use advanced mode (`canUseAdvanced()`) AND has selected advanced session mode (`currentSessionMode() === 'advanced'`). Admins always qualify for advanced mode but must still select it.
+Keys are stored in KV as `llm-keys:{bucketName}` and scoped per user (derived from auth). On container start, keys are read from KV and injected only as `CODEFLARE_OPENAI_API_KEY` / `CODEFLARE_GEMINI_API_KEY`; `entrypoint.sh` maps them back to bare provider env names only inside the scoped `consult-llm-mcp` server config for Claude (`~/.claude.json`) and Pi (`~/.pi/agent/mcp.json`). The LLM Keys accordion in Settings is only visible when the user can use advanced mode (`canUseAdvanced()`) AND has selected advanced session mode (`currentSessionMode() === 'advanced'`). Admins always qualify for advanced mode but must still select it.
 
 ### Public (Onboarding)
 
@@ -605,8 +607,8 @@ Both endpoints return the same JSON body:
 
 - [REQ-AGENT-004](../../sdd/spec/agents.md#req-agent-004-two-session-modes-standard-and-pro) - Two Session Modes: Standard and Pro
 - [REQ-AGENT-010](../../sdd/spec/agents.md#req-agent-010-deploy-credential-storage-github-pat-cf-api-token) - Deploy Credential Storage (GitHub PAT, CF API Token)
-- [REQ-AGENT-011](../../sdd/spec/agents.md#req-agent-011-agent-skills-rules-manually-recreatable-from-settings) - Agent Skills & Rules Manually Recreatable from Settings
-- [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push-deploy-credential-management-ui) - Push & Deploy credential management UI
+- [REQ-AGENT-011](../../sdd/spec/agents.md#req-agent-011-agent-skills--rules-manually-recreatable-from-settings) - Agent Skills & Rules Manually Recreatable from Settings
+- [REQ-AGENT-018](../../sdd/spec/agents.md#req-agent-018-push--deploy-credential-management-ui) - Push & Deploy credential management UI
 - [REQ-AGENT-049](../../sdd/spec/agents.md#req-agent-049-auto-upgrade-preseed-on-release) - Auto-upgrade preseed on release
 - [REQ-AUTH-002](../../sdd/spec/authentication.md#req-auth-002-saas-mode-uses-direct-github-oauth) - SaaS mode uses Direct GitHub OAuth
 - [REQ-AUTH-006](../../sdd/spec/authentication.md#req-auth-006-user-email-normalized) - User email normalized
@@ -648,3 +650,6 @@ Both endpoints return the same JSON body:
 - [REQ-TERM-001](../../sdd/spec/terminal.md#req-term-001-up-to-6-terminal-tabs-per-session) - Up to 6 terminal tabs per session
 - [REQ-TERM-002](../../sdd/spec/terminal.md#req-term-002-websocket-connection-to-container-pty) - WebSocket connection to container PTY
 - [REQ-TERM-004](../../sdd/spec/terminal.md#req-term-004-close-code-4503-is-authoritative-no-retry) - Close code 4503 is authoritative (no retry)
+- [REQ-TERM-016](../../sdd/spec/terminal.md#req-term-016-terminal-pane-reconnect-and-resize-authority) - Terminal Pane Reconnect and Resize Authority
+- [REQ-TERM-017](../../sdd/spec/terminal.md#req-term-017-multiview-pane-focus-and-input-routing) - MultiView Pane Focus and Input Routing
+- [REQ-TERM-018](../../sdd/spec/terminal.md#req-term-018-multiview-reopen-and-close) - MultiView Reopen and Close

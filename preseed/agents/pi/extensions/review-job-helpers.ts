@@ -1,4 +1,18 @@
-import { basename } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
+
+export const REVIEW_REFRESH_LIFECYCLE_EVENTS = ["resources_discover", "turn_start", "turn_end", "message_end"] as const;
+
+export type ReviewRefreshLifecycleEvent = typeof REVIEW_REFRESH_LIFECYCLE_EVENTS[number];
+
+export type ReviewRefreshHookApi = {
+  on: (event: ReviewRefreshLifecycleEvent, handler: (event: unknown, ctx: unknown) => void) => void;
+};
+
+export function registerReviewRefreshLifecycleHooks(api: ReviewRefreshHookApi, handler: (event: unknown, ctx: unknown) => void): void {
+  for (const event of REVIEW_REFRESH_LIFECYCLE_EVENTS) api.on(event, handler);
+}
 
 export type DurableReviewLaneSnapshot = {
   lane: string;
@@ -178,99 +192,192 @@ export function durableReviewMessageKey(input: {
   return [input.customType, input.repo || "", input.head || "", input.lane || "summary", input.path || ""].join("\u0000");
 }
 
-// --- Review-result delivery announcements (two-phase: execution done != delivery done) ---
-// The durable review engine acks a head and writes summary.md, but pushing the summary BACK into
-// the live session is unreliable: pi.sendMessage only persists a custom message to the session
-// transcript when the agent session emits a `message_end` (role:"custom") event, which never fires
-// from the off-turn setInterval reaper (no live session loop) nor from a stale-bound sender after a
-// reload. The old code created a one-shot `<lane>.sent` marker BEFORE sending and trusted the send,
-// so a silent no-op permanently suppressed every retry. These helpers drive a small durable state
-// machine instead — pending -> attempted -> visible|failed — whose ONLY proof of delivery is the
-// announcement's nonce appearing in the session transcript (scannable plain text, written iff the
-// message actually persisted). Pure decision logic lives here; the disk records live in
-// review-jobs.ts and the wiring/transcript-scan in review-enforcement.ts.
-export type ReviewAnnouncementKind = "summary" | "autofix";
-export type ReviewAnnouncementStatus = "pending" | "attempted" | "visible" | "failed";
+// --- Review monitor delivery decisions ---
+export type ReviewMonitorAction = "wait" | "clean" | "autofix_required" | "manual_review_required" | "failed";
+export type ReviewMonitorStatus = "waiting" | "ready" | "failed";
 
-export type ReviewAnnouncement = {
-  kind: ReviewAnnouncementKind;
+export type ReviewMonitorDecisionInput = {
+  lanes: string[];
+  resultExists: (lane: string) => boolean;
+  summaryExists: boolean;
+  failedLanes: string[];
+  counts: ReviewSeverityCounts;
+  approvalRequired: boolean;
+};
+
+export type ReviewMonitorDecision = {
+  status: ReviewMonitorStatus;
+  action: ReviewMonitorAction;
+  missing: string[];
+  failed: string[];
+};
+
+export function reviewMonitorDecision(input: ReviewMonitorDecisionInput): ReviewMonitorDecision {
+  const failed = [...input.failedLanes];
+  if (failed.length > 0) return { status: "failed", action: "failed", missing: [], failed };
+
+  const missing = input.lanes.filter((lane) => !input.resultExists(lane));
+  if (!input.summaryExists) missing.push("summary");
+  if (missing.length > 0) return { status: "waiting", action: "wait", missing, failed: [] };
+
+  const action = actionableReviewCount(input.counts) > 0
+    ? (input.approvalRequired ? "manual_review_required" : "autofix_required")
+    : "clean";
+  return { status: "ready", action, missing: [], failed: [] };
+}
+
+export type ReviewMonitorSpawnDecisionInput = {
+  completed: boolean;
+  startedAt?: number;
+  now: number;
+  ttlMs: number;
+};
+
+export type ReviewMonitorSpawnDecision = "spawn" | "skip_running" | "skip_completed";
+
+export function reviewMonitorSpawnDecision(input: ReviewMonitorSpawnDecisionInput): ReviewMonitorSpawnDecision {
+  if (input.completed) return "skip_completed";
+  if (input.startedAt !== undefined && input.now - input.startedAt < input.ttlMs) return "skip_running";
+  return "spawn";
+}
+
+export type ReviewMonitorCompletionRecord = {
+  repo?: unknown;
+  head?: unknown;
+  summaryPath?: unknown;
+  completedAt?: unknown;
+  result?: unknown;
+};
+
+export function parseReviewMonitorCompletedAt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const normalized = value.replace(/\.(\d{3})\d+(?=Z|[+-]\d{2}:?\d{2}$)/, ".$1");
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+// Returns the first field that fails validation, or undefined when the record is valid.
+// Callers use the reason to emit a diagnostic event instead of silently deleting a rejected
+// completion record (which is otherwise indistinguishable from "monitor still running").
+export function reviewMonitorCompletionRejectReason(input: {
+  record: ReviewMonitorCompletionRecord;
   repo: string;
   head: string;
-  status: ReviewAnnouncementStatus;
-  attempts: number;
-  nonce: string;
-  createdAt: number;
-  lastAttemptAt?: number;
-  deliveredAt?: number;
-  lastError?: string;
-};
-
-// Deterministic, transcript-scannable delivery token. Caller passes the time stamp (Date.now in the
-// extension) so this stays pure/testable. No spaces; embeds kind+head so distinct announcements can
-// never collide, and the stamp distinguishes a re-created announcement from its predecessor.
-export function reviewAnnouncementNonce(kind: ReviewAnnouncementKind, head: string, stamp: number): string {
-  return `cf-review-${kind}:${head.slice(0, 12)}:${stamp}`;
+  summaryPath: string;
+  latestInputMtime: number;
+}): string | undefined {
+  if (input.record.repo !== input.repo) return "repo_mismatch";
+  if (input.record.head !== input.head) return "head_mismatch";
+  if (input.record.summaryPath !== input.summaryPath) return "summary_path_mismatch";
+  const result = input.record.result;
+  if (result !== "clean" && result !== "findings") return "invalid_result";
+  const completedAt = parseReviewMonitorCompletedAt(input.record.completedAt);
+  if (completedAt === undefined) return "missing_completed_at";
+  if (completedAt + 1000 < input.latestInputMtime) return "stale_completed_at";
+  return undefined;
 }
 
-export type AnnouncementAttemptInput = {
-  status: ReviewAnnouncementStatus;
-  attempts: number;
-  lastAttemptAt?: number;
-  now: number;
-  maxAttempts: number;
-  retryDelayMs: number;
-};
-
-// Should emitPendingAnnouncements (re)send this announcement on this tick? `pending` sends once;
-// `attempted` re-sends only after the retry delay AND while under the attempt cap; terminal states
-// (`visible`/`failed`) never send. This is the SOLE owner of retry/backoff timing.
-export function shouldAttemptAnnouncement(input: AnnouncementAttemptInput): boolean {
-  if (input.status === "visible" || input.status === "failed") return false;
-  if (input.status === "pending") return true;
-  if (input.attempts >= input.maxAttempts) return false;
-  return input.now - (input.lastAttemptAt ?? 0) >= input.retryDelayMs;
+export function reviewMonitorCompletionRecordReady(input: {
+  record: ReviewMonitorCompletionRecord;
+  repo: string;
+  head: string;
+  summaryPath: string;
+  latestInputMtime: number;
+}): boolean {
+  return reviewMonitorCompletionRejectReason(input) === undefined;
 }
 
-export type AnnouncementReconcileInput = {
-  kind: ReviewAnnouncementKind;
-  status: ReviewAnnouncementStatus;
-  attempts: number;
-  lastAttemptAt?: number;
-  nonceFound: boolean;
-  now: number;
-  maxAttempts: number;
-  retryDelayMs: number;
-  createdAt?: number;
-  maxAgeMs?: number;
-};
-
-export type AnnouncementReconcileDecision = "visible" | "failed" | "keep";
-
-// Post-send verdict from observing whether the nonce is now in the session transcript. Proof of
-// delivery wins outright. An `attempted` announcement that has burned its attempt cap AND given the
-// final attempt its full retry window without ever appearing is `failed` (the user is told to run
-// /review-results); anything still in flight is `keep` (emit retries it per shouldAttemptAnnouncement).
-// Age backstop — SUMMARY ONLY: the idle-gated summary defers (no attempt burned) while the agent
-// streams, so a record that never observes an idle tick would otherwise retry forever without ever
-// escalating; once older than maxAgeMs it becomes `failed` so the documented /review-results fallback
-// stays reachable and nothing is acked-and-lost. The AUTOFIX announcement is deliberately EXEMPT: it
-// defers off-turn (no live session) without burning an attempt, so aging it would mark it `failed` at
-// attempts:0 — expiring the fix turn before it ever fired. An undelivered autofix instead reaches a
-// terminal state via head-supersede (a newer push retires the stale head via abandonReviewAnnouncements),
-// or via the attempt cap above while still claimable and a send keeps erroring — never on age alone.
-// (Once the one-shot autofix.requested marker is claimed, claim() returns false so the record can no
-// longer re-fire to accrue attempts; head-supersede is then its only terminal path.) Keyed on
-// createdAt, so the summary backstop is independent of the attempt counter and never penalises a
-// normal in-flight retry.
-export function announcementReconcileDecision(input: AnnouncementReconcileInput): AnnouncementReconcileDecision {
-  if (input.nonceFound) return "visible";
-  if (input.status === "failed") return "failed";
-  if (input.status === "attempted" && input.attempts >= input.maxAttempts) {
-    return input.now - (input.lastAttemptAt ?? 0) >= input.retryDelayMs ? "failed" : "keep";
+// Normalize the untyped subagents-service spawn() return into an agent id. Different service
+// versions return a bare id string or an object carrying the id under one of several keys. A
+// successful spawn must not be misread as a failure (empty/missing -> undefined), so the
+// review-monitor dedup claim latches on a real id instead of re-spawning every cycle.
+export function resolveSpawnedAgentId(spawned: unknown): string | undefined {
+  if (typeof spawned === "string") return spawned.trim() ? spawned : undefined;
+  if (spawned && typeof spawned === "object") {
+    const record = spawned as Record<string, unknown>;
+    for (const key of ["agentId", "id", "agent_id"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) return value;
+    }
   }
-  if (input.kind === "summary" && input.maxAgeMs !== undefined && input.createdAt !== undefined && input.now - input.createdAt >= input.maxAgeMs) return "failed";
-  return "keep";
+  return undefined;
 }
+
+// All lanes are complete but the monitor has not produced a valid completion record. If the
+// review has been pending past the age bound the monitor cannot deliver (service down, lost
+// subagent, repeatedly-rejected completion record): give up and surface it instead of
+// re-spawning forever and blocking merge silently.
+export function reviewCompletionDeliveryStalled(input: { completionReady: boolean; deliveryAgeMs: number; maxAgeMs: number }): boolean {
+  if (input.completionReady) return false;
+  return input.deliveryAgeMs >= input.maxAgeMs;
+}
+
+// The monitor delivery window opens when all lanes complete and the monitor is spawned, so the
+// give-up clock must run from the monitor's own spawn time (its claim's startedAt) bounded by the
+// monitor's polling TTL — never from the review-window start against the lane budget, which the
+// lanes already consume and which would kill a slow-but-healthy monitor. Before a live monitor
+// claim exists (first finalize tick, or a monitor that never spawned) fall back to the window
+// start discounted by the lane budget, so the lanes keep their full budget and the monitor its
+// full TTL before we give up, while still terminating the wait instead of blocking merge forever.
+export function reviewDeliveryGiveUp(input: {
+  completionReady: boolean;
+  now: number;
+  reviewStartedAt: number;
+  monitorStartedAt: number | undefined;
+  laneBudgetMs: number;
+  monitorTtlMs: number;
+}): boolean {
+  const deliveryAgeMs = input.monitorStartedAt !== undefined
+    ? input.now - input.monitorStartedAt
+    : input.now - input.reviewStartedAt - input.laneBudgetMs;
+  return reviewCompletionDeliveryStalled({ completionReady: input.completionReady, deliveryAgeMs, maxAgeMs: input.monitorTtlMs });
+}
+
+export type ReviewMonitorStartupFailureMessage = {
+  customType: "codeflare-review-monitor-startup-failed";
+  content: string;
+  display: true;
+  details: { repo: string; head: string; reason: string; prompt: string };
+};
+
+export function reviewMonitorStartupFailureMessage(input: { repo: string; head: string; reason: string; prompt: string }): ReviewMonitorStartupFailureMessage {
+  return {
+    customType: "codeflare-review-monitor-startup-failed",
+    content: [
+      `PR-boundary review-monitor startup failed for ${input.repo} at ${input.head.slice(0, 12)} (${input.reason}).`,
+      "Start the fallback review-monitor now as a background subagent and use the prompt below exactly.",
+      "A durable monitor claim is already recorded for this head; do not start more than one fallback monitor.",
+      "Do not edit files before starting the monitor; its REVIEW_RESULT handoff must reach the main session.",
+      "",
+      "```text",
+      input.prompt,
+      "```",
+    ].join("\n"),
+    display: true,
+    details: { repo: input.repo, head: input.head, reason: input.reason, prompt: input.prompt },
+  };
+}
+
+export type ReviewSummaryMessage = {
+  customType: "codeflare-review-summary-v4";
+  content: string;
+  display: true;
+  details: { repo: string; head: string; manual: true };
+};
+
+export function reviewResultsSummaryMessage(input: { repo: string; head: string; content: string }): ReviewSummaryMessage {
+  return {
+    customType: "codeflare-review-summary-v4",
+    content: input.content.replace(/^PR-boundary review acknowledged for (.+?) at ([0-9a-f]{7,40})\./m, "PR-boundary review results for $1 at $2."),
+    display: true,
+    details: { repo: input.repo, head: input.head, manual: true },
+  };
+}
+export function isTaskSessionFile(file: string | undefined): boolean {
+  return typeof file === "string" && /(?:^|[\\/])tasks[\\/]/.test(file);
+}
+
 
 export type ReviewSeverityCounts = {
   critical: number;
@@ -325,31 +432,6 @@ export type MergedReviewSummaryModel = {
   recommendation: string;
 };
 
-export type ReviewAutofixMessage = {
-  customType: "codeflare-review-autofix-request";
-  content: string;
-  display: false;
-  details: { repo: string; head: string; nonce?: string };
-};
-
-export type ReviewAutofixOptions = {
-  triggerTurn: true;
-  deliverAs: "followUp";
-};
-
-export type ReviewAutofixRequest = {
-  message: ReviewAutofixMessage;
-  options: ReviewAutofixOptions;
-};
-
-export type ReviewAutofixSender = {
-  sendMessage: (message: ReviewAutofixMessage, options: ReviewAutofixOptions) => void;
-};
-
-export type ReviewAutofixRow = {
-  counts: ReviewSeverityCounts;
-};
-
 export type DurableReviewStatusState = "completed" | "running" | "pending";
 
 export type DurableReviewStatusSegment = {
@@ -363,68 +445,6 @@ export type DurableReviewStatusStyle = {
   running?: (text: string) => string;
   pending?: (text: string) => string;
 };
-
-export type ReviewAutofixMode = "auto" | "manual" | "unset";
-
-export function reviewAutofixModeFromUserMessages(messages: string[]): ReviewAutofixMode {
-  let mode: ReviewAutofixMode = "unset";
-  const manualPattern = /\b(?:do not|don't|dont|no|stop)\s+(?:auto(?:matically)?[-\s]*)?(?:fix|implement|apply)\b|\bdo\s+not\s+auto[-\s]*(?:fix|implement)\b|\bdon't\s+auto[-\s]*(?:fix|implement)\b|\bwait\s+for\s+(?:my\s+)?(?:go|approval|command)\b/i;
-  const autoPattern = /\bautomatic(?:ally)?\s+is\s+fine\b|\b(?:go|proceed)\b[^.!?]*\b(?:fix|implement|apply)\b[^.!?]*\bfindings?\b|\b(?:fix|implement)\s+(?:all\s+)?(?:legitimate\s+)?(?:PR-boundary\s+review\s+)?findings\b/i;
-  for (const message of messages) {
-    if (manualPattern.test(message)) mode = "manual";
-    if (autoPattern.test(message)) mode = "auto";
-  }
-  return mode;
-}
-
-export function reviewAutofixRequest(repo: string, head: string, nonce?: string): ReviewAutofixRequest {
-  const lines = [
-    `Fix legitimate PR-boundary review findings for ${basename(repo)} at ${head}.`,
-    "Use the merged review summary immediately above as the actionable finding list; do not fix from partial lane results.",
-    "Before editing, committing, or pushing, verify the review job for this exact head is complete and every required lane has a result file.",
-    "If any required review lane is still running, pending, missing, or unknown, do not edit, commit, or push; wait for the final merged review summary.",
-    "If the user has explicitly said not to automatically fix/implement this round, or to wait for GO/approval, do not edit, commit, or push; present the findings and wait for their command.",
-    "Otherwise, fix all legitimate MEDIUM, HIGH, and CRITICAL findings only.",
-    "A finding's age is never a reason to skip it: fix every legitimate finding whether it is newly introduced or pre-existing, in this diff or adjacent. Do not exclude, defer, or ask about a legitimate finding because it pre-dates this change — legitimacy is the only criterion.",
-    "Do not rerun or start CI monitoring unless explicitly asked or a merge/deploy gate requires it.",
-    "Commit the fix as a new commit and push to the same branch; do not amend or rewrite history.",
-  ];
-  // A delivery nonce (when supplied) rides in a trailing HTML comment so it lands verbatim in the
-  // persisted transcript line — the announcement state machine proves delivery by finding it there.
-  if (nonce) lines.push(`<!-- cf-review-delivery ${nonce} -->`);
-  return {
-    message: {
-      customType: "codeflare-review-autofix-request",
-      content: lines.join("\n"),
-      display: false,
-      details: nonce ? { repo, head, nonce } : { repo, head },
-    },
-    options: { triggerTurn: true, deliverAs: "followUp" },
-  };
-}
-
-export function sendReviewAutofixRequest(sender: ReviewAutofixSender, repo: string, head: string, nonce?: string): void {
-  const request = reviewAutofixRequest(repo, head, nonce);
-  sender.sendMessage(request.message, request.options);
-}
-
-export function requestReviewAutofixForRows(input: {
-  sender: ReviewAutofixSender;
-  repo: string;
-  head: string;
-  rows: ReviewAutofixRow[];
-  reviewComplete: boolean;
-  suppress?: boolean;
-  nonce?: string;
-  claim: () => boolean;
-}): boolean {
-  if (!input.reviewComplete) return false;
-  if (input.suppress) return false;
-  if (!input.rows.some((row) => actionableReviewCount(row.counts) > 0)) return false;
-  if (!input.claim()) return false;
-  sendReviewAutofixRequest(input.sender, input.repo, input.head, input.nonce);
-  return true;
-}
 
 export function durableReviewStatusSegments(input: {
   lanes: string[];
@@ -547,7 +567,7 @@ export function durableReviewSummaryModel(rows: DurableReviewSummaryRow[]): Dura
     rows,
     actionable,
     recommendation: actionable > 0
-      ? `automatically fix ${actionable} actionable MEDIUM/HIGH/CRITICAL finding(s), commit, and push only the fix diff`
+      ? `verify ${actionable} actionable MEDIUM/HIGH/CRITICAL finding(s), fix only legitimate findings, commit, and push only the fix diff`
       : "no actionable MEDIUM/HIGH/CRITICAL findings remain",
   };
 }
@@ -706,7 +726,7 @@ function mergedFindingsList(findings: ReviewFinding[]): string {
 
 export function mergedReviewRecommendation(counts: ReviewSeverityCounts): string {
   const actionable = actionableReviewCount(counts);
-  if (actionable > 0) return `automatically fix ${actionable} actionable MEDIUM/HIGH/CRITICAL finding(s), commit, and push only the fix diff`;
+  if (actionable > 0) return `verify ${actionable} actionable MEDIUM/HIGH/CRITICAL finding(s), fix only legitimate findings, commit, and push only the fix diff`;
   if (counts.low > 0) return "review LOW findings when convenient; no MEDIUM/HIGH/CRITICAL findings remain";
   return "no findings remain";
 }
@@ -726,7 +746,7 @@ export function mergedReviewSummaryModel(input: MergedReviewSummaryInput): Merge
 export function formatMergedReviewSummary(input: MergedReviewSummaryInput): string {
   const model = mergedReviewSummaryModel(input);
   return [
-    `PR-boundary review acknowledged for ${model.repoName} at ${model.headShort}.`,
+    `PR-boundary review results for ${model.repoName} at ${model.headShort}.`,
     "",
     "## Review Summary",
     "",
@@ -872,7 +892,7 @@ export type ReviewState = {
   overall: ReviewOverall;
   acked: boolean;
   summaryReady: boolean;
-  autofixRequested: boolean;
+  monitorCompleted: boolean;
   breakerOpen: boolean;
   attempts: number;
   startedAt?: number;
@@ -895,7 +915,7 @@ export type ComputeReviewStateInput = {
   ackHead: string;
   breakerHead: string;
   attempts: number;
-  autofixRequested: boolean;
+  monitorCompleted: boolean;
   startedAt?: number;
 };
 
@@ -933,7 +953,7 @@ export function computeReviewStateFrom(input: ComputeReviewStateInput): ReviewSt
     overall,
     acked: input.head !== "" && input.ackHead === input.head,
     summaryReady: input.lanes.length > 0 && input.lanes.every((lane) => laneStatus[lane] === "completed"),
-    autofixRequested: input.autofixRequested,
+    monitorCompleted: input.monitorCompleted,
     breakerOpen: input.head !== "" && input.breakerHead === input.head,
     attempts: input.attempts,
     startedAt: input.startedAt,
@@ -968,6 +988,35 @@ export type OpenPrReconcileInput = {
 
 export type OpenPrReconcileDecision = { reconcile: boolean; reason: string };
 
+export type AgentHeadAdvanceInput = {
+  beforeHead: string;
+  afterHead: string;
+  enforced: boolean;
+  draft: boolean;
+  acked: boolean;
+  breakerOpen: boolean;
+  windowExists: boolean;
+};
+
+export function isAgentSpawnerToolEvent(event: any): boolean {
+  const toolName = String(event?.toolName || event?.tool_name || "").toLowerCase();
+  return toolName === "agent" || toolName === "subagent" || Boolean(event?.input?.subagent_type || event?.input?.subagentType);
+}
+
+// Agent/subagent pushes are invisible to the main session's bash tool stream because the subagent runs
+// in another Pi process. This pure gate is the compensating signal: if an Agent tool started with one
+// enforced PR head and ended with a different enforced, unacked, unblocked head, that head must be
+// reviewed exactly like a directly observed `git push`. Same-head inherited PRs still offer/noop.
+export function agentHeadAdvanceRequiresReview(input: AgentHeadAdvanceInput): boolean {
+  return Boolean(input.enforced
+    && !input.draft
+    && input.afterHead
+    && input.afterHead !== input.beforeHead
+    && !input.acked
+    && !input.breakerOpen
+    && !input.windowExists);
+}
+
 export type OpenPrReconcileLifecycleInput = {
   activeRun: boolean;
   hasRepo: boolean;
@@ -996,6 +1045,36 @@ export function shouldReconcileOpenPr(input: OpenPrReconcileInput): OpenPrReconc
   if (input.breakerOpen) return { reconcile: false, reason: "review breaker open for head" };
   if (input.hasReviewJob || input.reviewActive) return { reconcile: false, reason: "review window already exists for head" };
   return { reconcile: true, reason: "open enforced PR head is unacknowledged with no review window" };
+}
+
+export type ReviewWindowStartDecisionInput = {
+  bypassPresent: boolean;
+  canConsumeBypass: boolean;
+  boundaryEvent: boolean;
+};
+export type ReviewWindowStartDecision = "start" | "ack_bypass" | "wait_for_main_session";
+
+export function reviewWindowStartDecision(input: ReviewWindowStartDecisionInput): ReviewWindowStartDecision {
+  if (!input.bypassPresent || !input.boundaryEvent) return "start";
+  return input.canConsumeBypass ? "ack_bypass" : "wait_for_main_session";
+}
+
+export type ReviewBoundaryStartDecisionInput = {
+  acked: boolean;
+  breakerOpen: boolean;
+  windowExists: boolean;
+  dedupeAllowed: () => boolean;
+  bypassPresent: boolean;
+  canConsumeBypass: boolean;
+};
+export type ReviewBoundaryStartDecision = ReviewWindowStartDecision | "skip_acked" | "skip_breaker" | "skip_window_exists" | "skip_dedupe";
+
+export function reviewBoundaryStartDecision(input: ReviewBoundaryStartDecisionInput): ReviewBoundaryStartDecision {
+  if (input.acked) return "skip_acked";
+  if (input.breakerOpen) return "skip_breaker";
+  if (input.windowExists) return "skip_window_exists";
+  if (!input.dedupeAllowed()) return "skip_dedupe";
+  return reviewWindowStartDecision({ bypassPresent: input.bypassPresent, canConsumeBypass: input.canConsumeBypass, boundaryEvent: true });
 }
 
 // Action gate for a reconciled (missed-boundary) PR head (REQ-AGENT-058 revised).
@@ -1107,40 +1186,44 @@ export function mergeGateDecision(input: MergeGateInput): MergeGateDecision {
   return { action: "block", head: block.head, reason: block.reason };
 }
 
-// Resolve which repo a review handler should act on, WITHOUT consulting the shared graphify
-// active-cwd sentinel. That sentinel (/home/user/.cache/codeflare-hooks/graphify-active-cwd) is a
-// single-active-repo file written by BOTH Claude's graphify-active-repo.sh hook AND Pi's
-// codeflare-pi.ts (proactively, on every tool execution) from each agent's OWN cwd — so under
-// concurrent agents it flaps to whichever agent acted last, not the repo THIS Pi session is
-// reviewing. When Pi reviews a different (e.g. nested) repo than the one that last wrote the
-// sentinel, sentinel-based resolution silently misroutes finalize/footer to the wrong .git: the
-// summary never emits, autofix never starts, and the progress footer shows nothing. Precedence:
-//   commandCwd (explicit `cd`/`-C` in the boundary command) -> sessionCwd (Pi's session cwd)
-//   -> sessionReviewRepo (already-resolved root remembered in-session, for the no-ctx reaper)
-//   -> processCwd (Pi process dir, last resort).
-// commandCwd/sessionCwd/processCwd are directories resolved to a git root via gitRootOf;
-// sessionReviewRepo is already a git root and is returned verbatim.
-// activeRepo (added) is the IN-MEMORY active-cwd codeflare-pi.ts tracks on every tool execution —
-// the SAME signal the statusline footer resolves the repo from. It is load-bearing when the Pi
-// session cwd is a NON-repo parent workspace (/home/user/workspace) and the user works in a nested
-// clone via `cd`/`git -C`: commandCwd is absent on a slash command (/review-run) and on a
-// no-command reconciliation tick, sessionCwd/processCwd resolve to the parentless workspace, and
-// sessionReviewRepo is unset until a review has already run — so without activeRepo BOTH /review-run
-// AND open-PR reconciliation returned undefined ("not inside an SDD repository" / reconciliation
-// silently bailed on hasRepo=false and never auto-started) even though the footer showed the repo.
-// It sits after the reliable signals, before processCwd, validated through gitRootOf. This is the
-// recallActiveRepo() in-memory value (this Pi process only), NOT the cross-process on-disk sentinel
-// that flaps under concurrent agents — so it is safe for routing, unlike the sentinel above.
+export const CODEFLARE_WORKSPACE = "/home/user/workspace";
+
+function workspaceChildRoot(path: string | undefined, workspace = CODEFLARE_WORKSPACE): string | undefined {
+  if (!path) return undefined;
+  const root = resolve(workspace);
+  const candidate = resolve(path);
+  const rel = relative(root, candidate);
+  if (!rel || rel.startsWith("..") || rel.startsWith("/")) return undefined;
+  const repoName = rel.split(/[\\/]/)[0];
+  return repoName ? join(root, repoName) : undefined;
+}
+
+function localHasGitDir(repo: string): boolean {
+  return existsSync(join(repo, ".git"));
+}
+
+export function workspaceRepoFromPath(
+  path: string | undefined,
+  hasGitDir: (repo: string) => boolean,
+  workspace = CODEFLARE_WORKSPACE,
+): string | undefined {
+  const repo = workspaceChildRoot(path, workspace);
+  return repo && hasGitDir(repo) ? repo : undefined;
+}
+
+// Codeflare clones repos only as direct children of /home/user/workspace. Review routing must stay
+// inside that shape; arbitrary git-root walking and graphify active-cwd sentinels are cross-agent
+// hazards. Precedence is intentionally small: command cwd -> session cwd -> active repo -> remembered
+// review repo -> process cwd, with every candidate narrowed to /home/user/workspace/<repo>.
 export function resolveReviewRepo(
   input: { commandCwd?: string; sessionCwd?: string; sessionReviewRepo?: string; activeRepo?: string; processCwd?: string },
-  gitRootOf: (dir: string) => string | undefined,
+  hasGitDir: (repo: string) => boolean,
 ): string | undefined {
-  const fromDir = (dir: string | undefined): string | undefined => (dir ? gitRootOf(dir) : undefined);
-  return fromDir(input.commandCwd)
-    ?? fromDir(input.sessionCwd)
-    ?? input.sessionReviewRepo
-    ?? fromDir(input.activeRepo)
-    ?? fromDir(input.processCwd);
+  return workspaceRepoFromPath(input.commandCwd, hasGitDir)
+    ?? workspaceRepoFromPath(input.sessionCwd, hasGitDir)
+    ?? workspaceRepoFromPath(input.activeRepo, hasGitDir)
+    ?? workspaceRepoFromPath(input.sessionReviewRepo, hasGitDir)
+    ?? workspaceRepoFromPath(input.processCwd, hasGitDir);
 }
 
 // In-session memory of the repos this Pi session is tracking, shared across
@@ -1165,20 +1248,55 @@ const REVIEW_REPO_KEY = Symbol.for("codeflare.reviewRepo");
 // no-ctx reaper can finalize ALL of them, not just the last one (P6) — otherwise a second repo's review
 // hangs unfinalized until the user returns to it.
 const REVIEW_REPOS_KEY = Symbol.for("codeflare.reviewRepos");
+const DEFAULT_REVIEW_REPO_REGISTRY = join(homedir(), ".pi", "agent", "codeflare-review-repos.json");
 type CodeflareRepoMemory = { [ACTIVE_REPO_KEY]?: string; [REVIEW_REPO_KEY]?: string; [REVIEW_REPOS_KEY]?: Set<string> };
 const repoMemory = globalThis as unknown as CodeflareRepoMemory;
 
+function reviewRepoRegistryPath(): string {
+  return process.env.CODEFLARE_REVIEW_REPO_REGISTRY || DEFAULT_REVIEW_REPO_REGISTRY;
+}
+
+function readPersistedReviewRepos(): string[] {
+  try {
+    const registryPath = reviewRepoRegistryPath();
+    if (!existsSync(registryPath)) return [];
+    const parsed = JSON.parse(readFileSync(registryPath, "utf8"));
+    return Array.isArray(parsed)
+      ? parsed.flatMap((repo): string[] => {
+        const root = typeof repo === "string" ? workspaceChildRoot(repo) : undefined;
+        return root && localHasGitDir(root) ? [root] : [];
+      })
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePersistedReviewRepos(repos: string[]): void {
+  try {
+    const registryPath = reviewRepoRegistryPath();
+    mkdirSync(dirname(registryPath), { recursive: true });
+    writeFileSync(registryPath, `${JSON.stringify([...new Set(repos)].sort(), null, 2)}\n`, "utf8");
+  } catch {
+    // Best effort: in-memory delivery still works inside the current process.
+  }
+}
+
 export function rememberReviewRepo(repo: string | undefined): void {
-  if (!repo) return;
-  repoMemory[REVIEW_REPO_KEY] = repo;
+  const root = workspaceChildRoot(repo);
+  if (!root) return;
+  repoMemory[REVIEW_REPO_KEY] = root;
   if (!repoMemory[REVIEW_REPOS_KEY]) repoMemory[REVIEW_REPOS_KEY] = new Set<string>();
-  repoMemory[REVIEW_REPOS_KEY]!.add(repo);
+  repoMemory[REVIEW_REPOS_KEY]!.add(root);
+  writePersistedReviewRepos([...readPersistedReviewRepos(), root]);
 }
 export function recallReviewRepo(): string | undefined {
-  return repoMemory[REVIEW_REPO_KEY];
+  const remembered = workspaceChildRoot(repoMemory[REVIEW_REPO_KEY]);
+  return remembered ?? readPersistedReviewRepos()[0];
 }
 export function recallReviewRepos(): string[] {
-  return repoMemory[REVIEW_REPOS_KEY] ? [...repoMemory[REVIEW_REPOS_KEY]!] : [];
+  const remembered = repoMemory[REVIEW_REPOS_KEY] ? [...repoMemory[REVIEW_REPOS_KEY]!] : [];
+  return [...new Set([...remembered.flatMap((repo) => workspaceChildRoot(repo) ? [workspaceChildRoot(repo)!] : []), ...readPersistedReviewRepos()])];
 }
 
 export function rememberActiveRepo(repo: string | undefined): void {
@@ -1217,38 +1335,6 @@ export function activeRepoSentinelForDisplay(input: {
   hasGitDir: (path: string) => boolean;
 }): string | undefined {
   return guardedActiveRepoSentinel(input);
-}
-
-// Guarded persisted active-repo fallback for PR-boundary REVIEW ROUTING. This is stricter than the
-// display fallback above: the path must be a git repo, live under this session's roots, and be an SDD
-// project. It lets commandless reconciliation reach `gh pr view` for nested repos after a reload while
-// still preventing another agent's flapping sentinel from hijacking review enforcement.
-export function activeRepoSentinelForReview(input: {
-  sentinelContent: string | undefined;
-  sessionRoots: (string | undefined)[];
-  hasGitDir: (path: string) => boolean;
-  hasSddProject: (path: string) => boolean;
-}): string | undefined {
-  return guardedActiveRepoSentinel(input);
-}
-
-export function activeRepoCandidateForReview(input: {
-  rememberedActiveRepo: string | undefined;
-  persistedSentinelContents: (string | undefined)[];
-  sessionRoots: (string | undefined)[];
-  hasGitDir: (path: string) => boolean;
-  hasSddProject: (path: string) => boolean;
-}): string | undefined {
-  for (const sentinelContent of [input.rememberedActiveRepo, ...input.persistedSentinelContents]) {
-    const repo = activeRepoSentinelForReview({
-      sentinelContent,
-      sessionRoots: input.sessionRoots,
-      hasGitDir: input.hasGitDir,
-      hasSddProject: input.hasSddProject,
-    });
-    if (repo) return repo;
-  }
-  return undefined;
 }
 
 // Npm package source strings a durable review lane should load as additionalExtensionPaths.

@@ -96,7 +96,7 @@ const ACTIVE_REPO_SENTINEL = "/home/user/.cache/codeflare-hooks/graphify-active-
 // session cwd, so it warned "not inside a git repository" whenever the Pi session cwd was a
 // non-repo parent workspace and the user worked in a nested clone via `cd repo && ...` /
 // `git -C repo`. It now uses the SAME shared resolver the rest of the review system uses
-// (resolveReviewRepo: session cwd -> in-session review repo -> in-memory active repo -> process
+// (resolveReviewRepo: session cwd -> in-memory active repo -> in-session review repo -> process
 // cwd; in-memory recall only, never the flap-prone sentinel for routing). Because /review-status
 // is strictly read-only, it then falls back to the guarded on-disk sentinel for DISPLAY — the
 // identical last resort the statusline footer uses (activeRepoSentinelForDisplay, guarded so a
@@ -110,7 +110,7 @@ function reviewStatusRepo(ctx: ExtensionCommandContext): string | undefined {
       activeRepo: recallActiveRepo(),
       processCwd: process.cwd(),
     },
-    findGitRoot,
+    (repo) => existsSync(join(repo, ".git")),
   );
   if (resolved) return resolved;
   let sentinelContent: string | undefined;
@@ -178,7 +178,7 @@ export function renderReviewStatus(input: ReviewStatusInput): string {
     lines.push("Lanes:       none required for this head");
   }
   lines.push(`Summary:     ${state.summaryReady ? join(repo, ".git", "sdd-review-results", head, "summary.md") : "not ready yet"}`);
-  lines.push(`Autofix:     ${state.autofixRequested ? "requested" : "not requested"}`);
+  lines.push(`Monitor:     ${state.monitorCompleted ? "reported" : "not reported"}`);
   lines.push(`Breaker:     ${state.breakerOpen ? "OPEN — push a new commit or use /tmp/review-bypass" : "closed"}`);
   lines.push(`Merge gate:  ${state.acked ? "OPEN (current head acked)" : "BLOCKED until current head is acked"}`);
   if (events.length > 0) {

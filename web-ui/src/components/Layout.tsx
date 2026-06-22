@@ -8,6 +8,7 @@ import '../styles/layout.css';
 import { sessionStore, getUsageWarningLevel, getDismissedQuotaLevel, setDismissedQuotaLevel } from '../stores/session';
 import { storageStore } from '../stores/storage';
 import { terminalStore, reconnectDisconnectedTerminals, reconnectOnVisibilityReturn, scheduleDisconnect, cancelScheduledDisconnect } from '../stores/terminal';
+import { terminalWorkspaceStore } from '../stores/terminal-workspace';
 import { forceResetKeyboardState, enableVirtualKeyboardOverlay, isSamsungBrowser, cleanupDebugOverlay } from '../lib/mobile';
 import { logger } from '../lib/logger';
 import { loadSettings, applyAccentColor } from '../lib/settings';
@@ -58,6 +59,15 @@ const Layout: Component<LayoutProps> = (props) => {
   const [isStoragePanelOpen, setIsStoragePanelOpen] = createSignal(false);
   const [showTilingOverlay, setShowTilingOverlay] = createSignal(false);
   const [viewState, setViewState] = createSignal<ViewState>('dashboard');
+  let viewTransitionTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const clearViewTransitionTimer = () => {
+    if (viewTransitionTimer) {
+      clearTimeout(viewTransitionTimer);
+      viewTransitionTimer = undefined;
+    }
+  };
+  onCleanup(clearViewTransitionTimer);
 
   // Vault readiness: ground-truth probe against the proxy. We can't trust
   // session status flags here. The SilverBullet supervisor starts late in
@@ -343,6 +353,30 @@ const Layout: Component<LayoutProps> = (props) => {
     storageStore.fetchStats();
   });
 
+  const tiledSlotCount = (layout: TileLayout) => {
+    if (layout === '4-grid') return 4;
+    if (layout === '3-split') return 3;
+    return layout === '2-split' ? 2 : 1;
+  };
+
+  const visibleTerminalKeys = createMemo(() => {
+    const activeWorkspace = terminalWorkspaceStore.getActiveWorkspace();
+    const sessionId = activeWorkspace && activeWorkspace.kind === 'session' ? activeWorkspace.sessionId : null;
+    const terminals = sessionId ? sessionStore.getTerminalsForSession(sessionId) : null;
+    const tiling = sessionId ? sessionStore.getTilingForSession(sessionId) : null;
+    if (sessionId && terminals && tiling && tiling.enabled) {
+      const activeSessionId = sessionId;
+      const layout = tiling.layout;
+      const tabOrder = sessionStore.getTabOrder(activeSessionId) ?? [];
+      const terminalIds = new Set(terminals.tabs.map((tab) => tab.id));
+      return tabOrder
+        .filter((tabId) => terminalIds.has(tabId))
+        .slice(0, tiledSlotCount(layout))
+        .map((tabId) => `${activeSessionId}:${tabId}`);
+    }
+    return terminalWorkspaceStore.getVisiblePanes().map((pane) => `${pane.sessionId}:${pane.terminalId}`);
+  });
+
   // Auto-refresh sessions + storage when tab returns from background
   const handleVisibilityChange = () => {
     if (!document.hidden) {
@@ -366,7 +400,7 @@ const Layout: Component<LayoutProps> = (props) => {
       scheduleDisconnect(DASHBOARD_WS_DISCONNECT_DELAY_MS);
     } else {
       cancelScheduledDisconnect();
-      reconnectDisconnectedTerminals(untrack(() => sessionStore.activeSessionId) ?? undefined);
+      reconnectDisconnectedTerminals(undefined, visibleTerminalKeys());
     }
   });
 
@@ -392,7 +426,7 @@ const Layout: Component<LayoutProps> = (props) => {
               sessionStore.setActiveSession(sessionId);
               setViewState('terminal');
               setTimeout(() => terminalStore.triggerLayoutResize(), 50);
-              reconnectOnVisibilityReturn(sessionId);
+              reconnectOnVisibilityReturn(undefined, visibleTerminalKeys());
             }, 50);
             return;
           }
@@ -401,7 +435,7 @@ const Layout: Component<LayoutProps> = (props) => {
         setTimeout(() => {
           if (viewState() !== 'dashboard') enableVirtualKeyboardOverlay();
         }, 300);
-        reconnectOnVisibilityReturn(untrack(() => sessionStore.activeSessionId) ?? undefined);
+        reconnectOnVisibilityReturn(undefined, visibleTerminalKeys());
       }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
@@ -416,28 +450,49 @@ const Layout: Component<LayoutProps> = (props) => {
   createEffect(() => {
     const session = sessionStore.getActiveSession();
     const hasActiveTerminal = session && (session.status === 'running' || session.status === 'initializing' || sessionStore.isSessionInitializing(session.id));
+    const hasActiveMultiView = terminalWorkspaceStore.getActiveWorkspace().kind === 'multiview';
 
-    if (hasActiveTerminal && viewState() === 'dashboard') {
+    if ((hasActiveTerminal || hasActiveMultiView) && viewState() === 'dashboard') {
       setViewState('terminal');
       setTimeout(() => terminalStore.triggerLayoutResize(), 50);
-    } else if (!hasActiveTerminal && viewState() === 'terminal') {
+    } else if (!hasActiveTerminal && !hasActiveMultiView && viewState() === 'terminal') {
+      terminalWorkspaceStore.setDashboardWorkspace();
       setViewState('dashboard');
     }
   });
 
   // Handlers
+  const enterTerminalView = () => {
+    clearViewTransitionTimer();
+    setViewState('expanding');
+    viewTransitionTimer = setTimeout(() => {
+      viewTransitionTimer = undefined;
+      setViewState('terminal');
+      terminalStore.triggerLayoutResize();
+    }, VIEW_TRANSITION_DURATION_MS);
+  };
+
+  const openSessionWorkspace = (id: string, shouldStart = false) => {
+    const terminalId = shouldStart ? '1' : sessionStore.getTerminalsForSession(id)?.activeTabId || '1';
+    sessionStore.setActiveSession(id);
+    terminalWorkspaceStore.setSingleSessionWorkspace(id, terminalId);
+    enterTerminalView();
+    if (shouldStart) void sessionStore.startSession(id).catch(() => {});
+  };
+
   const handleSelectSession = (id: string) => {
     const session = sessionStore.sessions.find((s) => s.id === id);
-    if (session?.status === 'running') {
-      sessionStore.setActiveSession(id);
+    if (session?.status === 'running' || session?.status === 'initializing') {
+      openSessionWorkspace(id);
     } else if (session?.status === 'stopped') {
-      sessionStore.setActiveSession(id);
-      void sessionStore.startSession(id).catch(() => {});
+      openSessionWorkspace(id, true);
     }
   };
 
   const handleStartSession = async (id: string) => {
     sessionStore.setActiveSession(id);
+    terminalWorkspaceStore.setSingleSessionWorkspace(id, sessionStore.getTerminalsForSession(id)?.activeTabId || '1');
+    enterTerminalView();
     try {
       await sessionStore.startSession(id);
     } catch (err) {
@@ -457,12 +512,29 @@ const Layout: Component<LayoutProps> = (props) => {
     const session = await sessionStore.createSession(name, agentType, tabConfig);
     if (session) {
       sessionStore.setActiveSession(session.id);
+      terminalWorkspaceStore.setSingleSessionWorkspace(session.id, '1');
+      enterTerminalView();
       // Update preferences with last-used agent type
       if (agentType) {
         sessionStore.updatePreferences({ lastAgentType: agentType });
       }
       await sessionStore.startSession(session.id);
     }
+  };
+
+  const handleOpenMultiView = () => {
+    if (!terminalWorkspaceStore.openMultiView()) return;
+    setShowTilingOverlay(false);
+    sessionStore.setActiveSession(null);
+    enterTerminalView();
+  };
+
+  const handleCloseMultiView = () => {
+    terminalWorkspaceStore.closeMultiView();
+    setShowTilingOverlay(false);
+    clearViewTransitionTimer();
+    sessionStore.setActiveSession(null);
+    setViewState('dashboard');
   };
 
   // Handler for per-session init progress dismiss
@@ -477,31 +549,27 @@ const Layout: Component<LayoutProps> = (props) => {
   const handleOpenDashboard = () => {
     // Keyboard cleanup is handled reactively by Terminal.tsx when props.active
     // becomes false (via onCleanup in the keyboard lifecycle effect).
+    terminalWorkspaceStore.setDashboardWorkspace();
+    setShowTilingOverlay(false);
+    clearViewTransitionTimer();
     setViewState('collapsing');
-    setTimeout(() => {
-      sessionStore.setActiveSession(null);
+    sessionStore.setActiveSession(null);
+    viewTransitionTimer = setTimeout(() => {
+      viewTransitionTimer = undefined;
       setViewState('dashboard');
     }, VIEW_TRANSITION_DURATION_MS);
   };
 
   const handleDashboardSessionSelect = (sessionId: string) => {
     const session = sessionStore.sessions.find(s => s.id === sessionId);
-    if (session?.status === 'running') {
-      sessionStore.setActiveSession(sessionId);
+    if (session?.status === 'running' || session?.status === 'initializing') {
+      openSessionWorkspace(sessionId);
     } else if (session?.status === 'stopped') {
       // Always do a full start — even if the container could auto-wake via SDK,
       // the filesystem is empty after sleep (no R2 sync). startSession() runs
       // entrypoint.sh which restores files from R2 before starting the terminal.
-      sessionStore.setActiveSession(sessionId);
-      void sessionStore.startSession(sessionId).catch(() => {});
+      openSessionWorkspace(sessionId, true);
     }
-
-    // Start expansion animation
-    setViewState('expanding');
-    setTimeout(() => {
-      setViewState('terminal');
-      terminalStore.triggerLayoutResize();
-    }, VIEW_TRANSITION_DURATION_MS);
   };
 
   const handleSettingsClick = () => {
@@ -605,6 +673,8 @@ const Layout: Component<LayoutProps> = (props) => {
           onStopSession={handleStopSession}
           onDeleteSession={handleDeleteSession}
           onCreateSession={handleCreateSession}
+          onOpenMultiView={handleOpenMultiView}
+          onCloseMultiView={handleCloseMultiView}
         />
       </Show>
 
@@ -619,6 +689,7 @@ const Layout: Component<LayoutProps> = (props) => {
           onCloseTilingOverlay={handleCloseTilingOverlay}
           onTileClick={handleTileClick}
           onOpenSessionById={handleOpenSessionById}
+          onOpenMultiView={handleOpenMultiView}
           onDashboardSessionSelect={handleDashboardSessionSelect}
           onCreateSession={handleCreateSession}
           onStartSession={handleStartSession}

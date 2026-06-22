@@ -35,6 +35,38 @@ use judgment.)
    piece) until the REQ is honestly `Implemented`. See [[spec-discipline]],
    [[tdd-discipline]], [[documentation-discipline]].
 
+## Work continuity
+
+When a new user message arrives while you are mid-task, do not abandon or switch away from
+the active task just because the new message exists. Queue the new instruction mentally,
+finish the current concrete step to a safe stopping point, then handle the new request in
+order. If the new message explicitly says to stop, pause, or reprioritize, obey it; otherwise
+complete what you were doing first.
+
+## Review push gate
+
+Do not push while a PR-boundary review is running, pending, missing, stale, or otherwise
+not complete for the current head, unless the user explicitly authorizes pushing despite
+that active/incomplete review. Wait for the final merged review summary for the exact head,
+then fix legitimate findings before pushing another head.
+
+## Review-result handoff gate
+
+When a background `review-monitor` completes with `REVIEW_RESULT`, the very next
+assistant response MUST start by printing a detailed user-facing review summary before
+analysis, excuses, tool calls, todo updates, or fixes. Include the exact result line,
+severity counts, lane status, ranked findings, summary path, monitor transcript path if
+available, and the planned next action. Only after that summary may you read files,
+triage findings, or edit code.
+
+## CI-result handoff gate
+
+When a background CI monitor completes with `CI_RESULT`, the very next assistant response
+MUST start by printing a user-facing CI summary before analysis, tool calls, todo updates,
+review-status checks, fixes, deploys, or pushes. Include the exact result line, monitored
+head, workflow/run id and URL when present, log path, failed-log command when present, and
+planned next action. Only after that summary may you inspect logs or edit code.
+
 ## Hard gates
 
 - **Plan gate (every plan / ExitPlanMode).** A plan MUST contain an explicit

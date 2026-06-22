@@ -1,6 +1,6 @@
 /**
  * Structural / behavioural tests for the composed onboarding login page
- * (REQ-AUTH-020). The page is now Header + LoginCard (+ SsoAccordion +
+ * (REQ-AUTH-020 / REQ-AUTH-021). The page is now Header + LoginCard (+ SsoAccordion +
  * RequestedPanel) + Footer; these tests render it through the Container API and
  * assert the wiring that matters — the GitHub OAuth entry, the SSO buttons being
  * CTAs (never real auth routes), the hidden-by-default confirmation, the
@@ -10,20 +10,22 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { experimental_AstroContainer as AstroContainer } from 'astro/container';
 import LoginPage from '../pages/login.astro';
 import { LOGIN } from '../content/site';
-import { dom, decodeEntities } from './_helpers/dom';
+import { documentDom, dom, decodeEntities } from './_helpers/dom';
 
 let html: string;
 let body: HTMLElement;
+let documentNode: Document;
 let text: string;
 
 beforeAll(async () => {
   const container = await AstroContainer.create();
   html = await container.renderToString(LoginPage);
   body = dom(html);
+  documentNode = documentDom(html);
   text = decodeEntities(html);
 });
 
-describe('onboarding login page (REQ-AUTH-020)', () => {
+describe('onboarding login page (REQ-AUTH-020 / REQ-AUTH-021)', () => {
   it('GitHub is the single primary action and links to the OAuth entry route', () => {
     const gh = body.querySelector('.login-github')!;
     expect(gh).not.toBeNull();
@@ -68,9 +70,21 @@ describe('onboarding login page (REQ-AUTH-020)', () => {
     expect(map.default).toBeTruthy();
   });
 
-  it('inherits the shared layout: the splash mount-point and the back link', () => {
-    expect(html).toContain('data-flare-fluid');
+  it('inherits the shared nav and font preloads while omitting landing-only motion hooks', () => {
     expect(body.querySelector('.login-back')?.getAttribute('href')).toBe(LOGIN.back.href);
+    const preloads = Array.from(documentNode.head.querySelectorAll('link[rel="preload"][as="font"]'));
+    expect(preloads.map((link) => link.getAttribute('type'))).toEqual(['font/woff2', 'font/woff2']);
+    expect(body.querySelector('[data-flare-fluid]')).toBeNull();
+    expect(body.querySelector('[data-hero-kicker]')).toBeNull();
+    expect(body.querySelector('[data-ft-loop]')).toBeNull();
+    expect(body.querySelector('[data-agentfoot]')).toBeNull();
+    expect(body.querySelector('[data-proof]')).toBeNull();
+  });
+
+  it('renders the same single shared ambient glow layer as the landing page', () => {
+    // The glow is one BaseLayout-owned layer shared across pages, so /login carries
+    // the identical treatment rather than its old bespoke .login-main background glow.
+    expect(body.querySelectorAll('.page-ambient-glow')).toHaveLength(1);
   });
 
   it('is excluded from search indexing (auth URLs carry ?status / ?error)', () => {
