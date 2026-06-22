@@ -115,15 +115,34 @@ export function startVaultPrewarm(opts: VaultPrewarmOptions): VaultPrewarmHandle
   const timeoutMs = opts.timeoutMs ?? DEFAULT_VAULT_PREWARM_TIMEOUT_MS;
   const prewarmId = opts.prewarmId ?? createPrewarmId();
   const iframe = documentRef.createElement('iframe');
-  const previousFocus = getRestorableFocus(documentRef);
+  // The element to restore focus to is tracked LIVE, not snapshotted at start:
+  // prewarm begins when the vault goes ready (background), typically before the
+  // user enters the terminal, so a start-time snapshot would aim restore at a
+  // stale dashboard element. The focusin listener keeps this pointed at whatever
+  // the user is actually using (e.g. the xterm textarea) when SilverBullet inside
+  // the iframe grabs focus late.
+  let lastGoodFocus = getRestorableFocus(documentRef);
   const focusRestoreTimers: unknown[] = [];
   let finished = false;
   let timer: unknown = null;
 
-  const restoreFocus = () => restoreFocusIfPrewarmCaptured(documentRef, iframe, previousFocus);
+  const restoreFocus = () => restoreFocusIfPrewarmCaptured(documentRef, iframe, lastGoodFocus);
+
+  // Single guard for the whole prewarm lifetime: if the iframe captured focus,
+  // hand it straight back; otherwise remember the live focus as the restore target.
+  const onFocusIn = () => {
+    if (documentRef.activeElement === iframe) {
+      restoreFocus();
+      return;
+    }
+    const restorable = getRestorableFocus(documentRef);
+    if (restorable && restorable !== iframe) lastGoodFocus = restorable;
+  };
 
   const cleanup = () => {
     windowRef.removeEventListener('message', onMessage);
+    windowRef.removeEventListener('blur', restoreFocus);
+    documentRef.removeEventListener('focusin', onFocusIn);
     iframe.removeEventListener('focus', restoreFocus);
     iframe.removeEventListener('load', restoreFocus);
     if (timer !== null) {
@@ -175,6 +194,12 @@ export function startVaultPrewarm(opts: VaultPrewarmOptions): VaultPrewarmHandle
   iframe.style.pointerEvents = 'none';
 
   windowRef.addEventListener('message', onMessage);
+  // The parent WINDOW reliably fires `blur` when focus moves into a child iframe,
+  // even in browsers where the parent does not get a `focusin` for intra-iframe
+  // focus. restoreFocus only acts when activeElement === iframe, so a legitimate
+  // tab/app switch (where the iframe is not the active element) is a no-op.
+  windowRef.addEventListener('blur', restoreFocus);
+  documentRef.addEventListener('focusin', onFocusIn);
   iframe.addEventListener('focus', restoreFocus);
   iframe.addEventListener('load', restoreFocus);
   documentRef.body.appendChild(iframe);

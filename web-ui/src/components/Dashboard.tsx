@@ -46,21 +46,15 @@ const Dashboard: Component<DashboardProps> = (props) => {
   const [collapseReady, setCollapseReady] = createSignal(false);
   const viewport = createTerminalViewportClass();
   const multiViewWorkspace = createMemo(() => terminalWorkspaceStore.reconcileMultiView(props.sessions, viewport()));
-  // Mobile-only: which right-column face is shown (GitHub vs R2 storage). The
-  // flip control in each panel header toggles it; desktop shows both stacked.
+  // Mobile-only: which single right-column face is visible (GitHub vs R2 storage).
+  // GitHub leads — whenever it is enabled it is the DEFAULT face (the Connect card
+  // until connected, the repo browser once connected), with a flip control to reach
+  // the storage browser; only when GitHub is disabled is storage the sole face. Keyed
+  // off `githubStore.enabled` alone — there is no session-tier gate. On tablet/desktop
+  // both faces stack as a split (more vertical room) and the flip controls are hidden
+  // by CSS, so there is nothing to flip. (REQ-GITHUB-007/010)
   const [panelFace, setPanelFace] = createSignal<'github' | 'storage'>('github');
-  // On mobile only one right-column face is visible at a time. The GitHub face is
-  // only a valid target when GitHub is enabled; when it is not (non-enterprise /
-  // onboarding) force the storage (R2) face so the empty GitHub panel can never
-  // become the active face and cover the file browser. (REQ-GITHUB-002)
-  // The GitHub repo panel is an advanced-session feature in non-enterprise modes
-  // (matches the Vault button gate, sessionMode === 'advanced'); enterprise shows it
-  // whenever the backend enables it. Connect itself is not gated here — it lives in
-  // Guided Setup + the Settings accordion and works for every user.
-  const githubPanelAvailable = () =>
-    githubStore.enabled &&
-    (sessionStore.enterpriseMode || sessionStore.preferences?.sessionMode === 'advanced');
-  const effectiveFace = () => (githubPanelAvailable() ? panelFace() : 'storage');
+  const effectiveFace = () => (githubStore.enabled ? panelFace() : 'storage');
   const [showCreateDialog, setShowCreateDialog] = createSignal(false);
   const [showLimitPopup, setShowLimitPopup] = createSignal(false);
   const [showUserMenu, setShowUserMenu] = createSignal(false);
@@ -92,61 +86,99 @@ const Dashboard: Component<DashboardProps> = (props) => {
   const [githubMaxH, setGithubMaxH] = createSignal<number | null>(null);
   const [storageMaxH, setStorageMaxH] = createSignal<number | null>(null);
 
-  // One usable panel = chrome (~120px) + at least 4 rows (52px); below twice that
-  // the column flips to a single panel.
-  const MIN_PANEL_HEIGHT = 120 + 4 * 52;
-
+  // Measure a face's TRUE natural height — what it wants with all its content shown
+  // and nothing constraining it — as a fixed point that never depends on the column
+  // height, the sibling face, or any max-height we previously wrote (so re-measures
+  // are idempotent and the split is loop-free). First neutralize our own sizing: drop
+  // max-height AND flex so the face hugs its content. Then:
+  //  - WITH an inner scroller (the repo / file list): under `flex: 0 0 auto` the
+  //    overflow:auto scroller lays out collapsed (~0px), so its laid-out box is NOT
+  //    its content — we must add the list's FULL content via `scrollHeight` (which is
+  //    the content height regardless of the scroller's box, hence invariant under our
+  //    writes) to the surrounding chrome (header/search = face box minus scroller box).
+  //    Measuring only the collapsed box is exactly what made a 20-repo panel report a
+  //    ~2-repo height and clip the rest. This relies on the list rows being
+  //    intrinsically sized (the fixed-height repo / file rows): a descendant sized as a
+  //    vertical percentage / `flex-grow` / `cqh` would collapse with the scroller and
+  //    undercount again.
+  //  - NO scroller (connect / loading / error / empty face): the content-hugging face
+  //    box IS the natural height.
   const measureNatural = (face: HTMLElement | undefined, scrollSel: string): number | null => {
     if (!face) return null;
+    const prevMaxH = face.style.maxHeight;
+    const prevFlex = face.style.flex;
+    face.style.maxHeight = 'none';
+    face.style.flex = '0 0 auto';
     const scroller = face.querySelector<HTMLElement>(scrollSel);
-    if (!scroller) return face.scrollHeight; // connect card / empty face: no inner scroll
-    // Chrome (header/search) is invariant under the applied max-height, so deriving
-    // it from the current boxes is stable; add the list's full scroll content.
-    const chrome = Math.max(0, face.getBoundingClientRect().height - scroller.getBoundingClientRect().height);
-    return Math.ceil(chrome + scroller.scrollHeight);
+    const natural = scroller
+      ? Math.max(0, face.getBoundingClientRect().height - scroller.getBoundingClientRect().height) + scroller.scrollHeight
+      : face.getBoundingClientRect().height;
+    face.style.flex = prevFlex;
+    face.style.maxHeight = prevMaxH;
+    return Math.ceil(natural);
   };
 
   const measureLayout = () => {
     const right = rightColRef;
     if (!right) return;
-    const mode = decidePanelLayoutMode({
-      width: right.clientWidth,
-      height: right.clientHeight,
-      minPanelHeight: MIN_PANEL_HEIGHT,
-    });
+    // width = VIEWPORT (mobile breakpoint, matches the CSS flip); height = the
+    // column's own box (too-short check). Never the column's measured WIDTH — the
+    // layout caps that small, so it would wrongly flip every tablet/laptop.
+    const mode = decidePanelLayoutMode({ width: window.innerWidth, height: right.clientHeight });
     setLayoutMode(mode);
-    if (mode === 'flip') {
+    // Measured caps only make sense for the TWO-panel split. In flip mode, or when
+    // GitHub is disabled (Storage is the sole face — the GitHub face is not rendered),
+    // there is no second panel to balance — clear the caps so the single face just
+    // fills the column instead of capping to its content and leaving empty space.
+    if (mode === 'flip' || !githubStore.enabled) {
       setGithubMaxH(null);
       setStorageMaxH(null);
       return;
     }
-    setGithubMaxH(measureNatural(githubFaceRef, '.github-repo-rows'));
-    setStorageMaxH(measureNatural(storageFaceRef, '.storage-drop-zone'));
+    const gh = measureNatural(githubFaceRef, '.github-repo-rows');
+    const st = measureNatural(storageFaceRef, '.storage-drop-zone');
+    // Idempotent write: a redundant trigger that re-measures the same value is a no-op.
+    setGithubMaxH((p) => (p === gh ? p : gh));
+    setStorageMaxH((p) => (p === st ? p : st));
   };
 
   onMount(() => {
+    const right = rightColRef;
+    if (!right) return;
     let raf = 0;
     const schedule = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(measureLayout); };
-    schedule();
-    // Re-measure on two triggers: the column's own box resizing (viewport /
-    // orientation), and its CONTENT changing (repos/files loaded, folder navigated,
-    // in-panel search filtered). A ResizeObserver only sees the column's own box, so
-    // it misses content changes — those alter the inner scrollHeight, not the column
-    // size. A MutationObserver on the subtree catches the row add/removes an in-panel
-    // search produces, which the child components filter via their own local signals
-    // this component cannot reach. Both degrade gracefully when absent (jsdom).
+    // Re-measure on the two things that change the split. This is loop-free because
+    // measureLayout's measurement is a FIXED POINT (measureNatural reads the natural
+    // height with our own max-height removed), so a redundant re-measure returns the
+    // same value and the idempotent setters make it a no-op. (The #568 flicker came
+    // from measuring the face height WHILE our max-height was applied, so each measure
+    // perturbed the next — not from which element was observed.) The observers are also
+    // chosen so they cannot even see our writes:
+    //  - the column BOX resizing (viewport / orientation / header / banner reflow). The
+    //    column is `flex: 1; overflow: hidden`, sized by the OUTER layout, so the
+    //    max-height we set on its face CHILDREN can never change the column's own box.
+    //  - rows ADDED/REMOVED inside either panel (GitHub connect↔list↔load-more state,
+    //    storage show-hidden toggle, folder navigation, R2 readiness). childList only:
+    //    the max-height we set is a style ATTRIBUTE, which a childList observer ignores.
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
+    ro?.observe(right);
     const mo = typeof MutationObserver !== 'undefined' ? new MutationObserver(schedule) : null;
-    if (rightColRef) {
-      ro?.observe(rightColRef);
-      mo?.observe(rightColRef, { childList: true, subtree: true });
-    }
+    mo?.observe(right, { childList: true, subtree: true });
+    schedule(); // initial measure
     onCleanup(() => { ro?.disconnect(); mo?.disconnect(); cancelAnimationFrame(raf); });
   });
 
   onMount(() => {
     sessionStore.startR2Polling();
     storageStore.fetchStats();
+
+    // Load GitHub status here, OUTSIDE the GitHub panel. The right-column GitHub
+    // face only renders when `githubStore.enabled`, and `enabled` is set by
+    // loadStatus() — if that call lived only in GitHubPanel.onMount it would never
+    // run while the panel is unmounted, so an enabled instance would never reveal
+    // its panel (the connect card included). Kicking it off from the always-mounted
+    // Dashboard breaks that deadlock. Best-effort; never blocks. (REQ-GITHUB-007)
+    void githubStore.loadStatus?.();
 
     // REQ-MEM-001 AC4: capture the browser's IANA timezone and sync it
     // to the user's preferences so the next session start propagates
@@ -213,8 +245,8 @@ const Dashboard: Component<DashboardProps> = (props) => {
   return (
     <div class="dashboard-container" data-testid="dashboard">
       <div class="dashboard-panel-wrapper">
-        <KittScanner />
         <div class={`dashboard-panel ${panelExpanded() ? 'dashboard-panel--expanded' : ''}`} data-testid="dashboard-floating-panel">
+          <KittScanner />
 
         {/* Integrated Header */}
         <div class="dashboard-panel-header">
@@ -424,21 +456,23 @@ const Dashboard: Component<DashboardProps> = (props) => {
             data-layout={layoutMode() === 'flip' ? 'flip' : undefined}
             ref={rightColRef}
           >
-            <div
-              class="panel-flip-face panel-flip-face--github"
-              data-active={effectiveFace() === 'github'}
-              ref={githubFaceRef}
-              style={layoutMode() !== 'flip' && githubMaxH() != null ? { 'max-height': `${githubMaxH()}px` } : undefined}
-            >
-              <GitHubPanel onFlip={() => setPanelFace('storage')} />
-            </div>
+            <Show when={githubStore.enabled}>
+              <div
+                class="panel-flip-face panel-flip-face--github"
+                data-active={effectiveFace() === 'github'}
+                ref={githubFaceRef}
+                style={layoutMode() !== 'flip' && githubMaxH() != null ? { 'max-height': `${githubMaxH()}px` } : undefined}
+              >
+                <GitHubPanel onFlip={() => setPanelFace('storage')} />
+              </div>
+            </Show>
             <div
               class="panel-flip-face panel-flip-face--storage"
               data-active={effectiveFace() === 'storage'}
               ref={storageFaceRef}
-              style={layoutMode() !== 'flip' && storageMaxH() != null ? { 'max-height': `${storageMaxH()}px` } : undefined}
+              style={layoutMode() !== 'flip' && githubStore.enabled && storageMaxH() != null ? { 'max-height': `${storageMaxH()}px` } : undefined}
             >
-              <Show when={githubPanelAvailable()}>
+              <Show when={githubStore.enabled}>
                 <div class="files-panel-header" data-testid="files-panel-header">
                   <h2 class="files-panel-title" data-testid="files-panel-title">Storage Browser</h2>
                   <IconButton

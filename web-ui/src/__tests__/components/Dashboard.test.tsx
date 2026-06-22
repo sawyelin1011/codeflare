@@ -52,13 +52,19 @@ vi.mock('../../components/github/GitHubPanel', () => ({
   )
 }));
 
-// Controllable GitHub enablement for the right-column face logic.
-vi.mock('../../stores/github', () => {
-  let _enabled = false;
+// Controllable GitHub enablement for the right-column face logic. `enabled` is a real
+// reactive signal so a test can flip it DURING mount (e.g. from inside loadStatus) and
+// watch the GitHub face appear — proving the deadlock fix end-to-end, not just the call.
+vi.mock('../../stores/github', async () => {
+  const { createSignal } = await vi.importActual<typeof import('solid-js')>('solid-js');
+  const [enabled, setEnabled] = createSignal(false);
   return {
     githubStore: {
-      get enabled() { return _enabled; },
-      _setEnabled: (v: boolean) => { _enabled = v; },
+      get enabled() { return enabled(); },
+      _setEnabled: (v: boolean) => setEnabled(v),
+      // Dashboard kicks this off on mount to break the enabled-gates-the-panel
+      // deadlock (status is loaded outside the gated GitHub panel).
+      loadStatus: vi.fn(),
     },
   };
 });
@@ -196,6 +202,10 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks clears call history but NOT a queued mockImplementationOnce, so
+    // reset loadStatus fully — otherwise an unconsumed once-impl from one test could
+    // leak into the next. (The end-to-end deadlock test queues one such impl.)
+    vi.mocked(githubStore.loadStatus).mockReset();
     viewportMock.setViewport?.('desktop');
   });
 
@@ -284,6 +294,28 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     render(() => <Dashboard {...defaultProps} />);
 
     expect(sessionStore.startR2Polling).toHaveBeenCalledTimes(1);
+  });
+
+  it('REQ-GITHUB-007: loads GitHub status from the Dashboard on mount so the enabled-gated GitHub panel is not deadlocked', () => {
+    render(() => <Dashboard {...defaultProps} />);
+
+    // Status load is kicked off OUTSIDE the gated GitHub panel — otherwise an enabled
+    // instance would never set `enabled`, so its panel (and connect card) never appears.
+    expect(githubStore.loadStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('REQ-GITHUB-007: the Dashboard-triggered status load that enables GitHub reveals the GitHub face (deadlock fix, end-to-end)', () => {
+    // Start disabled (the deadlock state: if status only loaded inside the gated panel
+    // the face would never appear). The mocked loadStatus stands in for the real one —
+    // when the Dashboard calls it on mount it flips enabled false→true, exactly as the
+    // real store does after GET /status — and the GitHub face must then appear as default.
+    (githubStore as any)._setEnabled(false);
+    (githubStore.loadStatus as any).mockImplementationOnce(() => { (githubStore as any)._setEnabled(true); });
+    render(() => <Dashboard {...defaultProps} />);
+
+    const right = screen.getByTestId('dashboard-panel-right');
+    expect(right.querySelector('.panel-flip-face--github')).not.toBeNull();
+    expect(right.getAttribute('data-face')).toBe('github');
   });
 
   it('does not sweep Vault IndexedDB caches from the non-authoritative dashboard session props', () => {
@@ -390,9 +422,9 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     render(() => <Dashboard {...defaultProps} />);
 
     const right = screen.getByTestId('dashboard-panel-right');
-    const githubFace = right.querySelector('.panel-flip-face--github')!;
+    // GitHub unavailable: its face is not rendered at all, so it cannot cover R2.
+    expect(right.querySelector('.panel-flip-face--github')).toBeNull();
     const storageFace = right.querySelector('.panel-flip-face--storage')!;
-    expect(githubFace.getAttribute('data-active')).toBe('false');
     expect(storageFace.getAttribute('data-active')).toBe('true');
     expect(right.getAttribute('data-face')).toBe('storage');
     // Nothing to flip to, so no "Show GitHub" back control is offered.
@@ -418,14 +450,17 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(screen.getByTestId('files-panel-header')).toBeInTheDocument();
   });
 
-  it('REQ-GITHUB-007: hides the GitHub face for a non-advanced non-enterprise session even when enabled (advanced gate)', () => {
+  it('REQ-GITHUB-007: renders the GitHub face as the default for a standard (non-advanced, non-enterprise) session whenever GitHub is enabled — no session-tier gate', () => {
     (githubStore as any)._setEnabled(true);
-    (sessionStore as any)._setSessionMode('standard'); // not advanced
+    (sessionStore as any)._setSessionMode('standard'); // not advanced, not enterprise
     render(() => <Dashboard {...defaultProps} />);
 
     const right = screen.getByTestId('dashboard-panel-right');
-    expect(right.getAttribute('data-face')).toBe('storage');
-    expect(screen.queryByTestId('storage-flip-btn')).not.toBeInTheDocument();
+    // The GitHub face is rendered and leads — the advanced/enterprise gate is gone,
+    // so a plain enabled session still gets the GitHub browser (connect card included).
+    expect(right.querySelector('.panel-flip-face--github')).not.toBeNull();
+    expect(right.getAttribute('data-face')).toBe('github');
+    expect(screen.getByTestId('storage-flip-btn')).toBeInTheDocument();
   });
 
   it('REQ-GITHUB-007: shows the GitHub face for an enterprise session regardless of session mode', () => {
@@ -435,6 +470,7 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     render(() => <Dashboard {...defaultProps} />);
 
     const right = screen.getByTestId('dashboard-panel-right');
+    expect(right.querySelector('.panel-flip-face--github')).not.toBeNull();
     expect(right.getAttribute('data-face')).toBe('github');
   });
 
@@ -449,6 +485,243 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     // Flip back to GitHub from the storage back-button.
     fireEvent.click(screen.getByTestId('storage-flip-btn'));
     expect(right.getAttribute('data-face')).toBe('github');
+  });
+
+  it('REQ-GITHUB-010: wires the re-measure observers on the column box + row mutations, never watching the max-height (style) it writes (loop-free observer config)', () => {
+    const roTargets: Element[] = [];
+    const moCalls: Array<{ target: Element; options?: MutationObserverInit }> = [];
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealMO = (globalThis as any).MutationObserver;
+    class SpyRO { observe(el: Element) { roTargets.push(el); } unobserve() {} disconnect() {} }
+    class SpyMO {
+      observe(el: Element, options?: MutationObserverInit) { moCalls.push({ target: el, options }); }
+      disconnect() {} takeRecords() { return [] as MutationRecord[]; }
+    }
+    (globalThis as any).ResizeObserver = SpyRO;
+    (globalThis as any).MutationObserver = SpyMO;
+    try {
+      (githubStore as any)._setEnabled(true);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right');
+      const githubFace = right.querySelector('.panel-flip-face--github')!;
+      const storageFace = right.querySelector('.panel-flip-face--storage')!;
+
+      // The re-measure IS wired — gutting the observers entirely must fail this test.
+      expect(roTargets).toContain(right);
+      const columnMO = moCalls.filter((c) => c.target === right);
+      expect(columnMO.length).toBeGreaterThan(0);
+
+      // ...but never resize-observe the faces whose max-height we set: a ResizeObserver
+      // on a face we resize WOULD fire on our own writes (a loop edge we must not add).
+      expect(roTargets).not.toContain(githubFace);
+      expect(roTargets).not.toContain(storageFace);
+
+      // The column MutationObserver watches row add/remove only, NEVER attributes —
+      // the max-height we write is a style attribute, so attribute observation would
+      // feed our own writes back as re-measures.
+      for (const c of columnMO) {
+        expect(c.options?.childList).toBe(true);
+        expect(c.options?.attributes).not.toBe(true);
+      }
+    } finally {
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).MutationObserver = RealMO;
+    }
+  });
+
+  it('REQ-GITHUB-010: applies the measured natural height as a face max-height, holds steady on a redundant observer callback, and updates only when content height changes (behavioral fixed point — proves no thrash)', () => {
+    let natural = 300;
+    let roCb: () => void = () => {};
+    const measuredWith = { maxHeight: '', flex: '', flexGrow: '' };
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealRAF = globalThis.requestAnimationFrame;
+    const RealCAF = globalThis.cancelAnimationFrame;
+    const origGBCR = HTMLElement.prototype.getBoundingClientRect;
+    class CapRO { constructor(cb: () => void) { roCb = cb; } observe() {} unobserve() {} disconnect() {} }
+    (globalThis as any).ResizeObserver = CapRO;
+    // Run the rAF-debounced measure synchronously so we can drive it deterministically.
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
+    (globalThis as any).cancelAnimationFrame = () => {};
+    // Stub the face's content height, AND capture its style at the moment it is
+    // measured — so we can prove measureNatural actually neutralized the face
+    // (dropped max-height + flex) before reading the box. Asserting only the height
+    // would still pass if the neutralization were removed; capturing the style makes
+    // the test fail when the fix is reverted.
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      if (this.classList?.contains('panel-flip-face--github')) {
+        measuredWith.maxHeight = this.style.maxHeight;
+        measuredWith.flex = this.style.flex;
+        measuredWith.flexGrow = this.style.flexGrow;
+      }
+      return { height: natural, width: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} } as DOMRect;
+    };
+    try {
+      (githubStore as any)._setEnabled(true);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right');
+      const githubFace = right.querySelector('.panel-flip-face--github') as HTMLElement;
+
+      // Initial measure applied the natural content height...
+      expect(githubFace.style.maxHeight).toBe('300px');
+      // ...and it measured UNCONSTRAINED — proving the production fixed point rather
+      // than assuming it (fails if measureNatural stops neutralizing the face).
+      expect(measuredWith.maxHeight).toBe('none');
+      expect(measuredWith.flex === '0 0 auto' || measuredWith.flexGrow === '0').toBe(true);
+      // Redundant observer callback, unchanged content: stays put (idempotent / no thrash).
+      natural = 300;
+      roCb();
+      expect(githubFace.style.maxHeight).toBe('300px');
+      // Content grew: the next callback re-measures and updates.
+      natural = 400;
+      roCb();
+      expect(githubFace.style.maxHeight).toBe('400px');
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = origGBCR;
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).requestAnimationFrame = RealRAF;
+      (globalThis as any).cancelAnimationFrame = RealCAF;
+    }
+  });
+
+  it('REQ-GITHUB-010: sizes the GitHub face to its FULL list content (chrome + scroller.scrollHeight), not the collapsed scroller box — a long repo list is never undercounted', () => {
+    let roCb: () => void = () => {};
+    const CHROME = 120;    // header + search: the face box minus the (collapsed) scroller box
+    const CONTENT = 1200;  // full scroll content of a long repo list (e.g. 20 rows)
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealRAF = globalThis.requestAnimationFrame;
+    const RealCAF = globalThis.cancelAnimationFrame;
+    const origGBCR = HTMLElement.prototype.getBoundingClientRect;
+    class CapRO { constructor(cb: () => void) { roCb = cb; } observe() {} unobserve() {} disconnect() {} }
+    (globalThis as any).ResizeObserver = CapRO;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
+    (globalThis as any).cancelAnimationFrame = () => {};
+    // Under the neutralized (flex:0 0 auto) measure the overflow:auto list lays out
+    // COLLAPSED: the face box reports only its chrome and the scroller box reports ~0,
+    // while the list's true height lives in scrollHeight. measureNatural must add
+    // scrollHeight — reading the collapsed box is the undercount that showed 2 of 20 repos.
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      const height = this.classList?.contains('github-repo-rows')
+        ? 0
+        : this.classList?.contains('panel-flip-face--github')
+          ? CHROME
+          : 0;
+      return { height, width: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} } as DOMRect;
+    };
+    try {
+      (githubStore as any)._setEnabled(true);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right');
+      const githubFace = right.querySelector('.panel-flip-face--github') as HTMLElement;
+      // The real GitHubPanel renders `.github-repo-rows`; the stub omits it, so inject
+      // the scroller with a large scroll content but a collapsed laid-out box.
+      const scroller = document.createElement('div');
+      scroller.className = 'github-repo-rows';
+      Object.defineProperty(scroller, 'scrollHeight', { value: CONTENT, configurable: true });
+      githubFace.appendChild(scroller);
+      // Re-measure now that the list content exists.
+      roCb();
+      // chrome (120) + full content (1200) = 1320 — NOT the collapsed 120-only box.
+      expect(githubFace.style.maxHeight).toBe(`${CHROME + CONTENT}px`);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = origGBCR;
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).requestAnimationFrame = RealRAF;
+      (globalThis as any).cancelAnimationFrame = RealCAF;
+    }
+  });
+
+  it('REQ-GITHUB-010: sizes the Storage face to its full list content (chrome + scroller.scrollHeight) via the .storage-drop-zone selector', () => {
+    let roCb: () => void = () => {};
+    const CHROME = 90;
+    const CONTENT = 1500;
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealRAF = globalThis.requestAnimationFrame;
+    const RealCAF = globalThis.cancelAnimationFrame;
+    const origGBCR = HTMLElement.prototype.getBoundingClientRect;
+    class CapRO { constructor(cb: () => void) { roCb = cb; } observe() {} unobserve() {} disconnect() {} }
+    (globalThis as any).ResizeObserver = CapRO;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
+    (globalThis as any).cancelAnimationFrame = () => {};
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      const height = this.classList?.contains('storage-drop-zone')
+        ? 0
+        : this.classList?.contains('panel-flip-face--storage')
+          ? CHROME
+          : 0;
+      return { height, width: 0, top: 0, left: 0, right: 0, bottom: 0, x: 0, y: 0, toJSON() {} } as DOMRect;
+    };
+    try {
+      (githubStore as any)._setEnabled(true);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right');
+      const storageFace = right.querySelector('.panel-flip-face--storage') as HTMLElement;
+      const scroller = document.createElement('div');
+      scroller.className = 'storage-drop-zone';
+      Object.defineProperty(scroller, 'scrollHeight', { value: CONTENT, configurable: true });
+      storageFace.appendChild(scroller);
+      roCb();
+      expect(storageFace.style.maxHeight).toBe(`${CHROME + CONTENT}px`);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = origGBCR;
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).requestAnimationFrame = RealRAF;
+      (globalThis as any).cancelAnimationFrame = RealCAF;
+    }
+  });
+
+  it('REQ-GITHUB-010: GitHub unavailable → GitHub face is not rendered and Storage is the sole face with no max-height cap (single-panel fills the full-height column)', () => {
+    let roCb: () => void = () => {};
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealRAF = globalThis.requestAnimationFrame;
+    const RealCAF = globalThis.cancelAnimationFrame;
+    class CapRO { constructor(cb: () => void) { roCb = cb; } observe() {} unobserve() {} disconnect() {} }
+    (globalThis as any).ResizeObserver = CapRO;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
+    (globalThis as any).cancelAnimationFrame = () => {};
+    try {
+      (githubStore as any)._setEnabled(false);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right');
+      // No empty GitHub face left in the column to push Storage down...
+      expect(right.querySelector('.panel-flip-face--github')).toBeNull();
+      // ...and Storage carries no measured cap, so it fills the full-height column
+      // instead of capping to its content and pinning to the bottom with a gap above.
+      const storageFace = right.querySelector('.panel-flip-face--storage') as HTMLElement;
+      expect(storageFace).not.toBeNull();
+      roCb();
+      expect(storageFace.style.maxHeight).toBe('');
+    } finally {
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).requestAnimationFrame = RealRAF;
+      (globalThis as any).cancelAnimationFrame = RealCAF;
+    }
+  });
+
+  it('REQ-GITHUB-010: the split/flip decision uses the VIEWPORT width, not the right-column width (a narrow column on a wide viewport must not flip)', () => {
+    let roCb: () => void = () => {};
+    const RealRO = (globalThis as any).ResizeObserver;
+    const RealRAF = globalThis.requestAnimationFrame;
+    const realInnerWidth = window.innerWidth;
+    class CapRO { constructor(cb: () => void) { roCb = cb; } observe() {} unobserve() {} disconnect() {} }
+    (globalThis as any).ResizeObserver = CapRO;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => { cb(0); return 0; };
+    (window as any).innerWidth = 1024; // pin a wide viewport, do not rely on the jsdom default
+    try {
+      (githubStore as any)._setEnabled(true);
+      render(() => <Dashboard {...defaultProps} />);
+      const right = screen.getByTestId('dashboard-panel-right') as HTMLElement;
+      // Wide viewport (1024) but a NARROW own column-width and enough height to split.
+      // If the decision (wrongly) used the column width (400 < 600) it would flip;
+      // using window.innerWidth (1024) it must stay split.
+      Object.defineProperty(right, 'clientWidth', { configurable: true, value: 400 });
+      Object.defineProperty(right, 'clientHeight', { configurable: true, value: 800 });
+      roCb();
+      expect(right.getAttribute('data-layout')).not.toBe('flip');
+    } finally {
+      (globalThis as any).ResizeObserver = RealRO;
+      (globalThis as any).requestAnimationFrame = RealRAF;
+      (window as any).innerWidth = realInnerWidth;
+    }
   });
 
   // === Expansion Tests ===
@@ -519,12 +792,15 @@ describe('Dashboard / REQ-SUB-019 (session limit popup in frontend)', () => {
     expect(onSettingsClick).toHaveBeenCalledTimes(1);
   });
 
-  it('renders KittScanner component in dashboard', () => {
+  it('renders KittScanner inside the dashboard panel so it sits on the header, not above the centered panel', () => {
     render(() => <Dashboard {...defaultProps} />);
 
-    const dashboard = screen.getByTestId('dashboard');
-    const kittScanner = dashboard.querySelector('.kitt-scanner');
+    const panel = screen.getByTestId('dashboard-floating-panel');
+    const kittScanner = panel.querySelector('.kitt-scanner');
     expect(kittScanner).toBeInTheDocument();
+    // Anchored to the panel (its parent), not the full-height wrapper — otherwise the
+    // absolute scanner floats in the empty space above the now content-sized panel.
+    expect(kittScanner?.parentElement).toBe(panel);
   });
 
   it('should use mdiXml icon path for the header logo (not mdiBrain)', () => {
